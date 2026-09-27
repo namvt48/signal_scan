@@ -1,0 +1,16 @@
+PASS 32miPz step 1/2 SELL ETAC     qty≈11,562,737.379190 ← quote 9,733.622581
+PASS 32miPz step 2/2 SELL CATE     qty≈9,733.622581 ← quote 7.431563
+PASS 32miPz đủ 2/2 step, không thừa
+PASS 3s6s8i step 1/4 BUY  CATE     qty≈19,770.901779 ← quote 14.970060
+PASS 3s6s8i step 2/4 SELL CATE     qty≈90.343227 ← quote 0.003735
+PASS 3s6s8i step 3/4 SELL CATE     qty≈90.343226 ← quote 0.003735
+PASS 3s6s8i step 4/4 BUY  ETAC     qty≈46,147,370.817002 ← quote 570.588796
+PASS 3s6s8i đủ 4/4 step, không thừa
+PASS N3DHJV step 1/3 SELL NINJACAT qty≈9,385,021.844639 ← quote 1.651701
+PASS N3DHJV step 2/3 SELL MSFTx    qty≈0.565543 ← quote 280.365138
+PASS N3DHJV step 3/3 SELL MSFTx    qty≈1.086159 ← quote 538.668938
+PASS N3DHJV đủ 3/3 step, không thừa
+PASS N3DHJV Σ MSFTx SELL steps = 1.65170136 (= net route cũ)
+PASS N3DHJV không có event mint==USDC (USDC chỉ là quote; USDC/SOL reject major-major)
+PASS 3s6s8i* strip balance-row ETAC: steps y hệt (per-leg, không cần balance diff)
+OK: per-step route detection 15/15

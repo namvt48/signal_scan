@@ -1,0 +1,5 @@
+[16:09:56] # 1 ví mới: set watermark head (dùng --backfill N để thấy tx cũ)
+[16:09:56] # watch 1 ví | feed=ws | 5 quote-mints | min $0.5
+[16:09:57] # feed=ws logsSubscribe 1 ví | sweep 60.0s | Ctrl-C dừng
+[16:13:05] 09-11 16:12:54 [33mTRANSFER_IN [0m 8NQ32…eEQr  0.631234 USDC ≈ $0.53  EPjFWdd5…  https://solscan.io/tx/41vJVKZvn9UXYX2HaS2PDGzc77p3VqpamZ6YFPQ6JYy82dnwfXi7P9DC9cn3ixG1oh2KU9rzZeechVszu3RFTSzo
+[16:14:42] 09-11 16:14:31 [33mTRANSFER_IN [0m 8NQ32…eEQr  1.214371 USDC ≈ $1.14  EPjFWdd5…  https://solscan.io/tx/FcuChS8zPauGmfviztfUZpva3jdb3bXvPiF4v9kjRvB2s6Yy7Qrc3NqEsGyaoJapvgFRKQJ4sRNL4hUavTUnpMf

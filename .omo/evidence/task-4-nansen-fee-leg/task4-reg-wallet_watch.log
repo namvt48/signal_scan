@@ -1,0 +1,32 @@
+PASS 2mneSLq2D3 ACK   BUY  9gP2kCy3wA 0.3480
+PASS 2mneSLq2D3 ACK   BUY  FLcwGtnhY2 31,386,721.0969
+PASS 3GkmwgW2vE ACK   SELL Xsc9qvGR1e 0.0485
+PASS 3GkmwgW2vE RFQ   BUY  Xsc9qvGR1e 0.0485
+PASS 4arviYxdWk ACK   BUY  AaEhFTX4na 325,262.4987
+PASS 4arviYxdWk ACK   BUY  JUPyiwrYJF 1,064.3005
+PASS 5ddSkkUi1B ACK   SELL AaEhFTX4na 312,930.0000
+PASS 5ddSkkUi1B ACK   SELL JUPyiwrYJF 453.5317
+PASS 5ddSkkUi1B ACK   SELL JUPyiwrYJF 1,729.7824
+PASS UPNTbDWxn3 ACK   SELL 98sMhvDwXj 6.3463
+PASS UPNTbDWxn3 ACK   SELL HYm6BfpDQk 1,488,274.0000
+OK: 11/11 nhãn per-step khớp ground-truth (gross leg)
+OK: track_post_body CHỈ SWAP+BUY → body; SELL/TRANSFER/RECEIVE/empty-mint → None
+OK: track_post_body thiếu giá → body KHÔNG có 'usd' (fail-open); priced → usd đúng
+OK: 3 event quote USDC — quote_usd == quote_qty (px=1.0)
+OK: _target_event gộp 1 tx → 1 CA (FLCW, JUPCAT); tx toàn SELL → None
+OK: rule A — OTC fill ⇒ BUY MARINE / BUY ZINC, tiền-route loại, bán thật ⇒ None
+OK (a): _handle_tx nhận ví qua owner(pre/postTokenBalances) dù vắng accountKeys
+OK (b): fetch_new_sigs giữ cap sig cũ nhất ⇒ watermark không nhảy qua đuôi
+OK (d): ví chỉ NHẬN token mà không ký ⇒ event RECEIVE (log-only)
+OK (i): phantom H74 bị bỏ, row thật 9CmbYf nguyên vẹn (fix §4.1)
+OK (ii): 6 mint qty_net == net ví; OK (iii): FLCW fee 3% → qty_net/qty=0.97
+09-11 10:44:36 [32mBUY         [0m 9BB7T…mUPG  0.048463 NVDAx ← USDC 10.592848 ≈ $10.59 @218.5773388606/tk (gross) step 1/1  Xsc9qvGR…  https://solscan.io/tx/3GkmwgW2vEkN4yKdVGBUfFbKy4txizu9Z7F7uf6Wfx8NCRLpfy8oi8Z5ishebqn78x5u5o3oTy1EMqfmGokxH6RN
+09-21 10:00:00 [32mBUY         [0m 9BB7T…mUPG  10 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 1/4  Mint1…  https://solscan.io/tx/SIGstub
+09-21 10:00:00 [32mBUY         [0m 9BB7T…mUPG  20 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 2/4  Mint2…  https://solscan.io/tx/SIGstub
+09-21 10:00:00 [32mBUY         [0m 9BB7T…mUPG  30 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 3/4  Mint3…  https://solscan.io/tx/SIGstub
+09-21 10:00:00 [32mBUY         [0m 9BB7T…mUPG  40 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 4/4  Mint4…  https://solscan.io/tx/SIGstub
+09-21 10:00:00 [31mSELL        [0m 9BB7T…mUPG  50 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 4/4  Mint5…  https://solscan.io/tx/SIGstub
+09-21 10:00:00 RECEIVE     [0m 9BB7T…mUPG  60 TOK ← WSOL 1 ≈ $100.00 @1/tk (gross) step 1/4  Mint6…  https://solscan.io/tx/SIGstub
+OK (iv): post đúng hop net>0 (1 real + 3/6 stub) + dedupe + ts_epoch_ms + không fallback
+OK (v): rotate theo ngày UTC → events-YYYYMMDD.jsonl.gz, file live giữ nguyên tên
+PASS: wallet_watch — qty_net / per-hop POST / rotate jsonl / phantom §4.1

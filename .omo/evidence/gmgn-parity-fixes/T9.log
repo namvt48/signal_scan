@@ -1,0 +1,703 @@
+=== T9 evidence — 2026-09-15 23:59:39 +07 ===
+
+--- (d) RETIRE test_gmgn_parity.py: CONFIRM ABSENT (T4 already deleted it; nothing to remove) ---
+ls: cannot access 'scripts/test_gmgn_parity.py': No such file or directory
+plan ref: T4 line 243 'xoá scripts/test_gmgn_parity.py'; fixtures *.pkl KEPT:
+scripts/fixtures/gmgn_parity.pkl
+scripts/fixtures/route_txs.pkl
+scripts/fixtures/soltxs2.pkl
+scripts/fixtures/soltxs.pkl
+
+--- RED BEFORE (test_wallet_watch.py — calls ww.classify removed in T4) ---
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_wallet_watch.py", line 56, in <module>
+    for e in ww.classify(tx, w):
+             ^^^^^^^^^^^
+AttributeError: module 'wallet_watch' has no attribute 'classify'
+exit=1
+
+--- RED BEFORE (test_route_detect.py — calls ww.classify) ---
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_route_detect.py", line 45, in <module>
+    EVENTS = {lbl: ww.classify(tx, WALLET) for lbl, tx in txs.items()}
+                   ^^^^^^^^^^^
+AttributeError: module 'wallet_watch' has no attribute 'classify'
+exit=1
+
+--- RED BEFORE (test_block_feed.py — does not exist yet) ---
+/home/namvt/.asdf/installs/python/3.12.7/bin/python3: can't open file '/home/namvt/Desktop/dev-space/signal_scan/scripts/test_block_feed.py': [Errno 2] No such file or directory
+exit=2
+
+--- pre-existing ruff state + fix (E401 nansen_probe.py:37, split imports, zero behavior change) ---
+E401 [*] Multiple imports on one line
+  --> scripts/nansen_probe.py:37:1
+   |
+Found 1 error (1 fixed, 0 remaining).
+"""
+
+import argparse
+import json
+import os
+
+=== T9 GREEN evidence — 2026-09-16 (session 2, sau restart; RED ở trên vẫn nguyên giá trị) ===
+
+--- commands run (mỗi test chạy 2 LẦN, diff output == identical) ---
+$ python3 scripts/test_block_feed.py      ; run1=0 run2=0 DETERMINISTIC
+$ python3 scripts/test_wallet_watch.py    ; run1=0 run2=0 DETERMINISTIC
+$ python3 scripts/test_route_detect.py    ; run1=0 run2=0 DETERMINISTIC
+$ python3 scripts/test_gmgn_api_parity.py ; run1=0 run2=0 DETERMINISTIC (T8 gate KHÔNG vỡ)
+
+--- test_block_feed.py (MỚI, 19/19 PASS) — output run1 verbatim ---
+PASS (i) 29 event từ 9 tx: got 29
+PASS (i) per-sig == EXPECT_COUNT: {'2k3KYp18': 2, '33hqSn4Q': 4, '3BbWVS3K': 4, '3fec2kXP': 2, '3nzGD2WV': 4, '3pkGZDK1': 4, '4zmaV87B': 3, '58pWphuG': 4, '5XLTG1WX': 2}
+PASS (i) getBlock params == _BLOCK_PARAMS (maxSupportedTransactionVersion=1)
+PASS (i) getSlot params == [{"commitment": "confirmed"}]
+PASS (i) state persist block_slot=1000: 1000
+PASS (i) head set cho mọi ví tracked
+PASS (ii) ví ngoài accountKeys ⇒ 0 event: got 0
+PASS (iii) 2 slot skip ⇒ vẫn đủ 29 event ở slot 1002: got 29
+PASS (iii) block_slot tiến lên 1002: 1002
+PASS (iii) lỗi KHÔNG-skip ⇒ RuntimeError propagate, feed không nuốt
+PASS (iv) gap line in đúng khuôn run_block_feed
+PASS (iv) nhảy lên 690, 29 event: n=29 slot=690
+PASS (v) tx None ⇒ KHÔNG mark _seen (T5)
+PASS (v) lượt None ⇒ 0 event: got 0
+PASS (v) retry ⇒ 2 event + seen: got 2
+PASS (v) sig đã seen ⇒ không fetch lại (dedup read-only đầu process_sig)
+PASS (v) rpc raise ⇒ KHÔNG mark _seen
+PASS (v) raise-retry ⇒ tổng 4 event: got 4
+PASS wallet_watch_state.json thật KHÔNG đổi (sha256 guard)
+OK: block-feed 19/19 (offline, deterministic)
+
+--- test_wallet_watch.py (UPDATE classify→detect_swaps, 11/11 per-step) — tail ---
+OK: 11/11 nhãn per-step khớp ground-truth (gross leg)
+OK: track_post_body BUY/SELL → body, TRANSFER/empty-mint → None
+exit=0   (2 row TRANSFER_* 387w9fh8EF đã XOÁ — Jupiter withdraw, legs REJECT "plumbing", 0 step; trace leg ở appendix dưới)
+
+--- test_route_detect.py (UPDATE classify→detect_swaps, 15/15 per-step) — tail ---
+PASS N3DHJV Σ MSFTx SELL steps = 1.65170136 (= net route cũ)
+PASS N3DHJV không có event mint==USDC (USDC chỉ là quote; USDC/SOL reject major-major)
+PASS 3s6s8i* strip balance-row ETAC: steps y hệt (per-leg, không cần balance diff)
+OK: per-step route detection 15/15
+exit=0   (check "route NOT set" XOÁ — key 'route' không còn trong model, step/n_steps thay thế)
+
+--- T8 gate tail (không vỡ) ---
+PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+
+--- ruff + ast ---
+$ python3 -m ruff check scripts/  → All checks passed! (exit 0)
+$ python3 -c "import ast; ast.parse(...)" (3 file test) → AST OK
+
+--- LSP diagnostics (severity=error) ---
+scripts/test_block_feed.py    → No diagnostics found
+scripts/test_wallet_watch.py  → No diagnostics found
+scripts/test_route_detect.py  → No diagnostics found
+
+--- 2 bug phát hiện khi green-hoá (ghi lại để khỏi tái phạm) ---
+1. Ví "11111111111111111111111111111111" (32×1) là SYSTEM PROGRAM — có mặt
+   trong accountKeys MỌI tx ⇒ scenario (ii) từng "0 event" hoá 18 event.
+   Fix: ABSENT = lật ký tự cuối ví tracked + assert không có trong fixture keys.
+2. process_sig in fmt(ev) chứa datetime.now ⇒ stdout test khác nhau giữa 2 run
+   (vi phạm determinism). Fix: redirect stdout+stderr quanh lời gọi (quiet()).
+
+=== APPENDIX — leg tables đã soát TAY (nguồn của mọi expected value ở trên) ===
+(GHI CHÚ: /tmp bị clear sau restart session — derive outputs gốc mất. Appendix dưới
+được REGENERATE offline từ CÙNG fixtures bằng detector thật (deterministic — script
+giữ tại /tmp/t9_appendix.py, seed y hệt 2 test; mọi expected value trong test đều
+trace lại được vào các dòng REJECT/STEP/EVENT nguyên văn dưới đây.)
+
+### A) block_sample 9 sigs — ví từ oracle rows (nguồn EXPECT_COUNT/29 events)
+
+== 2k3KYp18 wallet=FhsbQzAJ… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (3, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    RANK USDC=0.0 SPCX=1.0 JUDE=2.0
+    PAIR (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) JUDE←SPCX by=frame
+    PAIR (2, 3, 'ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY', 12) SPCX←USDC by=frame
+    STEP 2k3KYp18 | (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 3) | SsJYbzwwR4VF185kxyGX73H8rGCHURjsvoYiZNVcfHw | JUDE | SPCX | WALLET | POOL | SELL | 9678051.40366 | 9.524479 | gross_leg
+    STEP 2k3KYp18 | (2, 3, 'ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY', 12) | FyhWbqUrp9sWzkAbQoSeJvzJ8ag3QfQsagWnQwfNeG89 | SPCX | USDC | WALLET | POOL | SELL | 9.524479 | 1415.838994 | gross_leg
+    EVENT step=1/2 SELL base=7aTdJBD8QJ qty=9678051.403663 ← quote=SPCXxcqXj6 qty=9.524479
+    EVENT step=2/2 SELL base=SPCXxcqXj6 qty=9.524479 ← quote=EPjFWdd5Au qty=1415.838994
+
+== 33hqSn4Q wallet=FhsbQzAJ… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 4) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 4) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (4, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (3, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 9) So11111111111111111111111111111111111111112 major_pair
+    REJECT (3, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 9) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v major_pair
+    RANK USDC=0.0 WSOL=0.0 WBTC=0.5 XBT=1.0 cbBTC=1.0
+    PAIR (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 4) XBT←WSOL by=frame
+    PAIR (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 12) XBT←WBTC by=frame
+    PAIR (3, 3, 'ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', 15) cbBTC←WBTC by=frame
+    PAIR (3, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 18) cbBTC←USDC by=frame
+    STEP 33hqSn4Q | (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 4) | 2xujW8K8ZQiSpVo5mnxxeyjSJwRu56NM5gbr13j9TAxn | XBT | WSOL | WALLET | POOL | SELL | 102766.565214 | 2.006944216 | gross_leg
+    STEP 33hqSn4Q | (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 12) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | XBT | WBTC | WALLET | POOL | SELL | 638160.364952 | 0.01656677 | gross_leg
+    STEP 33hqSn4Q | (3, 3, 'ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', 15) | 5e7YKtneHhm9Q86fBsVjwAmiu5sDNu67pu1Hy4N5TwNF | cbBTC | WBTC | POOL | RELAY | BUY | 0.01657105 | 0.01656677 | gross_leg
+    STEP 33hqSn4Q | (3, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 18) | HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM | cbBTC | USDC | RELAY | POOL | SELL | 0.01657105 | 1286.802742 | gross_leg
+    EVENT step=1/4 SELL base=BLLieANeMi qty=102766.565214 ← quote=So11111111 qty=2.006944216
+    EVENT step=2/4 SELL base=BLLieANeMi qty=638160.364952 ← quote=3NZ9JMVBmG qty=0.01656677
+    EVENT step=3/4 BUY base=cbbtcf3aa2 qty=0.01657105 ← quote=3NZ9JMVBmG qty=0.01656677
+    EVENT step=4/4 SELL base=cbbtcf3aa2 qty=0.01657105 ← quote=EPjFWdd5Au qty=1286.802742
+
+== 3BbWVS3K wallet=FhsbQzAJ… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) 8LstZpZuR9Dy7JCZC3YwPEWtbYhuDVFAYV37r6ZAcuHz aggregator_frame
+    REJECT (4, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (5, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    RANK USDC=0.0 CARDS=1.0 OS=2.0
+    PAIR (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 14) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 17) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 20) OS←CARDS by=frame
+    STEP 3BbWVS3K | (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) | 2N1KNuLSt167P6p9P8HYcisTvTTv4vYTM8QJBbtv1xYU | CARDS | USDC | POOL | RELAY | BUY | 1184.394609 | 151.328066 | gross_leg
+    STEP 3BbWVS3K | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 14) | HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD | CARDS | USDC | POOL | RELAY | BUY | 36772.236971 | 4703.117027 | gross_leg
+    STEP 3BbWVS3K | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 17) | F3DAAusn8mob9swWaX4ehaRrhi2Q3XJScKkuUpXdvn2i | CARDS | USDC | POOL | RELAY | BUY | 964.657141 | 123.451845 | gross_leg
+    STEP 3BbWVS3K | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 20) | 5dYsxy1hJ8DxejsfHJR9wyRsuLHw6wCLKk7idc1kszUn | OS | CARDS | POOL | RELAY | BUY | 10588363.7901 | 38921.288721 | gross_leg
+    EVENT step=1/4 BUY base=CARDSccUMF qty=1184.394609 ← quote=EPjFWdd5Au qty=151.328066
+    EVENT step=2/4 BUY base=CARDSccUMF qty=36772.236971 ← quote=EPjFWdd5Au qty=4703.117027
+    EVENT step=3/4 BUY base=CARDSccUMF qty=964.657141 ← quote=EPjFWdd5Au qty=123.451845
+    EVENT step=4/4 BUY base=8LstZpZuR9 qty=10588363.790051019 ← quote=CARDSccUMF qty=38921.288721
+
+== 3fec2kXP wallet=FhsbQzAJ… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 3, 'SCoRcH8c2dpjvcJD6FiPbCSQyQgu3PcUAWj2Xxx3mqn', 13) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) - not_spl
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) - not_spl
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) - not_spl
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 28) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) - not_spl
+    REJECT (4, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 12) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (5, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (6, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb same_mint
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb same_mint
+    REJECT (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb same_mint
+    RANK USDC=0.0 SPCX=1.0 JUDE=2.0
+    PAIR (4, 3, 'SCoRcH8c2dpjvcJD6FiPbCSQyQgu3PcUAWj2Xxx3mqn', 13) SPCX←USDC by=frame
+    PAIR (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) JUDE←SPCX by=seq_gap
+    STEP 3fec2kXP | (4, 3, 'SCoRcH8c2dpjvcJD6FiPbCSQyQgu3PcUAWj2Xxx3mqn', 13) | EHcege7dok1iYs7SxL2XzDPvhg6XzMVcx2V5SkMUurJP | SPCX | USDC | POOL | WALLET | BUY | 16.7186 | 2488.948469 | gross_leg
+    STEP 3fec2kXP | (4, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 18) | SsJYbzwwR4VF185kxyGX73H8rGCHURjsvoYiZNVcfHw | JUDE | SPCX | POOL | WALLET | BUY | 9678051.40366 | 16.224732 | gross_leg
+    EVENT step=1/2 BUY base=SPCXxcqXj6 qty=16.7186 ← quote=EPjFWdd5Au qty=2488.948469
+    EVENT step=2/2 BUY base=7aTdJBD8QJ qty=9678051.403663 ← quote=SPCXxcqXj6 qty=16.224732
+
+== 3nzGD2WV wallet=FhsbQzAJ… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 5) - not_spl
+    REJECT (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 5) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 3) 8LstZpZuR9Dy7JCZC3YwPEWtbYhuDVFAYV37r6ZAcuHz aggregator_frame
+    REJECT (4, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (5, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    RANK USDC=0.0 CARDS=1.0 OS=2.0
+    PAIR (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 5) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 10) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 13) CARDS←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 16) OS←CARDS by=frame
+    STEP 3nzGD2WV | (3, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 5) | 2N1KNuLSt167P6p9P8HYcisTvTTv4vYTM8QJBbtv1xYU | CARDS | USDC | POOL | RELAY | BUY | 3476.641901 | 450.798346 | gross_leg
+    STEP 3nzGD2WV | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 10) | F3DAAusn8mob9swWaX4ehaRrhi2Q3XJScKkuUpXdvn2i | CARDS | USDC | POOL | RELAY | BUY | 1162.468777 | 150.332487 | gross_leg
+    STEP 3nzGD2WV | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 13) | HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD | CARDS | USDC | POOL | RELAY | BUY | 3033.796563 | 394.448555 | gross_leg
+    STEP 3nzGD2WV | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 16) | 5dYsxy1hJ8DxejsfHJR9wyRsuLHw6wCLKk7idc1kszUn | OS | CARDS | POOL | RELAY | BUY | 2392197.67871 | 7672.907241 | gross_leg
+    EVENT step=1/4 BUY base=CARDSccUMF qty=3476.641901 ← quote=EPjFWdd5Au qty=450.798346
+    EVENT step=2/4 BUY base=CARDSccUMF qty=1162.468777 ← quote=EPjFWdd5Au qty=150.332487
+    EVENT step=3/4 BUY base=CARDSccUMF qty=3033.796563 ← quote=EPjFWdd5Au qty=394.448555
+    EVENT step=4/4 BUY base=8LstZpZuR9 qty=2392197.678713395 ← quote=CARDSccUMF qty=7672.907241
+
+== 3pkGZDK1 wallet=FhsbQzAJ… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (3, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    RANK USDC=0.0 WBTC=0.5 cbBTC=1.0 XBT=1.5
+    PAIR (2, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 3) XBT←WBTC by=frame
+    PAIR (2, 3, 'ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', 7) cbBTC←WBTC by=frame
+    PAIR (2, 3, 'MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms', 11) cbBTC←WBTC by=frame
+    PAIR (2, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 15) cbBTC←USDC by=frame
+    STEP 3pkGZDK1 | (2, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 3) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | XBT | WBTC | WALLET | POOL | SELL | 740926.930166 | 0.0200651 | gross_leg
+    STEP 3pkGZDK1 | (2, 3, 'ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA', 7) | 5e7YKtneHhm9Q86fBsVjwAmiu5sDNu67pu1Hy4N5TwNF | cbBTC | WBTC | POOL | WALLET | BUY | 0.0172121 | 0.0172075 | gross_leg
+    STEP 3pkGZDK1 | (2, 3, 'MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms', 11) | DUJ6GqqnusjP4ajzbDUx2veRkeXfNVnjh5vAQ1P5fuix | cbBTC | WBTC | POOL | WALLET | BUY | 0.0028584 | 0.0028576 | gross_leg
+    STEP 3pkGZDK1 | (2, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 15) | 2vPjbPRnz7V1SLGr56CmLLc7JspzfSfccWp3Th5KbrMJ | cbBTC | USDC | WALLET | POOL | SELL | 0.0200705 | 1559.565691 | gross_leg
+    EVENT step=1/4 SELL base=BLLieANeMi qty=740926.930166 ← quote=3NZ9JMVBmG qty=0.0200651
+    EVENT step=2/4 BUY base=cbbtcf3aa2 qty=0.0172121 ← quote=3NZ9JMVBmG qty=0.0172075
+    EVENT step=3/4 BUY base=cbbtcf3aa2 qty=0.0028584 ← quote=3NZ9JMVBmG qty=0.0028576
+    EVENT step=4/4 SELL base=cbbtcf3aa2 qty=0.0200705 ← quote=EPjFWdd5Au qty=1559.565691
+
+== 4zmaV87B wallet=FhsbQzAJ… events=3
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 6) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 6) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 6) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 6) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 19) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 19) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 19) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 19) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 33) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (3, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (4, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R same_mint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R same_mint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) DoGEV7LASBkQbibMc5k5vKnTZoMg423GpJ5QtJEGfm7R same_mint
+    RANK USDC=0.0 DOGE=1.0 SNOOPDOGE=2.0
+    PAIR (2, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 11) DOGE←USDC by=frame
+    PAIR (2, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 15) DOGE←USDC by=frame
+    PAIR (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) SNOOPDOGE←DOGE by=seq_gap
+    STEP 4zmaV87B | (2, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 11) | YWhRVsZ1cXPgcboSJ3jCyfN2VyuVcZszNRgjf3juinm | DOGE | USDC | POOL | RELAY | BUY | 3111.70405711 | 262.833109 | gross_leg
+    STEP 4zmaV87B | (2, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 15) | 7s9GwyhHTmszPpzYtLaUDFW3LYfuS6XCnFWrGqUk5X4n | DOGE | USDC | POOL | RELAY | BUY | 8673.39085549 | 732.746279 | gross_leg
+    STEP 4zmaV87B | (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 24) | 7y9T8ncZz1rFQ8QphiSMMzMeBs3RbvdKMZyDQoyqXTwf | SNOOPDOGE | DOGE | POOL | WALLET | BUY | 10363786.0429 | 11436.9637796 | gross_leg
+    EVENT step=1/3 BUY base=DoGEV7LASB qty=3111.70405711 ← quote=EPjFWdd5Au qty=262.833109
+    EVENT step=2/3 BUY base=DoGEV7LASB qty=8673.39085549 ← quote=EPjFWdd5Au qty=732.746279
+    EVENT step=3/3 BUY base=AjBGWjvzYB qty=10363786.042923 ← quote=DoGEV7LASB qty=11436.96377958
+
+== 58pWphuG wallet=FhsbQzAJ… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (5, 1, None, None) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) 8LstZpZuR9Dy7JCZC3YwPEWtbYhuDVFAYV37r6ZAcuHz no_pool_endpoint
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 11) - not_spl
+    REJECT (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 11) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 21) - not_spl
+    REJECT (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 21) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v no_pool_endpoint
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) - not_spl
+    REJECT (6, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (5, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 5) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v same_mint
+    REJECT (5, 3, 'QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv', 27) So11111111111111111111111111111111111111112 major_pair
+    REJECT (5, 3, 'QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv', 27) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v major_pair
+    RANK USDC=0.0 WSOL=0.0 OS=1.0 CARDS=1.0
+    PAIR (5, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 7) OS←CARDS by=frame
+    PAIR (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 11) OS←WSOL by=frame
+    PAIR (5, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 17) CARDS←USDC by=frame
+    PAIR (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 21) CARDS←USDC by=frame
+    STEP 58pWphuG | (5, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 7) | 5dYsxy1hJ8DxejsfHJR9wyRsuLHw6wCLKk7idc1kszUn | OS | CARDS | RELAY | POOL | SELL | 11033477.2484 | 26699.547315 | gross_leg
+    STEP 58pWphuG | (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 11) | 4L3ypsd1AHeBynRx9mQUb6XxL5ViipdEHaXVpoejzJ9D | OS | WSOL | RELAY | POOL | SELL | 1947084.22031 | 5.848984792 | gross_leg
+    STEP 58pWphuG | (5, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 17) | HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD | CARDS | USDC | RELAY | POOL | SELL | 20291.655959 | 2609.254878 | gross_leg
+    STEP 58pWphuG | (5, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 21) | 2N1KNuLSt167P6p9P8HYcisTvTTv4vYTM8QJBbtv1xYU | CARDS | USDC | RELAY | POOL | SELL | 6407.891356 | 824.225653 | gross_leg
+    EVENT step=1/4 SELL base=8LstZpZuR9 qty=11033477.24844975 ← quote=CARDSccUMF qty=26699.547315
+    EVENT step=2/4 SELL base=8LstZpZuR9 qty=1947084.220314662 ← quote=So11111111 qty=5.848984792
+    EVENT step=3/4 SELL base=CARDSccUMF qty=20291.655959 ← quote=EPjFWdd5Au qty=2609.254878
+    EVENT step=4/4 SELL base=CARDSccUMF qty=6407.891356 ← quote=EPjFWdd5Au qty=824.225653
+
+== 5XLTG1WX wallet=FhsbQzAJ… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) - not_spl
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) - not_spl
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) - not_spl
+    REJECT (4, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) - not_spl
+    REJECT (4, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) - not_spl
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) - not_spl
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v no_pool_endpoint
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) - not_spl
+    REJECT (5, 1, None, None) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v plumbing
+    REJECT (4, 2, 'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', 4) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v same_mint
+    RANK USDC=0.0 ORE=1.0 STEVE=2.0
+    PAIR (4, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 5) STEVE←ORE by=frame
+    PAIR (4, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) ORE←USDC by=frame
+    STEP 5XLTG1WX | (4, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 5) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | STEVE | ORE | WALLET | POOL | SELL | 20395086.1585 | 9.5460692188 | gross_leg
+    STEP 5XLTG1WX | (4, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 9) | C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz | ORE | USDC | RELAY | POOL | SELL | 9.5460692188 | 726.96198 | gross_leg
+    EVENT step=1/2 SELL base=F8eyg3TJjY qty=20395086.158547 ← quote=oreoU2P8bN qty=9.5460692188
+    EVENT step=2/2 SELL base=oreoU2P8bN qty=9.5460692188 ← quote=EPjFWdd5Au qty=726.96198
+
+### B) soltxs.pkl + soltxs2.pkl — 6 tx, ví ACK/SPLIT/RFQ có mặt trong accountKeys
+
+== soltxs.pkl:387w9fh8EF(SPLIT) wallet=5KXDF6Qn… events=0
+    REJECT (0, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (1, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (2, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 3) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 3) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 3) - not_spl
+    REJECT (3, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 3) - not_spl
+    REJECT (4, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (5, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (6, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (7, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (8, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (9, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (10, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (11, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (12, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (13, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (14, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (15, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (16, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+    REJECT (17, 1, None, None) JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN plumbing
+
+== soltxs.pkl:3GkmwgW2vE(ACK) wallet=AcKpsk3A… events=1
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    RANK USDC=0.0 NVDAx=1.0
+    PAIR (3, 2, '61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH', 3) NVDAx←USDC by=frame
+    STEP 3GkmwgW2 | (3, 2, '61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH', 3) | 9BB7Tt5uE5VdRsxA5XRqrjwNaq8XtgAUQW8czA6ymUPG | NVDAx | USDC | WALLET | POOL | SELL | 0.0484627 | 10.592848 | gross_leg
+    EVENT step=1/1 SELL base=Xsc9qvGR1e qty=0.0484627 ← quote=EPjFWdd5Au qty=10.592848
+
+== soltxs.pkl:3GkmwgW2vE(RFQ) wallet=9BB7Tt5u… events=1
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    RANK USDC=0.0 NVDAx=1.0
+    PAIR (3, 2, '61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH', 3) NVDAx←USDC by=frame
+    STEP 3GkmwgW2 | (3, 2, '61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH', 3) | AcKpsk3AKJR8YiTrHr2XCFZ2WV8gcM3zjgcr4P1MjHD1 | NVDAx | USDC | POOL | WALLET | BUY | 0.0484627 | 10.592848 | gross_leg
+    EVENT step=1/1 BUY base=Xsc9qvGR1e qty=0.0484627 ← quote=EPjFWdd5Au qty=10.592848
+
+== soltxs.pkl:2mneSLq2D3(ACK) wallet=AcKpsk3A… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (5, 1, None, None) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (6, 1, None, None) - not_spl
+    REJECT (7, 1, None, None) - not_spl
+    REJECT (7, 2, 'GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1', 15) - not_spl
+    REJECT (7, 2, 'GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1', 15) - not_spl
+    REJECT (7, 3, 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', 19) - not_spl
+    REJECT (7, 3, 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', 19) 9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa no_pool_endpoint
+    REJECT (8, 1, None, None) - not_spl
+    REJECT (9, 1, None, None) - not_spl
+    REJECT (10, 1, None, None) - not_spl
+    RANK WSOL=0.0 WBNB=1.0 FLCW=2.0
+    PAIR (7, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 16) WBNB←WSOL by=frame
+    PAIR (7, 3, 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', 19) FLCW←WBNB by=frame
+    STEP 2mneSLq2 | (7, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 16) | CmyuZJEnEoTnSD5mJLMtzLApocPNszZCWwkiEBbUD3ez | WBNB | WSOL | POOL | RELAY | BUY | 0.34804351 | 2.5 | gross_leg
+    STEP 2mneSLq2 | (7, 3, 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', 19) | WLHv2UAZm6z4KyaaELi5pjdbJh6RESMva1Rnn8pJVVh | FLCW | WBNB | POOL | WALLET | BUY | 31386721.0969 | 0.34804351 | gross_leg
+    EVENT step=1/2 BUY base=9gP2kCy3wA qty=0.34804351 ← quote=So11111111 qty=2.5
+    EVENT step=2/2 BUY base=FLcwGtnhY2 qty=31386721.096855 ← quote=9gP2kCy3wA qty=0.34804351
+
+== soltxs.pkl:5ddSkkUi1B(ACK) wallet=AcKpsk3A… events=3
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 7) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 16) - not_spl
+    REJECT (2, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 16) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 25) - not_spl
+    RANK WSOL=0.0 JUP=1.0 JUPCAT=2.0
+    PAIR (2, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 3) JUPCAT←JUP by=frame
+    PAIR (2, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 12) JUP←WSOL by=frame
+    PAIR (2, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 16) JUP←WSOL by=frame
+    STEP 5ddSkkUi | (2, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 3) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | JUPCAT | JUP | WALLET | POOL | SELL | 312930 | 2183.314112 | gross_leg
+    STEP 5ddSkkUi | (2, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 12) | C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz | JUP | WSOL | WALLET | POOL | SELL | 1729.78245 | 4.037298603 | gross_leg
+    STEP 5ddSkkUi | (2, 3, 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', 16) | Eio6hAieGTAmKgfvbEfbnXke6o5kfEd74tqHm2Z9SFjf | JUP | WSOL | WALLET | POOL | SELL | 453.531662 | 1.058427864 | gross_leg
+    EVENT step=1/3 SELL base=AaEhFTX4na qty=312930.0 ← quote=JUPyiwrYJF qty=2183.314112
+    EVENT step=2/3 SELL base=JUPyiwrYJF qty=1729.78245 ← quote=So11111111 qty=4.037298603
+    EVENT step=3/3 SELL base=JUPyiwrYJF qty=453.531662 ← quote=So11111111 qty=1.058427864
+
+== soltxs2.pkl:4arviYxdWk(ACK) wallet=AcKpsk3A… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (5, 1, None, None) - not_spl
+    REJECT (6, 1, None, None) - not_spl
+    REJECT (7, 1, None, None) - not_spl
+    REJECT (7, 2, 'GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1', 11) - not_spl
+    REJECT (7, 2, 'GMGNreQcJFufBiCTLDBgKhYEfEe9B454UjpDr5CaSLA1', 11) - not_spl
+    REJECT (8, 1, None, None) - not_spl
+    REJECT (9, 1, None, None) - not_spl
+    REJECT (10, 1, None, None) - not_spl
+    RANK WSOL=0.0 JUP=1.0 JUPCAT=2.0
+    PAIR (7, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 12) JUP←WSOL by=frame
+    PAIR (7, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 15) JUPCAT←JUP by=frame
+    STEP 4arviYxd | (7, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 12) | C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz | JUP | WSOL | POOL | RELAY | BUY | 1064.300462 | 2.5 | gross_leg
+    STEP 4arviYxd | (7, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 15) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | JUPCAT | JUP | POOL | WALLET | BUY | 325262.498731 | 1064.300462 | gross_leg
+    EVENT step=1/2 BUY base=JUPyiwrYJF qty=1064.300462 ← quote=So11111111 qty=2.5
+    EVENT step=2/2 BUY base=AaEhFTX4na qty=325262.498731 ← quote=JUPyiwrYJF qty=1064.300462
+
+== soltxs2.pkl:UPNTbDWxn3(ACK) wallet=AcKpsk3A… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 3, 'FLUX6xBayGxLX9UcimVRxXFMHH6q43mAbRvDzSpCsvfK', 14) So11111111111111111111111111111111111111112 no_pool_endpoint
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 17) So11111111111111111111111111111111111111112 no_pool_endpoint
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (3, 3, 'FLUX6xBayGxLX9UcimVRxXFMHH6q43mAbRvDzSpCsvfK', 14) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v same_mint
+    REJECT (3, 3, 'BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi', 17) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v same_mint
+    RANK USDC=0.0 98sMhv…=1.0 WUFF=2.0
+    PAIR (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 8) WUFF←98sMhv… by=frame
+    PAIR (3, 3, 'goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE', 11) 98sMhv…←USDC by=frame
+    STEP UPNTbDWx | (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 8) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | WUFF | 98sMhv… | WALLET | POOL | SELL | 1488274 | 6.346289517 | gross_leg
+    STEP UPNTbDWx | (3, 3, 'goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE', 11) | 8TDBxPXyGvxcaoHZoY5D4X2vePuhMYekKpTEhEhaQX5b | 98sMhv… | USDC | RELAY | POOL | SELL | 6.346289517 | 507.895193 | gross_leg
+    EVENT step=1/2 SELL base=HYm6BfpDQk qty=1488274.0 ← quote=98sMhvDwXj qty=6.346289517
+    EVENT step=2/2 SELL base=98sMhvDwXj qty=6.346289517 ← quote=EPjFWdd5Au qty=507.895193
+
+### C) route_txs.pkl — ví Be24…RR6 (nguồn expected steps test_route_detect)
+
+== 32miPz wallet=Be24Gbf5… events=2
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 3) - not_spl
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 3) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) - not_spl
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump no_pool_endpoint
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump no_pool_endpoint
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump no_pool_endpoint
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 14) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 17) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 17) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 17) - not_spl
+    REJECT (2, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 17) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) - not_spl
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) So11111111111111111111111111111111111111112 no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) So11111111111111111111111111111111111111112 no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) So11111111111111111111111111111111111111112 no_pool_endpoint
+    REJECT (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (2, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH', 34) - not_spl
+    RANK WSOL=0.0 CATE=1.0 ETAC=2.0
+    PAIR (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) ETAC←CATE by=frame
+    PAIR (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) CATE←WSOL by=frame
+    STEP 32miPzsX | (2, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 6) | 9Ytoy36r8jEjgNDBPGtkK2LZgc6QLUzXJiB9rM5jwdr | ETAC | CATE | WALLET | POOL | SELL | 11562737.3792 | 9733.622581 | gross_leg
+    STEP 32miPzsX | (2, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 22) | HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3 | CATE | WSOL | WALLET | POOL | SELL | 9733.622581 | 7.431563015 | gross_leg
+    EVENT step=1/2 SELL base=DhM9xy8gQz qty=11562737.37919 ← quote=Ai66LHZG9M qty=9733.622581
+    EVENT step=2/2 SELL base=Ai66LHZG9M qty=9733.622581 ← quote=So11111111 qty=7.431563015
+
+== 3s6s8i wallet=Be24Gbf5… events=4
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (5, 1, None, None) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (5, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 9) - not_spl
+    REJECT (6, 1, None, None) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) - not_spl
+    REJECT (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 23) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 25) - not_spl
+    REJECT (6, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 25) - not_spl
+    REJECT (6, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 25) - not_spl
+    REJECT (6, 3, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 25) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 30) - not_spl
+    REJECT (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 30) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 39) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) - not_spl
+    REJECT (6, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 14) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (7, 1, None, None) - not_spl
+    REJECT (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) So11111111111111111111111111111111111111112 same_mint
+    REJECT (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 30) Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump unpaired
+    RANK WSOL=0.0 CATE=1.0 ETAC=2.0
+    PAIR (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) CATE←WSOL by=seq_gap
+    PAIR (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) CATE←WSOL by=pool_key
+    PAIR (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) CATE←WSOL by=pool_key
+    PAIR (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 30) ETAC←CATE by=seq_gap
+    STEP 3s6s8iVz | (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) | HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3 | CATE | WSOL | POOL | WALLET | BUY | 19770.901779 | 14.97005982 | gross_leg
+    STEP 3s6s8iVz | (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) | G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP | CATE | WSOL | WALLET | POOL | SELL | 90.343227 | 0.003735045 | gross_leg
+    STEP 3s6s8iVz | (6, 3, 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', 15) | 5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD | CATE | WSOL | WALLET | POOL | SELL | 90.343226 | 0.003735045 | gross_leg
+    STEP 3s6s8iVz | (6, 3, '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 30) | 9Ytoy36r8jEjgNDBPGtkK2LZgc6QLUzXJiB9rM5jwdr | ETAC | CATE | POOL | WALLET | BUY | 46147370.817 | 570.588796 | gross_leg
+    EVENT step=1/4 BUY base=Ai66LHZG9M qty=19770.901779 ← quote=So11111111 qty=14.97005982
+    EVENT step=2/4 SELL base=Ai66LHZG9M qty=90.343227 ← quote=So11111111 qty=0.003735045
+    EVENT step=3/4 SELL base=Ai66LHZG9M qty=90.343226 ← quote=So11111111 qty=0.003735045
+    EVENT step=4/4 BUY base=DhM9xy8gQz qty=46147370.817002 ← quote=Ai66LHZG9M qty=570.588796
+
+== N3DHJV wallet=Be24Gbf5… events=3
+    REJECT (0, 1, None, None) - not_spl
+    REJECT (1, 1, None, None) - not_spl
+    REJECT (2, 1, None, None) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (2, 2, 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 2) - not_spl
+    REJECT (3, 1, None, None) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) - not_spl
+    REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) So11111111111111111111111111111111111111112 aggregator_frame
+    REJECT (4, 1, None, None) - not_spl
+    REJECT (3, 3, 'goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE', 17) EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v major_pair
+    REJECT (3, 3, 'goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE', 17) So11111111111111111111111111111111111111112 major_pair
+    RANK USDC=0.0 MSFTx=1.0 NINJACAT=2.0
+    PAIR (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 8) NINJACAT←MSFTx by=frame
+    PAIR (3, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 11) MSFTx←USDC by=frame
+    PAIR (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 14) MSFTx←USDC by=frame
+    STEP N3DHJV87 | (3, 3, 'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', 8) | GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL | NINJACAT | MSFTx | WALLET | POOL | SELL | 9385021.84464 | 1.65170136 | gross_leg
+    STEP N3DHJV87 | (3, 3, 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 11) | J1D1y41YHyJ3sTkd3CPXxcQcH3sB9JbexDQifN4djLyT | MSFTx | USDC | WALLET | POOL | SELL | 0.56554254 | 280.365138 | gross_leg
+    STEP N3DHJV87 | (3, 3, 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 14) | D6bRhQUcR9B7bPbbqgxpE17MjyUjBtr8hHQCcJoHrrv1 | MSFTx | USDC | WALLET | POOL | SELL | 1.08615882 | 538.668938 | gross_leg
+    EVENT step=1/3 SELL base=Du12R6ZESJ qty=9385021.844639 ← quote=XspzcW1PRt qty=1.65170136
+    EVENT step=2/3 SELL base=XspzcW1PRt qty=0.56554254 ← quote=EPjFWdd5Au qty=280.365138
+    EVENT step=3/3 SELL base=XspzcW1PRt qty=1.08615882 ← quote=EPjFWdd5Au qty=538.668938
+

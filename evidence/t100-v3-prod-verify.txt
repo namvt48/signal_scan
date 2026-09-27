@@ -1,0 +1,15 @@
+49nkLrXi lf= 120561469.78895901 t100pct= 0
+FYtP5Aii lf= 184765328.848528 t100pct= 0
+2ezdFs8G lf= 409774617.131079 t100pct= 0
+zj1jpp7Q lf= 169413095.20305502 t100pct= 0
+7XGqEgFs lf= 356999615.864236 t100pct= 0
+Ax5dAamJ lf= 280763719.86651796 t100pct= 0
+DShht9B8 lf= 208428160.23330998 t100pct= 46.608510018091444
+8VjFid8B lf= 25854338.624151 t100pct= 0
+4U4U8oXw lf= 35207797.020762004 t100pct= 0
+G1jBdXXA lf= 182114971.190323 t100pct= 0
+--- detail chg24h (MBS):
+--- detail top-level keys:
+keys: ['ca', 'chain', 'price', 'supply', 'holders', 'freshSupplyPct', 'top100SupplyPct', 'medianHolderAmount', 'top100', 'snapshotAt']
+top100 -> list[dict] 100 fields: ['address', 'percentOwnership', 'balance', 'balanceUsd', 'addrType', 'isNew', 'chg24h', 'name']
+top100 chg24h sample: [-2175455.026363, 0, 0, 0, 0]

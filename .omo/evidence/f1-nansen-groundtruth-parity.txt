@@ -1,0 +1,151 @@
+F1 — PLAN COMPLIANCE AUDIT (READ-ONLY, INDEPENDENT RECOMPUTATION)
+Plan: .omo/plans/nansen-groundtruth-parity.md (F1 spec @199)
+Date: 2026-09-22 | Round: FINAL (overwrites prior f1 evidence file)
+Mode: read-only audit; only this file written. No pytest-into-repo-state mutation,
+no git/deploy/ssh/docker, no threshold relaxation (_EPS, NET_CAP=0.015, GROSS_CAP=0.08,
+USD_CAP=0.10, UNAVAIL_CAP=0.20, TRANSFER_WARN=0.10 untouched), no EXPECT_COUNT increase.
+All numbers below were recomputed live by this auditor from artifacts, NOT copied from report.md.
+
+====================================================================
+1. ARTIFACT INVARIANTS (md5sum + wc -l)
+====================================================================
+$ md5sum .probe/nansen-parity/parity.jsonl .probe/nansen-24h/tx-sample.jsonl scripts/wallet_watch.py .probe/nansen-parity/report.md scripts/nansen_parity.py
+84943fb665e145e03ac384b0ba8e7956  .probe/nansen-parity/parity.jsonl   (743 lines — required 743)
+6edc3702cecb4740dad17716284bc867  .probe/nansen-24h/tx-sample.jsonl
+e57b910f0677e196f8158ee8de5df034  scripts/wallet_watch.py
+6a913c172e5a8ab019de800864a386d6  .probe/nansen-parity/report.md      (2797 lines)
+48616981ef06e4987ff1178903e126e0  scripts/nansen_parity.py            (post-F4-fix)
+RESULT: PASS — parity.jsonl exactly 743 lines.
+
+====================================================================
+2. INDEPENDENT pass_bar RECOMPUTATION G1–G12 FROM parity.jsonl
+   (one-off python3 - <<'PY'; no harness import; report.md NOT used as source)
+====================================================================
+Gate | Independent result (parity.jsonl)                                         | report.md | Match
+G1   | False  50 (available=743)                                                 | identical | YES
+G2   | False  tfp=24; transfer_only_unavailable=0/254 (0.0%, warn bar 10% not hit)| identical | YES
+G3   | False  36 (available=743)                                                 | identical | YES
+G4   | True   9/9                                                                | identical | YES
+G5   | False  6/8                                                                | identical | YES
+G6   | True   487/487, na=21                                                     | identical | YES
+G7   | False  409/489, truth_zero=254                                            | identical | YES
+G8   | False  476/498                                                            | identical | YES
+G9   | False  meas=476 p50=1.0045 p90=1.1086 max_raw=5.2300 max_adj_dev=4.2066   | identical | YES
+G10  | False  8/9 p50=1.0451 p90=1.0782 max=1.1682                               | identical | YES
+G11  | False  deferred=11 truth_null=13                                          | identical | YES
+G12  | True   0/733=0.0%                                                         | identical | YES
+Independent drift median: 1.004495015102189 == report G9 p50=1.0045.
+RESULT: PASS — 12/12 recomputed gates match report.md exactly, zero divergence.
+
+====================================================================
+3. G13 (ORACLE SUITES — RUN LIVE BY AUDITOR)
+====================================================================
+$ python3 scripts/test_gmgn_api_parity.py            -> PASS 29/29, exit 0
+$ python3 scripts/backtest_parity.py --from-fixture  -> PASS 29/29, exit 0
+$ one-off 3fec2kXP events == 2 (hermetic seed from scripts/fixtures/gmgn_rows_fixture.json, d["rows"]) -> PASS
+Report carries no G13 FAIL annotation (9 annotations == the 9 False gates above) => G13 True,
+independently confirmed. EXPECT_COUNT unchanged: both suite files mtime 2026-09-15 (untouched).
+RESULT: PASS.
+
+====================================================================
+4. GROUP RECOUNT FROM TRUTH (tx-sample.jsonl, independent)
+====================================================================
+990 truth rows -> 743 distinct (transactionHash, wallet, ca) groups.
+parity.jsonl: 743 lines, 743 distinct keys, 0 duplicates, 0 missing, 0 extra; 733 distinct sigs both sides.
+RESULT: PASS — line count == group recount, no group dropped (incl. zero UNAVAILABLE groups).
+
+====================================================================
+5. TRACE / FETCH_ERROR INVARIANTS
+====================================================================
+- 240 records in must-trace classes {MISSING, TYPE_MISMATCH, AMOUNT_MISMATCH, GROSS_MISMATCH,
+  USD_MISMATCH, TRANSFER_FALSE_POSITIVE}: 0 with empty reject_trace. PASS.
+- UNAVAILABLE records: 0 -> "every UNAVAILABLE has fetch_error" vacuously satisfied. PASS.
+- Every record class in closed set; 0 records missing required keys. PASS.
+
+====================================================================
+6. trace-22.md (22-sig manual trace)
+====================================================================
+22/22 entries present.
+C1: reject reasons for 9/9 same-ca txs (aggregator_frame count 9/9). PASS.
+C2: 4/5 transfer-only sigs events=0; the 1 violation (1bPapYy2...) documented as oracle
+    divergence AND reflected in the G2 FAIL annotation — documented, not silent. PASS.
+C3: RxrDxxL2 — leg 3ZLekZYq excluded by discriminator (a); sibling seq=9 blocked by (c). PASS.
+
+====================================================================
+7. EVIDENCE FILES
+====================================================================
+- .omo/evidence/task-{1..8}-nansen-groundtruth-parity.txt: all 8 exist. PASS.
+- .probe/EVIDENCE-2026-09-22-nansen-groundtruth-parity.md contains closing line
+  "EVIDENCE_RECORDED: .probe/EVIDENCE-2026-09-22-nansen-groundtruth-parity.md". PASS.
+
+====================================================================
+8. REPORT STRUCTURE — "FAIL + ROOT-CAUSE, NOT SILENT" REQUIREMENT
+====================================================================
+- 13 gate rows @ report.md:22-38 (all G1–G13, none invented, none omitted).
+- 9 FAIL annotation subsections @43-71 == exactly the 9 False gates (G1,G2,G3,G5,G7,G8,G9,G10,G11).
+- G11 annotation @69-70 names the 2 OUTRANKED sigs (4184uVCQPTEi... ca=GvFe6EjS...;
+  4o7ZDdK2NRsy... ca=4UnNG97k...) — F4 round-1 REJECT fix (f4-fix-g11, +8 lines in
+  nansen_parity.py::_phase2_lines) present in the regenerated report.
+- 251 root-cause entries @72-325 == 743 - 492 MATCH: 100% of non-MATCH records covered,
+  each pointing at sig + trace line.
+- DEFERRED_USD_NULL section @2428-2459: 13 entries = 11 plain + 2 "OUTRANKED by
+  AMOUNT_MISMATCH (CLASS_PRECEDENCE)" + closing "11 deferred + 2 outranked = 13 truth
+  usd-null, no deferral lost".
+- NET_IDENTITY_NA list @2481-2503: 21 entries (== G6 na=21).
+- Mismatch adjudication @2504-2766: 251 rows; verdict counts 11+98+74+68 = 251 (complete).
+RESULT: PASS.
+
+====================================================================
+9. REPRODUCIBILITY (DETERMINISTIC RERUN, ZERO NETWORK)
+====================================================================
+$ rm -rf /tmp/f1-verify && mkdir -p /tmp/f1-verify && python3 scripts/nansen_parity.py \
+    --truth .probe/nansen-24h/tx-sample.jsonl --out /tmp/f1-verify \
+    --prices .probe/nansen-parity/prices.json \
+    --oracle '{"gmgn_ok": true, "backtest_ok": true, "fec2kxp_events": 2}' \
+    > /tmp/f1-verify-run.log 2>&1
+EXIT=0; run log contains "network calls: 0".
+cmp /tmp/f1-verify/parity.jsonl .probe/nansen-parity/parity.jsonl -> byte-identical.
+Normalized report.md diff (generated_at: and truth: lines excluded) -> empty.
+RESULT: PASS — current nansen_parity.py (post-F4-fix) regenerates master artifacts exactly,
+hermetically. (Artifacts under /tmp = allowed exception per Success criteria #10.)
+
+====================================================================
+10. SCOPE CLEANLINESS (SUCCESS CRITERIA #10, plan @230)
+====================================================================
+find . -newermt "2026-09-22 13:00" (plan window; first artifact task-1 evidence @14:06):
+  Whitelisted: scripts/wallet_watch.py, scripts/nansen_parity.py, scripts/test_nansen_parity.py,
+  scripts/test_nansen_fee_leg.py; scripts/fixtures/nansen/* (3 files); .probe/nansen-parity/**
+  (fetch22.py, trace22.py, fixtures/*, prices.json, prices22.json, fetch_errors.json,
+  red-log-3/green-log-3/qa-log-3.txt [TDD RED->GREEN logs mandated by plan], t8-determinism.log,
+  parity.jsonl, report.md, trace-22.md, dryrun/, smoke/); .probe/EVIDENCE-2026-09-22-...md;
+  .omo/evidence/task-{1..8}-nansen-groundtruth-parity.txt.
+  Adjudicated non-violations: scripts/__pycache__/{nansen_parity,wallet_watch}.cpython-312.pyc
+  and .probe/nansen-parity/__pycache__/fetch22.cpython-312.pyc = CPython bytecode byproducts of
+  running whitelisted tests (transient, zero source edit); .omo/plans/nansen-groundtruth-parity.md
+  mtime 18:37 + .omo/evidence/f{2,3,4}*.txt = orchestrator/reviewer workflow bookkeeping
+  (start-work boulder + review waves), not worker artifacts.
+  Untouched confirmations (mtime): scripts/wallet_hist.py 2026-09-16; Makefile 2026-09-16;
+  scripts/test_gmgn_api_parity.py 2026-09-15 23:24; scripts/backtest_parity.py 2026-09-15 23:42
+  -> contingency Must-have #6 never fired, no fee_leg-filter edits, no EXPECT_COUNT change;
+  docker-compose.yml 09:51; docs/proxy-routing-design.md 09:53; .probe/nansen-24h/tx-sample.jsonl
+  10:29 — all pre-window.
+  server/.env mtime 12:45:35 = 1h21m BEFORE first plan artifact (task-1 @14:06) and before any
+  .probe/nansen-parity file (fetch22.py @14:25): out-of-band operational edit (daily TCBS token
+  rotation cadence), no worker evidence touches server/ inside the window. Ruled out-of-scope.
+  .ruff_cache: absent. No src/, server/, docs/, .probe/nansen-24h/ entries inside window.
+grep git/deploy/ssh/docker across all evidence files: every hit is a negation statement
+("no git", "không commit") or by-design note — no such command was executed. PASS.
+RESULT: PASS.
+
+====================================================================
+F1 APPROVE CONDITION (spec @199)
+====================================================================
+Spec: "APPROVE chỉ khi 13 gate đạt HOẶC report ghi rõ gate FAIL + root-cause (không im lặng)."
+Observed: 4 gates PASS (G4, G6, G12, G13), 9 gates FAIL (G1, G2, G3, G5, G7, G8, G9, G10, G11).
+All 9 FAILs carry explicit annotations + root-cause; 251/251 non-MATCH records root-caused and
+adjudicated (semantic-valid vs detector-bug, with traces); 13/13 DEFERRED_USD_NULL accounted;
+independent recomputation matches report on every gate; artifacts byte-reproducible with zero
+network; scope clean per #10; evidence chain complete (8 task files + EVIDENCE_RECORDED).
+All F1 checks PASS.
+
+VERDICT: APPROVE

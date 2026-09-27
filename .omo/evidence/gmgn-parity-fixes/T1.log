@@ -1,0 +1,105 @@
+=== T1 EVIDENCE - fixture set build ===
+source_dir: .omo/drafts/gmgn-parity-fixes-fixture
+dest_dir: scripts/fixtures
+generated_utc: Tue Sep 15 09:08:51 AM UTC 2026
+qa_script: /tmp/t1_check.py
+
+--- COPY FIDELITY (source vs scripts/fixtures, sha256) ---
+COPY OK 2k3KYp18.json 3d97f9049da3
+COPY OK 33hqSn4Q.json 58562576e9ff
+COPY OK 33hqSn4QyCKb.json 58562576e9ff
+COPY OK 3BbWVS3K.json ad59d981ad81
+COPY OK 3fec2kXP.json ca92bd6ed40d
+COPY OK 3nzGD2WV.json 61957c5f911a
+COPY OK 3pkGZDK1.json 111c42a35903
+COPY OK 4zmaV87B.json 55fe63dcc7d3
+COPY OK 4zmaV87BnoMS.json 55fe63dcc7d3
+COPY OK 58pWphuG.json c335708dd554
+COPY OK 58pWphu.json c335708dd554
+COPY OK 5XLTG1WX.json 3e490dd3bffc
+COPY OK gmgn_rows_fixture.json 93a8f39d306e
+COPY OK gm_activity_FhsbQ_50rows.json f4439bcfb0e0
+sha256_compared=14 mismatches=0
+stale_state: files_compared=14 source_vs_copy_mismatches=0
+
+--- DEDUPE (group 12 tx files by transaction.signatures[0]) ---
+SIG 2k3KYp183hqPsyroYZpfwpLzt1cLcUcipnTd7viCDg8XgxqyS9HMqwMNLUmcVjDDv3NYEMwiR5zVroweZxAvwVzE files=['2k3KYp18.json']
+SIG 33hqSn4QyCKbA8ynY2JrZhbSG357G38Ync9aHPW6BC5V4rzH6PZ2B2yvNjuT6FJssgDNGcZ7okpyp7a6bLUcHBnV files=['33hqSn4Q.json', '33hqSn4QyCKb.json']
+SIG 3BbWVS3K7pLEXcNCj8vxCH7q51Cy3D1ZTXgm2FcaV3VfKnXPxujzVmWf29R9RX7k2XQMWCSfdTFfJQqodY8vYE57 files=['3BbWVS3K.json']
+SIG 3fec2kXPqQmkMVVzeUqvw1R3SfSaBgiuA2wL9tDuDAVauzCAXu84EYyEX9vDCQ9Y5iaEtQ2XAr8NDeXGus9QdzBj files=['3fec2kXP.json']
+SIG 3nzGD2WVG7XJwSnfhzRqTs41VrxykLyqMyM6KoWgfVdnKkhuTnuB7nuQsoKzUjP1oiNePhYUts9ir82g88RRgpaP files=['3nzGD2WV.json']
+SIG 3pkGZDK1VAxWJyXhN5Wodn4KJXuUNBduiznDevdT9ybSDM2cD77Uxku9DpBsD63zqpsXuSrnD5cr6LVDgQjvwZnH files=['3pkGZDK1.json']
+SIG 4zmaV87BnoMSKjn4PrMSLZQvhYWRZ5zez4KLHZM1x23LbkbDUiDgfN1FVYuSTXoW4KGeaKQFr63MhPXzaLACdvBX files=['4zmaV87B.json', '4zmaV87BnoMS.json']
+SIG 58pWphuGoowgZwWhjCTQwgZcYMrWQyf9nqWU9YuqRgLbL8Q9tcqWfeJ1EA4UEYpDWc2ijegkuVv9xNPvV5yc46Rx files=['58pWphuG.json', '58pWphu.json']
+SIG 5XLTG1WXJquDoHp8sd48zt3E7PWydkT57JKZMLbHUpcHfeDjegevxaTgRSCNabMbK9gSq6b2sDEtgYjq2Zgi5rh2 files=['5XLTG1WX.json']
+unique_sigs=9
+tx_files=12
+root_has_result_wrapper_count=0 (expect 0)
+
+--- DUPLICATE PAIRS (byte-identical check, sha256) ---
+PAIR 4zmaV87B.json 55fe63dcc7d3677b6442be83a5fb1495dd2a5c3e9c6b18a066717d8884b670fb | 4zmaV87BnoMS.json 55fe63dcc7d3677b6442be83a5fb1495dd2a5c3e9c6b18a066717d8884b670fb => IDENTICAL
+PAIR 33hqSn4Q.json 58562576e9ff89fab1fb3efcab5b5c8e8a55a104c580c84c3c5b0ad2b457843d | 33hqSn4QyCKb.json 58562576e9ff89fab1fb3efcab5b5c8e8a55a104c580c84c3c5b0ad2b457843d => IDENTICAL
+PAIR 58pWphuG.json c335708dd554e24898c06f60a8063edf317a0cc27a532a650d42287def3c8ac9 | 58pWphu.json c335708dd554e24898c06f60a8063edf317a0cc27a532a650d42287def3c8ac9 => IDENTICAL
+
+--- ORACLE gmgn_rows_fixture.json ---
+rows=29
+root_keys=['caveat', 'rows', 'source', 'tx_key']
+row_has_tx_hash=True
+row_has_event_type=True
+row_has_sig=False (expect False)
+row_has_side=False (expect False)
+ROWCOUNT 2k3KYp183hqPsyroYZpfwpLzt1cLcUcipnTd7viCDg8XgxqyS9HMqwMNLUmcVjDDv3NYEMwiR5zVroweZxAvwVzE = 2
+ROWCOUNT 33hqSn4QyCKbA8ynY2JrZhbSG357G38Ync9aHPW6BC5V4rzH6PZ2B2yvNjuT6FJssgDNGcZ7okpyp7a6bLUcHBnV = 4
+ROWCOUNT 3BbWVS3K7pLEXcNCj8vxCH7q51Cy3D1ZTXgm2FcaV3VfKnXPxujzVmWf29R9RX7k2XQMWCSfdTFfJQqodY8vYE57 = 4
+ROWCOUNT 3fec2kXPqQmkMVVzeUqvw1R3SfSaBgiuA2wL9tDuDAVauzCAXu84EYyEX9vDCQ9Y5iaEtQ2XAr8NDeXGus9QdzBj = 2
+ROWCOUNT 3nzGD2WVG7XJwSnfhzRqTs41VrxykLyqMyM6KoWgfVdnKkhuTnuB7nuQsoKzUjP1oiNePhYUts9ir82g88RRgpaP = 4
+ROWCOUNT 3pkGZDK1VAxWJyXhN5Wodn4KJXuUNBduiznDevdT9ybSDM2cD77Uxku9DpBsD63zqpsXuSrnD5cr6LVDgQjvwZnH = 4
+ROWCOUNT 4zmaV87BnoMSKjn4PrMSLZQvhYWRZ5zez4KLHZM1x23LbkbDUiDgfN1FVYuSTXoW4KGeaKQFr63MhPXzaLACdvBX = 3
+ROWCOUNT 58pWphuGoowgZwWhjCTQwgZcYMrWQyf9nqWU9YuqRgLbL8Q9tcqWfeJ1EA4UEYpDWc2ijegkuVv9xNPvV5yc46Rx = 4
+ROWCOUNT 5XLTG1WXJquDoHp8sd48zt3E7PWydkT57JKZMLbHUpcHfeDjegevxaTgRSCNabMbK9gSq6b2sDEtgYjq2Zgi5rh2 = 2
+expected_sum=29
+ROWS FAIL prefix=2k3KYp18 expected=2 got=1
+ROWS FAIL prefix=33hqSn4Q expected=4 got=1
+ROWS FAIL prefix=3BbWVS3K expected=4 got=1
+ROWS FAIL prefix=3fec2kXP expected=2 got=1
+ROWS FAIL prefix=3nzGD2WV expected=4 got=1
+ROWS FAIL prefix=3pkGZDK1 expected=4 got=1
+ROWS FAIL prefix=4zmaV87B expected=3 got=1
+ROWS FAIL prefix=58pWphuG expected=4 got=1
+ROWS FAIL prefix=5XLTG1WX expected=2 got=1
+ROWS FAIL
+
+--- BLOCK SAMPLE scripts/fixtures/block_sample.json ---
+block_txs=9
+block_unique_sigs=9
+block_version_values=[0]
+block_sigs_in_source_set=9/9
+BLOCK OK
+
+--- MALFORMED INPUT PROBE ---
+missing_key_probe=OK raised KeyError: 'transaction'
+extra_key_probe=OK raised ValueError: unexpected keys ['result']
+json_files_loaded=15 load_errors=0
+
+--- MISLEADING-SUCCESS CHECK (counts derived by parsing, not constants) ---
+DERIVED tx_files_parsed=12 unique_sigs_parsed=9 rows_parsed=29 block_txs_parsed=9
+
+no_wallet_literal_hardcoded=true
+N/A prompt_injection: no untrusted text consumed (local JSON only)
+N/A dirty_worktree: not a git repo
+N/A hung_long_commands: all local ms-scale
+N/A flaky_tests: no tests written in T1
+N/A repeated_interruptions: single-shot file copy
+N/A cancel_resume: no long-running flow
+
+--- INDEPENDENT VERIFICATION (orchestrator, re-measured, not trusting the executor) ---
+NOTE: the "ROWS FAIL" block above is a BUG IN THE QA SCRIPT, not in the data: it counted
+DISTINCT SIGS matching each prefix (always 1) instead of ROWS per sig. The ROWCOUNT lines
+above it (keyed by full sig) already print the correct 2/4/4/2/4/4/3/4/2 = 29.
+V1 copy fidelity: files=14 sha256 mismatches=0 OK
+V2 tx_files=12 unique_sigs=9 result_wrapper=0 OK
+V3 rows=29 root=['caveat','rows','source','tx_key'] per-sig row counts = 2,4,4,2,4,4,3,4,2 (sum 29) OK
+V3b row keys: tx_hash=True event_type=True sig_present=False side_present=False OK
+V4 block_sample: block_txs=9 shape_ok=True sigs_match_fixture=True keys=['blockHeight','blockTime','transactions'] OK
+V5 json_valid=15/15 OK
+VERDICT: confirmed

@@ -1,0 +1,113 @@
+# F3 — Constraint / Scope / Security Review (independent verifier)
+Date: 2026-09-16 (Asia/Ho_Chi_Minh) · Plan: .omo/plans/gmgn-parity-fixes.md §5 + §8
+Verifier did NOT write any of the reviewed code. All commands run fresh; outputs verbatim.
+
+## Item 1 — No GMGN API (D1 / §5.1): PASS
+Commands:
+  grep -rin "gmgn" scripts/                     → hits in: .py files (48), fixtures/*.json, __pycache__/*.pyc
+  grep -rn "openapi|gmgn.ai/api|url.*gmgn" scripts/ --include="*.py" (filtered) → NO hits
+  grep -n "dex_native|cost_usd|launchpad_platform|buy_cost_usd|gmgn" scripts/wallet_watch.py (code-only, comments/docstrings/description stripped) → ZERO hits
+  grep -rn "https?://" scripts/ --include="*.py" | grep -v solscan →
+    wallet_watch.py:46-47  https://solana-rpc.publicnode.com, https://api.mainnet-beta.solana.com  (Solana RPC)
+    wallet_watch.py:197    https://api.dexscreener.com/...                                          (token metadata)
+    wallet_watch.py:72,1036 http://127.0.0.1:8124                                                   (local alpha-engine API)
+    nansen_probe.py:46     https://app.nansen.ai/...                                                (pre-existing file, NOT in changed set)
+Classification of EVERY gmgn hit class:
+  (a) FIXTURE/TEST-ONLY (legitimate):
+      - scripts/fixtures/gmgn_rows_fixture.json + gm_activity_FhsbQ_50rows.json: recorded oracle rows incl.
+        gmgn.ai logo URLs and GMGN fields — data at rest, never fetched.
+      - scripts/test_gmgn_api_parity.py, test_block_feed.py, test_wallet_watch.py, test_route_detect.py,
+        backtest_parity.py: module names, docstrings citing the plan ("parity row GMGN", "D1", "T8/T9"),
+        fixture filename gmgn_rows_fixture.json, oracle comparison only (§5.1 explicitly allows test-side
+        comparison: "chỉ dùng trong test để đối chiếu").
+      - scripts/__pycache__/*.pyc: compiled artifacts of the above.
+  (b) wallet_watch.py hits (L17,18,70,270,326,328,334,599,614,751,1006,1027): ALL comments/docstrings/CLI
+      help describing row-parity semantics ("1 event = 1 GMGN row", "--show-fail … như tab đỏ GMGN").
+      No import, no URL, no field read. Runtime consumes ZERO GMGN fields (verified by code-only grep above).
+  (c) VIOLATIONS: none. backtest_parity.py docstring itself asserts "NEITHER ever calls the GMGN API (D1)"
+      and greps for dex_native/cost_usd in it returned 0 (oracle read goes through test_gmgn_api_parity import).
+No file imports or references openapi.gmgn.ai anywhere under scripts/.
+
+## Item 2 — No hand-typed mint/WALLET literals in TEST comparison path: PASS
+Command: grep -oE "[1-9A-HJ-NP-Za-km-z]{32,44}" scripts/test_gmgn_api_parity.py | wc -l
+Output:  0            ← REQUIRED 0 ✓ (oracle expectations built from fixtures; §5.7 docstring in file confirms)
+For completeness (same regex on siblings):
+  scripts/test_block_feed.py:   0
+  scripts/backtest_parity.py:   0
+  scripts/test_wallet_watch.py: 9   — classified NOT a violation: 5 mints are hermetic seed KEYS for ww._info
+      (JUP/NVDAx/FLCW/JUPCAT/WUFF of the pre-existing soltxs*.pkl regression), 3 are ROLES identifiers
+      (ACK/SPLIT/RFQ) + 1 duplicate (TR_W). If hand-type were wrong the seed would miss and the test fails —
+      self-checking keys, not pasted oracle values. Expected qty/side tuples are documented as "suy từ
+      detector chạy trên fixture rồi đối chiếu TAY với leg raw/dec" with raw leg evidence in T9.log.
+  scripts/test_route_detect.py: 6   — same classification: WALLET + 5 mints are fixture identifiers/seed keys
+      for route_txs.pkl; expectations numeric, derived (docstring logs raw leg ints, cross-checked in T9.log).
+By-design (per task note + plan §3/T3): wallet_watch.py long base58 literals = GLOBAL_QUOTES (WSOL/USDC/USDT
+L57-59), _AGGREGATORS+DEX program ids (L257-300), TIER_A (L272: WSOL/USDC/USDT + JUP-adjacent), TIER_B
+(L278: WBTC 3NZ9…), _PLUMBING/_TOKEN_PROGS (system/token programs). These are the plan-mandated constants. NOT a violation.
+
+## Item 3 — No new dependency: PASS
+All imports in the 6 changed scripts (verbatim grep of import lines):
+  wallet_watch.py:            argparse, json, os, sys, time, urllib.error, urllib.request, collections.defaultdict,
+                              datetime, typing, asyncio (local L850), websockets (local L853)
+  test_gmgn_api_parity.py:    copy, hashlib, importlib.util, inspect, json, os, socket, sys, textwrap, time,
+                              collections.Counter, typing
+  test_block_feed.py:         contextlib, importlib.util, io, json, os, socket, tempfile, collections.Counter
+  test_wallet_watch.py:       importlib.util, os, pickle
+  test_route_detect.py:       copy, importlib.util, os, pickle
+  backtest_parity.py:         argparse, importlib.util, os, sys, time
+Everything is Python stdlib EXCEPT `websockets`, which plan §5.2 names as the PRE-EXISTING set
+("hiện trạng: stdlib + websockets cho feed ws"). Zero third-party additions. ✓
+
+## Item 4 — Scope: server/ and src/ NOT modified: PASS
+Command: find server/ src/ -newermt "2026-09-13" -type f -printf "%T+ %p" (node_modules excluded)
+Found files (server/src/api.ts, settings.ts, db.ts, signals.ts; src/App.tsx, types.ts, SettingsPanel.tsx,
+restDataStore.ts, dataStore.ts) ALL have mtime 2026-09-14 16:26–16:30 +0700.
+Plan execution window (changed-set mtimes): 2026-09-15 22:43 → 2026-09-16 09:51.
+⇒ server/ and src/ were last touched ~30h BEFORE plan work started; unrelated prior session, not this plan.
+Confirmed changed set matches context exactly:
+  -rw wallet_watch.py Sep 15 22:43 · test_gmgn_api_parity.py Sep 15 23:24 · test_wallet_watch.py Sep 16 00:02
+  -rw backtest_parity.py Sep 15 23:42 · docs/2026-09-15-...md Sep 15 23:33 · test_route_detect.py Sep 16 09:41
+  -rw test_block_feed.py Sep 16 09:51
+  ls: cannot access 'scripts/test_gmgn_parity.py': No such file or directory   ← intentionally deleted (T4/T9) ✓
+
+## Item 5 — Fixtures intact: PASS
+  ls scripts/fixtures/*.pkl  → gmgn_parity.pkl, route_txs.pkl, soltxs2.pkl, soltxs.pkl        (4/4 ✓)
+  ls scripts/fixtures/*.json | wc -l → 15                                                      (15/15 ✓)
+
+## Item 6 — Importability (production contract): PASS
+Command: python3 -c "import importlib.util; spec_from_file_location('wallet_watch','scripts/wallet_watch.py'); exec_module(...)"
+Output:
+  IMPORTLIB LOAD OK: /home/namvt/Desktop/dev-space/signal_scan/scripts/wallet_watch.py
+  has detect_swaps: True
+Freeze check: sha256sum scripts/wallet_watch.py =
+  d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720  ← MATCHES frozen hash from context ✓
+
+## Item 7 — Security: PASS
+  Secrets: grep -n "api_key|API_KEY|secret|SECRET|Bearer|token=" over all 6 changed scripts → 0 hits.
+           All long base58 literals are PUBLIC Solana program/mint IDs (not private keys).
+  eval/exec: only hit = test_gmgn_api_parity.py:725 exec(compile(src.replace(...))) — mutation-testing harness.
+           Input = inspect.getsource() of the LOCAL FROZEN wallet_watch.py (sha256+mtime asserted before/after),
+           substituted anchor asserted unique. Trusted input, test-only, NOT product code. Acceptable.
+  Network in offline test paths:
+           test_gmgn_api_parity.py: behavioral block — ww.http_json/ww.rpc raise + socket.socket monkeypatched
+             to raise (L120-131), _info seeded from fixture ⇒ no metadata lookup possible.
+           test_block_feed.py: pg.block_network(ww) (L84) — same triple block; feed driven from
+             fixtures/block_sample.json.
+           test_wallet_watch.py / test_route_detect.py: no socket monkeypatch, BUT hermetic by construction —
+             _info/_supply/_sol_px seeded (token_info never fetches), and detect_swaps() is contractually
+             network-free (§5.3: reads caches only; verified no http call in detect_swaps source).
+           wallet_watch.py runtime network (Solana RPC, DexScreener, localhost API) is the product's purpose
+             and pre-existing — not a test path.
+
+## Notes / observations (non-blocking)
+- __pycache__/*.pyc contain "gmgn" — compiled artifacts of reviewed sources; ignore.
+- scripts/nansen_probe.py references app.nansen.ai — pre-existing file, outside changed set, untouched by plan.
+- §3-T2-notes / §3-T7-notes deviations (frame_id pairing, major_pair reject, maxSupportedTransactionVersion 0→1,
+  skip matcher superset, _ONCE_MAX_SLOTS=5) are documented WITH counterproof in T2.log/T7.log and fall inside
+  plan latitude ("sửa detector, không sửa test"); none breaches §5.1–§5.9 or §8. Functional verification of
+  these is F1/F2 territory, re-checked here only for constraint compliance.
+- §8 Scope OUT scan: no server/src/providers/gmgn.ts restoration, no wallet_trades schema change touched,
+  no new module split from wallet_watch.py (importlib contract intact), no GMGN pagination/backfill code,
+  no launchpad field emission found in wallet_watch.py events.
+
+F3 VERDICT: APPROVE

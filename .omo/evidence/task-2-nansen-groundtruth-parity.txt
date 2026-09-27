@@ -1,0 +1,45 @@
+TASK 2 EVIDENCE — nansen-groundtruth-parity: measurement of fee-leg drops in scripts/wallet_watch.py
+Date: 2026-09-22 14:51 +07 (Asia/Ho_Chi_Minh)
+Plan: .omo/plans/nansen-groundtruth-parity.md todo 2 (lines 134-141)
+Deliverable for todo 4: CONCLUSION TABLE (C0-C5) in .probe/nansen-parity/trace-22.md
+
+CRITERION 1 — >=17 real txs from mainnet-beta, cached as ROOT-LEVEL JSON (no {"result":...} wrapper)
+- Scenario: fetch 23 selected sigs (9 same-ca buy+sell + 8 diff-ca + 5 transfer-only sorted[:5] + 1 extra fixture pick 5fgRuKgt)
+- Invocation: python3 .probe/nansen-parity/fetch22.py   (RPC pinned https://api.mainnet-beta.solana.com; env SOLANA_RPC_URL/RPC_HTTP verified unset; ww.rpc NEVER used)
+- Observable: "sigs: 23 ok=23 unavailable=0 errors_filed=0" ; rerun => "network calls: 0" (all cached_ok)
+- Artifact: .probe/nansen-parity/fixtures/*.json (23 valid tx + 1 QA negative-cache null, see MANUAL QA)
+- Verified: json.load(p)["transaction"]["signatures"][0] == sig for every fixture (root-level); 48Y3e48T4zGm slot=449097995 matches reference; tx-sample source .probe/nansen-24h/tx-sample.jsonl 990 lines md5 6edc3702cecb4740dad17716284bc867
+
+CRITERION 2 — REAL detector reject traces, hermetic (zero network during detect)
+- Invocation: python3 .probe/nansen-parity/trace22.py
+- Observable: "entries: 23 (22 numbered + 1 appendix) · cross-check mismatches: 0 · probe errors: 0" ; "network calls: 0" ; elapsed 0.4s
+- Method: real ww.detect_swaps(tx, wallet, tr.append); http_json/rpc/socket.socket patched to AssertionError tripwires during detect; prices seeded from snapshot .probe/nansen-parity/prices22.json (captured via real ww.token_info/ww._warm_prices, 35 mints, sol_usd=116.62) BEFORE network block; side-channel leg walker mirrors _legs_with_roles (wallet_watch.py:616-666) + _pair_steps rejects (:717-724); walker-vs-RAW-REJECT cross-check = 0 mismatches on all 23 txs
+- Artifact: .probe/nansen-parity/trace-22.md (1105 lines: 22 numbered entries + Appendix A + CONCLUSION TABLE lines 1213-1300)
+
+CRITERION 3 — CONCLUSION TABLE measured (COUNTED from raw payloads + real detector traces, not inferred)
+- C0 CRITICAL (trace-22.md:1213): 9/9 real fee legs have rd=POOL under the detector's own balance-based role() (wallet_watch.py:596-601: account present in pre/postTokenBalances with delta != 0 => POOL). Todo-4 discriminator (b) `role(dst) != "POOL"` AS WRITTEN WOULD BLOCK 9/9 REAL FEE LEGS while plan test C1/integration expects fixture 48Y3e48T4z to EMIT SELL(fee_leg) — both cannot hold; todo 4 must re-derive (b) (e.g. dst_owner not in {pool owners}, or drop (b) and lean on (a)+(c)+catch-set). Raw evidence (48Y3e48T4zGm fee leg, mint 3z2tRjNu…, plain `transfer` seq=20): dst=AiL1eURqVYPMVVnhH3SwHPZzbYCRF1fmNAFzqKqFwiX owner=3CgvbiM3op4vjrrjH2zcrQUwsqh5veNVRjFCB9N6sRoD pre=361676716052 post=366569794672 Δ=4893078620 raw = fee exactly (dec=8 => 48.9307862 ui; single fee leg to that collector in this tx); src=FHBKw7Pdr6hqhGUHrv2Hgs44FzZTyRLnB4aXSuuwPxjw (wallet ATA, rs=WALLET); encl at capture=None (denylist eats JUP6) => reason=aggregator_frame; stack=JUP6LkbZ…,Tokenkeg…
+- C1 (trace-22.md:1223): 9/9 same-ca fee legs reason=aggregator_frame (counted dict {'aggregator_frame': 9}), JUP6LkbZ… in stack 9/9, rs=WALLET 9/9, rd=POOL 9/9, has_BUY=True 9/9; fee amt == Nansen truth sell amt exactly 9/9; ratio vs gross BUY 0.0990%-0.5000%; RAW REJECT lines quoted verbatim per sig
+- C2 (trace-22.md:1252): transfer-only 4/5 confirmed events=0 + has_BUY_step_same_mint=False. #1 1bPapYy2 = measured VIOLATION of the expectation, characterized as ORACLE DIVERGENCE (not detector bug): tx is a real Jupiter route (STEP BUY Canary(JAzfwUUb…)←SOL via LBUZKhRx… + STEP BUY INJ(1NJMqVM4…)←USDC via DNL1tgEj…) => 2 events; Nansen recorded only 5 transfer rows (all ca=1NJMqVM4, sum net=0); _net_owner 1NJMqVM4=0.0 USDC=0.0 Canary=+855200.695470 => INJ BUY carries qty_net=None (n_mint falsy, wallet_watch.py:800); BUY Canary has NO Nansen row for this sig. Its 3 wallet-out INJ legs (0.002663051/0.106522017/0.00266305 — exactly 3 of Nansen's transfer amounts) rejected same_mint (encl=pAMMBay6…, rd=POOL) => NOT in catch-set {aggregator_frame, plumbing, no_pool_endpoint} AND rd=POOL => double-guarded from fee promotion despite has_BUY=True (real-world C7b analog). Handoff: todo 5 classify will see TRANSFER_FALSE_POSITIVE candidate => G2 adjudication + 'GMGN/Nansen oracle divergence' report section, NOT a detector change
+- C3 (trace-22.md:1268): RxrDxxL2 leg 3ZLekZYq…: the 0.50%-shaped leg (seq=10, amt=0.033718955, matches reference 0.033719/0.50%) has rs=RELAY => killed by condition (a) role(src)=="WALLET" FALSE, not by (c); same-mint steps SELL/SELL => (c) would also block. Sibling leg (seq=9, amt=6.74379102, rs=WALLET, rd=RELAY, reason=no_pool_endpoint, has_BUY=False) IS in catch-set with rd!=POOL — blocked ONLY by condition (c): real-world "condition (c) has teeth" case, same class as 58pWphuG leg OS in plan Must-NOT #3
+- C4 (trace-22.md:1275): 48Y3e48T4z EXACT match to plan reference: slot=449097995, meta.err=None, BUY SURGE qty=48930.786206 qty_net=48881.855420, REJECT (3, 2, 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 7) 3z2tRjNuQjoq6UDcw4zyEPD1Eb5KXMPYb4GWFzVT1DPg aggregator_frame, _net_owner 3z2tRjNu=48881.85541984998; 5fgRuKgt events=0 (matches reference; POOL→WALLET 0.030842463 same_mint + POOL↔POOL no_pool_endpoint dust, pump.fun receipt shape)
+- C5 (trace-22.md:1284): diff-ca 8/8 wallet-out legs rd=POOL on all aggregator_frame legs (only RxrDxxL2 seq=9 rd=RELAY, killed by (c)) — context for G5
+
+CRITERION 4 — fixture copies for todo 4 tests
+- Artifact: scripts/fixtures/nansen/48Y3e48T.json, RxrDxxL2.json, 5fgRuKgt.json
+- Observable: each verified root-level after copy ("FIXTURE … verified root-level signatures[0]==<sig>")
+
+CRITERION 5 — scripts/wallet_watch.py UNCHANGED (read-only measurement task)
+- Observable: md5sum scripts/wallet_watch.py = 3a8739be96405bb94926bf8cb0e454cc (baseline == current, checked after all runs)
+
+MANUAL QA
+- Cache determinism: python3 .probe/nansen-parity/fetch22.py (rerun) => "sigs: 23 ok=23 unavailable=0 errors_filed=0 / network calls: 0"; python3 .probe/nansen-parity/trace22.py (rerun) => identical md (1105 lines), "network calls: 0", mismatches 0, prices snapshot reused (captured_at=2026-09-22T07:33:30+00:00)
+- Failure QA: python3 .probe/nansen-parity/fetch22.py --sigs 1111111111111111111111111111111111111111111111111111111111111111 (64x'1', valid base58, nonexistent) => 3 attempts each logged "null_result JSON-RPC result=null (cached as null)", final "sigs: 1 ok=0 unavailable=1 errors_filed=1", exit=0, NO uncaught exception; cache file .probe/nansen-parity/fixtures/1111…1.json = valid JSON containing null (negative cache, json.load => None). QA artifact intentionally left in fixtures/ as documented negative-cache demo — exact-sig key can never collide with a real tx
+- LSP: lsp_diagnostics on .probe/nansen-parity/trace22.py => "No diagnostics found"
+
+RISKS / HANDOFF NOTES
+- Todo 4 MUST read C0 first: discriminator (b) as written contradicts measured reality (9/9 rd=POOL). C1 synthetic builder must reproduce the rd=POOL shape (collector dst account present in balance tables with Δ>0), NOT rd=RELAY, or the real-fixture integration expectation (SELL fee_leg 48.930786 on 48Y3e48T4z) fails
+- Todo 5: 1bPapYy2 group => TRANSFER_FALSE_POSITIVE candidate by oracle divergence; adjudicate under G2 + report section, no detector change implied
+- Prices snapshot .probe/nansen-parity/prices22.json is deliberately separate from todo 6/8 prices.json (wider mint set)
+- Probe scripts are one-off analysis tooling under .probe/ (not shipped code); wallet_watch.py untouched
+
+EVIDENCE_RECORDED: /home/namvt/Desktop/dev-space/signal_scan/.omo/evidence/task-2-nansen-groundtruth-parity.txt

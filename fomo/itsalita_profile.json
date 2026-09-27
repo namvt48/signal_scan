@@ -1,0 +1,18 @@
+{
+  "handle": "itsalita",
+  "displayName": "itsalita",
+  "avatar": null,
+  "userId": null,
+  "wallets": {
+    "solana": "3NBf1zmwZjfY7LM5WAdpYNpPVYAC6Fr8MYvGzScFVJq8",
+    "evm": "0xe2bb5bac3c5aa50ffa38cb9c7a2bc3aa45427eef"
+  },
+  "pnlUsd": null,
+  "volumeUsd": null,
+  "trades": null,
+  "followers": null,
+  "holdings": null,
+  "verified": false,
+  "source": "wallet",
+  "profile": null
+}

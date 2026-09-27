@@ -1,0 +1,95 @@
+# Rule A — CA = token ĐÍCH của TRADER (chốt 2026-09-18)
+
+## Thay đổi
+`scripts/wallet_watch.py`:
+- `_ROUTE_MINTS = TIER_A | TIER_B` — stablecoin + tier quote, không bao giờ là đích.
+- `_signer_keys(tx)`, `_net_owner(tx, owner)` — tách từ thân `_target_event` cũ.
+- `_fill_dest(tx, wallet, me)` — OTC fill: ví bán memecoin không-route, một SIGNER
+  khác mua CÙNG mint ⇒ (buyer, mint).
+- `_fill_event(...)` — event CA cho fill: qty = net(dest) của buyer, quote = token
+  buyer trả, `amount_basis="net_delta"`, `via=buyer`, usd_basis quote|counterparty.
+- `_target_event`: (2) chỉ khi ví KHÔNG ký tx (đối ứng bị động) mới áp fill; ví có
+  event BUY khớp đích ⇒ dùng luôn event đó (leg đã đúng). Ví CÓ ký ⇒ đường cũ.
+
+## 6 suite offline (local, py3.12)
+```
+test_wallet_watch           EXIT=0  11/11 nhãn per-step + rule A OTC fill
+test_wallet_watch_config    EXIT=0
+test_route_detect           EXIT=0  15/15
+test_gmgn_api_parity        EXIT=0  29/29 row · mutation gate 4/4
+test_block_feed             EXIT=0  19/19 (29 event / 9 tx)
+test_rpc_resilience         EXIT=0  13/13
+```
+
+## Check 9 tx cũ (fixtures GMGN parity; 12 json → 9 sig; tracked = FhsbQzAJ…)
+old `_target_event` vs new: **CHANGED = 0/9**.
+
+| sig | ví track ký? | evs | old | new | row fixture |
+|---|---|---|---|---|---|
+| 3pkGZDK1 | True | 4 | cbbtcf3aa2 | cbbtcf3aa2 | buy cbBTC |
+| 33hqSn4Q | True | 4 | cbbtcf3aa2 | cbbtcf3aa2 | buy cbBTC |
+| 3BbWVS3K | True | 4 | 8LstZpZuR9 | 8LstZpZuR9 | buy OS |
+| 3nzGD2WV | True | 4 | 8LstZpZuR9 | 8LstZpZuR9 | buy OS |
+| 3fec2kXP | True | 2 | 7aTdJBD8QJ | 7aTdJBD8QJ | buy JUDE |
+| 4zmaV87B | True | 3 | AjBGWjvzYB | AjBGWjvzYB | buy SNOOPDOGE |
+| 58pWphuG | True | 4 | None | None | all sell |
+| 2k3KYp18 | True | 2 | None | None | all sell |
+| 5XLTG1WX | True | 2 | None | None | all sell |
+
+Ví track CÓ KÝ cả 9 tx ⇒ nhánh fill bị gate ⇒ 0 thay đổi; 6/9 có đích khớp
+`buy` row của fixture, 3/9 toàn SELL ⇒ None (đúng như nhãn cũ).
+
+## 4 diff còn lại (quét MỌI account trong 9 tx, 321 cặp ví×tx)
+Toàn bộ nằm ở ví KHÔNG track, KHÔNG có trong `wallets` table ⇒ 0 ảnh hưởng prod:
+- 3BbWVS3K / 5dYsxy1h: CARDS… → 8LstZpZuR9…
+- 3nzGD2WV / 5dYsxy1h: CARDS… → 8LstZpZuR9…
+- 3fec2kXP / SsJYbzww: None → 7aTdJBD8QJ…
+- 4zmaV87B / 7y9T8ncZ: None → AjBGWjvzYB…
+(gate mới: ví CÓ ký tx 2 signer — 3GkmwgW2vE — vẫn None, không thành tín hiệu mua)
+
+## Rule A trên 2 tx gốc
+- 4VPQRwNB: `GpMZbSM2` bán MARINE (không ký) ⇒ CA = MARINE, quote KNOTS,
+  qty=1605665.8104, via=5k3ZdP3vqN.
+- 3Vdkaok: `HLnpSz9h` bán ZINC (không ký) ⇒ CA = ZINC, quote USDC, qty=264.305358,
+  quote_usd=100.0, via=6UvTH39q9i.
+
+## Replay trên dữ liệu THẬT prod (`ruleA_real_regress.py`, read-only)
+Host `194.163.187.250`, `RPCS=["https://api.mainnet-beta.solana.com"]`
+(publicnode prune tx cũ → `result:null`; `rpc()` KHÔNG xoay endpoint khi null).
+
+A. `tracked_cas` auto rows = 20 (đã fetch đủ):
+- 13 row old==new==CA (không đổi)
+- 4 row rule A áp dụng trên ví KHÔNG ký:
+  `4VPQRwNBKU` LinkhB3a → F8Sc8HoZ(MARINE) · `3TMJokHcv2` 6GmAFSYs → 8RVBk8vx(KNOTS)
+  `3Vdkaok7kF` USD1ttGY(SELL) → zinc155B(ZINC) · `2XesETyv4k` → None (SELL, không đích)
+- other_change = 0
+
+B. `events.jsonl`: 0 thay đổi ngoài tập trên.
+
+## Deploy prod
+- backup: `/opt/wallet-watch/wallet_watch.py.bak.preRuleA.20260918T182342` (sha cũ 7d5d5b63…)
+- `wallet_watch.py` = rule A, sha256 `b36e645b5d02eef6a1f5ebed9705d60132cd398fc033a09d77270c11cfbc4da7`
+- 6 suite offline trong venv: EXIT=0 (wallet_watch · config · route_detect 15/15 ·
+  gmgn_api_parity 29/29+mutation 4/4 · block_feed 19/19 · rpc_resilience 13/13)
+- `systemctl restart wallet-watch` → active, MainPID 2272886, NRestarts=0
+- banner `# watch 5 ví | feed=ws | 5 quote-mints | min $50.0`, rpc Helius
+- traceback sau restart = 0 · heartbeat age 5s · events=72056 (không đổi)
+- sha file trên đĩa == sha rule A ✓
+
+## Sửa 2 row `tracked_cas` sai (user uỷ quyền)
+`fix_ruleA_cas.py` — PLAN{replace: 4VPQRwNBKU, 3Vdkaok7kF, 3TMJokHcv2; delete: 2XesETyv4k, BQ9F3CpgFZ}
+Dùng ĐÚNG pipeline prod: `_warm_prices(tx)` → `detect_swaps` → `_target_event` →
+`track_post_body` (thiếu `_warm_prices` ⇒ quote_usd=0 ⇒ body None — đã sửa).
+- backup DB: `signal_scan.db.bak.preRuleA.20260918T132932`
+- RESULT {'updated': 3, 'deleted': 2} ⇒ auto rows 21 → 19
+  `6GmAFSYs4g → 8RVBk8vx(LiUH)` usd 315.99 · `LinkhB3afb → F8Sc8HoZ(vJcM)` usd 761.12
+  `USD1ttGY1N → zinc155B(S4mS)` usd 100.0 · deleted DKNGQFNGQm, GY9mZfyPpx
+- verify qua API `/api/tracked-cas`: total 19 · stale_wrong [] ·
+  ruleA_targets_present ['zinc155BS4','F8Sc8HoZvJ','8RVBk8vxLi']
+
+## Tồn đọng (không nằm trong phạm vi được uỷ quyền)
+- `5dvXTZ5qwgaf` note `auto:SELL by HLnpSz9h…` — address ĐÚNG, chỉ side trong note
+  còn là SELL (rule A luôn post BUY).
+- Ví `GpMZbSM2`/`HLnpSz9h` đã ngừng track ⇒ các row cũ của chúng không tự sinh lại.
+
+EVIDENCE_RECORDED: .omo/evidence/rule-a-target/verify.log

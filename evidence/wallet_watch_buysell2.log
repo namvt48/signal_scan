@@ -1,0 +1,23 @@
+# watch 1 ví | feed=ws | 5 quote-mints | min $0.1
+# feed=ws logsSubscribe 1 ví | sweep 60.0s | Ctrl-C dừng
+09-11 17:23:59 [32mBUY         [0m 8NQ32…eEQr  0.001246 SOL ≈ $0.12  https://solscan.io/tx/3KcQY5PZe6Pqz1enLQAcjktPFsUxwQnizwdfxPX2bQwKvwrgqMqrgVF2U18ZtVkgFCue4CdfU2G6chLPfuNWKuE4
+09-11 17:24:30 [32mBUY         [0m 8NQ32…eEQr  0.540894 USDC ≈ $0.51  EPjFWdd5…  https://solscan.io/tx/MMiHnKrDjoSnQzTD7bsmuSQkNFxNn7xyKd68mpeNKMeYRQgrRCnzrtR7RDX9QnPUuBKf68UAqzmcm9uacB32wtU
+09-11 17:25:31 [32mBUY         [0m 8NQ32…eEQr  0.580616 SOL ≈ $57.75  https://solscan.io/tx/5txKVDBX7tdTsfHHq5PMckbupiFDonJ7mZGEStpafypwCDCL2beALNxDAAwEpqXDMc9QzWbCTuHZUUEy48Aweved
+09-11 17:26:02 [32mBUY         [0m 8NQ32…eEQr  0.18451 USDC ≈ $0.17  EPjFWdd5…  https://solscan.io/tx/53tbVFai4ZwFKJAM6wPyJui1tqckWHfhLCA7qRVZiJ77fAkAFiWeFVw6czTcgi6Embbei5FieBP7mbPJziUPm5xV
+09-11 17:26:03 [32mBUY         [0m 8NQ32…eEQr  0.001707 SOL ≈ $0.17  https://solscan.io/tx/Po4c7VwgaeNNinC5mYU2rnhLbTbTk477vnESC9jkoTrieiAoviBUwT9WoS4P71xjTNa5Fcoo5oTa1Hc5TFwqFNf
+09-11 17:26:04 [32mBUY         [0m 8NQ32…eEQr  0.002599 SOL ≈ $0.26  https://solscan.io/tx/49Sj2skPdqZo6jrNBevKbN3PNNoYrCJ6xHmzhDGse5eBGGfgnUV8aDCDcJDkgDJzxWEDkY44dXpVYdFQDVFfxLac
+09-11 17:26:10 [32mBUY         [0m 8NQ32…eEQr  0.197912 USDC ≈ $0.19  EPjFWdd5…  https://solscan.io/tx/3wijwSMeeJQWPEphzgCh3cDMZWF7igMuX9SV3nTUik4zWjqARXmYCZgyYBLnE8NgTcoUTuMetwW79BQyP7Ex7Jac
+09-11 17:26:19 [32mBUY         [0m 8NQ32…eEQr  0.018973 SOL ≈ $1.89  https://solscan.io/tx/uvMDDnwerP9XF5Z4NHCLAz3J3gmAyNTe6XjTbYz9VxQmzPV2T55mea951AbsEGP6PYWPT8CSB96aREa1PUwSzV1
+09-11 17:26:19 [32mBUY         [0m 8NQ32…eEQr  0.322457 USDC ≈ $0.30  EPjFWdd5…  https://solscan.io/tx/5iw4x7UnonDi3w1s8s2zqU7hbh63b4fUfuUPM734JjdRdxHPoKJqnmvtEfG384zcxec2xSR4S4byf2YWzXGfM4jq
+09-11 17:26:19 [32mBUY         [0m 8NQ32…eEQr  0.005908 SOL ≈ $0.59  https://solscan.io/tx/2WQmDGzWGp5AbtFqjdkSVR3aLAQj5re1SaxSUvCyK6GY3NHKyjtT1FS8yBiKNA1p3m9GMP5yas4NE8E5uLYQyDJg
+09-11 17:26:20 [32mBUY         [0m 8NQ32…eEQr  0.465998 USDC ≈ $0.46  EPjFWdd5…  https://solscan.io/tx/5cf3o3uHSLBfqC8SuQdMXKBtFAJqDSmzD89xBam3oGTp6ZmjxahZMhzPDh3cqjSkUh1nNGy9j99htjo1oonAunnw
+09-11 17:26:20 [32mBUY         [0m 8NQ32…eEQr  0.220385 USDC ≈ $0.22  EPjFWdd5…  https://solscan.io/tx/5L8kQbyENtasphrD46xnZLa6icjtRmMNoC411WQQQNC3HoYEvp5Q21q5B624WmChmRnzcQNsozuS3riUewYEENNU
+09-11 17:26:23 [32mBUY         [0m 8NQ32…eEQr  0.001374 SOL ≈ $0.14  https://solscan.io/tx/Wdx7KM3QKAQnkA99frNH7vRm1VMn8v82v6xG82SRowTZ1ppH96PxFL1zeGxP7Eg5ivjoKmPZBMVRjTGjKxgtv6e
+09-11 17:26:31 [32mBUY         [0m 8NQ32…eEQr  0.003872 SOL ≈ $0.39  https://solscan.io/tx/4pSAK8ue6aWVw7zFUr2NVewauEUgxcrguigEe3qyX1SSZBCU2168FzfaudwYXJnDrCbeozuypU5MJeEK6DxfxEwW
+09-11 17:27:49 [32mBUY         [0m 8NQ32…eEQr  0.001418 SOL ≈ $0.14  https://solscan.io/tx/LgcavgyrPMwHVHCD1MfpENo9JHhaUctbdJj5heFT8bJ4ceJS1V9gnP7bmUWgjTPooQei1WbdjiDyEzYkdYa8xAu
+09-11 17:28:24 [32mBUY         [0m 8NQ32…eEQr  0.003234 SOL ≈ $0.32  https://solscan.io/tx/2UKrEd4JpkCumfhfXdRWFJ9as3e2diRmba786Cenmw34D6APrz8Urt2aeuJDhBCFPJN9VL2Xy6kGvAFnLuUQrWse
+09-11 17:28:50 [32mBUY         [0m 8NQ32…eEQr  0.00112 SOL ≈ $0.11  https://solscan.io/tx/2QJzA9EmapPywwpq4tVs6HhTVy1mmjh4wxVXHbQFndFpHi7nwMdy3st3p1EvdV8C52naFvrb8KZzXGU5U5A2jfkx
+09-11 17:28:50 [32mBUY         [0m 8NQ32…eEQr  0.001264 SOL ≈ $0.13  https://solscan.io/tx/4K1J3uNup1NiqDLgFyeUGU4fKh84dCCADJN4ZPdphzRdZrr2BawQBrXgvbK1eQpwbmUCM3szimHLF7qrhqc4gAos
+09-11 17:28:50 [32mBUY         [0m 8NQ32…eEQr  0.002415 SOL ≈ $0.24  https://solscan.io/tx/4hPR8qhSbBFuQhHaPKPMFQ82GXtzTMtncEN8pQ9KLQQz7Yi5fNDNRoEKbyoHr8pL3Nhc8zC9xJj3UzK1Vz4nF5ng
+09-11 17:29:36 [32mBUY         [0m 8NQ32…eEQr  0.316184 USDC ≈ $0.30  EPjFWdd5…  https://solscan.io/tx/5dnNLQKpM1pD9dMnj5mqKGK2wMfVir5VrZk7oUAgqyNGmiaWoYGi2XnyDgRMw8rLVeLdorRZVHXqPNswaENBWAjs
+09-11 17:29:37 [32mBUY         [0m 8NQ32…eEQr  0.66203 USDC ≈ $0.62  EPjFWdd5…  https://solscan.io/tx/CMtP3ZaABrHx7B1cFYFY4kqYnX3y1axzQURbsVW7o4fqA6Uj7b5LstxA1pRBsoshcJHPCTnWQTvK4WDThr4qqgb

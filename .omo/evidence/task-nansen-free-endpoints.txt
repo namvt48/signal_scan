@@ -1,0 +1,101 @@
+# Task: retire Nansen holders-change / holders-balances / wp4t; single-call volume; 12h setup sweep
+# Date: 2026-09-22
+# Workdir: /home/namvt/Desktop/dev-space/signal_scan/server
+
+## VERIFICATION (commands actually executed)
+
+$ npm test
+> tsx --test test/*.test.ts
+
+ℹ tests 148
+ℹ suites 0
+ℹ pass 148
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2474.956901
+TEST_EXIT=0
+
+$ npm run build
+> tsc
+BUILD_EXIT=0
+
+## LSP DIAGNOSTICS (changed files)
+
+src/providers/nansen.ts      clean
+src/providers/provider.ts    clean
+src/providers/mock.ts        clean
+src/poller.ts                clean
+src/ingest.ts                clean
+src/signals.ts               clean
+src/config.ts                clean
+src/db.ts                    clean
+src/index.ts                 clean
+src/crawl.ts                 clean
+test/nansen.test.ts          clean
+test/signals.test.ts         clean
+test/poller.test.ts          2 pre-existing errors: [121:67] / [125:47] Type '"eth"' is not assignable to type '"sol"'.
+                             Root cause: src/shared/chain.ts declares `CHAINS = ['sol']` so Chain is 'sol' only.
+                             tsconfig.json has include:["src"], exclude:["test"] -> tsc never sees test/, `npm run build` exit 0,
+                             tsx --test strips types without checking -> runtime fine (tests pass). NOT introduced by this change.
+
+## SOURCE CHANGES
+
+providers/nansen.ts
+  - removed: NANSEN_HOLDERS_CHANGE_URL, NANSEN_HOLDERS_BALANCES_URL, NANSEN_WP4T_TRANSACTIONS_URL,
+    wp4tTransactionsBody, wp4tTransactionsToActivities, holdersChangeBody, holdersBalancesBody,
+    holdersBalancesToHolderRows, parseHoldersChange, Wp4tTxRow, HoldersBalancesRow, HoldersChangeRow,
+    NansenMarketProvider.topHolders(), NansenMarketProvider.walletActivity()
+  - added: NANSEN_TOKEN_INFORMATION_PATH='/api/v1/tgm/token-information', interface TokenInformation,
+    type TokenInformationPatch = MetricPatch & { holders?: number }, pure mapTokenInformation(),
+    NansenApiClient.tokenInformation(chain, ca) -> POST {chain, token_address, timeframe:'1d'}
+  - metric('volume') is now ONE tgm-volume-details call (intervalSec 86400); no volume1h from a 2nd call
+  - tokenInfo(): free volume + free gini + credit token-information (or free essential fallback); price = MC / circulating_supply
+
+providers/provider.ts
+  - MetricKind = 'essential' | 'volume' | 'gini'   (dropped 'holdersChange')
+  - MetricPatch: dropped `holders`; added vol24hPrev?, vol24hPrevAt?
+  - MarketDataProvider: removed topHolders(), walletActivity()
+
+providers/mock.ts
+  - removed holdersChange case, topHolders(), walletActivity(), and the HolderRow / WalletActivity imports
+
+poller.ts
+  - removed Tier type, walletTradesSweep, kickWalletTradesFor; kickWallet() lost its 5th `cas` param
+  - new newCasFirst() priority ordering (added_at within config.newCaPriorityMs)
+  - new applyVolumeDelta(): vol_1h = volume24h - vol_24h_prev, stored with vol_24h_prev_at (dt guard 30min..2h)
+  - seriesSweep + giniSweep.hot/cold -> ONE setupSweep at config.pollSetupMs (12h)
+  - startPoller tasks: essential, essentialGap, volume, wallet, symbolBackfill (+ setupSweep when crawlEnabled)
+
+ingest.ts
+  - METRIC_WRITERS: dropped ['holders','holders']; added ['vol24hPrev','vol_24h_prev'], ['vol24hPrevAt','vol_24h_prev_at']
+
+signals.ts
+  - sumTrackedBuyUsd(): source='nansen' -> source='watch'
+
+db.ts
+  - token_state + TokenStateRow + migration: added vol_24h_prev REAL, vol_24h_prev_at INTEGER
+  - removed listCaTargetsByVolume()
+
+config.ts
+  - pollEssentialMs 86_400_000 -> 3_600_000 ; essentialGapWindowMs 86_400_000 -> 3_600_000
+  - removed pollHotMs, pollColdMs, pollWalletTradesMs, hotVolumeUsd
+  - added pollSetupMs = 43_200_000 (12h), newCaPriorityMs = 3_600_000 (1h)
+
+index.ts   - credit-client comment updated (wp4t door retired)
+crawl.ts   - balanceSeries cache-only comment updated (setupSweep is the sole writer)
+
+## TEST CHANGES
+nansen.test.ts  - dropped retired-import/tests (wp4t x3, holders-balances, holders-change parsing);
+                  gini test now gini-only; volume metric asserts ONE 86_400 call + volume1h undefined;
+                  tokenInfo asserts 3 free endpoints, holders 0, volume1h undefined
+poller.test.ts  - imports trimmed; removed config.pollWalletTradesMs; removed topHolders/walletActivity from
+                  3 provider literals; deleted tier test + 2 walletTradesSweep tests + helpers;
+                  stale trades-door comments updated
+signals.test.ts - seed CA_A buys now inserted with source='watch'; source-split test updated
+                  (trackedBy=['CTW'], trackedInflow=900); holding/inflow test now 3300 from watch rows
+
+## DELIBERATELY NOT DONE (needs user decision)
+  - T100/LF stay on the free tgm-holders-hourly-stats series (user decision) — no credit endpoint added
+  - No deploy / ssh / docker restart performed (not requested)

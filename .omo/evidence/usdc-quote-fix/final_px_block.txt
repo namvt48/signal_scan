@@ -1,0 +1,13 @@
+    bm, qm, inferred = _base_quote(sa["mint"], sb["mint"], rank)
+    bl, ql = (sa, sb) if sa["mint"] == bm else (sb, sa)
+    qty = bl["raw"] / 10 ** bl["dec"]
+    qq = ql["raw"] / 10 ** ql["dec"]
+    # USDC/USDT neo $1 — _info không cache stablecoin ⇒ hardcode, không network
+    px = (
+        _sol_px["v"]
+        if qm == WSOL
+        else 1.0
+        if qm in (USDC, USDT)
+        else (_info.get(qm) or (None, 0.0))[1]
+    )
+    qusd = qq * px if px else 0.0

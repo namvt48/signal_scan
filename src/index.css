@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+/*
+  Design tokens — palette mirrored from the "Signal Scan Field Ops" reference.
+  Fixed green-tinted hexes (no color-mix); utilities read the runtime vars via @theme inline.
+*/
+@theme inline {
+  --color-canvas: var(--c-canvas);
+  --color-surface: var(--c-surface);
+  --color-surface2: var(--c-surface2);
+  /* Reference table chrome: header bg #F6F8F5, row hover #F3F6F1. */
+  --color-surface3: var(--c-surface3);
+  --color-hover: var(--c-hover);
+  --color-dark: var(--c-dark);
+  --color-line: var(--c-line);
+  --color-ink: var(--c-ink);
+  --color-ink2: var(--c-ink2);
+  --color-muted: var(--c-muted);
+  --color-accent: var(--c-accent);
+  --color-accent-ink: var(--c-accent-ink);
+  --color-pos: var(--c-pos);
+  --color-warn: var(--c-warn);
+  --color-neg: var(--c-neg);
+  --color-neut: var(--c-neut);
+  /* Bright decorative lime (badge mark, coin footer triangle) + soft tint for active pills. */
+  --color-lime: var(--c-lime);
+  --color-lime-soft: var(--c-lime-soft);
+  --color-good-ink: var(--c-good-ink);
+  --color-watch-ink: var(--c-watch-ink);
+  --font-display: "Plus Jakarta Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /* Reference card/chip shadows (--shadow-sm/--shadow-md). */
+  --shadow-sm: 0 1px 2px rgba(15, 20, 17, 0.08), 0 6px 16px -10px rgba(15, 20, 17, 0.2);
+  --shadow-md: 0 2px 4px rgba(15, 20, 17, 0.08), 0 14px 32px -16px rgba(15, 20, 17, 0.3);
+}
+
+:root {
+  color-scheme: light;
+  /* Fixed palette from the reference: --page/--card/--ink/--charcoal/--muted/--border/--accent/--good/--watch. */
+  --c-canvas: #F2F5F1;
+  --c-surface: #FFFFFF;
+  --c-surface2: #EEF2EC;
+  --c-surface3: #F6F8F5;
+  --c-hover: #F3F6F1;
+  --c-dark: #1B2420;
+  --c-line: #DCE4DA;
+  --c-ink: #17211B;
+  --c-ink2: #3F4A42;
+  --c-muted: #55645C;
+  --c-accent: #D7FA4B;
+  --c-accent-ink: #17211B;
+  --c-pos: #3E7D52;
+  --c-warn: #B3492E;
+  --c-neg: #B3492E;
+  --c-neut: #3F4A42;
+  --c-lime: #D7FA4B;
+  --c-lime-soft: #E9EFE6;
+  --c-good-ink: #E1EEE1;
+  --c-watch-ink: #F7D9CF;
+}
+
+body {
+  margin: 0;
+  background-color: var(--c-canvas);
+  color: var(--c-ink);
+  font-family: "Plus Jakarta Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background-color: var(--c-accent);
+  color: var(--c-accent-ink);
+}
+
+/* Tag-driven wallet name styling (see walletNameClass in ui.tsx). */
+.wl-name.rainbow {
+  font-weight: 700;
+  background: linear-gradient(90deg, #FF3B6B, #FF9F1C, #F4E04D, #4ADE80, #38BDF8, #A78BFA);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

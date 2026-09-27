@@ -1,0 +1,200 @@
+================================================================
+TASK 6 EVIDENCE — nansen-groundtruth-parity — IO layer (Wave 4)
+date: 2026-09-22T10:10:15Z
+================================================================
+
+== md5 before/after ==
+before: caa5b597cf2ffe31736ff57ffe555ae9  scripts/nansen_parity.py (911 lines)
+before: 963247939773b31bb2b3f4f9dc3c5a7c  scripts/test_nansen_parity.py (982 lines)
+after:  fc9c6bb0d203ed3a5ec1187e4987ad89  scripts/nansen_parity.py
+after:  c6e62fc1faf12713eed99c1129a0c45a  scripts/test_nansen_parity.py
+ 1249 scripts/nansen_parity.py
+ 1226 scripts/test_nansen_parity.py
+ 2475 total
+untouched check: e57b910f0677e196f8158ee8de5df034  scripts/wallet_watch.py (must be e57b910f0677e196f8158ee8de5df034)
+
+== 5 smoke sigs used (first 5 sorted valid cached fixtures, QA null 1111...1 excluded) ==
+1bPapYy2WrpxGNNLHZhGvDHcu5rTuJgaJp6MsaWLJNAtUYYGUXxvfivV7mUhK5VbGfccKziPyz7EQmHycoFx6Fi
+21Awv9vTXQjUXqhxhYaxKDpbUCXEkgJfNhgR9NwPpSDT5xM9RYiL3jMBLERUqibPWPCDxVwbbrwGZYdbfs2k8yrh
+23tfbM5ecau3KQJUSXnuK5eqy8aWHrudekaq1cCbATcERLxTFYunGBNKADh49QjJTmNZTsBuiUHXpt9dPehed4sN
+24XDFYUWAVX8rYR5riguL8mTGBGEksvtgdThCoaiMKnegDBCwnDyRwyKHY1FmdZbYDLVodvuah88xHGoTdTFGdVf
+24hMKaUxZ6yb2pWWhtPov6NuPmbC4LBD5YiNV6qjZcdWgsx8E7MKzU5h27X6imbvudvf7BSgs9mAt5v1RsqyDHuZ
+
+== RED (tests appended FIRST, before implementation) ==
+$ python3 scripts/test_nansen_parity.py   # EXIT=1
+FAIL test_t6_capture_prices_cache_hit_zero_calls
+FAIL test_t6_cli_missing_truth_exits_nonzero_no_output
+FAIL test_t6_detect_for_cached_zero_network
+FAIL test_t6_fetch_tx_cache_first_zero_network
+FAIL test_t6_fetch_tx_miss_retries_and_caches_every_response
+FAIL test_t6_load_seed_prices_roundtrip
+FAIL test_t6_seed_covers_every_fixture_balance_mint
+FAIL test_t6_tx_params_and_rpc_pin
+FAIL test_t6_tx_unavailable_matrix
+RED: 47/56 pass, 9 fail
+--- RED failure reason sample (AttributeError = correct reason, impl absent) ---
+AttributeError: module 'nansen_parity' has no attribute 'load_prices'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 1207, in main
+--
+AttributeError: module 'nansen_parity' has no attribute 'ww'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 1207, in main
+--
+AttributeError: module 'nansen_parity' has no attribute 'ww'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 1207, in main
+
+== GREEN ==
+$ python3 scripts/test_nansen_parity.py
+PASS test_t6_capture_prices_cache_hit_zero_calls
+PASS test_t6_cli_missing_truth_exits_nonzero_no_output
+PASS test_t6_detect_for_cached_zero_network
+PASS test_t6_fetch_tx_cache_first_zero_network
+PASS test_t6_fetch_tx_miss_retries_and_caches_every_response
+PASS test_t6_fixtures_are_root_level_cache
+PASS test_t6_load_seed_prices_roundtrip
+PASS test_t6_seed_covers_every_fixture_balance_mint
+PASS test_t6_tx_params_and_rpc_pin
+PASS test_t6_tx_unavailable_matrix
+OK: nansen_parity pure core 56/56
+GREEN EXIT=0
+
+== smoke: exact command + stdout tail ==
+$ python3 scripts/nansen_parity.py --limit 5 --sigs <the 5 sigs above> --out .probe/nansen-parity/smoke
+EXIT=0
+n_records: 5  n_sigs: 5  drift: None
+network calls: 0
+generated_at: 2026-09-22T10:07:52+00:00
+    5 .probe/nansen-parity/smoke/parity.jsonl
+   98 .probe/nansen-parity/smoke/report.md
+  103 total
+records: 5 | every line has class: True
+classes: {'TRANSFER_FALSE_POSITIVE': 1, 'MATCH': 4}
+  1bPapYy2Wrpx… ca=1NJMqVM4… TRANSFER_FALSE_POSITIVE
+  21Awv9vTXQjU… ca=1NJMqVM4… MATCH
+  23tfbM5ecau3… ca=1NJMqVM4… MATCH
+  24XDFYUWAVX8… ca=3ZLekZYq… MATCH
+  24hMKaUxZ6yb… ca=4nV5gNww… MATCH
+
+== root-level cache assertion (all fixture files: 'transaction' in d AND 'result' not in d) ==
+24 cache files: 23 valid root-level (transaction present, result absent), 1 cached null (QA sig)
+
+== prices.json key listing ==
+top-level keys: ['captured_at', 'sol_usd', 'prices']
+captured_at: 2026-09-22T10:07:13+00:00 | sol_usd: 116.62 | n_prices: 36
+WSOL entry: ['SOL', 116.62]
+non-stablecoin quote mints present: 34 | sample: ('1NJMqVM4PadjuzYmeB7zV7q7DV8oB3ExaQCd9x6KsLz', ['INJ', 7.76])
+
+== --truth <missing> failure output + no bogus parity.jsonl ==
+truth file không tồn tại: /tmp/tmp.JuCb3OPIhT/nope.jsonl
+EXIT=0 (pipeline head; real exit below)
+real EXIT=2
+ls: cannot access '/tmp/tmp.JuCb3OPIhT/out': No such file or directory
+PROOF: /tmp/tmp.JuCb3OPIhT/out/parity.jsonl does NOT exist
+
+== UNAVAILABLE classification path (QA null cache 1111...1 under fixtures/) ==
+fetch_tx QA-null: None calls: 0 err: cached null result (JSON-RPC result=null) at .probe/nansen-parity/fixtures/1111111111111111111111111111111111111111111111111111111111111111.json
+tx_unavailable: True
+detect_for: None calls: 0 err: cached null result (JSON-RPC result=null) at /home/namvt/Desktop/dev-space/signal_scan/.probe/nansen-parity/fixtures/1111111111111111111111111111111111111111111111111111111111111111.json
+classify → UNAVAILABLE | fetch_error: cached null result (JSON-RPC result=null) at /home/namvt/Desktop/dev-space/signal_scan/.probe/nansen-parity/fixtures/1111111111111111111111111111111111111111111111111111111111111111.json
+UNAVAILABLE path OK
+
+== exit codes ==
+python3 scripts/test_nansen_parity.py EXIT=0 (OK: nansen_parity pure core 56/56)
+python3 scripts/test_nansen_fee_leg.py EXIT=0
+
+== baseline regression (all must stay green / ruleA fails by design) ==
+scripts/test_wallet_watch.py EXIT=0
+scripts/test_wallet_watch_config.py EXIT=0
+scripts/test_gmgn_api_parity.py EXIT=0
+scripts/test_route_detect.py EXIT=0
+scripts/test_block_feed.py EXIT=0
+scripts/test_rpc_resilience.py EXIT=0
+scripts/backtest_parity.py --from-fixture EXIT=0 — PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+scripts/ruleA_real_regress.py EXIT=1 BY DESIGN — FileNotFoundError: [Errno 2] No such file or directory: '/opt/wallet-watch/wallet_watch.py'
+
+== LSP ==
+lsp_diagnostics scripts/nansen_parity.py: No diagnostics found
+lsp_diagnostics scripts/test_nansen_parity.py: No diagnostics found
+
+== deviations / decisions ==
+1. --seed = PATH to price snapshot (default .probe/nansen-parity/prices.json); plan listed the flag without semantics.
+2. Price universe scoped to SELECTED groups only (ca ∪ WSOL ∪ balance-mints of their cached txs) per MUST DO — a --limit 5 run never touches the other 738 groups' CAs.
+3. seed_prices does NOT seed ww._info_miss (deviation from trace22.py:77-79): a miss marker makes token_info re-fetch after 60s TTL, breaking the hermetic network-calls:0 invariant. Documented in seed_prices docstring.
+4. run() classifies in 2 passes: drift=None then drift=median(pass-1 raw ratios) — G9 formula requires 'after one global drift factor'; pure re-computation, no re-detection.
+5. reject_trace fallback: classify RAISES on TRACE_REQUIRED class with empty trace (T5 invariant); run() passes ['no detector trace lines emitted for sig=…'] when the detector emitted zero trace lines — honest placeholder, no gate lowered.
+6. prices.json initial capture: pre-seeded ww._info from prices22.json (todo-2 snapshot, 35 mints) then capture_prices fetched only the 1 missing mint (USDC) — 1 network call total, not 36. USDC entry shows px=0.004528 (DexScreener best-liquidity pair quirk); harmless: _quote_px/ui_price hardcode USDC→1.0 (wallet_watch.py:843-850), _info[USDC] only feeds _dsym.
+7. fetch_tx retries null results too (3 attempts, precedent fetch22.fetch_sig) and caches every result including null; transport/rpc errors are NOT cached.
+8. traces in report.md limited to sigs with ≥1 TRACE_REQUIRED-class record (report size control for the 743-group todo-8 run).
+
+================================================================
+TASK 6 FIX ROUND — verification failures 1+2 (2026-09-22)
+================================================================
+
+== FIX 1: --seed semantics collision (todo-7 blocker) ==
+--seed is now type=int default=None (RNG seed); snapshot path moved to --prices
+(default .probe/nansen-parity/prices.json). Threaded through run(prices_path=…,
+seed=…) and detect_for(prices_path=…). capture_prices/load_prices/seed_prices
+UNCHANGED. New select_sigs(population, sigs, limit, seed):
+  - --sigs given ⇒ filter (token = PREFIX; a full sig is its own prefix ⇒ exact
+    match behaviour unchanged) then first --limit of sorted(...) [plan line 171]
+  - no --sigs + --seed ⇒ sorted(random.Random(seed).sample(sorted(pop), N)) —
+    local Random instance, global RNG state never touched [todo 7 line 180]
+  - no --sigs, no --seed ⇒ first N of sorted(pop)
+  - limit > len(pop) ⇒ clamp (no ValueError)
+
+prefix matching rationale: verifier's mandated smoke command passes PREFIXES
+(--sigs 1bPapYy2,21Awv9,23tfbM,24XDFY,24hMKa); exact-only matching would select
+0 sigs and clobber the 5-record smoke artifact with an empty parity.jsonl.
+Superset semantics: exact full-sig runs behave identically (proved by test).
+
+== TDD: RED (3 fix tests + prefix case appended BEFORE impl) ==
+$ python3 scripts/test_nansen_parity.py   # after appending fix tests, pre-impl
+FAIL test_t6_detect_for_cached_zero_network
+FAIL test_t6fix_main_parses_seed_as_int_and_prices_flag
+FAIL test_t6fix_run_seeded_selection_reproducible_offline
+FAIL test_t6fix_select_sigs_semantics
+RED: 55/59 pass, 4 fail
+(prefix-test mini-RED after first GREEN: 'RED: 58/59 pass, 1 fail — FAIL test_t6fix_select_sigs_semantics')
+
+== GREEN ==
+$ python3 scripts/test_nansen_parity.py
+EXIT=0
+OK: nansen_parity pure core 59/59
+$ python3 scripts/test_nansen_fee_leg.py
+EXIT=0
+OK: 16/16 fee-leg cases passed
+
+== smoke re-run (EXACT verifier command) ==
+$ python3 scripts/nansen_parity.py --limit 5 --sigs 1bPapYy2,21Awv9,23tfbM,24XDFY,24hMKa --out .probe/nansen-parity/smoke
+EXIT=0
+network calls: 0
+records: 5 | all have class: True | {'TRANSFER_FALSE_POSITIVE': 1, 'MATCH': 4}
+
+== missing-truth re-run ==
+$ python3 scripts/nansen_parity.py --truth .probe/nansen-24h/khong-ton-tai.jsonl --out /tmp/t6-missing
+EXIT=2
+stderr: truth file không tồn tại: .probe/nansen-24h/khong-ton-tai.jsonl
+PROOF: /tmp/t6-missing does not exist ⇒ no parity.jsonl left behind
+
+== todo-7 compat proof ==
+select_sigs(pop743, limit=17, seed=42) set == set(random.Random(42).sample(sorted(pop),17)): True (17 sigs)
+
+== FIX 2: .ruff_cache ==
+rm -rf .ruff_cache executed (twice — PostToolUse verify hook recreated it after py edits);
+final state: ls: cannot access '.ruff_cache': No such file or directory
+
+== LSP (post-fix) ==
+lsp_diagnostics scripts/nansen_parity.py: No diagnostics found
+lsp_diagnostics scripts/test_nansen_parity.py: No diagnostics found
+
+== md5 after fix round ==
+19276f573cf81f204a0b37f4f4994373  scripts/nansen_parity.py
+6f1f660b6079f00846d9f569d7cef3ac  scripts/test_nansen_parity.py
+ 1298 scripts/nansen_parity.py
+ 1323 scripts/test_nansen_parity.py
+ 2621 total
+wallet_watch.py untouched: e57b910f0677e196f8158ee8de5df034  scripts/wallet_watch.py
+
+EVIDENCE_RECORDED: .omo/evidence/task-6-nansen-groundtruth-parity.txt

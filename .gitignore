@@ -1,0 +1,26 @@
+node_modules
+dist
+*.local
+.DS_Store
+.env
+.env.*
+backups/
+# proxies.txt / proxies-stable.txt carry credentials — never commit
+data/
+
+# --- backup ignores (2026-09-27) ---
+# helius-keys.txt, gmgn-private.hex — credentials, never commit
+keys/
+logs/
+.probe/
+.probe-p8-raw.json
+.playwright-mcp/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+lookup_cache.json
+scripts/heartbeat
+# keep the example env (negates .env.* above)
+!.env.example
+!**/.env.example

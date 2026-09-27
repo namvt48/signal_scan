@@ -1,0 +1,160 @@
+# Task 8 — Full ground-truth parity run: completion log (tail of T8 after aborted subagent)
+# Plan: .omo/plans/nansen-groundtruth-parity.md (Wave 6, todo 8)
+# Date: 2026-09-22 | Session scope: determinism proof + 2 evidence files + hygiene. NO .py modified. NO full re-run (parity.jsonl/report.md already final).
+# Full-run artifacts were produced at 18:08 by:
+#   python3 scripts/nansen_parity.py --truth .probe/nansen-24h/tx-sample.jsonl --out .probe/nansen-parity --prices .probe/nansen-parity/prices.json --oracle
+# (full-run stdout not re-captured here by design — re-running 733 sigs adds no information; artifacts md5-verified below instead)
+
+## CMD 1 — artifact integrity (input state verification)
+$ md5sum .probe/nansen-parity/parity.jsonl .probe/nansen-parity/report.md scripts/nansen_parity.py scripts/wallet_watch.py .probe/nansen-24h/tx-sample.jsonl
+84943fb665e145e03ac384b0ba8e7956  .probe/nansen-parity/parity.jsonl
+e3e50e687cfc80f73ba068854e025410  .probe/nansen-parity/report.md
+46d50b8c748a93b7299475bb4e383692  scripts/nansen_parity.py
+e57b910f0677e196f8158ee8de5df034  scripts/wallet_watch.py
+6edc3702cecb4740dad17716284bc867  .probe/nansen-24h/tx-sample.jsonl
+EXIT=0
+$ wc -l .probe/nansen-parity/parity.jsonl
+743 .probe/nansen-parity/parity.jsonl
+$ ls .probe/nansen-parity/fixtures | wc -l
+734        # 733 sig fixtures + prices.json
+=> all 5 md5 == required ground truth. parity.jsonl and report.md NOT touched again for the rest of this session.
+
+## CMD 2 — subset selection (deterministic, reproducible)
+$ python3 -c "import json; sigs=sorted({json.loads(l)['sig'] for l in open('.probe/nansen-parity/parity.jsonl')}); sub=sigs[:24]; print(len(sigs), len(sub)); print(','.join(sub))"
+733 total sigs; 24 subset
+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
+EXIT=0
+
+## CMD 3 — subset re-run (determinism probe)
+$ rm -rf /tmp/t8-det && python3 scripts/nansen_parity.py --truth .probe/nansen-24h/tx-sample.jsonl --out /tmp/t8-det --prices .probe/nansen-parity/prices.json --sigs <24-csv above>
+EXIT=0
+tail of stdout (report render): ... adjudication rows for the 24-sig subset (TYPE_MISMATCH/TRANSFER_FALSE_POSITIVE/MISSING/USD_MISMATCH entries with traces, GMGN/Nansen oracle divergence, scope boundary, fee-USD stats count=0) ...
+network calls: 0
+$ wc -l /tmp/t8-det/parity.jsonl
+24 /tmp/t8-det/parity.jsonl
+
+## CMD 4 — byte comparison vs master parity.jsonl (key = sig,wallet,ca)
+$ python3 <compare script: json per-line equality on (sig,wallet,ca)>
+First pass result: 10 IDENTICAL, 14 DIFF, 0 MISSING-IN-MASTER (of 24)
+$ python3 <field-level diff of the 14>
+FIELD usd_ratio_adj: 14 rows differ   # ONLY field that differs; examples:
+  1stc9BPCU833: master=0.37869859208334156 rerun=0.37628249756370136
+  21iSfpAUtMm6: master=0.9326269953401922  rerun=0.92667684126142
+  229EfMY7t6wt: master=9.4092525128198e-06 rerun=9.349221543850336e-06
+$ grep -n 'usd_ratio_adj\|drift' scripts/nansen_parity.py | head
+413: usd_ratio_adj = usd_ratio_raw / drift   # drift = median(usd_ratio_raw over RUN SET) (global_drift @161)
+$ python3 <verify: raw identical + adj recomputable>
+raw identical all 24: True
+subset drift=1.0109448365, adj==raw/drift exact: True
+EXIT=0 (all)
+=> Diagnosis: usd_ratio_adj is set-size normalization (median over the measured population), NOT time/random/network state.
+   Full run: drift = median of 476 ratios. Subset: drift = median of 24 = 1.0109448365. adj = raw/drift recomputed EXACTLY (<1e-12).
+=> Determinism VERDICT: IDENTICAL (all raw measurements + 22 other fields byte-equal; adj exactly recomputable).
+
+## CMD 5 — wrote .probe/nansen-parity/t8-determinism.log (45 lines)
+$ python3 <generate log>
+wrote .probe/nansen-parity/t8-determinism.log (45 lines)
+VERDICT: IDENTICAL (10 full + 14 adj-only-explained of 24)
+EXIT=0
+# Log contains: command, exit 0, 'network calls: 0', per-row IDENTICAL/DIFF(adj-only) table with master vs rerun values,
+# drift explanation with line refs (nansen_parity.py:413-415, @161), raw-identical + adj-recompute verifications, final VERDICT: IDENTICAL.
+
+## CMD 6 — test suites (re-run this session, all offline, plain assert — NO pytest)
+$ python3 scripts/test_nansen_parity.py
+PASS test_classify_amount_mismatch ... (59 PASS lines) ... PASS test_write_report_sections
+OK: nansen_parity pure core 59/59
+EXIT=0
+$ python3 scripts/test_nansen_fee_leg.py
+PASS C1 ... PASS integration-5fgRuKgt
+OK: 16/16 fee-leg cases passed
+EXIT=0
+$ python3 scripts/test_gmgn_api_parity.py
+  fixtures: 12 file tx -> 9 sig distinct · oracle rows=29 · hermetic (ww.http_json/ww.rpc/socket.socket = raise)
+  sha256 trước: b6eb618bcdd84238d0e4daf011572362ab8c076b12daddb62bd72fd793dad9cc
+  per-sig: 9/9 match — sig 3fec2kXP expected_rows=2 emitted_events=2 pinned_count=2 match (EXPECT_COUNT untouched)
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+  MUTATION 1..4: 1/12/19/4 FAIL lines => RED ok; REVERT fresh load => FAIL-lines 0
+  sha256 sau: b6eb618b…dad9cc (byte-identical: True) · MUTATION GATE: 4/4 RED(FAIL)->GREEN(PASS) · ALL OK
+PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+EXIT=0
+$ python3 scripts/backtest_parity.py --from-fixture
+parity steps 29/29 (100.0%) · identity 29/29 (100.0%) · side 29/29 (100.0%) · amounts exact 23/23 + 6/6 gross bounded <= 8% (policy D14)
+SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+EXIT=0
+$ python3 scripts/ruleA_real_regress.py
+Traceback (most recent call last):
+  File ".../scripts/ruleA_real_regress.py", line 29, in <module>
+    old = load("ww_old", "/opt/wallet-watch/wallet_watch.py")
+FileNotFoundError: [Errno 2] No such file or directory: '/opt/wallet-watch/wallet_watch.py'
+EXIT=1   # CORRECT BY DESIGN — local env lacks /opt deployment; NOT a failure, NOT "fixed"
+$ md5sum scripts/test_nansen_parity.py scripts/test_nansen_fee_leg.py scripts/test_gmgn_api_parity.py scripts/backtest_parity.py
+6f1f660b6079f00846d9f569d7cef3ac  scripts/test_nansen_parity.py      (1323 lines)
+7f09f4a9b046628187be363cfd55f462  scripts/test_nansen_fee_leg.py     (724 lines)
+dba55cd56935270290ef462608ce05a0  scripts/test_gmgn_api_parity.py    (939 lines)
+5ca0e08f1b9d9dad838d8fa53cfcc1b0  scripts/backtest_parity.py         (285 lines)
+
+## CMD 7 — audit whitelist
+$ find scripts server src docs -newermt '2026-09-22 12:00' -type f -not -name '*.pyc' | sort
+scripts/fixtures/nansen/48Y3e48T.json
+scripts/fixtures/nansen/5fgRuKgt.json
+scripts/fixtures/nansen/RxrDxxL2.json
+scripts/nansen_parity.py
+scripts/test_nansen_fee_leg.py
+scripts/test_nansen_parity.py
+scripts/wallet_watch.py
+server/.env
+EXIT=0
+Whitelisted: nansen_parity.py, wallet_watch.py, test_nansen_fee_leg.py, test_nansen_parity.py, fixtures/nansen/* — all expected.
+NOT modified: src/, docs/, scripts/wallet_hist.py, docker*, Makefile, .probe/nansen-24h/ (tx-sample md5 verified == 6edc3702…).
+Deviation (honest report): server/.env mtime 2026-09-22 12:45:35 +0700 — NOT written by T8 (harness imports stdlib+wallet_watch only; T8 wrote only .probe/nansen-parity/*, .omo/evidence/*, /tmp). Out-of-band service-config touch predating the 18:08 artifacts; flagged for orchestrator.
+
+## CMD 8 — parity.jsonl integrity audit
+$ python3 <dup-key + field count + class counts>
+rows: 743 fields: 24 dup keys: 0
+[('MATCH', 492), ('USD_MISMATCH', 68), ('AMOUNT_MISMATCH', 62), ('TYPE_MISMATCH', 50), ('MISSING', 36), ('TRANSFER_FALSE_POSITIVE', 24), ('DEFERRED_USD_NULL', 11)]   # Σ=743 ✓
+EXIT=0
+
+## CMD 9 — report.md structure verification
+$ grep -n '^## ' .probe/nansen-parity/report.md
+1 title · 7 Class counts · 22 Gates G1–G13 · 42 Root causes — 100% of non-MATCH · 296 Detector trace excerpts · 2396 Phase-2 notes · 2455 GMGN/Nansen oracle divergence · 2461 Scope boundary · 2469 Fee-USD ratio stats
+$ grep -c '^- ' <(sed -n '42,295p' .probe/nansen-parity/report.md)
+251   # == 743-492 non-MATCH = 100% coverage ✓ (in-module assert harness @766)
+EXIT=0
+
+## CMD 10 — G11 gap-2 root cause (recomputed from parity.jsonl)
+$ python3 <records with notes.usd_null==True and their FINAL class>
+truth usd-null groups: 13 ; deferred: 11
+  4184uVCQPTEi… ca=GvFe6EjS… class=AMOUNT_MISMATCH unmatched=0 over=0 shape=buy_only sides_truth={'buy':1,'sell':0,'transfer':0} sides_ev={'buy':1,'sell':0,'sell_fee':0}
+  4o7ZDdK2NRsy… ca=4UnNG97k… class=AMOUNT_MISMATCH unmatched=0 over=0 shape=buy_only sides_truth={'buy':1,'sell':0,'transfer':0} sides_ev={'buy':1,'sell':0,'sell_fee':0}
+=> 2 usd-null groups SWALLOWED by AMOUNT_MISMATCH (higher CLASS_PRECEDENCE). DEFERRED_USD_NULL applies only when type+amount pass. Precedence artifact, not a lost deferral. 11 deferred listed in report @2398-2409.
+EXIT=0
+
+## CMD 11 — G5 6/8 root cause (recomputed from parity.jsonl)
+$ python3 <replicate diff_ca_sigs + G5 pass condition (nansen_parity.py:527-535, 644-651)>
+diff_ca_sigs total=8 ; passed=6/8
+FAIL 5AFpPgjmDNA8… missing_side=SELL ev_buy=1 ev_sell=0 classes=['MATCH','MISSING']
+   ca=Ai66LHZG… class=MISSING shape=sell_only sides_truth={'buy':0,'sell':2,'transfer':0} sides_ev={'buy':0,'sell':0,'sell_fee':0} unmatched=2
+   trace: REJECT (2,2,'JUP6Lkb…',2) Ai66LHZG… aggregator_frame · REJECT (2,3,'LBUZK…',4) Ai66LHZG… no_pool_endpoint · REJECT … not_spl
+   ca=FFgjwTgf… class=MATCH shape=buy_only (BUY side detected)
+FAIL 5WxwFDpxtHBG… missing_side=SELL ev_buy=1 ev_sell=0 classes=['AMOUNT_MISMATCH','MISSING']
+   ca=WXMRyRZh… class=MISSING shape=sell_only sides_truth={'buy':0,'sell':2,'transfer':0} sides_ev={'buy':0,'sell':0,'sell_fee':0} unmatched=2
+   trace: REJECT (2,2,'JUP6Lkb…',2) WXMRyRZh… aggregator_frame
+   ca=6oeiky8G… class=AMOUNT_MISMATCH shape=buy_only (BUY side detected)
+=> Both failures = sold-mint legs killed by designed Jupiter-aggregator rejects (aggregator_frame/no_pool_endpoint) — same coverage-gap family as G3. No wrong-side emission.
+EXIT=0
+
+## CMD 12 — evidence files + notepad + hygiene
+write .probe/EVIDENCE-2026-09-22-nansen-groundtruth-parity.md   (gate table, md5s, 9-gate root causes incl. G11 gap-2 + G5 2 sigs, determinism, audit, suite map)
+write .omo/evidence/task-8-nansen-groundtruth-parity.txt         (this file)
+append .omo/notepads/nansen-groundtruth-parity/learnings.md      (verdict, md5s, G13 --oracle, G11 gap, determinism probe)
+$ rm -rf .ruff_cache && ls -d .ruff_cache 2>&1
+ls: cannot access '.ruff_cache': No such file or directory   # removed ✓
+$ md5sum .probe/nansen-parity/parity.jsonl .probe/nansen-parity/report.md   # final re-verify after ALL commands
+84943fb665e145e03ac384b0ba8e7956  .probe/nansen-parity/parity.jsonl   # UNCHANGED ✓
+e3e50e687cfc80f73ba068854e025410  .probe/nansen-parity/report.md      # UNCHANGED ✓
+
+## VERDICT
+T8 complete: 743/743 groups; 13 gates reported (G4/G6/G12/G13 True; 9 False with 100% root-cause coverage — 251/251 non-MATCH entries); determinism proven on 24-sig subset (network calls: 0, byte-identical except derived usd_ratio_adj = raw/median(run-set), recomputed exactly); old oracle intact (G13 True via --oracle, 3fec2kXP==2); suites 59/59 + 16/16 + 29/29 + 29/29 green, ruleA exit 1 by design; whitelist clean except out-of-band server/.env flagged; .ruff_cache removed; parity.jsonl + report.md md5 unchanged.
+
+EVIDENCE_RECORDED: .omo/evidence/task-8-nansen-groundtruth-parity.txt

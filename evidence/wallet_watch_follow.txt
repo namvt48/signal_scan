@@ -1,0 +1,1 @@
+# watch 3 ví | poll 5.0s | 5 quote-mints | min $0.5 | Ctrl-C dừng

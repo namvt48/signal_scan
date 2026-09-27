@@ -1,0 +1,20 @@
+# Nansen web-door freshness vs repo cadence — BULLSHIT (sol), 2026-09-10
+# Sampler: repo holdersGiniBody POSTed /api/questions/tgm-holders-gini-stats every 20s, 11 samples, 3.3 min span, cleared Playwright session.
+{
+  "windowUTC": {"start": "2026-09-10T05:09:02Z", "end": "2026-09-10T05:12:22Z", "sampleEverySec": 20, "n": 11},
+  "first": {"holders": 3083, "t100pct": 57.1681, "freshpct": 8.9538, "medianUsd": 13.3454},
+  "last":  {"holders": 3104, "t100pct": 56.6371, "freshpct": 8.8301, "medianUsd": 13.2001},
+  "changeEvents": [
+    {"t": "05:09:22", "changes": ["holders 3083->3079", "t100 57.1681->57.1688", "fresh 8.9538->8.829", "med 13.3454->13.2458"]},
+    {"t": "05:09:42", "changes": ["holders 3079->3094", "t100 57.1688->57.1676", "fresh 8.829->8.9538", "med 13.2458->13.4245"]},
+    {"t": "05:10:22", "changes": ["holders 3094->3083", "t100 57.1676->57.1681", "med 13.4245->13.3454"]},
+    {"t": "05:12:03", "changes": ["holders 3083->3104", "t100 57.1681->56.6371 (structural)", "fresh 8.9538->8.8301", "med 13.3454->13.2001"]}
+  ],
+  "reading": {
+    "replicaJitter": "values cycle back to exact prior numbers within 20-60s (3079<->3083<->3094) = backend serves from several near-fresh replicas; ±0.05 on t100/med is noise, not latency",
+    "structuralUpdate": "one real cohort update in 3.3min window (05:12:03); door was stable ~100s before it -> door granularity ~1-2min for this token",
+    "repoWorstCaseLag": "tokenSweep 120s + FE poll 30s -> repo card <= ~2.5-3min behind the live UI value, avg ~1-1.5min",
+    "verdict": "repo is NOT meaningfully slower than Nansen: 120s cadence sits inside the door's own 1-2min update rhythm; 60s would double call volume (2 calls x N CAs /min) for no fresher signal"
+  },
+  "crossCheck": "05:07 --parse snapshot holders=3079 == one of the rotating replica values seen by the 20s sampler -> same source, same freshness class"
+}

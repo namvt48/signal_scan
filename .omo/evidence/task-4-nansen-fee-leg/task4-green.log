@@ -1,0 +1,17 @@
+PASS C1
+PASS C2
+PASS C3
+PASS C3-conflict
+PASS C4
+PASS C5
+PASS C6
+PASS C7
+PASS C7b
+PASS C7-real
+PASS C8
+PASS C9
+PASS C10
+PASS integration-48Y3e48T
+PASS integration-RxrDxxL2
+PASS integration-5fgRuKgt
+OK: 16/16 fee-leg cases passed

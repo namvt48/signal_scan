@@ -1,0 +1,392 @@
+================================================================================
+F2 — INDEPENDENT CODE QUALITY REVIEW
+Plan: .omo/plans/nansen-groundtruth-parity.md (line 200, items (a)–(i))
+Reviewer: INDEPENDENT REVIEWER F2 (read-only; only this evidence file written)
+Timestamp: 2026-09-22 19:29:31 +07
+Method: md5 verify -> MANUAL read of every new line -> suite re-runs -> mtime/find
+        audit. NO git (repo is not git). NO pytest. NO file modified by reviewer.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. MD5 / LINE-COUNT VERIFICATION (measured, not inherited)
+--------------------------------------------------------------------------------
+$ md5sum + wc -l  (current on-disk state):
+
+  e57b910f0677e196f8158ee8de5df034  scripts/wallet_watch.py            1862 L
+  46d50b8c748a93b7299475bb4e383692  scripts/nansen_parity.py           1702 L
+  6f1f660b6079f00846d9f569d7cef3ac  scripts/test_nansen_parity.py      1323 L
+  7f09f4a9b046628187be363cfd55f462  scripts/test_nansen_fee_leg.py      724 L
+  dba55cd56935270290ef462608ce05a0  scripts/test_gmgn_api_parity.py     939 L
+  5ca0e08f1b9d9dad838d8fa53cfcc1b0  scripts/backtest_parity.py          285 L
+  6edc3702cecb4740dad17716284bc867  .probe/nansen-24h/tx-sample.jsonl   990 rows
+
+Verdict vs plan/context baselines:
+  * wallet_watch.py == e57b910f0677e196f8158ee8de5df034  -> MATCH (post-T4).
+    != baseline 3a8739be96405bb94926bf8cb0e454cc -> CORRECT: T4 modified it on
+    purpose; T5–T8 did not touch it again.
+  * ALL other md5 + every line count + 990-row truth -> MATCH plan baselines exactly.
+  * tx-sample.jsonl md5 6edc3702cecb4740dad17716284bc867 -> MATCH (frozen, read-only).
+
+Baseline cross-check (from .omo/evidence/task-1-nansen-groundtruth-parity.txt,
+recorded BEFORE any change):
+  3a8739be96405bb94926bf8cb0e454cc  scripts/wallet_watch.py       (baseline)
+  dba55cd56935270290ef462608ce05a0  scripts/test_gmgn_api_parity.py (baseline)
+  5ca0e08f1b9d9dad838d8fa53cfcc1b0  scripts/backtest_parity.py      (baseline)
+=> test_gmgn_api_parity.py & backtest_parity.py CURRENT md5 == BASELINE md5
+   (byte-identical, UNMODIFIED). wallet_watch.py baseline 3a8739be -> now e57b910f.
+
+Note on line anchors: plan/context anchors (:582 _legs_with_roles, :818
+amount_basis, :827 detect_swaps) are BASELINE line numbers. New code inserted
+before them (_FEE_REJECT_REASONS @582, _fee_candidate @585, cap_fee @645) shifted
+everything down. This review located every item BY CONTENT, not by stale anchor.
+Current actual lines cited below.
+
+--------------------------------------------------------------------------------
+(a) detect_swaps SIGNATURE UNCHANGED  -> PASS
+--------------------------------------------------------------------------------
+scripts/wallet_watch.py:980
+  def detect_swaps(tx, wallet, trace=None) -> list[dict[str, Any]]:
+Parameter signature (tx, wallet, trace=None) is IDENTICAL to baseline :827.
+Only a return-type annotation (-> list[dict[str, Any]]) is present — not a
+parameter change, no new/removed/reordered params, no new required arg.
+Call site inside still: legs = _legs_with_roles(tx, wallet, trace, rejected) @993
+(rejected is the new OPTIONAL 4th arg — see (b)). VERDICT (a): PASS.
+
+--------------------------------------------------------------------------------
+(b) _legs_with_roles ONLY ADDS OPTIONAL PARAM, DEFAULT = OLD BEHAVIOR -> PASS
+--------------------------------------------------------------------------------
+scripts/wallet_watch.py:613
+  def _legs_with_roles(tx, wallet, trace=None, rejected=None):
+Baseline signature was (tx, wallet, trace=None). The ONLY delta is the appended
+optional param `rejected=None`. Default None preserves 100% old behavior:
+  * cap_fee closure @645-670 early-returns when `rejected is None`:
+      648:  if rejected is None or reason not in _FEE_REJECT_REASONS:
+      649:      return
+    => with default rejected=None NOTHING is captured, leg list built exactly as
+       before; the reject decisions themselves (@703, @720) are unchanged
+       (cap_fee is a pure side-channel observer, it does not alter `continue`).
+  * Existing callers passing only (tx, wallet) or (tx, wallet, trace) behave
+    identically. VERDICT (b): PASS.
+
+--------------------------------------------------------------------------------
+(c) NO RATIO/SIZE CONSTANTS IN NEW CODE (manual read, not grep) -> PASS
+--------------------------------------------------------------------------------
+Manually read EVERY new line. Numeric literals present and their classification:
+  * _FEE_REJECT_REASONS @582 = frozenset({"aggregator_frame","plumbing",
+    "no_pool_endpoint"}) — reason STRINGS, zero numeric constants.
+  * _fee_candidate @585-610 — builds a snapshot dict; program chosen from
+    nearest aggregator on stack (@593) else parent program (@595). No numbers.
+  * cap_fee @645-670 — condition (a) `rs != "WALLET"` (@651). No numbers.
+  * _quote_px @842-850 — WSOL->_sol_px, USDC/USDT->1.0 (stablecoin $1 PRICE PEG,
+    pre-existing concept), else _info price. The 1.0 is a price peg, NOT a fee
+    ratio/size classifier.
+  * _fee_event @906-940 — qty = raw / 10**dec (decimals conversion, universal in
+    file), qq = qty * up (INHERITS BUY unit_price), qusd = qq * px. No threshold.
+  * _promote_fee_candidates @943-977 — pool_refs set-build + nearest-BUY by
+    min(|Δseq|, seq) @973 (STRUCTURAL seq-distance, mirrors _match_pairs @748;
+    NOT a fee-size/ratio test).
+  * net_adj @1034-1036 — pure addition net_adj[m] = net[m] + fee_out[m].
+DISCRIMINATOR IS PURELY SHAPE-BASED: role(src)=="WALLET" + dst/dst_owner ∉
+pool_refs + exists BUY step same mint. There is NO fee-magnitude or fee-ratio
+threshold anywhere (the 0.0990%–0.5000% band, the 1.5%/8%/10%/15% caps live ONLY
+in the harness nansen_parity.py gates, never in the detector). VERDICT (c): PASS.
+
+--------------------------------------------------------------------------------
+(d) amount_basis "gross_leg" PRESERVED; fee event fee_leg:True; program NOT encl
+    -> PASS
+--------------------------------------------------------------------------------
+grep amount_basis / fee_leg / "program": in wallet_watch.py:
+  * OLD swap event (_swap_event) @897:  "amount_basis": "gross_leg"   (baseline
+    :818 value UNCHANGED; shifted to :897 by inserted code).
+  * OLD swap event program @896:        "program": bl["encl"]  (legit — paired leg
+    HAS a valid enclosing DEX; constraint is only that FEE event must not use encl).
+  * FEE event (_fee_event) @934:        "amount_basis": "gross_leg"  (same basis).
+  * FEE event @939:                     "fee_leg": True   (ONLY occurrence in file).
+  * FEE event program @933:             "program": cand["program"]   (NOT encl).
+    cand["program"] computed in _fee_candidate @592-595:
+      592:  if reason == "aggregator_frame":
+      593:      program = next((q for q,_s in reversed(stack) if q in _AGGREGATORS), None)
+      594:  else:
+      595:      program = parent[0] or ix.get("programId")
+    => program = nearest aggregator id (aggregator_frame) else parent frame
+       program-id. NEVER leg["encl"] (encl is None at the reject site — that is
+       the very reason for the reject @696). _fee_candidate does not even store
+       encl. The @1298/@1334 "net_delta" basis rows are the pre-existing
+       RECEIVE/_fill_event path (program=""), out of scope, untouched.
+  VERDICT (d): PASS.
+
+--------------------------------------------------------------------------------
+(e) DISCRIMINATOR = B1 (dst/dst_owner ∉ pool_refs), NOT role(dst)!="POOL"  -> PASS
+    [MOST IMPORTANT ITEM]
+--------------------------------------------------------------------------------
+_promote_fee_candidates  scripts/wallet_watch.py:943-977. Verbatim:
+
+  947:    pool_refs: set[str] = set()
+  948:    buy_base_legs: dict[str, list[dict[str, Any]]] = {}
+  949:    for sa, sb, _frame, pool, _by in steps:
+  950:        if pool is not None:
+  951:            pool_refs.add(pool)                       # <-- pool OWNER of step
+  952:        for lg in (sa, sb):
+  953:            if lg["rs"] == "POOL" and lg["src"] is not None:
+  954:                pool_refs.add(lg["src"])              # <-- pool-side token acct (src)
+  955:            if lg["rd"] == "POOL" and lg["dst"] is not None:
+  956:                pool_refs.add(lg["dst"])              # <-- pool-side token acct (dst)
+  957:        bm, _qm, _inf = _base_quote(sa["mint"], sb["mint"], rank)
+  958:        bl = sa if sa["mint"] == bm else sb
+  959:        if bl["rs"] == "POOL":                        # BUY base leg (§B3 @885)
+  960:            buy_base_legs.setdefault(bm, []).append(bl)
+  961:
+  962:    promoted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+  963:    fee_out: dict[str, float] = {}
+  964:    for cand in sorted(rejected, key=lambda c: c["seq"]):
+  965:        dst_owner = cand.get("dst_owner")
+  966:        if cand["dst"] in pool_refs or (
+  967:            dst_owner is not None and dst_owner in pool_refs
+  968:        ):
+  969:            continue                                  # <-- B1 REJECT
+  970:        buys = buy_base_legs.get(cand["mint"])
+  971:        if not buys:
+  972:            continue                                  # <-- (c) no BUY same mint
+  973:        bl = min(buys, key=lambda b: (abs(cand["seq"] - b["seq"]), b["seq"]))
+  974:        promoted.append((cand, bl))
+  975:        qty = cand["raw"] / 10 ** cand["dec"]
+  976:        fee_out[cand["mint"]] = fee_out.get(cand["mint"], 0.0) + qty
+  977:    return promoted, fee_out
+
+PROOF (e):
+  * Condition (b) is B1: @966-969 skips the candidate when `cand["dst"]` OR
+    `cand["dst_owner"]` is a member of `pool_refs`. This is EXACTLY
+    "dst/dst_owner ∉ pool_refs". It is **NOT** `role(dst) != "POOL"` — there is no
+    `role()`/`rd` comparison in the promote gate at all. (C0 confirmed: the
+    original plan's `role(dst)!="POOL"` was WRONG because 9/9 real fee legs measure
+    rd=POOL; B1 correctly replaces it — a real fee leg's dst is a plain fee wallet,
+    which is NOT in pool_refs, so it is promoted, while a WALLET->POOL junk leg's
+    dst IS in pool_refs and is blocked.)
+  * pool_refs construction (@947-956) == (∪ pool-side token-accounts ∪ pool OWNER
+    of every paired step in THIS tx):
+      - @951 adds the step's `pool` (owner) — "owner pool của paired step".
+      - @953-954 adds `lg["src"]` when that leg's src role == POOL — pool-side
+        token account.
+      - @955-956 adds `lg["dst"]` when that leg's dst role == POOL — pool-side
+        token account.
+    Built ONLY from `steps` (the tx's own paired steps) — tx-scoped, as specified.
+  * Condition (c) == has_BUY_step_same_mint: @957-960 builds
+    buy_base_legs[bm] = base legs whose rs=="POOL" (= BUY side per §B3 rule @885);
+    @970-972 `if not buys: continue` blocks promotion when the candidate's mint has
+    NO BUY step in-tx. So a same-mint SELL-only step (or no step) never promotes.
+  * Condition (a) role(src)=="WALLET" is enforced earlier at CAPTURE time in
+    cap_fee @650-652:  rs, rd = role(src), role(dst); if rs != "WALLET": return.
+    Only WALLET-out legs ever enter `rejected`.
+  * C3 cross-check by code: RxrDxxL2 leg 3ZLekZYq has rs=RELAY -> filtered by (a)
+    at @651 (never captured). Its sibling seq=9 (same mint, steps only SELL) ->
+    filtered by (c) at @971 (buy_base_legs has no BUY for that mint). Both guards
+    are real and present.
+  VERDICT (e): PASS — discriminator is B1 (pool_refs membership) + (c) BUY-step,
+  definitively NOT role(dst)!="POOL".
+
+--------------------------------------------------------------------------------
+(f) n_mint_adj APPLIES TO EVERY STEP OF SAME BASE MINT, ONLY WHEN FEE SELL OF
+    THAT MINT EXISTS (normal tx unchanged)  -> PASS
+--------------------------------------------------------------------------------
+detect_swaps  scripts/wallet_watch.py:1032-1043. Verbatim:
+
+  1032:    net = _net_owner(tx, wallet)
+  1033:    promoted, fee_out = _promote_fee_candidates(rejected, steps, rank)
+  1034:    net_adj = dict(net)                       # <-- COPY, original net intact
+  1035:    for m, extra in fee_out.items():
+  1036:        net_adj[m] = net_adj.get(m, 0.0) + extra   # <-- += Σ fee_out[m]
+  ...
+  1040:    for sa, sb, frame, pool, by in steps:
+  1041:        ev, bl, bm, qm = _swap_event(
+  1042:            tx, wallet, sig, ts, sa, sb, pool, rank, net_adj, gross
+  1043:        )
+
+PROOF (f):
+  * Applies to EVERY step of same base mint: net_adj (the adjusted copy) is passed
+    as net_map to _swap_event for EVERY step in the loop @1040-1043. Inside
+    _swap_event @877:  n_mint = net_map.get(bm, 0.0) if net_map else 0.0  (bm =
+    base mint of that step), then @879 qty_net = qty * n_mint / g_mint. So ALL
+    steps whose base mint == m read net_adj[m]. This is a per-mint global
+    adjustment via the shared map, NOT a local per-side patch (exactly as the plan
+    requires — "_swap_event đọc net_map.get(bm)").
+  * Only when a fee SELL of that mint exists: net_adj[m] differs from net[m] ONLY
+    for m in fee_out (populated @976 solely from PROMOTED fee candidates). For any
+    mint without a promoted fee SELL, net_adj[m] == net[m].
+  * Normal tx (no fee leg) => `rejected` yields no promotions => fee_out == {} =>
+    loop @1035-1036 no-op => net_adj == dict(net) => every step's qty_net is
+    computed from the SAME net as before => BEHAVIOR IDENTICAL. Confirmed.
+  * fee SELL qty_net: _fee_event @930 sets "qty_net": qty (= gross fee), matching
+    plan ("fee SELL mang qty_net = qty").
+  * Arithmetic cross-check vs plan line 41 (48Y3e48T4z): net[mint]=net_owner=
+    48881.855420; fee_out[mint]=48.930786 => net_adj[mint]=48930.786206; gross[mint]
+    (BUY base leg only; fee leg was rejected, not in gross)=48930.786206 => BUY
+    qty_net = 48930.786206 * 48930.786206/48930.786206 = 48930.786206. Σ signed =
+    BUY 48930.786206 − fee SELL 48.930786 = 48881.855420 == net_owner. Without adj:
+    48881.855420 − 48.930786 = 48832.924634 (the plan's "48832.92 — sai"). Mechanism
+    and arithmetic both MATCH.
+  * _net_owner @1228-1238 itself is UNCHANGED (clean pre=-1/post=+1 uiAmountString
+    per mint); the fee feature only consumes its output.
+  VERDICT (f): PASS.
+
+--------------------------------------------------------------------------------
+(g) nansen_parity.py IMPORTS ONLY stdlib + wallet_watch  -> PASS
+--------------------------------------------------------------------------------
+scripts/nansen_parity.py:12-33 (verbatim imports):
+  12: import argparse          13: import importlib.util   14: import json
+  15: import os                16: import random           17: import statistics
+  18: import sys               19: import time             20: import urllib.request
+  21: from dataclasses import dataclass, field
+  22: from datetime import datetime, timezone
+  28: _ww_spec = importlib.util.spec_from_file_location(
+  29:     "wallet_watch", os.path.join(_HERE, "wallet_watch.py"))
+  31: assert _ww_spec and _ww_spec.loader
+  32: ww = importlib.util.module_from_spec(_ww_spec)
+  33: _ww_spec.loader.exec_module(ww)
+Set of imports == {argparse, importlib.util, json, os, random, statistics, sys,
+time, urllib.request, dataclasses, datetime} — ALL Python stdlib — PLUS
+wallet_watch loaded via importlib (@28-33, anchor "@31" region). NO third-party
+library (no requests/numpy/pandas/pytest/etc.). Hermeticity corroborated by
+test_nansen_parity.py exit 0 (offline) and F3 network-block design.
+Thresholds UNCHANGED @180-186: _EPS=1e-9, NET_CAP=0.015, GROSS_CAP=0.08,
+USD_CAP=0.10, NET_OWNER_EPS=1e-6, UNAVAIL_CAP=0.20, TRANSFER_WARN=0.10.
+GATE_NAMES=13 gates @585. VERDICT (g): PASS.
+
+--------------------------------------------------------------------------------
+(h) test_gmgn_api_parity.py / backtest_parity.py — IF modified, ONLY fee_leg
+    filter; EXPECT_COUNT 3fec2kXP==2; NEVER increased  -> PASS
+--------------------------------------------------------------------------------
+DECISIVE: both files are UNMODIFIED (md5 byte-identical to task-1 baseline):
+  test_gmgn_api_parity.py  current dba55cd56935270290ef462608ce05a0 == baseline
+  backtest_parity.py       current 5ca0e08f1b9d9dad838d8fa53cfcc1b0 == baseline
+Corroboration:
+  * grep fee_leg in BOTH files -> ZERO matches. No fee_leg filter was added =>
+    the Must-have-#6 contingency NEVER fired (as the plan predicted: 3fec2kXP's 3
+    junk SPCX legs die at `same_mint` pairing reject @795-796 inside _pair_steps,
+    so they never enter the side-channel catch-set; and 0 leg is promotable).
+  * EXPECT_COUNT @85-95 intact, "3fec2kXP": 2 @89 (verbatim):
+      85: EXPECT_COUNT = {  # §2.3 — số event mỗi sig, HARD FAIL nếu lệch
+      86:   "2k3KYp18": 2,  87: "33hqSn4Q": 4,  88: "3BbWVS3K": 4,
+      89:   "3fec2kXP": 2,  90: "3nzGD2WV": 4,  91: "3pkGZDK1": 4,
+      92:   "4zmaV87B": 3,  93: "58pWphuG": 4,  94: "5XLTG1WX": 2, }
+    N_ROW,N_EXACT,N_GROSS = 29,23,6 @55 (unchanged). NO count increased.
+  * Since neither file was modified, the conditional "if modified -> only fee_leg
+    filter + divergence report" is vacuously satisfied AND the stronger事实 holds:
+    zero modification, zero EXPECT_COUNT drift.
+  VERDICT (h): PASS.
+
+--------------------------------------------------------------------------------
+(i) NO CHANGE to server/, src/, docs/, wallet_hist.py, .probe/nansen-24h/,
+    docker*, Makefile  -> PASS
+--------------------------------------------------------------------------------
+Plan work window measured from evidence mtimes: task-1 @ 2026-09-22 14:06:28
+(START) .. task-8 @ 2026-09-22 18:35 (END). Reference cut = 13:30 Sep-22.
+
+$ find server src docs -type f -newermt "2026-09-22 13:30"   -> EMPTY (0 files)
+$ find .probe/nansen-24h -type f -newermt "2026-09-22 13:30" -> EMPTY (0 files)
+$ find . -maxdepth 1 ( -name 'docker*' -o -name 'Makefile' ) -newermt 13:30 -> EMPTY
+$ find scripts -name wallet_hist.py -newermt "2026-09-22 13:30"            -> EMPTY
+=> NOTHING under any protected path changed during the plan window. DECISIVE.
+
+Individual mtimes (all PRE-date task-1 @14:06:28):
+  2026-09-16 17:47:21  scripts/wallet_hist.py   (md5 d079d4fd5da21d76c948bb1d1f3c3540)
+  2026-09-16 15:31:37  Makefile
+  2026-09-08 11:21     Dockerfile
+  2026-09-22 09:51     docker-compose.yml       (pre-window)
+  2026-09-22 10:29:15  .probe/nansen-24h/tx-sample.jsonl (frozen; md5 6edc3702… MATCH)
+
+server/.env ADJUDICATION (explicitly requested):
+  mtime = 2026-09-22 12:45:35  <  task-1 START 14:06:28  => OUTSIDE the plan
+  work window (T1–T8). It is NOT plan-caused. Corroborating mechanism: the harness
+  nansen_parity.py imports ONLY stdlib + wallet_watch (see (g)); wallet_watch.py
+  contains no path under server/ and never writes server/.env; no plan todo touches
+  server/. Other same-day server/src/docs files (config.ts 09:51, crawl.ts 11:45,
+  door-pool.test.ts 10:12, dist/providers/nansen.js 11:50, proxy-routing-design.md
+  09:53, .env.example 09:51) ALL have mtimes 09:51–12:45 < 14:06 => an EARLIER,
+  separate work session (the run2500 crawl / door-pool / proxy-routing work the
+  plan explicitly forbids touching — and did NOT touch during its window).
+  VERDICT: server/.env change is UNRELATED to this plan.
+  VERDICT (i): PASS.
+
+--------------------------------------------------------------------------------
+SUITE RE-RUNS (measured exit codes; reviewer ran each fresh)
+--------------------------------------------------------------------------------
+6 pre-existing suites (the "6 suite"):
+  [EXIT=0] scripts/test_wallet_watch.py          -> PASS: wallet_watch — qty_net / per-hop POST / rotate jsonl / phantom §4.1
+  [EXIT=0] scripts/test_wallet_watch_config.py   -> PASS: toàn bộ test config-from-API
+  [EXIT=0] scripts/test_gmgn_api_parity.py        -> PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+                                                    + MUTATION GATE: 4/4 RED(FAIL)→GREEN(PASS) · ALL OK
+                                                    + "wallet_watch.py byte-identical sau 4 mutation in-process: True"
+  [EXIT=0] scripts/test_route_detect.py           -> OK: per-step route detection 15/15
+  [EXIT=0] scripts/test_block_feed.py             -> OK: block-feed 19/19 (offline, deterministic)
+  [EXIT=0] scripts/test_rpc_resilience.py         -> OK: rpc-resilience 13/13 (offline, deterministic)
+
+New parity suites:
+  [EXIT=0] scripts/test_nansen_parity.py          -> OK: nansen_parity pure core 59/59
+  [EXIT=0] scripts/test_nansen_fee_leg.py         -> OK: 16/16 fee-leg cases passed
+                                                    (incl. integration-RxrDxxL2, integration-5fgRuKgt PASS)
+
+Backtest oracle:
+  [EXIT=0] scripts/backtest_parity.py --from-fixture
+            -> SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 ·
+               amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis
+               29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+            -> PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross
+
+Regression baseline (BY DESIGN exit 1 — reviewer did NOT "fix" it):
+  [EXIT=1] scripts/ruleA_real_regress.py
+            -> FileNotFoundError: [Errno 2] No such file or directory: '/opt/wallet-watch/wallet_watch.py'
+            (line 25 load() -> exec_module). EXACT old error preserved, no new error.
+  [EXIT=1] scripts/fix_ruleA_cas.py (bonus, same baseline cause)
+            -> FileNotFoundError: /opt/wallet-watch/wallet_watch.py  (module-level load)
+
+Expected-vs-actual: test_nansen_parity "59/59" MATCH; test_nansen_fee_leg "16/16"
+MATCH; test_gmgn_api_parity "PASS steps 29/29 · identity 29/29 · side 29/29 ·
+amounts exact 23/29 + 6 gross" MATCH verbatim; backtest --from-fixture exit 0 MATCH;
+ruleA_real_regress exit 1 + FileNotFoundError MATCH. ALL as specified.
+
+--------------------------------------------------------------------------------
+LSP DIAGNOSTICS
+--------------------------------------------------------------------------------
+lsp_diagnostics scripts/wallet_watch.py   (severity=error) -> No diagnostics found (0 error)
+lsp_diagnostics scripts/nansen_parity.py  (severity=error) -> No diagnostics found (0 error)
+
+--------------------------------------------------------------------------------
+READ-ONLY INTEGRITY (reviewer changed nothing)
+--------------------------------------------------------------------------------
+wallet_watch.py md5 AFTER all suite runs = e57b910f0677e196f8158ee8de5df034
+(unchanged) — the in-process mutation gates in test_gmgn_api_parity.py and
+test_nansen_fee_leg.py restored it byte-identical; reviewer's runs left no residue.
+No .ruff_cache created (verified absent). Only artifact written by reviewer =
+this file. (scripts/__pycache__ is the standard bytecode byproduct of running the
+suites — regenerated by every run incl. the plan's own; not a review contaminant.)
+
+================================================================================
+PER-ITEM SUMMARY
+================================================================================
+  (a) detect_swaps(tx, wallet, trace=None) signature @980 unchanged ............ PASS
+  (b) _legs_with_roles @613 adds ONLY optional rejected=None; default = old .... PASS
+  (c) no ratio/size constant in any new line (manual read); shape-based only .... PASS
+  (d) amount_basis "gross_leg" @897(old)/@934(fee); fee_leg:True @939;
+      fee program = cand["program"] @933 (aggregator/parent, NOT encl) ......... PASS
+  (e) discriminator = B1 (dst/dst_owner ∉ pool_refs @966-969) + (c) BUY-step
+      @970-972; pool_refs = ∪pool-side token accts ∪ step pool owner @947-956;
+      NOT role(dst)!="POOL" ................................................... PASS
+  (f) n_mint_adj (net_adj) @1034-1036 passed to EVERY step @1042; differs from
+      net only for mints with promoted fee SELL; empty fee_out => identical ..... PASS
+  (g) nansen_parity.py imports ONLY stdlib + wallet_watch (importlib @28-33) .... PASS
+  (h) test_gmgn_api_parity.py & backtest_parity.py UNMODIFIED (md5==baseline);
+      EXPECT_COUNT 3fec2kXP==2 @89 intact; no fee_leg filter; no count increase . PASS
+  (i) find -newermt 13:30 EMPTY on server/src/docs/.probe-nansen24h/docker*/
+      Makefile/wallet_hist.py; server/.env 12:45:35 pre-window, NOT plan-caused . PASS
+
+  Suites: 6 pre-existing EXIT=0 · test_nansen_parity EXIT=0 (59/59) ·
+          test_nansen_fee_leg EXIT=0 (16/16) · backtest --from-fixture EXIT=0 ·
+          ruleA_real_regress EXIT=1 FileNotFoundError (by design, preserved).
+  LSP: 0 error on wallet_watch.py and nansen_parity.py.
+
+All 9 items (a)–(i) PASS. All re-run suites match expected exit codes/output.
+No high-severity finding. No file modified by reviewer.
+
+VERDICT: APPROVE
+
+EVIDENCE_RECORDED: .omo/evidence/f2-nansen-groundtruth-parity.txt

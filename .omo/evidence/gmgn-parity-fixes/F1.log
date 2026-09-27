@@ -1,0 +1,73 @@
+F1 — INDEPENDENT EVIDENCE-COMPLETENESS AUDIT (§7 a–e) — FINAL (RE-RUN AFTER FIX)
+plan: .omo/plans/gmgn-parity-fixes.md | auditor: F1 (independent verifier, not an executor)
+run 1: 2026-09-16 → REJECT (sole cause: ledger.jsonl missing task-completed entries for T9/T10/T12, 10 lines).
+run 2: 2026-09-16 → prior REJECT cause RESOLVED: orchestrator appended T9/T10/T12 entries (same schema); all other items re-confirmed unchanged.
+VERDICT: APPROVE
+
+======================================================================
+LEDGER (prior failure — NOW PASS)
+======================================================================
+.omo/start-work/ledger.jsonl: wc -l = 13.
+Per-line census (event/task/verdict/artifact/detail):
+  L1 boulder-init | L2 T1 confirmed | L3 T3 confirmed | L4 T2 attempt (retry) | L5 T2 confirmed |
+  L6 T4 confirmed | L7 T5 confirmed | L8 T6 confirmed | L9 T7 confirmed | L10 T8 confirmed |
+  L11 T9 confirmed | L12 T10 confirmed | L13 T12 confirmed.
+Newly added entries, quoted:
+  L11: {"event": "task-completed", ... "task": "T9",  "tier": "MEDIUM", executor ses_f5a162880ffe… (Sisyphus-Junior unspecified-high), verdict "confirmed",
+        artifact ".omo/evidence/gmgn-parity-fixes/T9.log", commands 8 / adversarial_classes 6 / cleanup 1,
+        detail: "wallet_watch.py UNCHANGED (1164 lines, sha d7705569…4720). NEW scripts/test_block_feed.py 288 lines / 19 checks / 5 scenarios; …"}
+  L12: {"event": "task-completed", ... "task": "T10", "tier": "MEDIUM", executor ses_f5a161a76ffe… (Sisyphus-Junior unspecified-high), verdict "confirmed",
+        artifact ".omo/evidence/gmgn-parity-fixes/T10.log", commands 5 / adversarial_classes 4 / cleanup 1,
+        detail: "NEW scripts/backtest_parity.py 285 lines. Modes: --from-fixture (offline/CI default, 29-row parity under policy D14) …"}
+  L13: {"event": "task-completed", ... "task": "T12", "tier": "LIGHT",  executor ses_f5a160d77ffe… (Sisyphus-Junior writing), verdict "confirmed",
+        artifact ".omo/evidence/gmgn-parity-fixes/T12.log", commands 4 / adversarial_classes 3 / cleanup 1,
+        detail: "NEW docs/2026-09-15-gmgn-parity-and-block-feed.md 182 lines, 7 sections …"}
+Exactly-one check: task-completed counter = {T1:1, T2:1, T3:1, T4:1, T5:1, T6:1, T7:1, T8:1, T9:1, T10:1, T12:1} — every completed top-level task T1–T10, T12 has exactly one entry. No T11 entry (correct: T11 blocked, not completed).
+RESULT LEDGER: PASS — prior REJECT cause resolved.
+
+======================================================================
+(a) LOG EXISTENCE + NON-TRIVIALITY — PASS (re-confirmed, files unchanged since run 1)
+======================================================================
+T1.log 105 · T2.log 403 · T3.log 27 · T4.log 377 · T5.log 71 · T6.log 113 · T7.log 377 · T8.log 623 · T9.log 703 · T10.log 134 · T12.log 55 (wc -l; 2988 total). None empty/one-line; sampled contents substantive (fixture build + VERDICT confirmed; PAIR=31/REJECT=194 lines in T2; tier dumps + 3 green tests in T3; per-case [PASS] semantics in T5/T6; measurement + gates in T7; 19/19+11/11+15/15+gate PASS L85 in T9; EXIT CODE: 0 L71 + verbatim-match declaration L75-76 in T10; OBSERVED count grid in T12).
+T11.log: absent — by design, see (e).
+
+======================================================================
+(b) VERBATIM PASS STRING — PASS (re-confirmed)
+======================================================================
+Exact required line: "PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)"
+grep -c: T8.log = 6 (L110, L171 indented, L177, L450, L549 quote, L616 quote); T10.log = 2 (L69 stdin-out line, L75 verbatim quote).
+Line-start instances: T8.log:110, :177, :450; T10.log:69. Byte-exact incl. · separators; no paraphrase.
+
+======================================================================
+(c) T8 4-MUTATION RED→GREEN + FINAL PASS — PASS (re-confirmed)
+======================================================================
+MUTATION 1 — 1_TIER_A_WBTC      (L113): "1 FAIL line ⇒ RED ok" (L117), SUMMARY … FAIL-lines 1  (L118)
+MUTATION 2 — 2_no_single_POOL   (L122): "12 FAIL line ⇒ RED ok" (L126), SUMMARY steps 30/29 … FAIL-lines 12 (L127)
+MUTATION 3 — 3_wallet_flow_side (L139): "19 FAIL line ⇒ RED ok" (L143), SUMMARY … side 18/29 … FAIL-lines 19 (L144)
+MUTATION 4 — 4_delta_balance_amount (L156): "4 FAIL line ⇒ RED ok" (L160), SUMMARY … exact 19/23 … FAIL-lines 4 (L161)
+Revert: SUMMARY … FAIL-lines 0 (L170); sha256 sau d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720 (L173); "wallet_watch.py byte-identical sau 4 mutation in-process: True" (L175);
+"MUTATION GATE: 4/4 RED(FAIL)→GREEN(PASS) · ALL OK" (L176); final verbatim PASS (L177).
+Census: lines containing PASS = 14 (line-start ^PASS = 3: L110/L177/L450); lines containing FAIL = 90.
+
+======================================================================
+(d) T7 20-SLOT MEASUREMENT — PASS (re-confirmed)
+======================================================================
+Local phase B (T7.log): L185 "bytes/slot avg=12601693 (ok rows)" (12.6MB), L187 "ms p50=1085 p95=2274", JSONSUMMARY L191 slots=20 ok=20, 413/429/timeout=0.
+Server phase B (T7.log): L252 "bytes/slot avg=9661802 (ok rows)" (9.66MB), L253 "ms/block avg=698 (all) / 698 (ok)", JSONSUMMARY L258 slots=20 ok=20, 413/429/timeout=0.
+Matches plan key numbers: local p50 1085ms / p95 2274ms / 12.6MB; server 698ms / 9.66MB. L298 "12.6MB/slot × ~2.5 slot/s ≈ 31MB/s sustained".
+
+======================================================================
+(e) T11 — EXPECTED GAP (not a defect, not approvable yet)
+======================================================================
+`ls T11.log` → "No such file or directory". No production evidence exists (no systemctl restart output, no feed=block production banner, no grep -c TRANSFER_ = 0 on new events, no amount_basis==new-SWAP count). T11 is [~] BLOCKED pending user confirmation (plan TODO L250). Intentional; per instruction not counted as a rejection reason. F4 (production liveness) remains gated on T11.
+
+======================================================================
+FINAL VERDICT
+======================================================================
+LEDGER: PASS (T9=L11, T10=L12, T12=L13; exactly one task-completed per T1–T10, T12).
+(a) PASS · (b) PASS · (c) PASS · (d) PASS · (e) expected absence reported (T11 user-blocked; F4 still gated).
+Prior REJECT (run 1) was solely the missing T9/T10/T12 ledger entries — now present and schema-consistent ⇒ resolved.
+
+F1 VERDICT: APPROVE
+
+EVIDENCE_RECORDED: .omo/evidence/gmgn-parity-fixes/F1.log

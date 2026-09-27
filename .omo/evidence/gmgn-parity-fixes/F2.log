@@ -1,0 +1,150 @@
+# F2 — Independent Parity Re-Run Verifier Log
+# Plan: .omo/plans/gmgn-parity-fixes.md · Repo: /home/namvt/Desktop/dev-space/signal_scan (not a git repo)
+# Verifier: F2 (independent, adversarial; did NOT author any product/test code here)
+# Date: 2026-09-16 · All checks run fresh this session.
+
+====================================================================================================
+CHECK 1 — Gate re-run from scratch: `python3 scripts/test_gmgn_api_parity.py`
+====================================================================================================
+Command : python3 scripts/test_gmgn_api_parity.py; echo "EXIT=$?"
+Observed: EXIT=0
+Exact PASS string (printed twice — once mid-run, once final):
+  PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+Matches EXPECTED PASS from the F2 brief verbatim.
+Final SUMMARY line:
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+Hermetic banner observed in run:
+  hermetic : ww.http_json / ww.rpc / socket.socket = raise; seed _info không có marker _info_miss ⇒ token_info() không fetch (wallet_watch.py L184)
+  tolerance: non-gross rel ≤ 1e-06 trên uiAmount (pin §5.6, không nới) · gross rel_overstate ≤ 8% mẫu=EMITTED · G_ROWS=6
+Gate's own sha256 before/after (printed by the gate):
+  sha256 trước : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720
+  sha256 sau   : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720
+  wallet_watch.py byte-identical sau 4 mutation in-process: True
+VERDICT CHECK 1: PASS (exit 0, exact PASS string present)
+
+====================================================================================================
+CHECK 2 — Built-in mutations 4/4 RED→GREEN
+====================================================================================================
+Final mutation-gate line (quoted verbatim):
+  MUTATION GATE: 4/4 RED(FAIL)→GREEN(PASS) · ALL OK
+Per-mutation FAIL counts observed (all RED, revert GREEN):
+  MUTATION 1 — 1_TIER_A_WBTC          : 1 FAIL line  (identity: WBTC in TIER_A §2.4 VIOLATION)
+  MUTATION 2 — 2_no_single_POOL       : 12 FAIL lines (58pWphuG step-count 5≠4, key-multiset, amounts)
+  MUTATION 3 — 3_wallet_flow_side     : 19 FAIL lines (side 18/29, wallet-flow rule)
+  MUTATION 4 — 4_delta_balance_amount : 4 FAIL lines (delta-balance amounts rel=3.0e-02 > 1e-06)
+  REVERT — fresh module reload        : FAIL-lines 0 + PASS line reprinted
+VERDICT CHECK 2: PASS
+
+====================================================================================================
+CHECK 3 — F2's OWN independent mutation (NOT one of the 4 built-ins) — RED→GREEN proven
+====================================================================================================
+Target    : scripts/wallet_watch.py :: _base_quote (L545) — pinned lex tie-break for equal-rank pairs
+Patch     : 'if m1 < m2 else' -> 'if m1 > m2 else'  (in-process only, via gate.reprogram →
+            exec(compile(...), ww.__dict__); scripts/wallet_watch.py NEVER written)
+Orthogonality proof (my mutation vs the 4 built-ins):
+  mut1 = TIER_A set membership (ww.TIER_A.add(WBTC))            — touches tier data, not _base_quote
+  mut2 = _legs_with_roles pool-single-endpoint condition        — different function, different rule
+  mut3 = _swap_event side rule line                             — different function, different rule
+  mut4 = _legs_with_roles amount source (delta balance)         — different function, different rule
+  MINE = _base_quote lex tie-break flip — no built-in touches _base_quote; mechanism (rank-tie
+         lex ordering / quote_inferred pairing) is disjoint from tier/pool-endpoint/side/amounts.
+Driver    : /tmp/f2_mut_driver.py (written this session, DELETED after run: `ls` → "No such file or directory")
+Command   : python3 /tmp/f2_mut_driver.py; echo "DRIVER_EXIT=$?"  → DRIVER_EXIT=0
+
+Observed output (quoted):
+  BASELINE note   : khong co (baseline)
+  BASELINE FAILs  : 0
+  BASELINE SUMMARY: SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+
+  F2-MUT patch    : _base_quote: 'if m1 < m2 else' -> 'if m1 > m2 else'
+  F2-MUT SUMMARY  : SUMMARY steps 29/29 (paired 29/29) · identity 28/29 · side 28/29 · amounts exact 22/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 4
+  F2-MUT FAILs    : 4 (baseline had 0 )
+    FAIL 58pWphuG key-multiset (side,base,quote) lệch §2.3: oracle thiếu {('SELL', 'OS', 'CARDS'): 1} · event thừa {('BUY', 'CARDS', 'OS'): 1}
+    FAIL 58pWphuG#1 expected sell OS ← CARDS | got BUY CARDS ← OS: base_sym exp=OS got=CARDS; quote_sym exp=CARDS got=OS; side exp=SELL got=BUY; base_amt exp=11033477.24844975 got=26699.547315 rel=9.976e-01 > 1e-06; quote_amt exp=26699.547315 got=11033477.24844975 rel=4.122e+02 > 1e-06
+    FAIL OS<->CARDS: 3 row (exp 3), base != 'OS' ở 1 row (Bước 4)
+    FAIL 58pWphuG thứ tự step lệch invariant ĐO ĐƯỢC: reverse_sym_ok=3/4 (detector phải giữ thứ tự thực thi sort theo min(seq))
+
+  REVERT FAILs    : 0
+  REVERT SUMMARY  : SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+
+  sha256 before   : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720
+  sha256 after    : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720
+  sha == expected : True
+  F2 RED-GREEN-UNTouched: True
+
+Delta visible: baseline 0 FAIL → mutated 4 FAIL → reverted 0 FAIL. Gate has teeth against an
+orthogonal, verifier-authored mutation. Matches the F2-brief prediction ("4 FAIL lines on the
+tied tx 58pWphuG (OS↔CARDS)") — observed exactly that row set.
+VERDICT CHECK 3: PASS
+
+====================================================================================================
+CHECK 4 — Tolerance NOT loosened: literal pins + backtest_parity.py reuses them
+====================================================================================================
+Command : grep -n "REL_TOL\|GROSS_CAP" scripts/test_gmgn_api_parity.py scripts/backtest_parity.py
+Literal pins in scripts/test_gmgn_api_parity.py (quoted):
+  53:REL_TOL = 1e-6  # pin cứng §5.6 — so uiAmount, KHÔNG int-equal trên raw (artifact §2.2)
+  54:GROSS_CAP = 0.08  # 6 row LP-fee: rel_overstate ≤ 8%, mẫu = EMITTED (§T8, D14)
+  55:N_ROW, N_EXACT, N_GROSS = 29, 23, 6
+Both constants are module-level literals (= 1e-6 / = 0.08) and are USED at comparison sites
+(L230, L247-249 rel <= REL_TOL; L257-258 val > GROSS_CAP). Runtime banner confirms: "rel ≤ 1e-06 (pin §5.6, không nới) · gross rel_overstate ≤ 8%".
+scripts/backtest_parity.py imports — does NOT redefine (grep shows every occurrence is attribute
+access on the imported gate module; there is no `REL_TOL =` / `GROSS_CAP =` assignment in the file):
+  L51-63 load_gate_module(): importlib.util.spec_from_file_location("gmgn_parity_gate", T8_PATH) + exec_module
+    docstring: "Importing — rather than copying — the REL_TOL / GROSS_CAP / N_EXACT / N_GROSS /
+    gate() pipeline is what keeps D14 from drifting (§4 MUST DO)."
+  L82: f"(rel<={gate.REL_TOL:g}) {gate.N_EXACT}/{gate.N_ROW} + gross-bounded "
+  L83: f"(<= {gate.GROSS_CAP:.0%}) {gate.N_GROSS}/{gate.N_ROW} — IMPORTED from "
+  L123: f"gross bounded <= {gate.GROSS_CAP:.0%} (policy D14)",
+  Also reuses gate.load_fixtures / gate.preflight / gate.load_module / gate.block_network /
+  gate.seed_probe / gate.gate / gate.summary / gate.PASS_LINE (run_fixture, L103-130).
+VERDICT CHECK 4: PASS (pins literal; single source of truth; nothing loosened)
+
+====================================================================================================
+CHECK 5 — `grep -ri "gmgn.ai" scripts/`
+====================================================================================================
+Command : grep -rin "gmgn\.ai" scripts/                 → matches in EXACTLY 2 files, BOTH fixture DATA:
+  scripts/fixtures/gmgn_rows_fixture.json       (lines: "logo": "https://gmgn.ai/external-res/*.webp")
+  scripts/fixtures/gm_activity_FhsbQ_50rows.json (same — recorded oracle `logo` CDN field)
+Command : grep -rn "gmgn\.ai" scripts/ --include="*.py"  → PY_GREP_EXIT=1 (ZERO matches in any Python source)
+Command : non-fixture files                              → NONFIX_EXIT=1 (ZERO matches outside scripts/fixtures/)
+Command : grep -rn "openapi\.gmgn\.ai" scripts/          → OPENAPI_EXIT=1 (ZERO — the API host is absent EVERYWHERE, fixtures included)
+Command : grep -rn "GMGN_API_KEY" scripts/ --include="*.py" → KEY_PY_EXIT=1 (ZERO)
+Assessment (adversarial note, honest literal reading): the raw command `grep -ri "gmgn.ai" scripts/`
+is NOT zero — it hits inert fixture data (logo image URLs recorded inside the oracle payloads the
+plan REQUIRES to keep on disk). Zero in all code. Plan §5 constraint the check enforces (plan L368):
+"Không file nào import/URL tới `openapi.gmgn.ai`" — that holds absolutely (0/0), and runtime
+hermeticity is proven (http_json/rpc/socket raise; all runs incl. mutations completed offline with
+no network). No GMGN API dependency exists in any executable path. Deleting the logo field would
+mean mutating recorded oracle fixtures, which F2 is forbidden to do (MUST NOT modify test assets).
+VERDICT CHECK 5: PASS (intent: no GMGN API call/import/URL in code = 0; flag: 2 fixture DATA files
+contain recorded logo CDN URLs — disclosed here, not a runtime dependency)
+
+====================================================================================================
+CHECK 6 — Product file integrity + fixtures intact
+====================================================================================================
+Command : sha256sum scripts/wallet_watch.py
+  before gate           : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720 (gate-printed)
+  after gate+mutations  : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720 (gate-printed)
+  after F2 driver       : d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720 (in-driver + final fresh sha256sum)
+  == expected pin       : True (byte-identical through ALL runs; mtime unchanged 1789487012 per gate banner)
+Command : ls scripts/fixtures/*.pkl | wc -l → 4
+  gmgn_parity.pkl, route_txs.pkl, soltxs2.pkl, soltxs.pkl — all present.
+/tmp driver deleted after run (verified: "No such file or directory"). No product or test file edited by F2.
+VERDICT CHECK 6: PASS
+
+====================================================================================================
+OVERALL F2 VERDICT
+====================================================================================================
+[ x] Gate exit 0 + exact PASS string quoted (CHECK 1)
+[ x] 4/4 built-in mutation RED→GREEN line quoted (CHECK 2)
+[ x] F2's OWN independent mutation (_base_quote tie-break flip — none of the built-ins touch that
+     function/rule) reproduced RED: baseline 0 FAIL → mutated 4 FAIL → revert 0 FAIL, in-process,
+     disk untouched (CHECK 3)
+[ x] REL_TOL = 1e-6 / GROSS_CAP = 0.08 literal pins present and enforced; backtest_parity.py
+     IMPORTS them via gate.* (proven, not re-defined) (CHECK 4)
+[ x] gmgn.ai: zero in all code / zero openapi.gmgn.ai anywhere / zero GMGN_API_KEY in .py;
+     literal-grep nuance (fixture logo CDN data only) disclosed in CHECK 5
+[ x] wallet_watch.py sha256 == d7705569…4720 before and after everything; 4 .pkl fixtures intact;
+     /tmp driver removed (CHECK 6)
+
+F2 VERDICT: APPROVE

@@ -1,0 +1,160 @@
+== T8 GMGN row-parity gate — OFFLINE, hermetic (.omo/plans/gmgn-parity-fixes.md §T8) ==
+  fixtures : 12 file tx → 9 sig distinct (dedupe theo transaction.signatures[0]) · oracle rows=29 · sig trong oracle=9
+  fixture files : 2k3KYp18.json, 33hqSn4Q.json, 33hqSn4QyCKb.json, 3BbWVS3K.json, 3fec2kXP.json, 3nzGD2WV.json, 3pkGZDK1.json, 4zmaV87B.json, 4zmaV87BnoMS.json, 58pWphu.json, 58pWphuG.json, 5XLTG1WX.json
+  module   : /home/namvt/Desktop/dev-space/signal_scan/scripts/wallet_watch.py
+  sha256 trước : b6eb618bcdd84238d0e4daf011572362ab8c076b12daddb62bd72fd793dad9cc
+  mtime  trước : 1790068927
+  wallet   : FhsbQ…2bVG len=44  (đọc DATA['rows'][0]['wallet'] — không gõ literal, §5.7)
+  seed     : _info=13 mint TỪ fixture (token.symbol/quote_token.symbol), _info_miss=0, _sol_px['v']=100.0, min_usd=0.0 — idempotent, re-apply mỗi run
+  hermetic : ww.http_json / ww.rpc / socket.socket = raise; seed _info không có marker _info_miss ⇒ token_info() không fetch (wallet_watch.py L184)
+  tolerance: non-gross rel ≤ 1e-06 trên uiAmount (pin §5.6, không nới) · gross rel_overstate ≤ 8% mẫu=EMITTED · G_ROWS=6
+  decimals : detector lấy từ pre/postTokenBalances[].uiTokenAmount.decimals (§2.2 — row GMGN `token` KHÔNG có field decimals, chỉ quote_token có)
+
+---- per-sig expected-vs-got (guard misleading_success_output) ----
+sig 4zmaV87B  expected_rows= 3 emitted_events= 3 pinned_count=3 match  order(reverse_sym_ok=3/3, forward_sym_ok=1/3)  full_sig=4zmaV87BnoMSKjn4PrMSLZQvhYWRZ5zez4KLHZM1x23LbkbDUiDgfN1FVYuSTXoW4KGeaKQFr63MhPXzaLACdvBX
+sig 2k3KYp18  expected_rows= 2 emitted_events= 2 pinned_count=2 match  order(reverse_sym_ok=2/2, forward_sym_ok=0/2)  full_sig=2k3KYp183hqPsyroYZpfwpLzt1cLcUcipnTd7viCDg8XgxqyS9HMqwMNLUmcVjDDv3NYEMwiR5zVroweZxAvwVzE
+sig 3fec2kXP  expected_rows= 2 emitted_events= 2 pinned_count=2 match  order(reverse_sym_ok=2/2, forward_sym_ok=0/2)  full_sig=3fec2kXPqQmkMVVzeUqvw1R3SfSaBgiuA2wL9tDuDAVauzCAXu84EYyEX9vDCQ9Y5iaEtQ2XAr8NDeXGus9QdzBj
+sig 58pWphuG  expected_rows= 4 emitted_events= 4 pinned_count=4 match  order(reverse_sym_ok=4/4, forward_sym_ok=0/4)  full_sig=58pWphuGoowgZwWhjCTQwgZcYMrWQyf9nqWU9YuqRgLbL8Q9tcqWfeJ1EA4UEYpDWc2ijegkuVv9xNPvV5yc46Rx
+sig 3nzGD2WV  expected_rows= 4 emitted_events= 4 pinned_count=4 match  order(reverse_sym_ok=4/4, forward_sym_ok=2/4)  full_sig=3nzGD2WVG7XJwSnfhzRqTs41VrxykLyqMyM6KoWgfVdnKkhuTnuB7nuQsoKzUjP1oiNePhYUts9ir82g88RRgpaP
+sig 3BbWVS3K  expected_rows= 4 emitted_events= 4 pinned_count=4 match  order(reverse_sym_ok=4/4, forward_sym_ok=2/4)  full_sig=3BbWVS3K7pLEXcNCj8vxCH7q51Cy3D1ZTXgm2FcaV3VfKnXPxujzVmWf29R9RX7k2XQMWCSfdTFfJQqodY8vYE57
+sig 5XLTG1WX  expected_rows= 2 emitted_events= 2 pinned_count=2 match  order(reverse_sym_ok=2/2, forward_sym_ok=0/2)  full_sig=5XLTG1WXJquDoHp8sd48zt3E7PWydkT57JKZMLbHUpcHfeDjegevxaTgRSCNabMbK9gSq6b2sDEtgYjq2Zgi5rh2
+sig 33hqSn4Q  expected_rows= 4 emitted_events= 4 pinned_count=4 match  order(reverse_sym_ok=4/4, forward_sym_ok=0/4)  full_sig=33hqSn4QyCKbA8ynY2JrZhbSG357G38Ync9aHPW6BC5V4rzH6PZ2B2yvNjuT6FJssgDNGcZ7okpyp7a6bLUcHBnV
+sig 3pkGZDK1  expected_rows= 4 emitted_events= 4 pinned_count=4 match  order(reverse_sym_ok=4/4, forward_sym_ok=2/4)  full_sig=3pkGZDK1VAxWJyXhN5Wodn4KJXuUNBduiznDevdT9ybSDM2cD77Uxku9DpBsD63zqpsXuSrnD5cr6LVDgQjvwZnH
+
+oracle row order vs detector step order (đo trên fixture, không suy đoán):
+  2k3KYp18  n=2  reverse_sym_ok=2/2  forward_sym_ok=0/2
+  33hqSn4Q  n=4  reverse_sym_ok=4/4  forward_sym_ok=0/4
+  3BbWVS3K  n=4  reverse_sym_ok=4/4  forward_sym_ok=2/4
+  3fec2kXP  n=2  reverse_sym_ok=2/2  forward_sym_ok=0/2
+  3nzGD2WV  n=4  reverse_sym_ok=4/4  forward_sym_ok=2/4
+  3pkGZDK1  n=4  reverse_sym_ok=4/4  forward_sym_ok=2/4
+  4zmaV87B  n=3  reverse_sym_ok=3/3  forward_sym_ok=1/3
+  58pWphuG  n=4  reverse_sym_ok=4/4  forward_sym_ok=0/4
+  5XLTG1WX  n=2  reverse_sym_ok=2/2  forward_sym_ok=0/2
+  ⇒ GMGN xếp row NGƯỢC thứ tự thực thi; detect_swaps sort theo min(seq) = thứ tự thực thi (§3 Bước 1). Gate cặp theo bản đảo + kiểm key-multiset §2.3 độc lập thứ tự.
+
+---- bảng so 29 row: oracle(expected) | event(got) | rel | leg gross | OK/FAIL ----
+4zmaV87B#1       OK   ·          orow# 3  exp BUY  DOGE     ←USDC          3111.70406 /      262.833109  |  got BUY  DOGE     ←USDC          3111.70406 /      262.833109  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+4zmaV87B#2       OK   ·          orow# 2  exp BUY  DOGE     ←USDC          8673.39086 /      732.746279  |  got BUY  DOGE     ←USDC          8673.39086 /      732.746279  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+4zmaV87B#3       OK   ·          orow# 1  exp BUY  SNOOPDOGE←DOGE            10363786 /      11436.9638  |  got BUY  SNOOPDOGE←DOGE            10363786 /      11436.9638  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+2k3KYp18#1       OK   ·          orow# 5  exp SELL JUDE     ←SPCX           9678051.4 /        9.524479  |  got SELL JUDE     ←SPCX           9678051.4 /        9.524479  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+2k3KYp18#2       OK   ·          orow# 4  exp SELL SPCX     ←USDC            9.524479 /      1415.83899  |  got SELL SPCX     ←USDC            9.524479 /      1415.83899  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3fec2kXP#1       OK   ·          orow# 7  exp BUY  SPCX     ←USDC             16.7186 /      2488.94847  |  got BUY  SPCX     ←USDC             16.7186 /      2488.94847  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3fec2kXP#2       OK   ·          orow# 6  exp BUY  JUDE     ←SPCX           9678051.4 /       16.224732  |  got BUY  JUDE     ←SPCX           9678051.4 /       16.224732  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+58pWphuG#1       OK   ·          orow#11  exp SELL OS       ←CARDS         11033477.2 /      26699.5473  |  got SELL OS       ←CARDS         11033477.2 /      26699.5473  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+58pWphuG#2       OK   G:base     orow#10  exp SELL OS       ←WSOL          1796185.19 /      5.84898479  |  got SELL OS       ←WSOL          1947084.22 /      5.84898479  |  rel-base 8.40e-02 rel-quote 0.00e+00 base_overstate=7.7500%
+58pWphuG#3       OK   ·          orow# 9  exp SELL CARDS    ←USDC           20291.656 /      2609.25488  |  got SELL CARDS    ←USDC           20291.656 /      2609.25488  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+58pWphuG#4       OK   G:base     orow# 8  exp SELL CARDS    ←USDC          6394.91359 /      824.225653  |  got SELL CARDS    ←USDC          6407.89136 /      824.225653  |  rel-base 2.03e-03 rel-quote 0.00e+00 base_overstate=0.2025%
+3nzGD2WV#1       OK   G:quote    orow#15  exp BUY  CARDS    ←USDC           3476.6419 /      449.888419  |  got BUY  CARDS    ←USDC           3476.6419 /      450.798346  |  rel-base 0.00e+00 rel-quote 2.02e-03 quote_overstate=0.2018%
+3nzGD2WV#2       OK   ·          orow#14  exp BUY  CARDS    ←USDC          1162.46878 /      150.332487  |  got BUY  CARDS    ←USDC          1162.46878 /      150.332487  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3nzGD2WV#3       OK   ·          orow#13  exp BUY  CARDS    ←USDC          3033.79656 /      394.448555  |  got BUY  CARDS    ←USDC          3033.79656 /      394.448555  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3nzGD2WV#4       OK   ·          orow#12  exp BUY  OS       ←CARDS         2392197.68 /      7672.90724  |  got BUY  OS       ←CARDS         2392197.68 /      7672.90724  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3BbWVS3K#1       OK   G:quote    orow#19  exp BUY  CARDS    ←USDC          1184.39461 /       150.96474  |  got BUY  CARDS    ←USDC          1184.39461 /      151.328066  |  rel-base 0.00e+00 rel-quote 2.41e-03 quote_overstate=0.2401%
+3BbWVS3K#2       OK   ·          orow#18  exp BUY  CARDS    ←USDC           36772.237 /      4703.11703  |  got BUY  CARDS    ←USDC           36772.237 /      4703.11703  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3BbWVS3K#3       OK   ·          orow#17  exp BUY  CARDS    ←USDC          964.657141 /      123.451845  |  got BUY  CARDS    ←USDC          964.657141 /      123.451845  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3BbWVS3K#4       OK   ·          orow#16  exp BUY  OS       ←CARDS         10588363.8 /      38921.2887  |  got BUY  OS       ←CARDS         10588363.8 /      38921.2887  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+5XLTG1WX#1       OK   ·          orow#21  exp SELL STEVE    ←ORE           20395086.2 /      9.54606922  |  got SELL STEVE    ←ORE           20395086.2 /      9.54606922  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+5XLTG1WX#2       OK   G:base     orow#20  exp SELL ORE      ←USDC          9.46722535 /       726.96198  |  got SELL ORE      ←USDC          9.54606922 /       726.96198  |  rel-base 8.33e-03 rel-quote 0.00e+00 base_overstate=0.8259%
+33hqSn4Q#1       OK   G:base     orow#25  exp SELL XBT      ←WSOL          97779.9064 /      2.00694422  |  got SELL XBT      ←WSOL          102766.565 /      2.00694422  |  rel-base 5.10e-02 rel-quote 0.00e+00 base_overstate=4.8524%
+33hqSn4Q#2       OK   ·          orow#24  exp SELL XBT      ←WBTC          638160.365 /      0.01656677  |  got SELL XBT      ←WBTC          638160.365 /      0.01656677  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+33hqSn4Q#3       OK   ·          orow#23  exp BUY  cbBTC    ←WBTC          0.01657105 /      0.01656677  |  got BUY  cbBTC    ←WBTC          0.01657105 /      0.01656677  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+33hqSn4Q#4       OK   ·          orow#22  exp SELL cbBTC    ←USDC          0.01657105 /      1286.80274  |  got SELL cbBTC    ←USDC          0.01657105 /      1286.80274  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3pkGZDK1#1       OK   ·          orow#29  exp SELL XBT      ←WBTC           740926.93 /       0.0200651  |  got SELL XBT      ←WBTC           740926.93 /       0.0200651  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3pkGZDK1#2       OK   ·          orow#28  exp BUY  cbBTC    ←WBTC           0.0172121 /       0.0172075  |  got BUY  cbBTC    ←WBTC           0.0172121 /       0.0172075  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3pkGZDK1#3       OK   ·          orow#27  exp BUY  cbBTC    ←WBTC           0.0028584 /       0.0028576  |  got BUY  cbBTC    ←WBTC           0.0028584 /       0.0028576  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+3pkGZDK1#4       OK   ·          orow#26  exp SELL cbBTC    ←USDC           0.0200705 /      1559.56569  |  got SELL cbBTC    ←USDC           0.0200705 /      1559.56569  |  rel-base 0.00e+00 rel-quote 0.00e+00 
+
+gross-leg rel_overstate   công thức PIN: (emitted − oracle) / EMITTED   cap 8%   (§T8: mẫu=EMITTED, mẫu=oracle thì row OS thành 8.4011% = fail giả)
+  33hqSn4Q SELL XBT      ←WSOL   leg=base  oracle=97779.9064         emitted=102766.565         overstate= 4.8524%  pin §2.2= 4.8524%  ok
+  3BbWVS3K BUY  CARDS    ←USDC   leg=quote oracle=150.96474          emitted=151.328066         overstate= 0.2401%  pin §2.2= 0.2401%  ok
+  3nzGD2WV BUY  CARDS    ←USDC   leg=quote oracle=449.888419         emitted=450.798346         overstate= 0.2018%  pin §2.2= 0.2018%  ok
+  58pWphuG SELL CARDS    ←USDC   leg=base  oracle=6394.91359         emitted=6407.89136         overstate= 0.2025%  pin §2.2= 0.2025%  ok
+  58pWphuG SELL OS       ←WSOL   leg=base  oracle=1796185.19         emitted=1947084.22         overstate= 7.7500%  pin §2.2= 7.7500%  ok
+  5XLTG1WX SELL ORE      ←USDC   leg=base  oracle=9.46722535         emitted=9.54606922         overstate= 0.8259%  pin §2.2= 0.8259%  ok
+  n_gross_row=6 (exp 6) · max overstate=7.7500%
+
+malformed probes (tx nền 2k3KYp18, 9 sig distinct, offline):
+  meta.err set                        -> 0 event   (detect_swaps: err != None => [])
+  block-level {'transactions': []}     -> list(ww._block_txs(...)) = []
+  meta key absent                     -> 0 event
+  meta.innerInstructions = []         -> 0 event
+  balances mất hết decimals+amount    -> 2 event
+  detect_swaps({})                    -> KeyError: 'transaction'   (caller production guard `if tx:` trước khi gọi — T2.log M4)
+
+SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+
+PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)timing: baseline gate wall 0.06s
+timing: mutation 1 wall 0.01s
+timing: mutation 2 wall 0.02s
+timing: mutation 3 wall 0.01s
+timing: mutation 4 wall 0.01s
+timing: revert gate wall 0.01s
+timing: total wall 0.12s
+
+
+======================================================================================================================
+MUTATION 1 — 1_TIER_A_WBTC
+======================================================================================================================
+  kỳ vọng (§T8)    : gate FAIL — identity FAIL ở các row WBTC
+  patch in-process : ww.TIER_A.add(3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh)   # mint đọc từ fixture, không gõ tay (§5.7)
+  kết quả          : 1 FAIL line ⇒ RED ok (test có răng)
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 1
+    FAIL §2.4 VIOLATION: WBTC 3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh nằm trong TIER_A (mint đọc từ fixture)
+
+======================================================================================================================
+MUTATION 2 — 2_no_single_POOL
+======================================================================================================================
+  kỳ vọng (§T8)    : gate FAIL — thừa event và/hoặc side FAIL ở 33hqSn4Q
+  patch in-process : _legs_with_roles: 'if (rs == "POOL") == (rd == "POOL"):' -> 'if False:  # MUT2 khong yeu cau dung 1 endpoint POOL'
+  kết quả          : 12 FAIL line ⇒ RED ok (test có răng)
+  SUMMARY steps 30/29 (paired 29/29) · identity 26/29 · side 29/29 · amounts exact 21/23 + 4/6 gross · quote_inferred 1/1 · amount_basis 29/30 · 1-POOL-endpoint 29/30 · FAIL-lines 12
+    FAIL 58pWphuG SỐ STEP lệch: oracle_rows=4 emitted_events=5
+    FAIL 58pWphuG per-sig count pin §2.3 exp=4 got=5
+    FAIL 58pWphuG key-multiset (side,base,quote) lệch §2.3: oracle thiếu {} · event thừa {('SELL', 'OS', 'USDC'): 1}
+    FAIL 58pWphuG#1 expected sell OS ← CARDS | got SELL OS ← USDC: quote_sym exp=CARDS got=USDC; base_amt exp=11033477.24844975 got=12980561.468764413 rel=1.765e-01 > 1e-06; quote_amt exp=26699.547315 got=13.296178 rel=9.995e-01 > 1e-06
+    FAIL 58pWphuG#2 expected sell OS ← WSOL | got SELL OS ← CARDS: quote_sym exp=WSOL got=CARDS; base_gross rel_overstate 83.720588% > 8%; quote_amt exp=5.848984792 got=26699.547315 rel=4.564e+03 > 1e-06
+    FAIL 58pWphuG#3 expected sell CARDS ← USDC | got SELL OS ← WSOL: base_sym exp=CARDS got=OS; quote_sym exp=USDC got=WSOL; base_amt exp=20291.655959 got=1947084.220314662 rel=9.495e+01 > 1e-06; quote_amt exp=2609.254878 got=5.848984792 rel=9.978e-01 > 1e-06
+    FAIL 58pWphuG#4 expected sell CARDS ← USDC | got SELL CARDS ← USDC: base_gross rel_overstate 68.485009% > 8%; quote_amt exp=824.225653 got=2609.254878 rel=2.166e+00 > 1e-06
+    FAIL 58pWphuG#5 EXTRA event SELL CARDS←USDC (oracle không có row tương ứng)
+    ... (4 FAIL line nữa)
+
+======================================================================================================================
+MUTATION 3 — 3_wallet_flow_side
+======================================================================================================================
+  kỳ vọng (§T8)    : gate FAIL — FAIL ≥ 11 row (rule ví-only đo được 18/29)
+  patch in-process : _swap_event: '"side": "BUY" if bl["rs"] == "POOL" else "SELL",' -> '"side": "BUY" if bl["rd"] == "WALLET" else "SELL",'
+  kết quả          : 19 FAIL line ⇒ RED ok (test có răng)
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 18/29 · amounts exact 14/23 + 4/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 19
+    FAIL 4zmaV87B key-multiset (side,base,quote) lệch §2.3: oracle thiếu {('BUY', 'DOGE', 'USDC'): 2} · event thừa {('SELL', 'DOGE', 'USDC'): 2}
+    FAIL 4zmaV87B#1 expected buy DOGE ← USDC | got SELL DOGE ← USDC: side exp=BUY got=SELL
+    FAIL 4zmaV87B#2 expected buy DOGE ← USDC | got SELL DOGE ← USDC: side exp=BUY got=SELL
+    FAIL 3nzGD2WV key-multiset (side,base,quote) lệch §2.3: oracle thiếu {('BUY', 'OS', 'CARDS'): 1, ('BUY', 'CARDS', 'USDC'): 3} · event thừa {('SELL', 'CARDS', 'USDC'): 3, ('SELL', 'OS', 'CARDS'): 1}
+    FAIL 3nzGD2WV#1 expected buy CARDS ← USDC | got SELL CARDS ← USDC: side exp=BUY got=SELL
+    FAIL 3nzGD2WV#2 expected buy CARDS ← USDC | got SELL CARDS ← USDC: side exp=BUY got=SELL
+    FAIL 3nzGD2WV#3 expected buy CARDS ← USDC | got SELL CARDS ← USDC: side exp=BUY got=SELL
+    FAIL 3nzGD2WV#4 expected buy OS ← CARDS | got SELL OS ← CARDS: side exp=BUY got=SELL
+    ... (11 FAIL line nữa)
+
+======================================================================================================================
+MUTATION 4 — 4_delta_balance_amount
+======================================================================================================================
+  kỳ vọng (§T8)    : gate FAIL — FAIL ở 33hqSn4Q sell XBT ← WBTC 638160.364952 (delta vault 99683.5682570003 / 619015.5540030003)
+  patch in-process : _legs_with_roles: 'legs.append(' -> '_ep = src if rs == "POOL" else dst\n        raw = abs(post_'
+  kết quả          : 4 FAIL line ⇒ RED ok (test có răng)
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 19/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 4
+    FAIL 2k3KYp18#1 expected sell JUDE ← SPCX | got SELL JUDE ← SPCX: quote_amt exp=9.524479 got=9.824735 rel=3.152e-02 > 1e-06
+    FAIL 5XLTG1WX#1 expected sell STEVE ← ORE | got SELL STEVE ← ORE: base_amt exp=20395086.158547 got=19783233.57379 rel=3.000e-02 > 1e-06
+    FAIL 33hqSn4Q#2 expected sell XBT ← WBTC | got SELL XBT ← WBTC: base_amt exp=638160.364952 got=619015.554003 rel=3.000e-02 > 1e-06
+    FAIL 3pkGZDK1#1 expected sell XBT ← WBTC | got SELL XBT ← WBTC: base_amt exp=740926.930166 got=718699.122261 rel=3.000e-02 > 1e-06
+
+======================================================================================================================
+REVERT — module fresh load lại từ scripts/wallet_watch.py (không revert bán phần)
+======================================================================================================================
+  SUMMARY steps 29/29 (paired 29/29) · identity 29/29 · side 29/29 · amounts exact 23/23 + 6/6 gross · quote_inferred 1/1 · amount_basis 29/29 · 1-POOL-endpoint 29/29 · FAIL-lines 0
+  PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+
+sha256 sau   : b6eb618bcdd84238d0e4daf011572362ab8c076b12daddb62bd72fd793dad9cc
+mtime  sau   : 1790068927
+wallet_watch.py byte-identical sau 4 mutation in-process: True
+MUTATION GATE: 4/4 RED(FAIL)→GREEN(PASS) · ALL OK
+PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)

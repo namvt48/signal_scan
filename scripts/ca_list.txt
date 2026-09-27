@@ -1,0 +1,11 @@
+# one CA per line; # comment = symbol. deployed_at TU DETECT (prod DB -> essential fallback)
+2ezdFs8GwqxxQCVFUAWEzYBKVnGVHskd1kthJASipump   # KIWI
+7XGqEgFsHTMZyf1GkCeR4cY5w9nhgh2xwQJhdwiqpump   # MVC
+Ax5dAamJPeuaLpFUzs9FdcpoUhHDcxyjPzxCJQidjups   # MINI
+DShht9B8wCRe5t3oqdPB77PnjJbKxbYaZyuWpZQjbonk   # CONK
+FYtP5AiiB4eUjVA88EeZS73PDpi7RPLusdqtXizYpump   # GOY
+G1jBdXXA2V2rLWW6nxFgnJy146wbDCfyuMGxNVAWpump   # AURABATTLES
+zj1jpp7QMveWHLs61vL9KMZf254KvW7j4AAmBF8ry2k   # BULLSHIT
+49nkLrXi8nCZBVKsShDNasEtPe4Vn1mx9Xbr3kTa8pTL   # APP
+4U4U8oXwDyVXGeTffMXds4NAgBgLFwq3wNvTCRTSpump   # TJR
+8VjFid8BVGcTPpUzf4PAWsA5nHJ5h2GQNXPEjyr2mF7t   # MBS

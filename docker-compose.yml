@@ -1,0 +1,74 @@
+# signal_scan — web (nginx + SPA) + api (poller/SQLite/express).
+# Host port: PORT=xxxx docker compose up -d (Makefile `make up` truyền PORT).
+# API env: tạo server/.env từ server/.env.example (POLL_*_MS, NANSEN_API_KEY, ...).
+# SQLite lives in ./$(DATA_DIR) (bind mount) — sao lưu/thử nghiệm chỉ cần copy thư mục này.
+#
+# 2 instance song song: cùng repo, khác COMPOSE_PROJECT_NAME + PORT + DATA_DIR.
+#   make deploy INSTANCE=b   (project signal_scan_b, port 8125, ./data-b)
+# Mỗi project có chrome/api/web riêng (DB riêng → ví riêng).
+#
+# Log cap: default json-file driver KHÔNG giới hạn → log mới (request/call) sẽ ăn
+# disk dần. 10m × 3 file/service = trần 30m/service, xoay vòng tự động.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # Headless Chromium — browser transport cho Nansen web-crawl (CF chặn non-browser TLS).
+  # API kết nối qua CDP (CRAWL_WS_ENDPOINT). Image v1 browserless: không cần token.
+  chrome:
+    image: browserless/chrome:1.61-chrome-stable
+    environment:
+      # Session cap (v1 name; v2 = TIMEOUT). Default 30s is shorter than our
+      # goto+settle, so the session dies and the CF clearance cookie with it -> 403.
+      CONNECTION_TIMEOUT: 1800000
+    restart: unless-stopped
+    # 1g OOM'd in production (measured 2026-09-19: 1019MiB/1GiB = 99.5%, CPU 305%,
+    # `Network.enable timed out` → every sweep timeout). ONE page is reused for all
+    # requests plus our own exec context, so the ceiling has to clear Chrome's RSS.
+    mem_limit: 6g
+    # Door-pool sizing (Nansen proxy routing): browserless v1 spawns 1 browser per
+    # WS connection, so N doors = N concurrent browsers in THIS container — one
+    # container, N connections (no extra chrome service).
+    # Budget: mem_limit ≈ 1g + 0.7g × N, where N = usable lines in CRAWL_PROXY_FILE.
+    # 6g covers N ≤ 7. Headroom, not a measured need: 2026-09-23 chrome RSS was
+    # 835MiB/3GiB (28%) with no pressure — the host has 24g total (~20g free).
+    # Chrome renders through /dev/shm; the 64m container default makes it fall back
+    # to disk and stall under load, so shm gets its own headroom too.
+    shm_size: 2g
+    logging: *default-logging
+  api:
+    build: ./server
+    env_file:
+      - path: server/.env
+        required: false
+    environment:
+      DB_PATH: /data/signal_scan.db
+      CRAWL_WS_ENDPOINT: ws://chrome:3000
+      NANSEN_CRAWL: "on"
+    volumes:
+      # ./$(DATA_DIR) also holds proxies.txt (CRAWL_PROXY_FILE) beside the SQLite DB.
+      # Not committed — it carries proxy credentials. Editing it = restart the system.
+      # DATA_DIR isolates a second instance's DB + proxy file from the first.
+      - ./${DATA_DIR:-data}:/data
+    depends_on:
+      - chrome
+    expose:
+      - "3001"
+    logging: *default-logging
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      # Clan column is per-instance: Makefile passes SHOW_CLAN=on for instance b, off for a.
+      args:
+        VITE_SHOW_CLAN: ${SHOW_CLAN:-off}
+        VITE_TITLE: ${TITLE:-signal_scan}
+    ports:
+      - "${PORT:-8124}:80"
+    logging: *default-logging
+    depends_on:
+      - api
+    restart: unless-stopped

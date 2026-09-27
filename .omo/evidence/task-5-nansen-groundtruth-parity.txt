@@ -1,0 +1,592 @@
+todo 5 PART 1/2 (constants + side_of + classify) — nansen-groundtruth-parity
+Date: 2026-09-22 (Asia/Ho_Chi_Minh)
+Scope: scripts/nansen_parity.py gains _EPS, NET_CAP, GROSS_CAP, USD_CAP,
+NET_OWNER_EPS, UNAVAIL_CAP, TRANSFER_WARN, CLASS_PRECEDENCE, TRACE_REQUIRED,
+RECORD_FIELDS, side_of, classify (+ private _record builder).
+scripts/test_nansen_parity.py gains mkev helper + 21 new tests.
+Existing 17 tests and all existing functions UNCHANGED (verified: RED run shows
+17/17 old PASS while 21 new FAIL with AttributeError 'no attribute classify').
+Part 2 (summarize/pass_bar/write_jsonl/write_report/GATE_NAMES/G9_FORMULA) NOT
+implemented — out of scope. No network, no pytest, no new deps, no git.
+scripts/wallet_watch.py NOT touched (parallel task).
+
+== MD5 BEFORE ==
+579e5ab7019d2657dcbc82016fa91451  scripts/nansen_parity.py   (156 lines)
+00b1f154e3e9b347db35462d7bccb568  scripts/test_nansen_parity.py (310 lines)
+
+== MD5 AFTER ==
+909e7a5f5d63cfad7e94d40a4db07c82  scripts/nansen_parity.py   (479 lines)
+8fdf1ce9c329b92312c26afe3e1a08c2  scripts/test_nansen_parity.py (680 lines)
+
+== 21 NEW TESTS ==
+test_side_of
+test_constants_precedence_and_trace_required
+test_classify_record_fields_exact
+test_classify_buy_only_with_fee_match
+test_classify_transfer_only_zero_events_match
+test_classify_transfer_only_with_buy_tfp
+test_classify_tfp_without_trace_raises
+test_classify_same_ca_fee_match
+test_classify_missing_and_raise
+test_classify_type_mismatch
+test_classify_amount_mismatch
+test_classify_gross_mismatch
+test_classify_usd_mismatch
+test_classify_net_identity_na_mixed_sign
+test_classify_net_identity_na_all_none
+test_classify_deferred_usd_null
+test_classify_unavailable_no_raise_and_none_events_raises
+test_classify_usd_missing_not_false_fail
+test_classify_receive_raises
+test_classify_diff_ca_filter
+test_classify_full_event_shape
+
+== OBJECTION (D6 step 2) — logged per spec, implemented as specified ==
+TRANSFER_FALSE_POSITIVE checks the literal `events` argument (all mints), while
+every metric uses `evs` filtered to group.ca (D2). In a sig where a
+transfer-only group for ca=X coexists with a swap for ca=Y, the literal check
+can raise a false TRANSFER_FALSE_POSITIVE for X. Measured C2 case (1bPapYy2…)
+gives TFP under BOTH readings, so the current gate is unaffected. Noted in the
+classify docstring; part 2 / todo 6 decides what to pass.
+
+== SPEC DEVIATION (test 8 threshold) ==
+Spec test 8 says `net_rel < 1e-12`, but with the spec's own binding inputs
+(truth buy 48930.78620605, truth fee-sell 48.9307862, ev qty_net 48930.786206
+and 48.930786) the exact value is 3.0686e-12 (fee qty rounded to 6 decimals
+vs truth 7 decimals ⇒ abs diff 1.5e-7 over 4.89e4). Verified numerically before
+writing the test. Test asserts `net_rel < 1e-11` — still ~1e4× tighter than
+NET_CAP 0.015 and proves the identity holds. All other test-8 numbers match
+spec exactly (net_owner_delta 0.0, fee_usd_ratios[0] 0.90399 ≈ 0.904 ±0.01,
+gross_rel_sell 4.087e-9 ≈ 4e-9).
+
+== RED LOG (real, captured BEFORE implementation: python3 scripts/test_nansen_parity.py) ==
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 502, in test_classify_amount_mismatch
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 388, in test_classify_buy_only_with_fee_match
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 567, in test_classify_deferred_usd_null
+    rec = np_.classify(grp, [mkev(qty=1000.0, qty_net=1000.0, quote_usd=12.4)])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 611, in test_classify_diff_ca_filter
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 649, in test_classify_full_event_shape
+    rec = np_.classify(grp, [ev])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 513, in test_classify_gross_mismatch
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 477, in test_classify_missing_and_raise
+    rec = np_.classify(grp, [], reject_trace=["REJECT (1,1,'pAMM…',2) no_event"])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 557, in test_classify_net_identity_na_all_none
+    rec = np_.classify(grp, [mkev(qty=1000.0, qty_net=None, quote_usd=12.5)])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 541, in test_classify_net_identity_na_mixed_sign
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 603, in test_classify_receive_raises
+    assert _raises_valueerror(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 309, in _raises_valueerror
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 604, in <lambda>
+    lambda: np_.classify(grp, [mkev(side="RECEIVE", qty=1000.0)])
+            ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 379, in test_classify_record_fields_exact
+    rec = np_.classify(grp, [mkev(qty=1000.0, qty_net=1000.0, quote_usd=12.5)])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 454, in test_classify_same_ca_fee_match
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 440, in test_classify_tfp_without_trace_raises
+    assert _raises_valueerror(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 309, in _raises_valueerror
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 441, in <lambda>
+    lambda: np_.classify(grp, [mkev(mint=CA), mkev(mint="OTHERMINT1")])
+            ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 426, in test_classify_transfer_only_with_buy_tfp
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 411, in test_classify_transfer_only_zero_events_match
+    rec = np_.classify(grp, [])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 488, in test_classify_type_mismatch
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 582, in test_classify_unavailable_no_raise_and_none_events_raises
+    rec = np_.classify(grp, None, fetch_error=err)
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 525, in test_classify_usd_mismatch
+    rec = np_.classify(
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 594, in test_classify_usd_missing_not_false_fail
+    rec = np_.classify(grp, [mkev(qty=1000.0, qty_net=1000.0, quote_usd=None)])
+          ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'classify'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 348, in test_constants_precedence_and_trace_required
+    assert np_.CLASS_PRECEDENCE == (
+           ^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'CLASS_PRECEDENCE'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 665, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 326, in test_side_of
+    assert np_.side_of({"side": "BUY"}) == "buy"
+           ^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'side_of'
+FAIL test_classify_amount_mismatch
+FAIL test_classify_buy_only_with_fee_match
+FAIL test_classify_deferred_usd_null
+FAIL test_classify_diff_ca_filter
+FAIL test_classify_full_event_shape
+FAIL test_classify_gross_mismatch
+FAIL test_classify_missing_and_raise
+FAIL test_classify_net_identity_na_all_none
+FAIL test_classify_net_identity_na_mixed_sign
+FAIL test_classify_receive_raises
+FAIL test_classify_record_fields_exact
+FAIL test_classify_same_ca_fee_match
+FAIL test_classify_tfp_without_trace_raises
+FAIL test_classify_transfer_only_with_buy_tfp
+FAIL test_classify_transfer_only_zero_events_match
+FAIL test_classify_type_mismatch
+FAIL test_classify_unavailable_no_raise_and_none_events_raises
+FAIL test_classify_usd_mismatch
+FAIL test_classify_usd_missing_not_false_fail
+FAIL test_constants_precedence_and_trace_required
+PASS test_fee_usd_gate_ok
+PASS test_global_drift
+PASS test_gross_bucket
+PASS test_gross_truth_abs
+PASS test_groups_key_and_shape_buy_only
+PASS test_groups_shapes
+PASS test_groups_usd_null_and_multirow
+PASS test_is_dust
+PASS test_load_truth
+PASS test_net_identity
+PASS test_net_identity_zero_truth_none
+PASS test_net_truth_signed
+PASS test_net_truth_transfer_only_zero
+FAIL test_side_of
+PASS test_sum_qnet_none_skip
+PASS test_sum_qnet_signed
+PASS test_usd_ratio
+PASS test_usd_ratio_none
+RED: 17/38 pass, 21 fail
+
+== GREEN LOG (real, captured AFTER implementation) ==
+PASS test_classify_amount_mismatch
+PASS test_classify_buy_only_with_fee_match
+PASS test_classify_deferred_usd_null
+PASS test_classify_diff_ca_filter
+PASS test_classify_full_event_shape
+PASS test_classify_gross_mismatch
+PASS test_classify_missing_and_raise
+PASS test_classify_net_identity_na_all_none
+PASS test_classify_net_identity_na_mixed_sign
+PASS test_classify_receive_raises
+PASS test_classify_record_fields_exact
+PASS test_classify_same_ca_fee_match
+PASS test_classify_tfp_without_trace_raises
+PASS test_classify_transfer_only_with_buy_tfp
+PASS test_classify_transfer_only_zero_events_match
+PASS test_classify_type_mismatch
+PASS test_classify_unavailable_no_raise_and_none_events_raises
+PASS test_classify_usd_mismatch
+PASS test_classify_usd_missing_not_false_fail
+PASS test_constants_precedence_and_trace_required
+PASS test_fee_usd_gate_ok
+PASS test_global_drift
+PASS test_gross_bucket
+PASS test_gross_truth_abs
+PASS test_groups_key_and_shape_buy_only
+PASS test_groups_shapes
+PASS test_groups_usd_null_and_multirow
+PASS test_is_dust
+PASS test_load_truth
+PASS test_net_identity
+PASS test_net_identity_zero_truth_none
+PASS test_net_truth_signed
+PASS test_net_truth_transfer_only_zero
+PASS test_side_of
+PASS test_sum_qnet_none_skip
+PASS test_sum_qnet_signed
+PASS test_usd_ratio
+PASS test_usd_ratio_none
+OK: nansen_parity pure core 38/38
+
+== FINAL VERIFICATION ==
+$ python3 scripts/test_nansen_parity.py; echo EXIT=$?
+OK: nansen_parity pure core 38/38
+EXIT=0
+
+EVIDENCE_RECORDED: /home/namvt/Desktop/dev-space/signal_scan/.omo/evidence/task-5-nansen-groundtruth-parity.txt
+
+
+================================================================
+todo 5 PART 2/2 (_pctl + summarize + GATE_NAMES + G9_FORMULA + pass_bar + write_jsonl + write_report) — 2026-09-22
+================================================================
+Scope: reporting half appended to scripts/nansen_parity.py (479→911 lines);
+8 tests + _six_records fixture appended to scripts/test_nansen_parity.py (680→982 lines).
+classify/side_of/constants and all 38 existing tests UNCHANGED (RED shows 38/38 old PASS).
+No 743/990 hardcoded in logic (the 13 in GATE_NAMES G11 text is spec-mandated name text only).
+wallet_watch.py NOT touched. No network/pytest/deps/git. basedpyright: 0 errors both files.
+
+== MD5 BEFORE (part 2) ==
+909e7a5f5d63cfad7e94d40a4db07c82  scripts/nansen_parity.py
+8fdf1ce9c329b92312c26afe3e1a08c2  scripts/test_nansen_parity.py
+
+== MD5 AFTER (part 2) ==
+caa5b597cf2ffe31736ff57ffe555ae9  scripts/nansen_parity.py
+963247939773b31bb2b3f4f9dc3c5a7c  scripts/test_nansen_parity.py
+
+== 8 NEW TESTS ==
+test_pctl_interpolation
+test_gate_names_and_g9_formula
+test_summarize_shape
+test_pass_bar_13_gates
+test_pass_bar_g4_g5_boundaries
+test_pass_bar_g6_g7_g9_g10_g11_g12
+test_write_jsonl_roundtrip
+test_write_report_sections
+
+== G9_FORMULA (verbatim, printed in every report) ==
+G9 formula: ok = (USD_MISMATCH count == 0) AND (max abs(usd_ratio_adj - 1) <= 0.10); usd_ratio_adj = usd_ratio_raw / drift; drift = median(usd_ratio_raw); usd_ratio_raw = sum(ev quote_usd) / sum(truth buy+sell usd), None excluded, never 0
+
+== RED LOG (real, before part-2 implementation) ==
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 732, in test_gate_names_and_g9_formula
+    assert len(np_.GATE_NAMES) == 13
+               ^^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'GATE_NAMES'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 767, in test_pass_bar_13_gates
+    gates = np_.pass_bar(np_.summarize(recs))
+            ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'pass_bar'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 807, in test_pass_bar_g4_g5_boundaries
+    g4 = np_.pass_bar(np_.summarize([rec_good]))[3]
+         ^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'pass_bar'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 842, in test_pass_bar_g6_g7_g9_g10_g11_g12
+    s = np_.summarize(recs)
+        ^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'summarize'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 725, in test_pctl_interpolation
+    assert np_._pctl([0.9, 1.0, 1.1], 0.5) == 1.0
+           ^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute '_pctl'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 741, in test_summarize_shape
+    s = np_.summarize(recs)
+        ^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'summarize'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 891, in test_write_jsonl_roundtrip
+    np_.write_jsonl(path, recs)
+    ^^^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'write_jsonl'
+Traceback (most recent call last):
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 967, in main
+    fn()
+  File "/home/namvt/Desktop/dev-space/signal_scan/scripts/test_nansen_parity.py", line 927, in test_write_report_sections
+    text = np_.write_report(path, recs, meta, {})
+           ^^^^^^^^^^^^^^^^
+AttributeError: module 'nansen_parity' has no attribute 'write_report'
+PASS test_classify_amount_mismatch
+PASS test_classify_buy_only_with_fee_match
+PASS test_classify_deferred_usd_null
+PASS test_classify_diff_ca_filter
+PASS test_classify_full_event_shape
+PASS test_classify_gross_mismatch
+PASS test_classify_missing_and_raise
+PASS test_classify_net_identity_na_all_none
+PASS test_classify_net_identity_na_mixed_sign
+PASS test_classify_receive_raises
+PASS test_classify_record_fields_exact
+PASS test_classify_same_ca_fee_match
+PASS test_classify_tfp_without_trace_raises
+PASS test_classify_transfer_only_with_buy_tfp
+PASS test_classify_transfer_only_zero_events_match
+PASS test_classify_type_mismatch
+PASS test_classify_unavailable_no_raise_and_none_events_raises
+PASS test_classify_usd_mismatch
+PASS test_classify_usd_missing_not_false_fail
+PASS test_constants_precedence_and_trace_required
+PASS test_fee_usd_gate_ok
+FAIL test_gate_names_and_g9_formula
+PASS test_global_drift
+PASS test_gross_bucket
+PASS test_gross_truth_abs
+PASS test_groups_key_and_shape_buy_only
+PASS test_groups_shapes
+PASS test_groups_usd_null_and_multirow
+PASS test_is_dust
+PASS test_load_truth
+PASS test_net_identity
+PASS test_net_identity_zero_truth_none
+PASS test_net_truth_signed
+PASS test_net_truth_transfer_only_zero
+FAIL test_pass_bar_13_gates
+FAIL test_pass_bar_g4_g5_boundaries
+FAIL test_pass_bar_g6_g7_g9_g10_g11_g12
+FAIL test_pctl_interpolation
+PASS test_side_of
+PASS test_sum_qnet_none_skip
+PASS test_sum_qnet_signed
+FAIL test_summarize_shape
+PASS test_usd_ratio
+PASS test_usd_ratio_none
+FAIL test_write_jsonl_roundtrip
+FAIL test_write_report_sections
+RED: 38/46 pass, 8 fail
+
+== GREEN LOG (real, after implementation) ==
+PASS test_classify_amount_mismatch
+PASS test_classify_buy_only_with_fee_match
+PASS test_classify_deferred_usd_null
+PASS test_classify_diff_ca_filter
+PASS test_classify_full_event_shape
+PASS test_classify_gross_mismatch
+PASS test_classify_missing_and_raise
+PASS test_classify_net_identity_na_all_none
+PASS test_classify_net_identity_na_mixed_sign
+PASS test_classify_receive_raises
+PASS test_classify_record_fields_exact
+PASS test_classify_same_ca_fee_match
+PASS test_classify_tfp_without_trace_raises
+PASS test_classify_transfer_only_with_buy_tfp
+PASS test_classify_transfer_only_zero_events_match
+PASS test_classify_type_mismatch
+PASS test_classify_unavailable_no_raise_and_none_events_raises
+PASS test_classify_usd_mismatch
+PASS test_classify_usd_missing_not_false_fail
+PASS test_constants_precedence_and_trace_required
+PASS test_fee_usd_gate_ok
+PASS test_gate_names_and_g9_formula
+PASS test_global_drift
+PASS test_gross_bucket
+PASS test_gross_truth_abs
+PASS test_groups_key_and_shape_buy_only
+PASS test_groups_shapes
+PASS test_groups_usd_null_and_multirow
+PASS test_is_dust
+PASS test_load_truth
+PASS test_net_identity
+PASS test_net_identity_zero_truth_none
+PASS test_net_truth_signed
+PASS test_net_truth_transfer_only_zero
+PASS test_pass_bar_13_gates
+PASS test_pass_bar_g4_g5_boundaries
+PASS test_pass_bar_g6_g7_g9_g10_g11_g12
+PASS test_pctl_interpolation
+PASS test_side_of
+PASS test_sum_qnet_none_skip
+PASS test_sum_qnet_signed
+PASS test_summarize_shape
+PASS test_usd_ratio
+PASS test_usd_ratio_none
+PASS test_write_jsonl_roundtrip
+# Nansen ground-truth parity report
+
+generated_at: 2026-09-22T12:00:00+07:00
+truth: .probe/nansen-24h/tx-sample.jsonl
+n_records: 7  n_sigs: 6  drift: 0.9978571191172294
+
+## Class counts (precedence order)
+
+| class | n |
+|---|---|
+| UNAVAILABLE | 1 |
+| TRANSFER_FALSE_POSITIVE | 1 |
+| MISSING | 1 |
+| TYPE_MISMATCH | 0 |
+| AMOUNT_MISMATCH | 0 |
+| GROSS_MISMATCH | 0 |
+| USD_MISMATCH | 0 |
+| NET_IDENTITY_NA | 1 |
+| DEFERRED_USD_NULL | 1 |
+| MATCH | 2 |
+
+## Gates G1–G13
+
+| gate | name | ok | value |
+|---|---|---|---|
+| G1 | TYPE_MISMATCH == 0 (available groups) | True | 0 (available=6) |
+| G2 | TRANSFER_FALSE_POSITIVE == 0 (available transfer-only groups; print transfer-only UNAVAILABLE, WARN if >10%) | False | tfp=1; transfer_only_unavailable=0/1 (0.0%) |
+| G3 | MISSING == 0 (available groups) | False | 1 (available=6) |
+| G4 | same-ca buy_sell: BUY + SELL(fee_leg=True), |qty_fee − truth_sell_gross|/truth_sell_gross <= 1.5% | False | 1/2 |
+| G5 | diff-ca sigs: SELL(sold mint) + BUY(bought mint) in same sig | True | 0/0 |
+| G6 | |sum signed qty_net − _net_owner(mint)| < 1e-6 (measurable mints; mixed-sign/all-None => NET_IDENTITY_NA, not FAIL) | True | 0/0, na=1 |
+| G7 | |sum signed qty_net − net_truth|/|net_truth| <= 1.5% when net_truth != 0 (buy +, sell −, transfer 0; qty_net None skipped+counted) | False | 3/4, truth_zero=1 |
+| G8 | gross per-side <= 8% (GROSS_CAP) | False | 6/7 |
+| G9 | global USD residual <= 10% after one global drift factor (median ratio); quote_usd None excluded+counted usd_missing, never 0 | False | meas=4 p50=0.9979 p90=1.0000 max_raw=1.0000 max_adj_dev=1.0000 |
+| G10 | fee-only USD <= 15% after drift (listed separately) | True | 1/1 p50=0.9059 p90=0.9059 max=0.9059 |
+| G11 | DEFERRED_USD_NULL == truth usd-null group count (13 in full sample) | True | deferred=1 truth_null=1 |
+| G12 | UNAVAILABLE <= 20% of sigs (exceed => STOP, new sample) | True | 1/6=16.7% |
+| G13 | old oracle intact: test_gmgn_api_parity 29/29 + backtest_parity --from-fixture 29/29 + 3fec2kXP == 2 | None | not measured in this run |
+
+G9 formula: ok = (USD_MISMATCH count == 0) AND (max abs(usd_ratio_adj - 1) <= 0.10); usd_ratio_adj = usd_ratio_raw / drift; drift = median(usd_ratio_raw); usd_ratio_raw = sum(ev quote_usd) / sum(truth buy+sell usd), None excluded, never 0
+
+## Root causes — 100% of non-MATCH
+
+- 48Y3e48T4z48… ca=CAUNAVAI… UNAVAILABLE: fetch_error: POST ... → null (3 tries)
+- sNull1… ca=3z2tRjNu… DEFERRED_USD_NULL: usdValueAtTxTime null in truth rows (USD gate deferred; type+amount still gated)
+- sNa1… ca=3z2tRjNu… NET_IDENTITY_NA: mixed_sign mint (BUY + non-fee SELL — mint aggregation breaks identity, pre-existing)
+- sTfp1… ca=1NJMqVM4… TRANSFER_FALSE_POSITIVE: REJECT (2,2,'pAMM…',3) 1NJ… same_mint
+- sMiss… ca=3z2tRjNu… MISSING: REJECT (1,1,'pAMM…',2) no_event
+
+## Phase-2 notes
+
+### DEFERRED_USD_NULL
+- sNull1 ca=3z2tRjNu4mScxS5Z6YkxFcCQeWvzRz7Kh4Qmx1E5UqJn
+
+### Fee-collector programs
+| sig | encl | program | collector |
+|---|---|---|---|
+| 48Y3e48T4z… | e#1 | pAMMBay6… | 3CgvbiM3… |
+
+### Known None-USD risk in wallet_hist
+Risk (verbatim): scripts/wallet_hist.py:106 `base += e["quote_usd"]` and :114-115 `all_usd += x["quote_usd"]` → TypeError when quote_usd is None.
+
+### Fee-USD stats + G10 threshold proposal
+raw: n=1 p50=0.9040 p90=0.9040 max=0.9040
+post-drift: p50=0.9059 p90=0.9059 max=0.9059
+Proposal: tighten the 15% G10 threshold once reproducible — currently locked from a single non-reproducible measurement.
+
+### NET_IDENTITY_NA list
+- sNa1… ca=3z2tRjNu… mixed_sign
+
+## GMGN/Nansen oracle divergence
+
+Nature: GMGN omits legs Nansen counts. Existing evidence: scripts/test_wallet_watch.py:10-13 documents deleting 2 TRANSFER labels of 387w9fh8EF because GMGN does not list the Jupiter-withdraw leg rejected as plumbing.
+Measured C2 case 1bPapYy2…: Nansen says transfer-only, detector emits 2 real BUY events — adjudicated by G2 as TRANSFER_FALSE_POSITIVE (oracle divergence), not a detector bug.
+Old oracle suite stays filtered by the fee_leg flag rather than by bumping EXPECT_COUNT — 3fec2kXP stays at exactly 2 events.
+
+## Scope boundary — detector layer only
+
+Parity holds in the Python detector; fee-SELL never reaches the dashboard:
+- scripts/wallet_watch.py:134 and :190 POST/emit BUY only
+- server/src/providers/nansen.ts:133-134 `if (row.txType !== 'buy') continue;`
+- server/src/db.ts:147-160 has no qty column
+`fee_leg` is the phase-2 hook.
+
+## Fee-USD ratio stats
+
+count=1
+raw: p50=0.9040 p90=0.9040 max=0.9040
+post-drift: p50=0.9059 p90=0.9059 max=0.9059
+
+| sig | ca | raw | adj | ok |
+|---|---|---|---|---|
+| sFee1 | 3z2tRjNu | 0.9040 | 0.9059 | True |
+
+PASS test_write_report_sections
+OK: nansen_parity pure core 46/46
+
+== FINAL VERIFICATION ==
+$ python3 scripts/test_nansen_parity.py; echo EXIT=$?
+OK: nansen_parity pure core 46/46
+EXIT=0
+
+EVIDENCE_RECORDED: /home/namvt/Desktop/dev-space/signal_scan/.omo/evidence/task-5-nansen-groundtruth-parity.txt

@@ -1,0 +1,377 @@
+======================================================================
+T7 — REAL block-scan transport (--feed block, default) + sol_price fix
+date: 2026-09-15 22:23:07 +07 (local host: namvt) | plan: .omo/plans/gmgn-parity-fixes.md §T7 L291-311
+======================================================================
+
+== 1. CODE VERIFICATION ==
+grep -c getBlock scripts/wallet_watch.py = 4
+run_block_feed: 49 lines (spec: < 50)
+AST OK
+All checks passed!
+RUFF: All checks passed!
+feed default source proof:
+1026:        "--feed",
+1027-        choices=["block", "ws", "poll"],
+1028-        default="block",
+1029-        help="block: quét getBlock mỗi slot confirmed (mặc định) | ws: node push theo block | poll: hẹn giờ HTTP",
+sol_price startup call site (main, sau banner, trước dispatch, wrapped):
+172-
+173-
+174:def sol_price() -> float:
+175-    if not _sol_px["v"]:
+176-        _sol_px["v"] = token_info(WSOL)[1] or 100.0
+177-    return _sol_px["v"]
+1104-    # T4 xoá) — price-provider fail không được abort startup.
+1105-    try:
+1106:        sol_price()
+1107-    except Exception:
+1108-        pass
+1109-    if args.feed == "block":
+getTransaction call sites (chỉ process_sig ws/poll — KHÔNG có trong block feed):
+
+== 2. SPEC DEVIATION (đo thật, bắt buộc phải lệch) ==
+Spec pin getBlock params maxSupportedTransactionVersion=0. Đo 2026-09-15 trên
+publicnode (local + server): ver=0 ⇒ 20/20 slot trả JSON-RPC error -32015
+'Transaction version (1) is not supported by the requesting client' — mainnet
+đã phát hành tx version-1; rpc() chỉ giữ message (rơi code) và -32015 không
+match '-32004'/'skipped' ⇒ feed CHẾT ngay slot đầu ⇒ outcome '--once không
+crash' bất khả thi với ver=0. Sửa tối thiểu: _BLOCK_PARAMS ver 0→1 (kèm
+comment measurement ngay tại constant). ver=1 ⇒ block thật ~10-13MB/slot.
+Tương tự: spec pin match '-32004'/'skipped slot' nhưng node thật报 'Slot N was
+skipped' ⇒ matcher mở rộng thành 'skipped' (⊇ cả 2 chữ ký spec); lỗi RPC lạ
+vẫn propagate (harness c chứng minh).
+KHÔNG đổi gì khác: không getTransaction trong block feed, không failover
+provider, không nới tolerance 413/429 (đo = 0%), ws/poll giữ nguyên.
+
+== 3. --help (knobs + feed choices) ==
+usage: wallet_watch.py [-h] [--wallets WALLETS] [--quotes QUOTES]
+                       [--interval INTERVAL] [--sweep SWEEP]
+                       [--backfill BACKFILL] [--once] [--min-usd MIN_USD]
+                       [--show-fail] [--jsonl JSONL] [--api-url API_URL]
+                       [--track] [--feed {block,ws,poll}]
+                       [--block-backfill BLOCK_BACKFILL]
+                       [--block-max-lag BLOCK_MAX_LAG]
+                       [--block-save-every BLOCK_SAVE_EVERY]
+                       [--block-sleep BLOCK_SLEEP] [--rpc-url RPC_URL]
+
+Solana wallet swap-step watcher (GMGN row parity)
+
+options:
+  -h, --help            show this help message and exit
+  --wallets WALLETS
+  --quotes QUOTES
+  --interval INTERVAL   giữa các nhịp, mode poll
+  --sweep SWEEP         mode ws: khoảng cách quét lưới-an-toàn (giây), chống
+                        sót tx không mention ví
+  --backfill BACKFILL   log N tx cũ cho ví chưa có state
+  --once
+  --min-usd MIN_USD
+  --show-fail           in cả dòng FAILED cho tx lỗi (spam sniper, như tab đỏ
+                        GMGN)
+  --jsonl JSONL         ghi thêm mỗi sự kiện 1 dòng JSON vào file này (log
+                        machine-readable)
+  --api-url API_URL     base URL của alpha-engine API (dùng cho --track)
+  --track               tự POST CA của mọi tx BUY/SELL vào API để auto-add
+                        tracking (mặc định tắt)
+  --feed {block,ws,poll}
+                        block: quét getBlock mỗi slot confirmed (mặc định) |
+                        ws: node push theo block | poll: hẹn giờ HTTP
+  --block-backfill BLOCK_BACKFILL
+                        feed block: cold start lùi N slot sau getSlot
+                        confirmed
+  --block-max-lag BLOCK_MAX_LAG
+                        feed block: lag vượt ngưỡng thì in gap và nhảy tới
+                        cur-max_lag
+  --block-save-every BLOCK_SAVE_EVERY
+                        feed block: save_state mỗi N slot
+  --block-sleep BLOCK_SLEEP
+                        feed block: sleep giữa các slot (giây)
+  --rpc-url RPC_URL     endpoint RPC HTTP; mặc định đọc env SOLANA_RPC_URL →
+                        RPC_HTTP → list có sẵn
+
+== 4. OFFLINE FAKE-RPC HARNESS (/tmp/t7_check.py, x2 — trong-process VÀ shell-level) ==
+[PASS] a.cold_start_backfill2
+       OBSERVED: calls=[('getSlot', [{'commitment': 'confirmed'}]), ('getSlot', [{'commitment': 'confirmed'}]), ('getBlock', [998, {'encoding': 'jsonParsed', 'transactionDetails': 'full', 'maxSupportedTransactionVersion': 1, 'rewards': False, 'commitment': 'confirmed'}])] blk_params_match=True block_slot=998
+[PASS] b.block_slot_persist
+       OBSERVED: getSlot_calls=1 persisted=501 transitions=[501]
+[PASS] c.skip_32004
+       OBSERVED: getBlock_slots=[1000, 1001, 1002, 1003] block_slot=1003 transitions=[1000, 1001, 1002, 1003] unknown_err_propagated='Rate limit exceeded'
+[PASS] d.none_block_and_nondict
+       OBSERVED: getBlock_slots=[1000, 1001, 1002, 1003, 1004] block_slot=1004
+[PASS] e.lag_gap_jump
+       OBSERVED: gap_line='# gap: skip slot 101..180 (lag>20)' save_at_jump=179 final=180 transitions=[179, 180]
+[PASS] f.save_every_and_g.sleep
+       OBSERVED: saves=[1001, 1003, 1004] sleeps=[0.25, 0.25, 0.25, 0.25, 0.25] final=1004 transitions=[1000, 1001, 1002, 1003, 1004]
+[PASS] h.sig_and_no_getTransaction
+       OBSERVED: handle_tx_sigs=['SIG_0', 'SIG_1', 'SIG_2'] methods=['getBlock', 'getSlot'] tx_shape_ok=True
+[PASS] mal.missing_txs_empty_nometa_200tx
+       OBSERVED: no_txs_calls=0 empty_calls=0 nometa_meta=None 200tx_calls=200 block_slot=1004
+[PASS] mal.getSlot_below_slot
+       OBSERVED: stdout='' block_slot=901
+[PASS] k.cancel_resume
+       OBSERVED: persisted_on_KI=1002 resume_start=1003 resumed_getBlock=[1003] transitions=[1000, 1001, 1002]
+[PASS] s1.sol_price_populates_at_startup
+       OBSERVED: _sol_px=150.0 token_info_calls=['So11111111111111111111111111111111111111112'] banner_has_feed_block=True
+       BANNER: ['# watch 1 ví | feed=block | 5 quote-mints | min $0.5']
+[PASS] s2.wsol_quote_usd_fix
+       OBSERVED: sig=FhsbQzAJ… warm: quote_usd=877.3477188 usd_pending=False | cold(no sol_price call): _sol_px=0.0 quote_usd=0.0 usd_pending=True
+[PASS] real_state_untouched
+       OBSERVED: before=('2026-09-11T11:36:49.371432+00:00', 613) after=('2026-09-11T11:36:49.371432+00:00', 613)
+HARNESS 13/13 PASS
+
+RUN1==RUN2: IDENTICAL
+T7_OFFLINE_HARNESS: ALL PASS (x2 identical)
+--- shell-level re-run diff: /tmp/t7_check.py chạy 2 lần, exit 0/0, diff rỗng ⇒ IDENTICAL ---
+
+== 5. REAL 20-SLOT MEASUREMENT — HOST: local ==
+HOST: local
+RPC: https://solana-rpc.publicnode.com
+WW_DIR: /home/namvt/Desktop/dev-space/signal_scan/scripts
+getSlot(confirmed) = 447282183  (199 ms)
+
+=== PHASE A-spec-pinned (maxSupportedTransactionVersion=0) ===
+slot 447282164: HTTP 200 | 239 bytes | 236 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282165: HTTP 200 | 239 bytes | 414 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282166: HTTP 200 | 239 bytes | 167 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282167: HTTP 200 | 239 bytes | 169 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282168: HTTP 200 | 239 bytes | 172 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282169: HTTP 200 | 239 bytes | 182 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282170: HTTP 200 | 239 bytes | 164 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282171: HTTP 200 | 239 bytes | 165 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282172: HTTP 200 | 239 bytes | 188 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282173: HTTP 200 | 239 bytes | 325 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282174: HTTP 200 | 239 bytes | 164 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282175: HTTP 200 | 239 bytes | 154 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282176: HTTP 200 | 239 bytes | 168 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282177: HTTP 200 | 239 bytes | 164 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282178: HTTP 200 | 239 bytes | 271 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282179: HTTP 200 | 239 bytes | 183 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282180: HTTP 200 | 239 bytes | 449 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282181: HTTP 200 | 239 bytes | 168 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282182: HTTP 200 | 239 bytes | 177 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282183: HTTP 200 | 239 bytes | 167 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+--- SUMMARY ---
+slots=20 ok=0 wall=4.2s
+bytes/slot avg=0 (ok rows)
+ms/block avg=212 (all) / 0 (ok)
+ms p50=172 p95=414
+http413=0 http429=0 timeout=0 bad_ratio=0% rpc_errors=20 (of which -32015=20)
+OVER20PCT=NO
+JSONSUMMARY {"host": "local", "phase": "A-spec-pinned", "version": 0, "slots": 20, "ok": 0, "wall_s": 4.2, "bytes_per_slot_avg": 0, "ms_per_block_avg": 212, "p50_ms": 172, "p95_ms": 414, "http_413": 0, "http_429": 0, "timeout": 0, "rpc_errors": 20, "minus32015": 20, "bad_ratio": 0.0, "over20pct": false, "blocks_parsed": 0, "event_count": 0}
+
+=== PHASE B-corrected (maxSupportedTransactionVersion=1) ===
+slot 447282164: HTTP 200 | 12727089 bytes | 1240 ms | txs=1368
+slot 447282165: HTTP 200 | 12573068 bytes | 2029 ms | txs=1221
+slot 447282166: HTTP 200 | 15294999 bytes | 1069 ms | txs=1628
+slot 447282167: HTTP 200 | 14999899 bytes | 1402 ms | txs=1361
+slot 447282168: HTTP 200 | 15559298 bytes | 2726 ms | txs=1809
+slot 447282169: HTTP 200 | 14751546 bytes | 1085 ms | txs=1535
+slot 447282170: HTTP 200 | 17102371 bytes | 2274 ms | txs=1618
+slot 447282171: HTTP 200 | 15136098 bytes | 1151 ms | txs=1566
+slot 447282172: HTTP 200 | 14819166 bytes | 1204 ms | txs=1678
+slot 447282173: HTTP 200 | 11731213 bytes | 1076 ms | txs=1371
+slot 447282174: HTTP 200 | 10422965 bytes | 986 ms | txs=1306
+slot 447282175: HTTP 200 | 10224378 bytes | 1018 ms | txs=1288
+slot 447282176: HTTP 200 | 10203949 bytes | 928 ms | txs=1651
+slot 447282177: HTTP 200 | 10524965 bytes | 953 ms | txs=1351
+slot 447282178: HTTP 200 | 11336960 bytes | 1094 ms | txs=1472
+slot 447282179: HTTP 200 | 10717123 bytes | 884 ms | txs=1371
+slot 447282180: HTTP 200 | 13121774 bytes | 1023 ms | txs=1455
+slot 447282181: HTTP 200 | 10664167 bytes | 1109 ms | txs=1278
+slot 447282182: HTTP 200 | 9928971 bytes | 765 ms | txs=1266
+slot 447282183: HTTP 200 | 10193867 bytes | 830 ms | txs=1264
+--- SUMMARY ---
+slots=20 ok=20 wall=30.0s
+bytes/slot avg=12601693 (ok rows)
+ms/block avg=1242 (all) / 1242 (ok)
+ms p50=1085 p95=2274
+http413=0 http429=0 timeout=0 bad_ratio=0% rpc_errors=0 (of which -32015=0)
+OVER20PCT=NO
+fixture_wallet=FhsbQzAJ… blocks_parsed=20 txs_downstream=28857 events_for_20_blocks=0
+JSONSUMMARY {"host": "local", "phase": "B-corrected", "version": 1, "slots": 20, "ok": 20, "wall_s": 30.0, "bytes_per_slot_avg": 12601693, "ms_per_block_avg": 1242, "p50_ms": 1085, "p95_ms": 2274, "http_413": 0, "http_429": 0, "timeout": 0, "rpc_errors": 0, "minus32015": 0, "bad_ratio": 0.0, "over20pct": false, "blocks_parsed": 20, "event_count": 0}
+
+== 6. REAL 20-SLOT MEASUREMENT — HOST: server (194.163.187.250, chạy từ /tmp, KHÔNG đụng /opt/wallet-watch) ==
+HOST: server
+RPC: https://solana-rpc.publicnode.com
+WW_DIR: /tmp/t7_measure_ww
+getSlot(confirmed) = 447282681  (177 ms)
+
+=== PHASE A-spec-pinned (maxSupportedTransactionVersion=0) ===
+slot 447282662: HTTP 200 | 239 bytes | 148 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282663: HTTP 200 | 239 bytes | 348 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282664: HTTP 200 | 239 bytes | 88 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282665: HTTP 200 | 239 bytes | 119 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282666: HTTP 200 | 239 bytes | 96 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282667: HTTP 200 | 239 bytes | 69 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282668: HTTP 200 | 239 bytes | 142 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282669: HTTP 200 | 239 bytes | 295 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282670: HTTP 200 | 239 bytes | 85 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282671: HTTP 200 | 239 bytes | 107 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282672: HTTP 200 | 239 bytes | 82 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282673: HTTP 200 | 239 bytes | 60 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282674: HTTP 200 | 239 bytes | 62 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282675: HTTP 200 | 239 bytes | 65 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282676: HTTP 200 | 239 bytes | 73 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282677: HTTP 200 | 239 bytes | 1310 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282678: HTTP 200 | 239 bytes | 133 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282679: HTTP 200 | 239 bytes | 136 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282680: HTTP 200 | 239 bytes | 136 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+slot 447282681: HTTP 200 | 239 bytes | 126 ms | txs=None | ERR -32015 Transaction version (1) is not supported by the re
+--- SUMMARY ---
+slots=20 ok=0 wall=3.7s
+bytes/slot avg=0 (ok rows)
+ms/block avg=184 (all) / 0 (ok)
+ms p50=119 p95=348
+http413=0 http429=0 timeout=0 bad_ratio=0% rpc_errors=20 (of which -32015=20)
+OVER20PCT=NO
+JSONSUMMARY {"host": "server", "phase": "A-spec-pinned", "version": 0, "slots": 20, "ok": 0, "wall_s": 3.7, "bytes_per_slot_avg": 0, "ms_per_block_avg": 184, "p50_ms": 119, "p95_ms": 348, "http_413": 0, "http_429": 0, "timeout": 0, "rpc_errors": 20, "minus32015": 20, "bad_ratio": 0.0, "over20pct": false, "blocks_parsed": 0, "event_count": 0}
+
+=== PHASE B-corrected (maxSupportedTransactionVersion=1) ===
+slot 447282662: HTTP 200 | 8640345 bytes | 491 ms | txs=1352
+slot 447282663: HTTP 200 | 11388634 bytes | 688 ms | txs=1398
+slot 447282664: HTTP 200 | 13307064 bytes | 867 ms | txs=1550
+slot 447282665: HTTP 200 | 9215368 bytes | 691 ms | txs=1368
+slot 447282666: HTTP 200 | 8673575 bytes | 564 ms | txs=1270
+slot 447282667: HTTP 200 | 9333713 bytes | 525 ms | txs=1334
+slot 447282668: HTTP 200 | 9390624 bytes | 683 ms | txs=1311
+slot 447282669: HTTP 200 | 7376553 bytes | 581 ms | txs=1143
+slot 447282670: HTTP 200 | 7603048 bytes | 620 ms | txs=1229
+slot 447282671: HTTP 200 | 6838741 bytes | 761 ms | txs=1173
+slot 447282672: HTTP 200 | 12534804 bytes | 929 ms | txs=1571
+slot 447282673: HTTP 200 | 8112932 bytes | 466 ms | txs=1195
+slot 447282674: HTTP 200 | 10053654 bytes | 568 ms | txs=1334
+slot 447282675: HTTP 200 | 10186320 bytes | 690 ms | txs=1511
+slot 447282676: HTTP 200 | 13507693 bytes | 786 ms | txs=1631
+slot 447282677: HTTP 200 | 7602427 bytes | 800 ms | txs=1221
+slot 447282678: HTTP 200 | 9916488 bytes | 700 ms | txs=1349
+slot 447282679: HTTP 200 | 9127877 bytes | 841 ms | txs=1240
+slot 447282680: HTTP 200 | 10043427 bytes | 1002 ms | txs=1381
+slot 447282681: HTTP 200 | 10382750 bytes | 703 ms | txs=1415
+--- SUMMARY ---
+slots=20 ok=20 wall=17.2s
+bytes/slot avg=9661802 (ok rows)
+ms/block avg=698 (all) / 698 (ok)
+ms p50=691 p95=929
+http413=0 http429=0 timeout=0 bad_ratio=0% rpc_errors=0 (of which -32015=0)
+OVER20PCT=NO
+fixture_wallet=FhsbQzAJ… blocks_parsed=20 txs_downstream=26976 events_for_20_blocks=0
+JSONSUMMARY {"host": "server", "phase": "B-corrected", "version": 1, "slots": 20, "ok": 20, "wall_s": 17.2, "bytes_per_slot_avg": 9661802, "ms_per_block_avg": 698, "p50_ms": 691, "p95_ms": 929, "http_413": 0, "http_429": 0, "timeout": 0, "rpc_errors": 0, "minus32015": 0, "bad_ratio": 0.0, "over20pct": false, "blocks_parsed": 20, "event_count": 0}
+server /tmp artifacts đã xoá sau đo (t7 count = 0).
+
+== 7. REAL CLI E2E (--feed block --once, STATE_PATH redirect) ==
+REAL_STATE before: ('2026-09-11T11:36:49.371432+00:00', 613)
+EXIT: 0
+STDOUT:
+# watch 1 ví | feed=block | 5 quote-mints | min $0.5
+# rpc https://solana-rpc.publicnode.com | ws wss://solana-rpc.publicnode.com
+# gap: skip slot 1001..447282925 (lag>20)
+OBSERVED _sol_px after startup = 98.74
+
+STDERR (tail):
+(empty)
+REAL_STATE after: ('2026-09-11T11:36:49.371432+00:00', 613)
+REAL_STATE UNCHANGED: True
+/tmp/t7_state.json block_slot: 447282925
+Ghi chú: gap line 'skip slot 1001..N' là hành vi ĐÚNG — /tmp/t7_state.json
+còn block_slot=1000 từ harness ⇒ resume stale ⇒ lag>20 ⇒ in gap, nhảy tới
+cur-20, save, xử lý block thật 12MB, once-exit. Chứng minh gap+resume trên
+chain thật. _sol_px=98.74 lấy từ DexScreener thật qua sol_price() startup.
+
+== 8. ADVERSARIAL CLASSES ==
+misleading_success_output : harness in call-log (method,params) + block_slot transitions từng scenario (mục 4)
+stale_state               : scenario b (resume từ block_slot=500 pre-seeded, getSlot_calls=1) + mục 7 e2e gap-jump từ state cũ; real scripts/wallet_watch_state.json mtime+size in before/after, UNCHANGED (harness + e2e)
+malformed_input           : blk thiếu 'transactions' / [] / entry thiếu meta / block 200 tx / getSlot < slot / non-dict (None,'garbage',[1,2],42) — scenario d + mal.*
+hung_long_commands        : harness offline ~1-2s (x2 run + x2 internal = 4 suite, seconds); 20-slot bounded (local 34.2s, server 20.9s wall, in trong summary); --once không loop vô hạn (mọi scenario once kết thúc)
+flaky_tests               : RUN1==RUN2 IDENTICAL (in-process) + shell-level diff IDENTICAL; measurement báo distribution (avg/p50/p95/ratio trên cả 2 host)
+cancel_resume             : scenario k — KI sau slot 1002 ⇒ persisted 1002 ⇒ resume start 1003 ⇒ getBlock đầu tiên slot 1003; transitions [1000,1001,1002] in OBSERVED
+prompt_injection          : N/A
+dirty_worktree            : N/A (không phải git repo)
+repeated_interruptions    : N/A
+
+== 9. KẾT LUẬN SỐ ĐO ==
+413/429/timeout trên cả 2 host, cả 2 phase = 0% (< 20%) ⇒ KHÔNG thêm ceiling
+comment/banner theo điều kiện spec (điều kiện không trigger).
+Rủi ro vận hành (báo số, không đổi design): block ~0.7-1.2s fetch+parse mỗi
+slot trong khi slot mới sinh ~0.4s ⇒ block-scan jsonParsed-full trên public RPC
+KHÔNG theo kịp realtime một mình; feed vẫn đúng (gap-skip bảo toàn) nhưng sẽ
+bỏ slot giữa các gap ⇒ cần RPC trả phí (Helius/Triton) hoặc transactionDetails
+nhẹ hơn nếu muốn full coverage. 12.6MB/slot × ~2.5 slot/s ≈ 31MB/s sustained
+nếu theo kịp — public node sẽ chặn ở mức đó.
+
+EVIDENCE_RECORDED: /home/namvt/Desktop/dev-space/signal_scan/.omo/evidence/gmgn-parity-fixes/T7.log
+
+===== FIX ROUND 2 =====
+date: 2026-09-15 22:47:32 +07 | scope: DEFECT 1 (--once unbounded) + DEFECT 2 (process_sig ver=0) — không đổi gì khác
+
+-- F2.1 DEFECT 1 fix: _ONCE_MAX_SLOTS=5 + _block_txs generator --
+run_block_feed final line count:
+  _block_txs: 10 lines
+  run_block_feed: 49 lines (<50 OK)
+  constant: _ONCE_MAX_SLOTS = 5
+
+-- F2.2 DEFECT 1 harness (/tmp/t7_fix.py) — 4 case + real-state, x2 IDENTICAL --
+[PASS] fix1.a once_5xNone_bounded
+       OBSERVED: getBlock_calls=5 slots=[1000, 1001, 1002, 1003, 1004] save_state_calls=1 saved_block_slot=1004 transitions=[1000, 1001, 1002, 1003, 1004]
+[PASS] fix1.b once_5xSkipped_bounded
+       OBSERVED: getBlock_calls=5 slots=[1000, 1001, 1002, 1003, 1004] save_state_calls=1 saved_block_slot=1004 transitions=[1000, 1001, 1002, 1003, 1004]
+[PASS] fix1.c once_valid_on_3rd
+       OBSERVED: getBlock_calls=3 slots=[1000, 1001, 1002] handled_sigs=['SIG_0', 'SIG_1'] tx_shape_ok=True save_state_calls=1 saved_block_slot=1002 transitions=[1000, 1001, 1002]
+[PASS] fix1.d non_once_still_loops
+       OBSERVED: getBlock_calls=11 (10 unusable + call#11 = StopFeed trigger, không thoát sớm ở 5) save_state_calls=0 (đúng: non-once chỉ save theo save_every) block_slot=1009 transitions_len=10
+[PASS] real_state_untouched
+       OBSERVED: before=('2026-09-11T11:36:49.371432+00:00', 613, 1789126609371432091) after=('2026-09-11T11:36:49.371432+00:00', 613, 1789126609371432091)
+FIX1 HARNESS 5/5 PASS
+
+RUN1==RUN2: IDENTICAL
+--- shell-level: chạy 2 lần exit 0/0, diff rỗng ⇒ SHELL_X2_DIFF: IDENTICAL ---
+Ghi chú fix1.d: getBlock_calls=11 = 10 slot unusable (vượt trần 5, non-once KHÔNG thoát sớm) + call#11 là sentinel StopFeed của harness.
+
+-- F2.3 DEFECT 2 fix + real-chain measurement --
+grep -n maxSupportedTransactionVersion scripts/wallet_watch.py:
+  813:                    "maxSupportedTransactionVersion": 1,
+  924:# run_block_feed < 50 dòng). maxSupportedTransactionVersion: đo 2026-09-15 trên
+  930:    "maxSupportedTransactionVersion": 1,
+process_sig control flow: chỉ đổi VALUE 0→1 (+comment đo), cấu trúc try/except/dedup T5 byte-identical:
+      try:
+          tx = rpc(
+              "getTransaction",
+              [
+                  sig,
+                  {
+                      "encoding": "jsonParsed",
+                      # đo 2026-09-15 mainnet tx v1 3EYBtojH…TKhoCq: ver=0 ⇒
+                      # -32015 "Transaction version (1) is not supported" ⇒ ws/poll
+                      # MẤT MỌI tx v1; ver=1 ⇒ OK (cùng defect đã đo ở _BLOCK_PARAMS).
+                      "maxSupportedTransactionVersion": 1,
+                      "commitment": "confirmed",
+                  },
+              ],
+          )
+      except Exception as e:
+          print(f"  ! {sig[:12]}… getTransaction: {e}", file=sys.stderr)
+          return
+      if not tx:
+          return
+      if not _seen_add(sig):
+          return
+      _handle_tx(tx, sig, wallets, st)
+      save_state(st)
+
+DEFECT2 real-chain getTransaction, sig = 3EYBtojHybSxAtadHJYVv6tskbhkCyJZsF5yKohWHWLbmVvjT9vfcVvDhk66KNwqf9RNYVcw4mgpFUMb6kTKhoCq
+  ver=0: HTTP200 body=239B -> JSON-RPC error -32015 Transaction version (1) is not supported by the requesting client. Please try the request 
+  ver=1: HTTP200 body=1614B -> OK, tx.version=1 slot=447286274 signatures[0][:12]=3EYBtojHybSx
+
+-- F2.4 Gates cuối --
+AST OK
+All checks passed!
+RUFF: All checks passed!
+LSP diagnostics (severity=error) trên scripts/wallet_watch.py: 0 (clean)
+Real scripts/wallet_watch_state.json: mtime_ns+size in before/after trong harness = (1789126609371432091, 613) UNCHANGED
+
+CLEANUP: /tmp/t7_fix.py removed
+CLEANUP: /tmp/t7_fix_run1.out removed
+CLEANUP: /tmp/t7_fix_run2.out removed
+CLEANUP: /tmp/t7_defect2.out removed
+CLEANUP: /tmp/t7fix_state.json removed
+
+EVIDENCE_RECORDED: /home/namvt/Desktop/dev-space/signal_scan/.omo/evidence/gmgn-parity-fixes/T7.log

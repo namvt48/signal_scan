@@ -1,0 +1,8 @@
+# node:20-slim = glibc -> better-sqlite3 prebuilt binaries work out of the box.
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+CMD ["node", "dist/index.js"]

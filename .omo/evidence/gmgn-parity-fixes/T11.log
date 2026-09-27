@@ -1,0 +1,105 @@
+T11 — Deploy + verify thật trên server
+======================================
+VERDICT: **PASS (attempt 2)** — nhưng có 1 CAVEAT coverage chưa đạt full.
+Attempt 1 FAIL (bắt được crash production) → fix → attempt 2 PASS.
+
+Người thực hiện: orchestrator (Atlas) qua ssh key auth; fix code delegate `ses_f579b19d1ffeDJqHYAXzedIZfT`.
+
+────────────────────────────────────────────────────────
+0) Deploy-readiness probe (read-only, trước khi mutate)
+────────────────────────────────────────────────────────
+- ssh + key auth OK: root@194.163.187.250 (host vmi2958603)
+- production chạy code CŨ: sha bf588883…30e7 / 39697 B; `def classify`=2, `run_block_feed`=0
+- `--feed` default = "block" (L1047) ⇒ restart không cần sửa unit
+- unit: wallet-watch.service + drop-in track.conf
+  ExecStart=venv/bin/python wallet_watch.py --min-usd 0.1 --jsonl events.jsonl --track --api-url http://127.0.0.1:8124
+- payload T11 chưa có trên server: fixtures/ ABSENT, test_gmgn_api_parity.py ABSENT
+
+────────────────────────────────────────────────────────
+1) ATTEMPT 1 — DEPLOY + PHÁT HIỆN CRASH (FAIL)
+────────────────────────────────────────────────────────
+- backup: cp -a wallet_watch.py wallet_watch.py.bak.preT11.20260916T060207
+- baseline: events.jsonl = 2012 dòng; NRestarts=0
+- scp wallet_watch.py (d7705569…4720 / 45735 B) + 5 test + backtest_parity → /opt/wallet-watch/ (rc=0)
+- scp -r scripts/fixtures → /opt/wallet-watch/fixtures (19 file, rc=0)
+- remote sha sau scp = d77055695a09d8830cff5d68ae64c91a0c71235638c89e826f227ed7c1aa4720 ✔ khớp local
+- GATE OFFLINE TRƯỚC RESTART (bắt buộc): `venv/bin/python test_gmgn_api_parity.py`
+    GATE_EXIT=0
+    PASS steps 29/29 · identity 29/29 · side 29/29 · amounts exact 23/29 + 6 gross (amount_basis=gross_leg)
+    MUTATION GATE: 4/4 RED(FAIL)→GREEN(PASS) · ALL OK
+    wallet_watch.py byte-identical sau 4 mutation in-process: True
+- restart: systemctl restart wallet-watch (pid 503094, 06:03:34 CEST)
+
+  **VERIFY THẤT BẠI:**
+  journalctl: 06:04:05 "Main process exited, code=exited, status=1/FAILURE" → restart counter 1
+  (sau đó NRestarts leo 1 → 3 = restart-loop; traceback trong watch.log leo 2 → 5)
+
+  Traceback thật (frame chính xác):
+    wallet_watch.py:1164 <module> → 1130 main → 973 run_block_feed
+        blk = rpc("getBlock", [slot, _BLOCK_PARAMS])
+      → 149 rpc → 142 http_json   ← raise IncompleteRead
+    http.client.IncompleteRead: IncompleteRead(496520 bytes read)
+    File "/usr/lib/python3.12/http/client.py", line 612, in _read_chunked
+
+  ROOT CAUSE: `http.client.IncompleteRead` kế thừa HTTPException → Exception,
+  KHÔNG thuộc OSError/URLError ⇒ thoát except tuple của rpc() (L155-161)
+  ⇒ vượt `except RuntimeError` ở run_block_feed L974 ⇒ giết daemon.
+  Cùng lỗ: `json.JSONDecodeError` (ValueError) khi body méo (proxy trả HTML).
+  Lỗ MỚI do T7 (block feed getBlock payload lớn); feed ws cũ không có nhánh này.
+
+────────────────────────────────────────────────────────
+2) FIX (delegate ses_f579b19d1ffeDJqHYAXzedIZfT)
+────────────────────────────────────────────────────────
+- `wallet_watch.py`: +`import http.client`; except tuple của rpc() +=
+  `http.client.HTTPException`, `json.JSONDecodeError`; nhánh non-skip của
+  run_block_feed: `raise` → warn `# rpc skip slot {slot}: {err}` + bỏ slot
+  (tái dùng khối `not isinstance(blk, dict)` sẵn có). Nhánh `-32004`/skipped giữ nguyên.
+- test mới `scripts/test_rpc_resilience.py` (200 dòng, 13/13): monkeypatch urlopen
+  trả body raise IncompleteRead ⇒ assert rpc() chỉ RuntimeError SAU khi hết endpoint,
+  HTML body → JSONDecodeError coi là transport, -32004 giữ chữ "skipped",
+  run_block_feed KHÔNG raise + in warn. RED trước fix → GREEN sau.
+- `test_block_feed.py` scenario (iii) flip: trước assert "lỗi KHÔNG-skip ⇒ RuntimeError propagate"
+  (= đúng contract cũ mà fix này đảo ngược) → nay assert warn + skip + sống sót;
+  vẫn giữ assert 29/29 event ở nhánh -32004 (không nới test).
+- sha MỚI: d7a0cf2260e2381e2a5be7d12d4b3ad5db2e3bfaec9b1a87989195d7fa829818 / 46396 B
+- local verify (orchestrator tự chạy): 5/5 suite EXIT=0 + LSP 0 error
+    test_gmgn_api_parity: PASS 29/29 nguyên văn + MUTATION GATE 4/4
+    test_block_feed 19/19 · test_wallet_watch 11/11 · test_route_detect 15/15 · test_rpc_resilience 13/13
+
+────────────────────────────────────────────────────────
+3) ATTEMPT 2 — REDEPLOY + VERIFY (PASS)
+────────────────────────────────────────────────────────
+- backup2: wallet_watch.py.bak.preT11b.20260916T061841 (bản crash d7705569…4720)
+- scp wallet_watch.py + test_rpc_resilience.py + test_block_feed.py; remote sha = d7a0cf22… ✔
+- GATE TRƯỚC RESTART: GATE_EXIT=0, PASS 29/29 nguyên văn, MUTATION GATE 4/4 ALL OK
+- restart (pid 513996)
+- Sau 90s (bản cũ chết ở 31s):
+    is_active=active · **NRestarts=0** · traceback KHÔNG tăng (5→5)
+    etime 01:30 · block_slot 447429681 → 447430065 (+384)
+- Sau ~7 phút:
+    NRestarts=0 · etime 06:47 · block_slot 447431116
+- **BANNER (đã flush): `# watch 4 ví | feed=block | 5 quote-mints | min $0.1` ⇒ feed=block XÁC NHẬN**
+- `grep -ac TRANSFER_ watch.log` = **0**
+- `grep -ac "rpc skip slot" watch.log` = 0 (đường warn mới chưa bị kích hoạt)
+- events.jsonl = 2012 (không ví nào giao dịch trong cửa sổ quan sát)
+
+────────────────────────────────────────────────────────
+4) CAVEAT — COVERAGE CHƯA ĐẠT FULL (cần biết)
+────────────────────────────────────────────────────────
+Đo trên watch.log (chỉ code mới):
+    gap_jumps = 1178 · total_slots_skipped = 3721 · max_single_gap = 67
+    error/rate-limit lines = 0 (KHÔNG phải lỗi, mà là năng lực RPC)
+Span first→last gap ≈ 4264 slot, bỏ 3721 ⇒ **coverage thực tế thấp (~13–40%)**.
+Nguyên nhân: `getBlock` ~1.1 s trong khi chain ra slot ~0.4 s ⇒ `--block-max-lag 20`
+nhảy tới liên tục ⇒ bỏ slot. Tức vẫn CÓ THỂ miss swap.
+Đây đúng là ceiling đã cảnh báo trước khi deploy.
+Khắc phục: RPC trả phí độ trễ thấp (hoặc tăng song song / nới max_lag có chủ đích).
+
+────────────────────────────────────────────────────────
+5) ROLLBACK KHẢ DỤNG
+────────────────────────────────────────────────────────
+- wallet_watch.py.bak.preT11.20260916T060207  = code cũ ổn định (bf588883…30e7)
+- wallet_watch.py.bak.preT11b.20260916T061841 = bản crash (d7705569…4720)
+
+Còn lại (chuyển F4): cần ≥1 event SWAP MỚI để assert count(`amount_basis`) == count(SWAP mới)
+và đối chiếu tay 1–2 sig với chain. Chưa có traffic ⇒ chưa thể hoàn tất.
