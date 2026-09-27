@@ -18,7 +18,7 @@ import {
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
-  trackedCasForWallet,
+  watchedCasForWallet,
   upsertNansenSeries,
   type CaScoreGateRow,
   type CaTarget,
@@ -899,10 +899,10 @@ export function earlySetupIdle(): Promise<void> {
 }
 
 /** Token balances for one wallet row, immediately. `ca` = the single pair a trade
- * event landed on; omitted = the wallet's own Tracked-by CAs (add/edit path). */
+ * event landed on; omitted = every still-tracked CA the wallet has traded (add/edit path). */
 export function kickWalletRow(row: WalletRow, ca?: string): void {
   if (!pollerDeps) return;
-  kickWallet(pollerDeps.provider, row.id, row.address, row.chain, ca ? [ca] : trackedCasForWallet(row.id));
+  kickWallet(pollerDeps.provider, row.id, row.address, row.chain, ca ? [ca] : watchedCasForWallet(row.id));
 }
 
 /** Pull one CA's token info now (creates token_state → detail 404 fix).

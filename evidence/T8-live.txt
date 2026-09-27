@@ -1,0 +1,115 @@
+T8 — EVM watcher LIVE smoke test (Base) — 2026-09-27
+====================================================
+Instance: B (/root/signal_scan_b, port 8125, project signal_scan_b)
+Purpose: prove the whole path end-to-end on real chain data (not a unit test):
+  API wallets(chain) -> chunked eth_getLogs backfill -> wallet topic filter
+  -> eth_getTransactionReceipt -> router allowlist -> classify_swap
+  -> price -> emit -> POST trade -> wallet_trades row
+
+Setup
+-----
+- Wallet registered through the real API (B had 0 wallets: fresh DB from T9):
+    POST http://127.0.0.1:8125/api/wallets
+    {"address":"0x4707b199110609a8b297ea3806b84975b8509211","chain":"base",
+     "name":"smoke-base-uniswapv3","source":"manual"}
+    -> {"id":"29b91e9c-3f5d-4ed7-9204-4793d312cc4f","chain":"base", ...}
+- Target found by an independent read-only probe: 0x4707b199... received DEGEN at
+  block 51852480 in tx 0x234599603d819c5bd91f83f2186434c6ee6ea7a5fb8ad81799717ce4329a6b02
+  via the allowlisted uniswap-v3 router 0x2626664c2603336E57B271c5C0b26F421741e481.
+- Backfill has an explicit cold-start rule (watchers/evm/feed.py:259-261): with no
+  state it starts AT THE TIP and never crawls history. To exercise the swap
+  deterministically the cursor was pre-seeded to just below it:
+    /root/signal_scan_b/evm_watch_state.json = {"evm":{"base":{"last_block":51852475}}}
+- minUsd temporarily set to 0 (PUT /api/settings) then restored to 50.
+
+Command
+-------
+cd /root/signal_scan_b && python3 -m watchers.evm --once --feed poll \
+  --api-url http://127.0.0.1:8125 --confirmations 1 --chunk 50 --min-usd 0 \
+  --jsonl /tmp/evm-smoke.jsonl
+
+Output (exit=0)
+---------------
+# evm watch base=1 bsc=0 ví (source=api) | feed=poll | conf=1 | min $0.0
+# rpc base=https://mainnet.base.org bsc=https://bsc-dataseed.binance.org
+# backfill base: block 51852476..51853139 (latest 51853139, conf 1, chunk 50)
+2026-09-27 14:31:47 BUY   0x4707…9211 [base]  520.591744 0x4ed4e862…  via uniswap-v3
+  https://basescan.org/tx/0x234599603d819c5bd91f83f2186434c6ee6ea7a5fb8ad81799717ce4329a6b02
+
+jsonl event (/tmp/evm-smoke.jsonl)
+---------------------------------
+{"type":"SWAP","chain":"base","wallet":"0x4707b199110609a8b297ea3806b84975b8509211",
+ "side":"BUY","ca":"0x4ed4e862860bed51a9570b96d89af5e1b0efefed",
+ "qty_raw":520591743995866623733,"qty":520.5917439958666,"router":"uniswap-v3",
+ "quote_sym":null,"quote_raw":null,
+ "tx":"0x234599603d819c5bd91f83f2186434c6ee6ea7a5fb8ad81799717ce4329a6b02",
+ "block":51852480,"ts":"2026-09-27 14:31:47","usd":0.0}
+
+DB row on B (data-b/signal_scan.db)
+----------------------------------
+wallet_trades: 1 row, chain='base'
+  ('29b91e9c-3f5d-4ed7-9204-4793d312cc4f', '0x4ed4e862860bed51a9570b96d89af5e1b0efefed',
+   1790494307000, 'buy', 0.0, 0.0,
+   '0x234599603d819c5bd91f83f2186434c6ee6ea7a5fb8ad81799717ce4329a6b02', 'watch', 'base')
+token_state base: ('0x4ED4...efefed','DEGEN',0.0011107534)
+
+Verdict
+-------
+PASS on Base: API wallet(chain=base) -> state-cursor backfill -> wallet topic filter
+-> receipt -> router allowlist (uniswap-v3) -> classify_swap -> emit -> POST trade
+-> wallet_trades row with chain='base'.
+
+Observations (not blockers)
+---------------------------
+- usd=0.0 and quote_sym=null: the classifier saw the DEGEN leg but no QUOTE_TOKEN leg
+  in that tx, and the daemon's DexScreener lookup returned no price, so usd fell back
+  to 0. The min_usd gate is fail-open while usd is None (feed.py:188), so the event
+  still emitted — the documented behaviour.
+BSC leg (same session, second run)
+----------------------------------
+BSC keyless RPC cannot serve receipts from the shipped default, so the run used the
+verified receipts-capable endpoint through the built-in env override (no code change):
+    BSC_RPC_URL=https://1rpc.io/bnb
+Setup: registered the wallet
+  POST /api/wallets {"address":"0xdde06e9cc710c4f9ec2b838463cc550a7027f713","chain":"bsc", ...}
+  -> {"id":"d43d7d45-bdf7-4c5e-83d8-663288e9b3de","chain":"bsc"}
+state cursor seeded: {"evm":{"base":{"last_block":51853139},"bsc":{"last_block":124296373}}}
+minUsd temporarily 0, then restored to 50.
+
+Command (same, with the env override + chunk 50 — 1rpc.io/bnb rejects wider ranges):
+BSC_RPC_URL=https://1rpc.io/bnb python3 -m watchers.evm --once --feed poll \
+  --api-url http://127.0.0.1:8125 --confirmations 1 --chunk 50 --min-usd 0 \
+  --jsonl /tmp/evm-smoke-bsc.jsonl
+
+Output (exit=0)
+---------------
+# evm watch base=1 bsc=1 ví (source=api) | feed=poll | conf=1 | min $0.0
+# rpc base=https://mainnet.base.org bsc=https://1rpc.io/bnb
+# backfill base: block 51853140..51853225 (latest 51853225, conf 1, chunk 50)
+# backfill bsc: block 124296374..124296591 (latest 124296591, conf 1, chunk 50)
+2026-09-27 14:55:03 SELL  0xdde0…f713 [bsc]  9.812144 0x0e09fabb… ← WBNB  via pancake-v3-smart
+  https://bscscan.com/tx/0x607af6449a43900801201c563ca9f17fe242cea20a2f01e7838b7062cbb900c1
+
+jsonl event
+-----------
+{"type":"SWAP","chain":"bsc","wallet":"0xdde06e9cc710c4f9ec2b838463cc550a7027f713",
+ "side":"SELL","ca":"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82","qty_raw":9812144000000000000,
+ "qty":9.812144,"router":"pancake-v3-smart","quote_sym":"WBNB",
+ "quote_raw":34983891809063400,
+ "tx":"0x607af6449a43900801201c563ca9f17fe242cea20a2f01e7838b7062cbb900c1",
+ "block":124296378,"ts":"2026-09-27 14:55:03","usd":0.0}
+
+DB rows on B (both chains, after both runs)
+------------------------------------------
+  ('bsc', 'sell', '0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82', 0.0, '0x607af644…900c1', 'watch')
+  ('base','buy',  '0x4ed4e862860bed51a9570b96d89af5e1b0efefed', 0.0, '0x23459960…9a6b02','watch')
+
+Note on direction: a pre-run probe had guessed this wallet was a BUY (it simply took
+the first token transfer's `to`). The classifier is authoritative and returned SELL —
+the two-leg view (CAKE out, WBNB in) is correct. The probe label was wrong, not the code.
+
+Verdict: T8 live E2E PASSES on BOTH chains.
+
+Open observation (see evidence/T8-price-bug.txt): usd=0.0 in BOTH events because the
+chain-aware price lookup never resolves an EVM CA (address-case mismatch), so the
+min_usd gate is effectively fail-open for every EVM trade.

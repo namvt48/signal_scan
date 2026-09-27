@@ -368,3 +368,22 @@ def test_refresh_cfg_failsoft(monkeypatch):
     monkeypatch.setattr(emain, "_wallets_path", "/nonexistent/wallets.txt")
     emain.refresh_cfg(per)  # không raise
     assert per == {"base": ["0xold"], "bsc": []}  # API chết ⇒ giữ nguyên ví
+
+
+def test_price_pairs_matches_evm_address_case_insensitively():
+    from watchers.common import price as price_mod
+
+    checksummed = "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"
+    from_log = checksummed.lower()
+    pairs = [
+        {
+            "baseToken": {"address": checksummed, "symbol": "DEGEN"},
+            "quoteToken": {
+                "address": "0x4200000000000000000000000000000000000006",
+                "symbol": "WETH",
+            },
+            "priceUsd": "0.0011",
+            "priceNative": "0.0000004",
+        }
+    ]
+    assert price_mod._price_from_pairs(pairs, from_log) == ("DEGEN", 0.0011)

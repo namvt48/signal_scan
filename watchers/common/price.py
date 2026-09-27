@@ -107,6 +107,9 @@ def _price_from_pairs(pairs, mint):
     thứ hạng pool của DexScreener. Pure — unit-test offline được."""
     pxs: list[float] = []
     sym = None
+    # EVM CA từ log là lowercase, DexScreener trả checksummed ⇒ phải lower() 2 vế;
+    # bỏ đi là mọi giá EVM về 0.0 (Sol base58 nguyên văn nên không đổi hành vi).
+    m = mint.lower()
     for p in pairs or []:
         b = p.get("baseToken") or {}
         q = p.get("quoteToken") or {}
@@ -115,9 +118,9 @@ def _price_from_pairs(pairs, mint):
             pn = float(p.get("priceNative") or 0.0)
         except (TypeError, ValueError):
             continue
-        if b.get("address") == mint:
+        if (b.get("address") or "").lower() == m:
             px, s = pu, b.get("symbol")
-        elif q.get("address") == mint:
+        elif (q.get("address") or "").lower() == m:
             px, s = (pu / pn if (pu > 0 and pn > 0) else 0.0), q.get("symbol")
         else:
             continue

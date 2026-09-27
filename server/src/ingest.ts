@@ -3,7 +3,7 @@
 // push + poll can coexist safely (trades dedupe on UNIQUE(wallet_id, ca, chain,
 // tx, side); balances are replaced per (wallet, chain) in one transaction).
 
-import type { Chain } from './shared/chain.js';
+import { canonicalCa, type Chain } from './shared/chain.js';
 import type {
   HolderRow,
   MetricPatch,
@@ -282,7 +282,7 @@ export function insertTrades(
   let inserted = 0;
   const run = db.transaction((rows: WalletActivity[]) => {
     for (const a of rows) {
-      inserted += ins.run(walletId, a.ca, a.ts, a.side, a.amountUsd, a.price, a.tx, source, a.chain).changes;
+      inserted += ins.run(walletId, canonicalCa(a.ca, a.chain), a.ts, a.side, a.amountUsd, a.price, a.tx, source, a.chain).changes;
     }
   });
   run(activities);

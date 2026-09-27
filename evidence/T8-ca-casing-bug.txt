@@ -1,0 +1,107 @@
+T8 — BUG 2: CA EVM không có dạng chuẩn tắc ⇒ mọi join giữa hai bảng trượt
+==========================================================================
+Phát hiện 2026-09-27, TRONG path EVM vừa thêm (Sol không dính). Cùng họ gốc với
+T8-price-bug.txt (so sánh hex có phân biệt hoa/thường), nhưng lần này ở phía SERVER.
+
+Symptom
+-------
+wallet_token_state.balance_usd = NULL cho MỌI holding EVM, dù token_state đã có giá.
+
+  wallet_token_state (B):
+    smoke-base  ca 0x4ed4e862860bed51a9570b96d89af5e1b0efefed  amount 520.5917  balance_usd NULL
+    smoke-bsc   ca 0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82  amount 1273.7954 balance_usd NULL
+
+  token_state (B) — CÙNG token, giá có sẵn:
+    ca 0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed  chain base  price 0.0011107534  DEGEN
+    ca 0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82  chain bsc   price 2.76244792    Cake
+
+Root cause
+----------
+Không có dạng chuẩn tắc (canonical form) cho CA EVM. Cùng một token tồn tại ở HAI dạng:
+  - CHECKSUMMED: tracked_cas.address, token_state.ca  (vì tôi POST vào dạng này)
+  - LOWERCASE  : wallet_trades.ca (daemon ghi từ log), holding trả về từ evm.ts (đọc RPC)
+Và mọi chỗ join/so khớp đều so nguyên văn:
+
+  db.ts:764   getTokenState(ca, chain)
+              -> 'SELECT * FROM token_state WHERE ca = ? AND chain = ?'   (KHÔNG normalize)
+  ingest.ts:250  const p = getTokenState(r.ca, chain)?.price
+              r.ca = CA lowercase từ holding (evm.ts) -> trượt -> price null
+  ingest.ts:254  ins.run(wid, r.ca, price !== null ? r.amount * price : null, ...)
+              -> balance_usd = NULL (đúng như comment: "no usable price -> NULL, never 0")
+
+  api.ts:464  kickWalletRow(wallet, parsed.ca)   (sau mỗi trade từ daemon)
+              parsed.ca cũng lowercase -> đường thứ 2 dẫn tới cùng mismatch.
+
+  api.ts:144  parseTrackedCaBody: address = strField(b,'address')  — KHÔNG checksum/normalize
+              => không có điểm nào chuẩn hoá; dạng lưu phụ thuộc hoàn toàn vào client POST gì.
+
+Hệ quả (đều là EVM-only)
+------------------------
+1. balance_usd NULL cho mọi holding EVM => signals.ts:143 MAX(s.balance_usd) AS balUsd = NULL
+   => cột Tracked-Inflow / Holding % của CA EVM hiển thị "—".
+2. kickWalletRow sau mỗi trade EVM không tìm thấy giá => nhánh re-read (api.ts:461-464)
+   không bao giờ tạo được entry_usd cho trade EVM.
+3. Bất kỳ join theo ca giữa output EVM (lowercase) và tracked_cas/token_state (checksummed)
+   đều trượt im lặng — kể cả trong SQL.
+4. Biến thể tiềm ẩn CÙNG lỗi ở địa chỉ VÍ: findWalletByAddress(wallet, chain) (api.ts:435)
+   so nguyên văn với wallets.address. Trên B hiện khớp CHỈ VÌ tôi POST địa chỉ ví dạng
+   lowercase (0x4707b199110609a8b297ea3806b84975b8509211) và daemon cũng gửi lowercase.
+   Nếu ai POST dạng checksummed, trade của ví đó sẽ 404 "wallet not tracked".
+
+Vì sao Sol không dính
+---------------------
+Base58 phân biệt hoa/thường và cả hai phía (holding provider + DB) lấy từ CÙNG một nguồn,
+nên không bao giờ lệch. Cũng chính vì thế KHÔNG được lower() mù quáng:
+lower('base58') gộp hai địa chỉ Sol khác nhau thành một => sai token. Mọi fix phải gate theo chain.
+
+Phạm vi ảnh hưởng
+-----------------
+- Prod A (sol-only): 0 row EVM => không có gì để migrate, Sol không bị ảnh hưởng.
+- B: 2 tracked_cas + 2 token_state + 3 wallet_trades + 2 wallet_token_state => migrate rất rẻ.
+=> Đây chính là THỜI ĐIỂM ĐÚNG để chốt dạng chuẩn tắc, trước khi có dữ liệu EVM thật.
+
+FIX (ĐÃ ÁP DỤNG 2026-09-27) — dạng chuẩn tắc: LOWERCASE, đặt tại TẦNG DB
+-----------------------------------------------------------------------
+Chọn LOWERCASE (RPC/log vốn lowercase, daemon đã ghi lowercase, hex so sánh không phân
+biệt hoa/thường). Đặt ở TẦNG DB — choke point không caller nào vượt qua — thay vì ở từng
+parser, nhờ vậy phủ luôn CSV import và các caller tương lai.
+
+  server/src/shared/chain.ts   canonicalCa(ca, chain):
+        const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+        return chain !== 'sol' && EVM_ADDRESS.test(ca) ? ca.toLowerCase() : ca;
+  CHỈ chuẩn hoá địa chỉ ĐÚNG dạng EVM (0x + 40 hex). Chuỗi khác trả nguyên văn — cần thiết
+  vì (a) sol base58 phân biệt hoa/thường, (b) test/poller.test.ts dùng CA giả không-hex
+  ('CA-BASE', 'CA-HOLD') làm fixture cho coalesce theo chain; lowercase mù quáng sẽ đứt link
+  wallet_trades.ca <-> CA truyền vào kickWalletHoldingsFor và làm fail 1 test hợp lệ.
+  server/src/db.ts   áp canonicalCa tại 7 điểm:
+        insertTrackedCa / findTrackedCa / setTrackedCaEntryUsd
+        insertWallet / updateWallet / findWalletByAddress
+        getTokenState                        <-- điểm trực tiếp gây balance_usd NULL
+  server/src/ingest.ts  insertTrades (:285) — điểm thứ 8, bắt buộc: UNIQUE key gồm `ca`
+        (wallet_id, ca, chain, tx, side), nên CA checksummed sẽ tạo ROW TRÙNG cho cùng một
+        trade on-chain và phá luôn dedup, không chỉ phá join.
+  token_state tự canonical vì nó sinh ra từ tracked_cas.address (đã canonical).
+
+VERIFY
+------
+1. Unit test mới server/test/ca-canonical.test.ts (3 case):
+   - EVM CA lưu & tra lowercase dù input checksummed
+   - sol CA giữ nguyên văn; findTrackedCa(ca.toLowerCase()) === undefined  <-- chốt chống
+     "đơn giản hoá" thành lower() toàn cục (sẽ gộp 2 tài khoản sol khác nhau => sai token)
+   - địa chỉ ví EVM checksummed vẫn khớp row lowercase
+   npm test: 306 -> 309 pass / 0 fail.   npx tsc --noEmit: exit 0.
+2. Live trên B (backup /tmp/backup-preca-*.db; migrate 4 row EVM của B về lowercase):
+   - base  520.5917 DEGEN: balance_usd None -> 0.5782490496553385  (= 520.5917 x 0.0011107534)
+   - bsc  1273.7955 CAKE : balance_usd None -> 3518.793698288505  (= 1273.7955 x 2.76244792)
+   khớp CHÍNH XÁC giá trị kỳ vọng; dup token_state keys sau migrate: [].
+3. Cách kick bsc: POST /api/wallet-watch/trades side='transfer' (api.ts:442-445 ghi 0 row
+   trade nhưng VẪN kick theo cặp) -> wallet_trades vẫn 3 row, KHÔNG pollute dữ liệu test.
+
+PHÁT HIỆN PHỤ (KHÔNG phải bug EVM; có sẵn từ trước và áp cả Sol)
+----------------------------------------------------------------
+trackedCasForWallet (db.ts:376-385) CHỈ tính t.side='buy'. Ví chỉ có trade SELL (ví bsc
+smoke: 2 sell / 0 buy) => tập CA rỗng => kickWalletRow(row) không có ca -> kickWallet nhận
+cas.length===0 -> NO-OP IM LẶNG (poller.ts:940) => holdings không bao giờ được refresh qua
+đường add/edit, row giữ giá trị cũ. Đây là lý do ví bsc vẫn NULL sau migrate DÙ casing đã
+đúng — đã loại trừ bằng chứng (xem mục 2/3: kick theo cặp thì bsc điền đúng 3518.79).
+Không sửa trong phạm vi T8: pre-existing, ảnh hưởng cả Sol, là quyết định sản phẩm.

@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
-import { CHAINS, type Chain } from './shared/chain.js';
+import { CHAINS, canonicalCa, type Chain } from './shared/chain.js';
 import { config } from './config.js';
 import { MOCK_CA_POOL } from './providers/mock.js';
 
@@ -372,12 +372,14 @@ export function trackedByPairs(cas: readonly string[]): { ca: string; wallet: Wa
   return rows.map(({ ca, ...wallet }) => ({ ca, wallet }));
 }
 
-/** The CAs one wallet is `Tracked by` and that are still tracked — its query set. */
-export function trackedCasForWallet(walletId: string): string[] {
+/** The CAs to re-query for one wallet now: every still-tracked CA it has traded (BUY or
+ *  SELL) — a sell-only wallet still refreshes its holding; it just is not a member
+ *  (`Tracked by` stays BUY-only, see trackedByPairs). */
+export function watchedCasForWallet(walletId: string): string[] {
   const rows = getDb()
     .prepare(
       `SELECT DISTINCT t.ca AS ca FROM wallet_trades t
-        WHERE t.wallet_id = ? AND t.side = 'buy' AND t.source = 'watch'
+        WHERE t.wallet_id = ? AND t.source = 'watch'
           AND t.ca IN (SELECT address FROM tracked_cas)`,
     )
     .all(walletId) as { ca: string }[];
@@ -412,7 +414,7 @@ export function getWallet(id: string): WalletRow | undefined {
 
 /** Identity key is (address, chain) — the same address on 2 chains = 2 wallets (T4). */
 export function findWalletByAddress(address: string, chain: Chain): WalletRow | undefined {
-  return getDb().prepare('SELECT * FROM wallets WHERE address = ? AND chain = ?').get(address, chain) as
+  return getDb().prepare('SELECT * FROM wallets WHERE address = ? AND chain = ?').get(canonicalCa(address, chain), chain) as
     | WalletRow
     | undefined;
 }
@@ -420,16 +422,17 @@ export function findWalletByAddress(address: string, chain: Chain): WalletRow | 
 export function insertWallet(input: WalletInput): WalletRow {
   const id = randomUUID();
   const tags = JSON.stringify(input.tags);
+  const address = canonicalCa(input.address, input.chain);
   getDb()
     .prepare('INSERT INTO wallets (id, address, name, tags, chain, source, clan) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(id, input.address, input.name, tags, input.chain, input.source, input.clan ?? '');
-  return { id, address: input.address, name: input.name, tags, chain: input.chain, source: input.source, clan: input.clan ?? '' };
+    .run(id, address, input.name, tags, input.chain, input.source, input.clan ?? '');
+  return { id, address, name: input.name, tags, chain: input.chain, source: input.source, clan: input.clan ?? '' };
 }
 
 export function updateWallet(id: string, next: WalletInput): WalletRow | undefined {
   getDb()
     .prepare('UPDATE wallets SET address = ?, name = ?, tags = ?, chain = ?, source = ?, clan = ? WHERE id = ?')
-    .run(next.address, next.name, JSON.stringify(next.tags), next.chain, next.source, next.clan ?? '', id);
+    .run(canonicalCa(next.address, next.chain), next.name, JSON.stringify(next.tags), next.chain, next.source, next.clan ?? '', id);
   return getWallet(id);
 }
 
@@ -571,13 +574,13 @@ export function listCaTargetsMissingIcon(withinMs: number): CaTarget[] {
 export function findTrackedCa(address: string, chain: Chain): TrackedCaRow | undefined {
   return getDb()
     .prepare('SELECT * FROM tracked_cas WHERE address = ? AND chain = ?')
-    .get(address, chain) as TrackedCaRow | undefined;
+    .get(canonicalCa(address, chain), chain) as TrackedCaRow | undefined;
 }
 
 export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
   const row: TrackedCaRow = {
     id: randomUUID(),
-    address: input.address,
+    address: canonicalCa(input.address, input.chain),
     chain: input.chain,
     note: input.note,
     added_at: new Date().toISOString(),
@@ -597,7 +600,7 @@ export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
 export function setTrackedCaEntryUsd(address: string, chain: Chain, usd: number): TrackedCaRow | undefined {
   getDb()
     .prepare('UPDATE tracked_cas SET entry_usd = ? WHERE address = ? AND chain = ? AND entry_usd IS NULL')
-    .run(usd, address, chain);
+    .run(usd, canonicalCa(address, chain), chain);
   return findTrackedCa(address, chain);
 }
 
@@ -764,7 +767,7 @@ export function deleteTrackedCasByIds(ids: readonly string[]): number {
 export function getTokenState(ca: string, chain: Chain): TokenStateRow | undefined {
   return getDb()
     .prepare('SELECT * FROM token_state WHERE ca = ? AND chain = ?')
-    .get(ca, chain) as TokenStateRow | undefined;
+    .get(canonicalCa(ca, chain), chain) as TokenStateRow | undefined;
 }
 
 /** Newest fetched_at across token_state — health endpoint freshness signal. */

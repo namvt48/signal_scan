@@ -1,0 +1,65 @@
+T8 — BUG: mọi trade EVM ra usd=0.0 (gate min_usd vô hiệu) — fixed 2026-09-27
+=============================================================================
+Symptom
+-------
+Every EVM swap emitted by the daemon carried usd=0.0. Consequence: the min_usd gate
+(feed.py:188) is fail-open while usd is None, so it never filtered anything, and every
+EVM trade would show $0 in the UI.
+
+Root cause
+----------
+watchers/common/price.py :: _price_from_pairs compared addresses CASE-SENSITIVELY:
+    if b.get("address") == mint:      # baseToken side
+    elif q.get("address") == mint:    # quoteToken side
+EVM CAs read out of eth_getLogs / receipts are LOWERCASE hex; DexScreener returns the
+CHECKSUMMED form. The strings never matched ⇒ pxs empty ⇒ (None, 0.0) ⇒ get_price_usd
+returns None ⇒ usd None.
+
+Proof (real DexScreener responses, address as sent vs as returned)
+-----------------------------------------------------------------
+DEGEN/base  ca(sent)=0x4ed4e862860bed51a9570b96d89af5e1b0efefed
+            base=0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed
+            exact ==ca : False     lowercase ==ca : True     priceUsd=0.001099
+CAKE/bsc    ca(sent)=0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82
+            base=0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82
+            exact ==ca : False     lowercase ==ca : True     priceUsd=2.77
+
+Why the test suite missed it
+----------------------------
+- scripts/test_evm_feed.py :: _isolate monkeypatches feed.price.get_price_usd to a stub
+  returning 1.0 (line 117), so the EVM tests NEVER touch the real price path.
+- scripts/test_wallet_watch.py DOES test a _price_from_pairs, but it loads the LEGACY
+  scripts/wallet_watch.py — a different file, Sol-only, which sends the mint verbatim
+  (DexScreener echoes it), so it can never hit the case mismatch.
+- The shared module watchers/common/price.py had no direct test at all.
+
+Fix
+---
+watchers/common/price.py: normalize once with `m = mint.lower()` and compare
+`(b.get("address") or "").lower() == m` / `(q.get("address") or "").lower() == m`.
+Sol is unaffected: base58 is sent verbatim and DexScreener echoes it, so lowercasing
+both sides still matches.
+Regression test added:
+  scripts/test_evm_feed.py :: test_price_pairs_matches_evm_address_case_insensitively
+
+Verification
+------------
+- pytest scripts/: 93 passed -> 94 passed.
+- Live on B: the same two events re-run through the daemon with the fixed price.py:
+
+  event                                            before      after
+  base BUY  520.5917 DEGEN  via uniswap-v3         usd 0.0     usd 0.5713   (≈ $0.57)
+  bsc  SELL 9.8121  CAKE ← WBNB via pancake-v3-smart usd 0.0   usd 27.1796  (≈ $27.18)
+  bsc  SELL 119.8460 CAKE ← WBNB via pancake-v3-smart   —      usd 331.9735 (≈ $331.97)
+
+  The third event is a swap that happened DURING this session (block 124297003) — it was
+  picked up by the same backfill range, so this is live capture, not just a replay.
+
+Console before: `BUY 0x4707…9211 [base] 520.591744 0x4ed4e862…` (no price)
+Console after : `BUY 0x4707…9211 [base] 520.591744 0x4ed4e862… ≈ $0.57 via uniswap-v3`
+
+Note
+----
+With the fix, min_usd now actually filters. In the seeded runs minUsd was temporarily 0;
+it was restored to 50 on B afterwards. Under the real 50 floor the $0.57 DEGEN buy would
+be dropped and the $27.18 / $331.97 CAKE sells kept — the intended behaviour.

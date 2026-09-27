@@ -1,0 +1,89 @@
+T8 — keyless RPC capability matrix (Base + BSC) + Base router-coverage scan — 2026-09-27
+=======================================================================================
+Probed from the host (root@194.163.187.250) with eth_blockNumber /
+eth_getLogs (token Transfer topic0) / eth_getTransactionReceipt.
+
+BSC endpoints
+-------------
+endpoint                              blockNumber  getLogs(30blk)  receipt(tip)
+https://1rpc.io/bnb                   OK           OK (10)         OK        <== only fully usable
+https://bsc-dataseed1.binance.org     OK           FAIL            OK
+https://bsc-dataseed.bnbchain.org     OK           FAIL            OK
+https://bsc-dataseed1.defibit.io      OK           FAIL            OK
+https://bsc.blockrazor.xyz            OK           FAIL            OK
+https://bsc.publicnode.com            OK           OK (6)          FAIL
+https://bsc-rpc.publicnode.com        OK           OK              FAIL (403, see below)
+https://rpc.ankr.com/bsc              FAIL         -               -
+https://binance.llamarpc.com          FAIL         -               -
+
+- bsc-rpc.publicnode.com refuses eth_getTransactionReceipt at EVERY tested depth —
+  including block-0 (the tip block):
+    {"jsonrpc":"2.0","error":{"code":-32602,"message":"Archive requests require a
+     personal token. Get one at: https://...}}
+  => not an archive-depth issue; receipts are gated behind a token account.
+- The daemon needs eth_getTransactionReceipt per candidate tx (watchers/evm/feed.py:211
+  process_tx) for BOTH paths: confirmed() near-tip polling AND the chunked backfill.
+  So BSC cannot run keyless on the bsc-dataseed*.binance.org family (getLogs
+  "limit exceeded") nor on *.publicnode.com (no receipts). Only https://1rpc.io/bnb
+  satisfies BOTH getLogs and receipts.
+- The daemon's BSC default today is bsc-dataseed.binance.org (see the run header
+  "# rpc base=https://mainnet.base.org bsc=https://bsc-dataseed.binance.org")
+  => BSC is misconfigured for keyless operation as shipped.
+
+Base endpoints
+--------------
+https://mainnet.base.org            OK   getLogs OK   receipts OK (40 ok / 0 fail)
+https://base-rpc.publicnode.com     OK   getLogs OK   receipts OK
+https://1rpc.io/base                -    getLogs FAIL
+https://base.llamarpc.com           525
+https://binance.llamarpc.com        000
+
+Base router-coverage scan (read-only, DEGEN, span=1200 blocks, 40 receipts)
+--------------------------------------------------------------------------
+receipt.to tally:
+  18x  0x278d858f05b94576c1e6f73285886876ff6ef8d2   <== ARBITRAGE BOT (see below)
+   6x  0x4ed4e862860bed51a9570b96d89af5e1b0efefed   (DEGEN token itself = plain transfer)
+   3x  0x2626664c2603336E57B271c5C0b26F421741e481   <== ALLOWLIST uniswap-v3
+   2x  0x8ea5ad2a58c1dae75394b1e8636e6518eb6dac50
+   1x  0x2192bc3b4028acc1113f2cd9ac2cba70c36520db
+   1x  0xe6b82c6eccdfb2d6bc55bb11a61bae5ab2c3f807
+   1x  0x97999aa3f972eb696131d6f83138ed34dbb031f6
+   1x  0x4b5c71082d027d16d2a146465d66f9eec11634f6
+
+- uniswap-v3 (allowlisted) DOES carry real DEGEN swaps => the allowlist is functional.
+  3 real trader wallets were extracted from 3 allowlisted txs:
+    0xd13da05b9288ba4961973110594bd0fe3428791f  (recv DEGEN x2, block 51851921)
+    0x4707b199110609a8b297ea3806b84975b8509211  (recv DEGEN, block 51852480 — used for T8)
+- IDENTIFIED, and CORRECTLY excluded: 0x278d858f05b94576c1e6f73285886876ff6ef8d2 is
+  an ARBITRAGE BOT (MEV), not a retail router. Source — Avalanche C-Chain Top-10 Gas
+  Contracts Classification Report, Rank 3: "Classification: arbitrageBot", 687-byte
+  stripped execution shim, "Deployer 0xb16dc631eec98b049565488a403d315a9f37fb33 is a
+  known arbitrageBot deployer", obfuscated selector BrrrrrrrrrrrrrZ2826820544() =
+  0xa00597a0:
+    https://gist.github.com/avasnap/52ff3efd3d7e0d103f21552ca2361a05
+  Corroborated here: txs to it on basescan carry method 0xa00597a0; the same address and
+  the same deployer 0xB16d…FB33 exist on Ethereum mainnet, Base, BSC, Polygon, Avalanche
+  and Unichain => a multi-chain bot, not a product router (no SDK/address-list reference
+  either — grep.app matched only a block fixture).
+  => AN EARLIER DRAFT OF THIS FILE CALLED THIS A "~45% COVERAGE GAP". THAT WAS WRONG:
+  these are bot operations, not tracked-wallet swaps, and process_tx's router gate
+  (feed.py:215-216) skips them by design. NO coverage gap is proven.
+- Other unidentified single-occurrence targets on Base (1-2 of 40 txs each; identity
+  unproven, low impact): 0x8ea5ad2a58c1dae75394b1e8636e6518eb6dac50,
+  0x2192bc3b4028acc1113f2cd9ac2cba70c36520db, 0xe6b82c6eccdfb2d6bc55bb11a61bae5ab2c3f807,
+  0x97999aa3f972eb696131d6f83138ed34dbb031f6, 0x4b5c71082d027d16d2a146465d66f9eec11634f6.
+- 0xb6e66024c87ef6812671c8ea00f2ecd96e8f3752 = "Framedl Game" (FRMDLGAME, ERC-721):
+  a game contract that merely co-emits in DEGEN txs — NOT a router. Do not add.
+
+Consequences
+------------
+1. BSC live smoke test is BLOCKED on keyless RPC. Fix = point the BSC fallback at
+   https://1rpc.io/bnb (verified: getLogs + receipts both OK), or supply an Alchemy
+   BSC key per plan D3/D4.
+2. Base works end-to-end today (T8-live.txt) and the allowlist behaves as designed: the
+   dominant non-allowlisted target is an arbitrage bot, which is intentionally skipped.
+   No capture loss is proven — the only open item is the five 1-2-tx addresses above.
+3. CORRECTION LOG: an earlier revision of this file reported "~45% of DEGEN swap txs
+   silently skipped", inferred from the height of the 0x278d858f tally alone. That
+   inference was wrong and is retracted; identity must be established before claiming a
+   coverage gap. (Same lesson as lsn_ca4eebf73162a804, applied to my own conclusion.)

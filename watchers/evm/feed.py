@@ -23,7 +23,9 @@ from watchers.evm import classify as cl
 
 DEFAULT_RPC = {
     "base": "https://mainnet.base.org",
-    "bsc": "https://bsc-dataseed.binance.org",
+    # Keyless endpoint duy nhất chạy cả getLogs + receipt; giới hạn ~50 block/getLogs
+    # (nên dùng --chunk 50). Có Alchemy key thì override qua BSC_RPC_URL.
+    "bsc": "https://1rpc.io/bnb",
 }
 DEFAULT_CONFIRMATIONS = (
     8  # Base ~2s / BSC ~3s block ⇒ ~16-24s trễ, ngoài độ sâu reorg thường
