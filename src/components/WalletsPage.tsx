@@ -68,7 +68,7 @@ function WalletModal({ initial, onClose, onSave }: { initial: Wallet | null; onC
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         <label className="block">
           <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Address</span>
-          <TextField value={draft.address} onChange={(e) => setDraft({ ...draft, address: e.target.value })} placeholder="base58 address" className="font-mono" autoFocus />
+          <TextField value={draft.address} onChange={(e) => setDraft({ ...draft, address: e.target.value })} placeholder="address (sol / 0x…)" className="font-mono" autoFocus />
         </label>
         <label className="block">
           <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Name</span>

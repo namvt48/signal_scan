@@ -154,20 +154,23 @@ function parseTrackedCaBody(
   };
 }
 
-/** One event the Solana-RPC wallet_watch daemon detected (POST /api/wallet-watch/trades). */
+/** One event a wallet-watch daemon detected (POST /api/wallet-watch/trades). */
 interface WatchTrade {
   wallet: string;
   ca: string;
   tx: string;
   ts: number;
   side: 'buy' | 'sell' | 'transfer';
+  chain: Chain;
   amountUsd?: number;
   price?: number;
 }
 
 /**
- * wallet+ca+tx+side identify the event (UNIQUE(wallet_id, ca, tx, side)). `side`
- * defaults to 'buy' so the pre-existing BUY-only daemon keeps working; a
+ * wallet+ca+chain+tx+side identify the event (UNIQUE(wallet_id, ca, chain, tx,
+ * side)). `side` defaults to 'buy' so the pre-existing BUY-only daemon keeps
+ * working; `chain` defaults to 'sol' so the DEPLOYED Sol daemon (which predates
+ * the field) keeps working during rollout — an unknown chain is a 400. A
  * `transfer` is NOT a trade row — it only triggers the balance refresh below.
  * amountUsd/price are optional: a buy the daemon could not price still proves
  * the wallet bought, and `Tracked by` never reads them.
@@ -189,7 +192,12 @@ function parseWatchTradeBody(body: unknown): ParseResult<WatchTrade> {
   if (rawSide !== 'buy' && rawSide !== 'sell' && rawSide !== 'transfer') {
     return { error: "side must be 'buy', 'sell' or 'transfer'" };
   }
-  const trade: WatchTrade = { wallet, ca, tx, ts, side: rawSide };
+  let chain: Chain = 'sol';
+  if (b.chain !== undefined) {
+    if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+    chain = b.chain;
+  }
+  const trade: WatchTrade = { wallet, ca, tx, ts, side: rawSide, chain };
   for (const key of ['amountUsd', 'price'] as const) {
     const v: unknown = b[key];
     if (v === undefined) continue;
@@ -321,7 +329,7 @@ export function createApp(providerName: string): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    if (findWalletByAddress(parsed.address)) {
+    if (findWalletByAddress(parsed.address, parsed.chain)) {
       res.status(409).json({ error: 'wallet address already exists' });
       return;
     }
@@ -343,7 +351,11 @@ export function createApp(providerName: string): Express {
     }
     const current = toWallet(cur);
     const next: WalletBody = { ...current, ...parsed };
-    if (next.address !== current.address && findWalletByAddress(next.address)) {
+    // Identity key is (address, chain): a change to EITHER half can collide.
+    if (
+      (next.address !== current.address || next.chain !== current.chain) &&
+      findWalletByAddress(next.address, next.chain)
+    ) {
       res.status(409).json({ error: 'wallet address already exists' });
       return;
     }
@@ -420,7 +432,7 @@ export function createApp(providerName: string): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    const wallet = findWalletByAddress(parsed.wallet);
+    const wallet = findWalletByAddress(parsed.wallet, parsed.chain);
     if (!wallet) {
       // Inserting would violate the wallets FK. The daemon only watches tracked
       // wallets, so this means the wallet was deleted between watch and post.

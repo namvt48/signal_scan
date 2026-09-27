@@ -1,0 +1,116 @@
+T8 — EVM watcher (Base + BSC): design notes
+============================================
+Plan: .omo/plans/evm-base-bsc.md (D7). Code: watchers/evm/{__init__,__main__,classify,feed,main}.py
+Tests: scripts/test_evm_{classify,feed,isolation}.py — 93 passed (59 baseline Sol + 34 new), xem T8-pytest.txt.
+
+1. FEED = WS + BACKFILL (continuity, R1)
+----------------------------------------
+- WS chính: eth_subscribe('logs') với 2 subscription/chain (plan D7):
+    sub1 topics = [TRANSFER_TOPIC, [pad(w)…], null]   (ví là FROM — chân bán/gửi)
+    sub2 topics = [TRANSFER_TOPIC, null, [pad(w)…]]    (ví là TO — chân mua/nhận)
+  TRANSFER_TOPIC = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+  pad(addr) = '0x' + 24×'0' + 40hex lowercase (classify.pad_address).
+  WSS url: env BASE_WSS_URL / BSC_WSS_URL, fallback suy từ RPC url (https→wss).
+- Log từ WS KHÔNG emit ngay — vào hàng đợi `pend`, chỉ xử lý khi đủ
+  confirmations (mục 3). Vì vậy WS chỉ là máy phát hiện sớm; nguồn sự thật
+  của continuity là last_block trong state.
+- (Re)connect: backfill() quét (last_block+1 .. latest-conf+1) bằng
+  eth_getLogs chunked TRƯỚC khi quay lại vòng WS ⇒ không hở block nào trong
+  lúc đứt kết nối / restart / deploy.
+- poll feed (--feed poll / --once): chỉ backfill lặp, không WS — fallback khi
+  provider không có WSS hoặc chạy cron one-shot.
+
+2. CHUNK + HALVE (R2 — provider giới hạn range)
+-----------------------------------------------
+- chunk_ranges(start, end, span): phủ kín [start..end] inclusive, không trùng
+  không hở; span≤0 ép về 1. Mặc định --chunk 500.
+- getLogs trả error chứa exceed/range/limit/too many/results ⇒ halve span
+  (span = (b-a+1)//2) rồi CHIA LẠI toàn bộ phần còn lại từ chunk lỗi ⇒
+  provider nào cũng qua (Base public 10k blocks, BSC dataseed ~5k, Ankr 3k…).
+- Test khoá: test_backfill_chunk_halving_on_range_error (FakeEvm max_span=100,
+  500→250→125→62, assert phủ kín 2..1000 liên tiếp).
+
+3. CONFIRMATIONS
+----------------
+- confirmed(block, latest, conf) = latest - block + 1 >= conf.
+- Mặc định --confirmations 8 ⇒ ~16s (Base 2s/block) / ~24s (BSC 3s/block) —
+  ngoài độ sâu reorg thông thường của cả 2 chain, trễ chấp nhận được cho
+  signal dashboard (không phải HFT).
+- Backfill chỉ quét tới end = latest - conf + 1 ⇒ block chưa đủ xác nhận
+  không bao giờ được emit; lần chạy kế tiếp (poll vòng sau / WS reconnect)
+  quét tiếp từ last_block+1 — không mất, không emit non.
+
+4. STATE (không giẫm daemon Sol)
+--------------------------------
+- st["evm"][chain]["last_block"] = block cao nhất đã XỬ LÝ XONG (save SAU mỗi
+  chunk hoàn thành ⇒ crash giữa chừng chỉ lặp lại chunk dở, không mất khúc giữa;
+  lặp lại an toàn vì dedup mục 5 + server UNIQUE(wallet,ca,tx,side)).
+- File RIÊNG: evm_watch_state.json + heartbeat_evm (patch state.STATE_PATH /
+  state.HEARTBEAT chỉ trong main() — import không đổi path Sol;
+  test_evm_isolation.py khoá ràng buộc này). Chạy song song 2 daemon
+  (watchers.sol + watchers.evm) không giẫm file nhau.
+- Cold start (chưa có state): bắt đầu từ tip, không bò lại lịch sử.
+
+5. MỘT EVENT / TX (dedup)
+-------------------------
+- 2 sub from/to đẩy cùng log 2 lần (self-transfer) và cùng tx 2 lần ⇒
+  _sort_logs dedup theo (transactionHash, logIndex) + sort (block, logIndex);
+  _seen_tx dedup theo txhash trong run (cap 4096, clear-all khi tràn).
+- classify_swap trả ĐÚNG 1 event/wallet/tx: token→token multi-hop = cạnh NHẬN
+  non-quote thắng (BUY — ví mở vị thế mới, đúng mục đích signal); nhiều chân
+  cùng token (route tách) ⇒ cộng dồn value, token nhiều chân lấy raw lớn nhất.
+- Test khoá: test_token_to_token_single_buy_event, test_backfill_scans…
+  (assert receipt_calls == [TX] — receipt chỉ fetch 1 lần).
+
+6. CLASSIFY GATES (chống noise — "no event on plain transfers")
+---------------------------------------------------------------
+- Gate 1: receipt.status phải 0x1 (tx revert ⇒ bỏ).
+- Gate 2: receipt.to phải nằm TRONG allowlist router của chain
+  (classify.ROUTERS — 7 địa chỉ đã verify kèm nguồn, xem T8-routers.txt;
+  BaseSwap seed trong plan SAI, đã sửa thành …fe505d86). Transfer thường,
+  dapp lạ, aggregator ngoài list ⇒ None.
+- Gate 3: transfer phải liên quan ví đang theo dõi (from hoặc to).
+- Gate 4: chỉ quote↔quote / rỗng ⇒ None.
+- Limitation (chấp nhận theo D7): swap qua aggregator mà tx.to không phải
+  router trong allowlist (1inch/Odos/Cow…) ⇒ MISS. Thêm router = thêm 1 dòng
+  vào ROUTERS sau khi verify nguồn.
+- Quote token per chain (classify.QUOTE_TOKENS): Base WETH/USDC/DAI,
+  BSC WBNB/USDT/USDC/BUSD — chân "tiền" để quyết định BUY/SELL.
+
+7. PIPELINE SAU CLASSIFY (tái dùng common, không đổi signature)
+---------------------------------------------------------------
+- Giá: common.price.get_price_usd(ca, chain) (DexScreener chain-aware, T4 seam).
+  Chưa định giá được (None) ⇒ VẪN emit amountUsd 0 — fail-open như Sol
+  (detector không được tự bỏ trade thật).
+- Gate min_usd: chỉ loại khi usd ĐÃ biết và < ngưỡng (giá None ⇒ không loại).
+  min_usd refresh từ /api/settings mỗi vòng poll / mỗi lần reconnect WS
+  (config._api_min_usd, fail-soft).
+- Wallets: /api/wallets lọc chain base/bsc (tab Wallet = nguồn sự thật, T4);
+  fallback wallets.txt (chỉ dòng 0x+40hex, vào cả 2 chain). API chết ⇒ giữ
+  list hiện tại (test_refresh_cfg_failsoft).
+- Emit: console (classify.fmt_event — explorer link basescan/bscscan) +
+  emit.jl_write (--jsonl) + emit.post_trade(classify.trade_body(...)) với
+  chain first-class ('base'/'bsc'; server T4 tra wallet theo (address,chain),
+  side lowercase 'buy'/'sell', ts = block time ms qua eth_getBlockByNumber).
+- --track: POST /api/tracked-cas chain-aware (emit.track_post_body hardcode
+  'sol' nên EVM có _track_ca riêng trong feed; 409 = đã tracked = ok; dedup
+  (chain,ca) trong run).
+- decimals: eth_call decimals() selector 0x313ce567, cache per (chain,ca);
+  fail ⇒ 18 (mặc định ERC-20).
+
+8. TESTABILITY
+--------------
+- classify.py THUẦN 100% (không IO) — unit test trực tiếp.
+- feed.py: mọi HTTP qua config.http_json (seam duy nhất) ⇒ FakeEvm monkeypatch
+  seam đó, test full pipeline backfill→classify→trade_body OFFLINE.
+  WS loop không test trực tiếp (cần ws server giả) — logic xác nhận/dedup/
+  backfill của nó nằm ở các hàm đã test (confirmed, _sort_logs, process_log,
+  backfill); phần chưa phủ là connect/recv plumbing.
+- KHÔNG có network call nào trong scripts/test_evm_*.py.
+
+9. CHƯA VERIFY LOCAL (chuyển T9 — cần instance B)
+-------------------------------------------------
+- WS/RPC live trên Base + BSC thật (public RPC có thể chặn eth_subscribe hoặc
+  giới hạn range khác giả lập) — chạy `python3 -m watchers.evm --once` rồi
+  feed=ws trên server, đối chiếu 1 tx thật qua explorer.
+- systemd unit + watchdog cho daemon evm (heartbeat_evm đã sẵn).

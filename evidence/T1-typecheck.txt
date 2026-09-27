@@ -1,0 +1,5 @@
+=== server: npx tsc --noEmit ===
+server exit: 0
+
+=== root: npx tsc --noEmit ===
+root exit: 0

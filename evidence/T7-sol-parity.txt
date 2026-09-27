@@ -1,0 +1,142 @@
+T7 — Solana behavior parity gate (generated 2026-09-27T12:03:28+07:00)
+baseline: git HEAD scripts/wallet_watch.py (2057-line monolith) vs watchers/ package
+method: AST — every top-level def/class source + every top-level constant value compared;
+        module-qualifier prefixes (config./emit./state./price.) un-applied before compare.
+
+== 1) parity script (/tmp/t7/parity.py) ==
+CODE  identical: 60   differ: 4   missing: 0
+CONST identical: 55   differ: 0   skipped(eval): 0
+
+-- code differs (expected: seam changes only) --
+   watch_trade_event
+   gmgn_info
+   token_info
+   main
+
+-- new top-level callables/classes not in monolith --
+   Any, Counter, datetime, defaultdict, get_price_usd, post_trade, timedelta, timezone
+
+== 2) the 4 intended source diffs (everything else is byte-identical) ==
+----- main -----
+ def main() -> None:
+-    global _cfg_cli_min_usd, _jsonl, _api_url, _track
+     ap = argparse.ArgumentParser(
+----- watch_trade_event -----
+         return
+-    try:
+-        req = urllib.request.Request(
+-            f"{_api_url}/api/wallet-watch/trades",
+-            data=json.dumps(body).encode(),
+-            headers={"Content-Type": "application/json"},
+-        )
+-        with urllib.request.urlopen(req, timeout=5):
+-            pass
+-    except Exception as ex:
+-        print(
+-            f"  ! watch-trade {body['ca'][:8]}…: {type(ex).__name__}: {str(ex)[:60]}",
+-            file=sys.stderr,
+-        )
++    post_trade(body)
+----- gmgn_info -----
+-def gmgn_info(mint):
++def gmgn_info(mint, chain="sol"):
+     """Giá USD của `mint` qua GMGN OpenAPI (header X-APIKEY, timestamp + client_id).
+     url = (
+-        f"{GMGN_TOKEN_INFO}?chain=sol&address={mint}"
++        f"{GMGN_TOKEN_INFO}?chain={chain}&address={mint}"
+         f"&timestamp={int(now)}&client_id={uuid.uuid4()}"
+----- token_info -----
+-def token_info(mint):
++def token_info(mint, chain="sol"):
+     """(symbol, price_usd) qua DexScreener (mặc định, như trước); GMGN chỉ khi bật
+     thời gian ⇒ hit vĩnh viễn, không bao giờ gọi mạng."""
++    # Khoá cache chain-aware: cùng một 0x address trên base và bsc là 2 token khác
++    # nhau (plan evm-base-bsc §1.3) ⇒ CA EVM khoá "<chain>:<ca>". Sol giữ khoá TRẦN
++    # = mint ⇒ hành vi cũ (và seed _info[mint] của test) y nguyên.
++    key = mint if chain == "sol" else f"{chain}:{mint}"
+     now = time.time()
+-    if mint in _info:
+-        if mint not in _info_at:
+-            return _info[mint]  # seed (test/fixture) — hit vĩnh viễn
+-        retry_fail = mint in _info_miss and now - _info_miss[mint] >= _INFO_RETRY_S
+-        if not retry_fail and now - _info_at[mint] < _INFO_TTL_S:
+-            return _info[mint]
++    if key in _info:
++        if key not in _info_at:
++            return _info[key]  # seed (test/fixture) — hit vĩnh viễn
++        retry_fail = key in _info_miss and now - _info_miss[key] >= _INFO_RETRY_S
++        if not retry_fail and now - _info_at[key] < _INFO_TTL_S:
++            return _info[key]
+     sym, px = None, 0.0
+     if _use_gmgn():
+-        sym, px = gmgn_info(mint)
++        sym, px = gmgn_info(mint, chain)
+     if not px:
+     if sym:
+-        _info[mint] = (sym, px)
+-        _info_at[mint] = now
+-        _info_miss.pop(mint, None)
++        _info[key] = (sym, px)
++        _info_at[key] = now
++        _info_miss.pop(key, None)
+     else:
+-        _info[mint] = (mint[:6] + "…", px)
+-        _info_miss[mint] = now
++        _info[key] = (mint[:6] + "…", px)
++        _info_miss[key] = now
+     time.sleep(0.1)
+-    return _info[mint]
++    return _info[key]
+
+== 3) python3 -m pytest scripts/ -q (ZERO test edits) ==
+...........................................................              [100%]
+59 passed in 1.87s
+
+== 4) standalone script-style runs ==
+PASS scripts/test_block_feed.py
+PASS scripts/test_gmgn_api_parity.py
+PASS scripts/test_nansen_fee_leg.py
+PASS scripts/test_nansen_parity.py
+PASS scripts/test_route_detect.py
+PASS scripts/test_rpc_resilience.py
+PASS scripts/test_wallet_watch_config.py
+PASS scripts/test_wallet_watch.py
+PASS scripts/test_ws_feed.py
+
+== 5) ruff (moved code must not gain new violations) ==
+orig monolith : 20
+watchers/ new : 19
+     19 E501
+(all remaining = pre-existing E501 in verbatim-moved lines; F/pyflakes + W + I clean)
+
+== 6) new chain-aware seams (for T8 EVM) ==
+get_price_usd(ca: str, chain: str = 'sol') -> float | None
+post_trade(trade: dict[str, Any]) -> None
+token_info(mint, chain='sol')
+gmgn_info(mint, chain='sol')
+
+-- cross-chain cache separation (same 0x CA on 3 chains must NOT collide) --
+seed _info['0xdead']      = ('SOLTOK', 1.11)   # bare key  = sol (old behaviour)
+seed _info['base:0xdead'] = ('BASETOK', 2.22)  # chain-scoped = base (T8)
+seed _info['bsc:0xdead']  = ('BSCTOK', 3.33)
+get_price_usd('0xdead')          -> 1.11
+get_price_usd('0xdead','base')   -> 2.22
+get_price_usd('0xdead','bsc')    -> 3.33
+cache keys -> ['0xdead', 'base:0xdead', 'bsc:0xdead']
+assert PASS: 3 distinct prices, no collision; sol path byte-identical to pre-T7.
+
+== 7) flat-shim graph vs PRODUCTION package graph (both paths, same fixtures) ==
+method: run _warm_prices + detect_swaps over scripts/fixtures/*.json twice —
+        once through the shim's flat namespace (test path), once through real
+        `import watchers.common.price / watchers.sol.classify` (deploy path) —
+        then compare event count AND full JSON payload of every event.
+fixtures compared        : 12
+events via flat shim     : 25
+events via production    : 25
+IDENTICAL payload (all fields, sort_keys JSON): True
+production wiring proven : price->config.http_json (stub called with DexScreener URL),
+                           emit->config._api_url, state->config.HERE, classify exports,
+                           feed.run_block_feed/run_ws_feed/_handle_tx, main.main/load_lines,
+                           watchers.sol.__main__ importable.
+=> the two import graphs are behaviourally the same daemon; no NameError on any
+   qualified cross-module ref in production mode.

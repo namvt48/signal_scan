@@ -152,11 +152,15 @@ export class Limiter implements ILimiter {
         this.pushBack(job);
         return; // kick() is called again on release
       }
-      this.start(job, now);
+      this.start(job);
     }
   }
 
-  private start(job: Job, now: number): void {
+  private start(job: Job): void {
+    // Slots are stamped at DISPATCH time, not at scheduling time: a stale stamp evicts
+    // before the real window expires, letting the actual request rate exceed the API
+    // limit under load (surfaced as the 6-starts-in-1s integration.test.ts flake).
+    const now = this.clock.now();
     for (const c of this.constraints) c.onStart(now, job.opts);
     if (this.pathWindow && job.opts.path) this.pathWindowFor(job.opts.path).onStart(now, job.opts);
     this.sem?.acquire();

@@ -105,12 +105,13 @@ Definition of done cần evidence file cho từng mục (§7).
   - deps: —
   - Evidence: `evidence/T3-migrate.txt` (before/after counts).
 
-- [ ] **T4** Tra wallet theo (address, chain) + trade kèm chain
+- [x] **T4** Tra wallet theo (address, chain) + trade kèm chain — DONE 2026-09-27
   - Files: `server/src/db.ts`, `server/src/api.ts`, `server/src/ingest.ts`
   - Việc: `findWalletByAddress(address, chain)`; `WatchTrade` thêm `chain` (validate `isChain`); endpoint `/api/wallet-watch/trades` tra theo `(address, chain)`; `insertTrades`/`replaceWalletBalances` ghi `chain`.
   - Acceptance: POST cùng address khác chain → vào đúng wallet; `wallet_trades` có chain; test `wallet-watch-trade.test.ts` cập nhật + PASS.
   - deps: T1, T3
   - Evidence: `server/test/wallet-watch-trade.test.ts` PASS + `evidence/T4-rows.txt`.
+  - Kết quả: resolver (address,chain); `WatchTrade.chain` vắng → 'sol' (compat daemon Sol đang deploy), lạ → 400; dup-guard POST/PATCH wallet key theo (address,chain); `insertTrades` ghi `a.chain` (giữ ON CONFLICT T3); `replaceWalletBalances` ghi chain + DELETE scope chain (sol sweep không xoá được row base); `emit.py::post_trade` default `chain='sol'`. Tests: 292 pass (283+9 mới: `wallet-chain-key.test.ts` + 4 case trong `wallet-watch-trade.test.ts`); tsc clean (server+root); pytest 59 pass. Probe: `scripts/t4_chain_rows_probe.ts`.
 
 ### P1 — EVM data + holdings (đọc)
 
@@ -130,12 +131,13 @@ Definition of done cần evidence file cho từng mục (§7).
 
 ### P2 — Wallet watch EVM (daemon Python)
 
-- [ ] **T7** Clean architecture `watchers/`
+- [x] **T7** Clean architecture `watchers/` — DONE 2026-09-27
   - Files: `watchtr/`mới: `watchers/common/{price,emit,state}.py`, `watchers/sol/{feed,classify}.py` (tách từ `scripts/wallet_watch.py`, GIỮ hành vi); `scripts/` giữ probe/test/fixture.
   - Việc: tách `wallet_watch.py` thành package, KHÔNG đổi logic Sol; cập nhật import test; giữ entrypoint tương thích (`python -m watchers.sol` hoặc shim).
   - Acceptance: test Sol hiện có (`test_wallet_watch.py`, `test_route_detect.py`, `test_gmgn_api_parity.py`) PASS với module mới; output event không đổi.
   - deps: —
   - Evidence: log test PASS + `evidence/T7-sol-parity.txt`.
+  - Kết quả: package `watchers/{__init__,common/{config,state,price,emit},sol/{classify,feed,main,__main__}}.py`; `scripts/wallet_watch.py` = shim namespace-phẳng (0 logic, giữ `ww.http_json`/`ww.STATE_PATH` monkeypatch + mutation gate) ⇒ **0 test phải sửa**, 59 pytest PASS + 9 script-style PASS. Parity AST: 60/64 def byte-identical, 55/55 const identical; 4 diff = seam có chủ đích (`main` bỏ `global` vì ref đã qualify; `watch_trade_event`→`post_trade`; `gmgn_info`/`token_info` nhận `chain="sol"`, cache key `<chain>:<ca>` cho CA EVM). Seam mới cho T8: `get_price_usd(ca, chain)` + `post_trade(trade)`. Evidence: `evidence/T7-{tree,entrypoint,sol-parity}.txt`.
 
 - [ ] **T8** EVM watcher `watchers/evm/` (mới)
   - Files: `watchers/evm/{feed,classify,main}.py`; dùng chung `watchers/common/price.py` + `emit.py`
@@ -174,7 +176,7 @@ Definition of done cần evidence file cho từng mục (§7).
 
 ## 5. Risks / verify-needed (phải xác nhận trong lúc làm, không được giả định)
 
-- **R1** Nansen **free crawl** có thực sự nhận chain EVM (`base`/`bnb`) không — T2 chứng minh. Nếu KHÔNG ⇒ gini EVM cần nguồn khác (GMGN? bỏ cột? Nansen paid?) → mở lại quyết định.
+- **R1** Nansen **free crawl** có thực sự nhận chain EVM (`base`/`bnb`) không — T2 chứng minh. Nếu KHÔNG ⇒ gini EVM cần nguồn khác (GMGN? bỏ cột? Nansen paid?) → mở lại quyết định. **→ RESOLVED 2026-09-27:** door (CDP) trả 200 cho `base` + `bnb` (cả 2 question, 2 lần chạy); control `notachain` → 400 kèm allowlist có `base`/`bnb`. Evidence: `evidence/T2b-nansen-evm-door.txt`, `evidence/T2-nansen-evm-probe.instanceA.json`. T6 UNBLOCKED.
 - **R2** Alchemy free WS `eth_subscribe` có trên **cả** Base và BNB Chain không; và `eth_getLogs` range cap per chain (Base block ~2s, BSC nhanh) → chunk size.
 - **R3** Reorg Base/BSC → số N confirmations an toàn; Sol dùng cơ chế riêng nên **không** port thẳng.
 - **R4** GMGN weight budget: 1 key dùng chung, Free **5 call/s** (`gmgn.ts:19-21`); 3 chain trên B tranh nhau → kiểm capacity, chấp nhận giảm cadence nếu cần.

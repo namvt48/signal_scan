@@ -89,9 +89,8 @@ export const config = {
     * no-pair mint costs a share of one free batch call per sweep, unlike the
     * credit-bound symbol floor — the window only trims ancient dead rows. */
   iconWindowMs: num('ICON_WINDOW_MS', 30 * 86_400_000),
-  /** Wallet HOLDINGS sweep: credit-free Solana RPC (getTokenAccountsByOwner) for
-   * sol; non-sol still burns 1 credit per (wallet, tracked CA) via currentBalance
-   * — keep the interval honest for those chains. */
+  /** Wallet HOLDINGS sweep — credit-free on EVERY chain since T5: sol via Solana
+   * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
   /** Official tgm/flows (credit-only) refresh — T100 multiple, LF, the bal_* chart
    * windows. Its own faster cadence (user 2026-09-24): credits are the only cost,
@@ -128,6 +127,12 @@ export const config = {
    * (JSON-RPC -32429 "max usage reached") — retired in-memory per client until
    * now + this, so a dead key is skipped instead of re-burned every sweep. */
   solanaRpcRetireMs: posNum('SOLANA_RPC_RETIRE_MS', 3_600_000),
+
+  // EVM JSON-RPC primaries (plan evm-base-bsc D3): env override per chain (e.g. a
+  // shared Alchemy URL). Empty → the keyless public endpoint in providers/evm.ts
+  // is the primary; set → evm.ts appends the keyless endpoint as the fail-over (R2).
+  baseRpcUrl: str('BASE_RPC_URL', ''),
+  bscRpcUrl: str('BSC_RPC_URL', ''),
 
   // Pacing: spread each sweep's requests evenly across SWEEP_PACE_FACTOR of its
   // interval (0.8 = dùng 80% chu kỳ, nghỉ 20%). Scale = tăng interval hoặc thêm

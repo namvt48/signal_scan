@@ -1,0 +1,88 @@
+T3 — chain-aware wallet tables migration evidence (2026-09-27, plan evm-base-bsc)
+=================================================================================
+
+FILES CHANGED
+  server/src/db.ts        SCHEMA: wallets UNIQUE(address,chain) + chain DEFAULT 'sol';
+                          wallet_token_state PK(wallet_id,ca,chain);
+                          wallet_trades UNIQUE(wallet_id,ca,chain,tx,side).
+                          open(): conditional one-shot table rebuild (detect:
+                          wallet_token_state lacks chain) under foreign_keys=OFF,
+                          single transaction, copy with chain='sol', drop/rename,
+                          recreate idx_trades_ca, then foreign_keys=ON + foreign_key_check.
+  server/src/ingest.ts    1-line: insertTrades ON CONFLICT target now
+                          (wallet_id,ca,chain,tx,side) — required, old target matches
+                          no constraint after T3 (chain writing itself stays T4).
+  server/test/signals.test.ts  2 stale deepEqual expectations += tags:[] (PRE-EXISTING
+                          failure at HEAD, proven via git stash; signals.ts emits tags
+                          since Sep 25, test never updated — unrelated to T3).
+  server/test/wallet-chain-migrate.test.ts  NEW (TDD: RED before impl, GREEN after).
+
+MIGRATION PROCEDURE
+  Old shape -> new shape via SQLite standard rebuild (UNIQUE/PK cannot be ALTERed):
+  PRAGMA foreign_keys=OFF (outside tx — no-op inside); BEGIN;
+  CREATE <t>_new (new DDL); INSERT INTO <t>_new SELECT <cols>, 'sol' FROM <t>;
+  DROP TABLE <t>; ALTER TABLE <t>_new RENAME TO <t>;  (x3 tables)
+  CREATE INDEX idx_trades_ca; COMMIT; PRAGMA foreign_keys=ON; PRAGMA foreign_key_check.
+  Idempotent: trigger = wallet_token_state.chain absent -> fresh DB and 2nd open no-op.
+  Runs AFTER the token_amount/source/clan ALTER migrations so all columns exist to copy.
+
+NEW TEST RESULT (server/test/wallet-chain-migrate.test.ts)
+✔ migration: old prod-shape DB keeps every row, backfilled chain=sol (48.2403ms)
+✔ fresh DB: open() on an empty path creates the chain-aware shape directly (9.165845ms)
+ℹ tests 2
+ℹ pass 2
+ℹ fail 0
+
+FULL SUITE (cd server && npm test — tsx --test test/*.test.ts test/ratelimit/*.test.ts)
+ℹ tests 283
+ℹ pass 283
+ℹ fail 0
+(note: one earlier full-suite run had 1 flake in ratelimit integration.test.ts —
+wall-clock timing test under parallel load; passes in isolation and on rerun: 283/283.)
+
+npx tsc --noEmit: CLEAN
+
+BEFORE/AFTER COUNTS + BACKFILL (old-shape temp DB, 1 wallet + 1 token_state + 1 trade)
+BEFORE (old-shape DB): wallets=1 wallet_token_state=1 wallet_trades=1
+AFTER open(): wallets=1 wallet_token_state=1 wallet_trades=1
+backfill: {"wc":"sol","sc":"sol","tc":"sol"}
+AFTER 2nd open() (no-op): wallets=1 wallet_token_state=1 wallet_trades=1
+
+PRAGMA DUMPS AFTER MIGRATION
+== PRAGMA table_info(wallets) ==
+  0 id TEXT notnull=0 dflt=null pk=1
+  1 address TEXT notnull=1 dflt=null pk=0
+  2 name TEXT notnull=1 dflt=null pk=0
+  3 tags TEXT notnull=1 dflt='[]' pk=0
+  4 chain TEXT notnull=1 dflt='sol' pk=0
+  5 source TEXT notnull=1 dflt='' pk=0
+  6 clan TEXT notnull=0 dflt=null pk=0
+== indexes on wallets ==
+  sqlite_autoindex_wallets_2 unique=1 origin=u cols=(address,chain)
+  sqlite_autoindex_wallets_1 unique=1 origin=pk cols=(id)
+
+== PRAGMA table_info(wallet_token_state) ==
+  0 wallet_id TEXT notnull=0 dflt=null pk=1
+  1 ca TEXT notnull=0 dflt=null pk=2
+  2 balance_usd REAL notnull=0 dflt=null pk=0
+  3 token_amount REAL notnull=1 dflt=0 pk=0
+  4 chain TEXT notnull=1 dflt='sol' pk=3
+== indexes on wallet_token_state ==
+  sqlite_autoindex_wallet_token_state_1 unique=1 origin=pk cols=(wallet_id,ca,chain)
+
+== PRAGMA table_info(wallet_trades) ==
+  0 id INTEGER notnull=0 dflt=null pk=1
+  1 wallet_id TEXT notnull=0 dflt=null pk=0
+  2 ca TEXT notnull=0 dflt=null pk=0
+  3 ts INTEGER notnull=0 dflt=null pk=0
+  4 side TEXT notnull=0 dflt=null pk=0
+  5 amount_usd REAL notnull=0 dflt=null pk=0
+  6 price REAL notnull=0 dflt=null pk=0
+  7 tx TEXT notnull=0 dflt=null pk=0
+  8 source TEXT notnull=1 dflt='nansen' pk=0
+  9 chain TEXT notnull=1 dflt='sol' pk=0
+== indexes on wallet_trades ==
+  idx_trades_ca unique=0 origin=c cols=(ca,side)
+  sqlite_autoindex_wallet_trades_1 unique=1 origin=u cols=(wallet_id,ca,chain,tx,side)
+
+PRAGMA foreign_key_check violations: 0

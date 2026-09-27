@@ -74,7 +74,7 @@ import {
 } from '../src/providers/nansen.js';
 import { hourlyStatsToPoints } from '../src/crawl.js';
 import { SolanaRpcClient } from '../src/providers/solana.js';
-import type { Chain } from '../src/shared/chain.js';
+import { EvmRpcClient, MULTICALL3_ADDRESS } from '../src/providers/evm.js';
 
 test('essential-data body + parser: marketCap null derives price×circulatingSupply', () => {
   const b = essentialDataBody('caX', 'sol') as { parameters: Record<string, unknown> };
@@ -404,7 +404,7 @@ test('NansenApiClient.currentBalance: request shape + data[0] parse (credits hea
   }
 });
 
-// --- wallet holdings: Solana RPC for 'sol', Nansen credits only as non-sol fallback
+// --- wallet holdings: Solana RPC for 'sol', EVM RPC (Multicall3) for base/bsc
 
 function solanaAccount(mint: string, uiAmountString: string): unknown {
   return { account: { data: { parsed: { info: { mint, tokenAmount: { uiAmountString, amount: uiAmountString, decimals: 0 } } } } } };
@@ -472,42 +472,75 @@ test('walletTokenHoldings (sol): RPC failure rejects — the sweep keeps the wal
   }
 });
 
-test('walletTokenHoldings (non-sol): credit-door fallback — one currentBalance per tracked CA, no RPC, warned once per chain', async () => {
-  const warns: string[] = [];
-  const origWrite = process.stderr.write;
-  const rpcCalls: string[] = [];
+// --- non-sol route: EVM RPC via Multicall3 (T5) — zero Nansen credits burned
+
+function evmWord(n: bigint): string {
+  return n.toString(16).padStart(64, '0');
+}
+
+/** ABI of `(bool true, bytes one-word)[]` — Multicall3.aggregate3's return shape. */
+function evmAggregateResult(words: readonly bigint[]): string {
+  const tuples = words.map((w) => evmWord(1n) + evmWord(0x40n) + evmWord(32n) + evmWord(w));
+  const offsets: string[] = [];
+  let at = BigInt(words.length * 32);
+  for (const t of tuples) {
+    offsets.push(evmWord(at));
+    at += BigInt(t.length / 2);
+  }
+  return `0x${evmWord(0x20n)}${evmWord(BigInt(words.length))}${offsets.join('')}${tuples.join('')}`;
+}
+
+const EVM_WALLET = '0x1111111111111111111111111111111111111111';
+const WETH_CA = '0x4200000000000000000000000000000000000006';
+const USDC_CA = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+
+test('walletTokenHoldings (base): EVM RPC route — ONE Multicall3 eth_call, zero credits, zero Solana RPC', async () => {
   const origFetch = globalThis.fetch;
+  const solCalls: RpcCall[] = [];
+  const evmHits: { to: string; data: string }[] = [];
   class RecordingApi extends NansenApiClient {
-    readonly calls: { wallet: string; chain: string; ca: string }[] = [];
+    credits = 0;
     override async currentBalance(wallet: string, chain: string, ca: string) {
-      this.calls.push({ wallet, chain, ca });
+      this.credits++;
       return { tokenAmount: 42, priceUsd: 2, valueUsd: 84 };
     }
   }
   try {
-    process.stderr.write = ((chunk: unknown) => {
-      const s = String(chunk);
-      if (s.includes('no RPC holdings source')) warns.push(s);
-      return true;
-    }) as typeof process.stderr.write;
-    globalThis.fetch = stubSolanaRpc(rpcCalls as unknown as RpcCall[]);
+    globalThis.fetch = (async (url: string, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; params: [{ to: string; data: string }] };
+      if (body.method === 'eth_call') {
+        evmHits.push({ to: body.params[0].to, data: body.params[0].data });
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: evmAggregateResult([1500000000000000000n, 1234567n, 18n, 6n]) }),
+          { status: 200 },
+        );
+      }
+      return stubSolanaRpc(solCalls)(url, init);
+    }) as unknown as typeof fetch;
     const api = new RecordingApi('key');
-    // The chain union is ['sol'] today (src/shared/chain.ts), so the non-sol
-    // credit fallback is unreachable by type — the cast exercises the branch the
-    // spec keeps as the escape hatch for a future multi-chain universe.
-    const other = 'bsc' as unknown as Chain;
-    const cas = [{ address: 'bsc1', chain: other }, { address: 'bsc2', chain: other }];
-    const p = new NansenMarketProvider(async () => ({ status: 200, json: {} }), api, () => cas, new SolanaRpcClient(['https://rpc.test']));
-    const rows = await p.walletTokenHoldings('WALLET', other);
-    assert.deepEqual(rows, [{ ca: 'bsc1', amount: 42 }, { ca: 'bsc2', amount: 42 }]);
-    assert.equal(api.calls.length, 2); // 1 credit per (wallet, tracked CA) on the fallback
-    assert.deepEqual(api.calls.map((c) => c.ca), ['bsc1', 'bsc2']);
-    assert.equal(rpcCalls.length, 0); // non-sol never touches the Solana RPC
-    await p.walletTokenHoldings('WALLET', other);
-    assert.equal(warns.length, 1); // one warn per chain, so the credit burn stays visible
-    assert.match(warns[0] ?? '', /chain bsc has no RPC holdings source/);
+    const cas = [
+      { address: WETH_CA, chain: 'base' as const },
+      { address: USDC_CA, chain: 'base' as const },
+    ];
+    const p = new NansenMarketProvider(
+      async () => ({ status: 200, json: {} }),
+      api,
+      () => cas,
+      new SolanaRpcClient(['https://rpc.test']),
+      new EvmRpcClient(() => ['https://evm.test']),
+    );
+    // balances [WETH 1.5e18, USDC 1234567] then decimals [18, 6] → token units
+    const rows = await p.walletTokenHoldings(EVM_WALLET, 'base');
+    assert.deepEqual(rows, [
+      { ca: WETH_CA, amount: 1.5 },
+      { ca: USDC_CA, amount: 1.234567 },
+    ]);
+    assert.equal(evmHits.length, 1); // the whole wallet is ONE batched eth_call
+    assert.equal(evmHits[0]!.to, MULTICALL3_ADDRESS);
+    assert.ok(evmHits[0]!.data.startsWith('0x82ad56cb'));
+    assert.equal(api.credits, 0); // no credit-door fallback — RPC only
+    assert.equal(solCalls.length, 0); // base never touches the Solana RPC
   } finally {
-    process.stderr.write = origWrite;
     globalThis.fetch = origFetch;
   }
 });

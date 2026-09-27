@@ -1,7 +1,7 @@
 // Reusable write layer — the REAL paid-upgrade seam. The poller writes through
 // these functions today; a future Birdeye WS ingest calls the same ones, so
-// push + poll can coexist safely (trades dedupe on UNIQUE(wallet_id, ca, tx,
-// side); balances are replaced per wallet in one transaction).
+// push + poll can coexist safely (trades dedupe on UNIQUE(wallet_id, ca, chain,
+// tx, side); balances are replaced per (wallet, chain) in one transaction).
 
 import type { Chain } from './shared/chain.js';
 import type {
@@ -235,13 +235,15 @@ export function insertSnapshot(ca: string, chain: Chain, rows: HolderRow[], take
 export function replaceWalletBalances(walletId: string, chain: Chain, rows: WalletTokenHolding[]): void {
   const db = getDb();
   const run = db.transaction((wid: string, current: WalletTokenHolding[]) => {
-    const del = db.prepare('DELETE FROM wallet_token_state WHERE wallet_id = ? AND ca = ?');
+    // Chain-scoped on BOTH sides: a sol sweep must never delete (or overwrite)
+    // the same wallet's base/bsc rows — chain is part of the PK since T3.
+    const del = db.prepare('DELETE FROM wallet_token_state WHERE wallet_id = ? AND ca = ? AND chain = ?');
     const ins = db.prepare(
-      'INSERT INTO wallet_token_state (wallet_id, ca, balance_usd, token_amount) VALUES (?, ?, ?, ?)',
+      'INSERT INTO wallet_token_state (wallet_id, ca, balance_usd, token_amount, chain) VALUES (?, ?, ?, ?, ?)',
     );
     const priceCache = new Map<string, number | null>();
     for (const r of current) {
-      del.run(wid, r.ca);
+      del.run(wid, r.ca, chain);
       if (r.amount <= 0) continue;
       let price = priceCache.get(r.ca);
       if (price === undefined) {
@@ -249,14 +251,14 @@ export function replaceWalletBalances(walletId: string, chain: Chain, rows: Wall
         price = p != null && p > 0 ? p : null; // no usable price -> NULL, never a fake 0
         priceCache.set(r.ca, price);
       }
-      ins.run(wid, r.ca, price !== null ? r.amount * price : null, r.amount);
+      ins.run(wid, r.ca, price !== null ? r.amount * price : null, r.amount, chain);
     }
   });
   run(walletId, rows);
 }
 
 /**
- * INSERT OR IGNORE dedupes on UNIQUE(wallet_id, ca, tx, side) — repolling the
+ * Dedupes on UNIQUE(wallet_id, ca, chain, tx, side) — repolling the
  * same activity window is idempotent. Returns the number of newly inserted rows.
  */
 export function insertTrades(
@@ -265,22 +267,22 @@ export function insertTrades(
   source: 'nansen' | 'watch' = 'nansen',
 ): number {
   const db = getDb();
-  // UNIQUE(wallet_id, ca, tx, side) holds ONE row per on-chain trade, so a trade
-  // both detectors saw must not be written twice: on conflict the 'watch'
+  // UNIQUE(wallet_id, ca, chain, tx, side) holds ONE row per on-chain trade, so a
+  // trade both detectors saw must not be written twice: on conflict the 'watch'
   // (Solana-RPC) provenance wins, because that is what drives `Tracked by`.
   // The WHERE keeps a no-op conflict at 0 changes, so `inserted` still means
   // "newly inserted" for callers that assert idempotency.
   const ins = db.prepare(
-    `INSERT INTO wallet_trades (wallet_id, ca, ts, side, amount_usd, price, tx, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(wallet_id, ca, tx, side)
+    `INSERT INTO wallet_trades (wallet_id, ca, ts, side, amount_usd, price, tx, source, chain)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(wallet_id, ca, chain, tx, side)
      DO UPDATE SET source = 'watch'
        WHERE wallet_trades.source = 'nansen' AND excluded.source = 'watch'`,
   );
   let inserted = 0;
   const run = db.transaction((rows: WalletActivity[]) => {
     for (const a of rows) {
-      inserted += ins.run(walletId, a.ca, a.ts, a.side, a.amountUsd, a.price, a.tx, source).changes;
+      inserted += ins.run(walletId, a.ca, a.ts, a.side, a.amountUsd, a.price, a.tx, source, a.chain).changes;
     }
   });
   run(activities);

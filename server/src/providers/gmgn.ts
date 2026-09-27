@@ -27,6 +27,7 @@ import { randomUUID } from 'node:crypto';
 import { timed } from '../log.js';
 import { limiters } from '../ratelimit/index.js';
 import { HttpError, type Priority } from '../ratelimit/types.js';
+import { chainSlugs } from '../shared/chain-slugs.js';
 import type { Chain } from '../shared/chain.js';
 import type { AssetInfo } from './solana.js';
 import type { MetricKind, MetricPatch } from './provider.js';
@@ -38,8 +39,8 @@ export const GMGN_TOKEN_INFO_WEIGHT = 1;
 
 /** GMGN slugs the chain `sol` — `solana` 404s TOKEN_NOT_FOUND (probed 2026-09-24). */
 function gmgnChain(chain: string): string {
-  if (chain === 'sol') return 'sol';
-  throw new Error(`gmgn: unsupported chain ${chain}`);
+  const slugs = chainSlugs(chain);
+  return slugs.gmgn;
 }
 
 /** GMGN sends every numeric field as a STRING ("425137.45927614") — coerce, 0 on junk. */

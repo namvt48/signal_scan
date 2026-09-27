@@ -1,4 +1,4 @@
-export const CHAINS = ['sol'] as const;
+export const CHAINS = ['sol', 'base', 'bsc'] as const;
 export type Chain = (typeof CHAINS)[number];
 
 export interface Wallet {

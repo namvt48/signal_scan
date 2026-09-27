@@ -1,0 +1,27 @@
+usage: __main__.py [-h] [--wallets WALLETS] [--once] [--feed {ws,poll}]
+                   [--min-usd MIN_USD] [--jsonl JSONL] [--api-url API_URL]
+                   [--track] [--confirmations CONFIRMATIONS] [--chunk CHUNK]
+                   [--poll-sleep POLL_SLEEP]
+
+EVM (Base + BSC) wallet swap watcher — mirror của watchers.sol (T8/D7)
+
+options:
+  -h, --help            show this help message and exit
+  --wallets WALLETS
+  --once                quét 1 vòng backfill rồi ra (ép --feed poll)
+  --feed {ws,poll}      ws = eth_subscribe logs/ví (mặc định); poll =
+                        eth_getLogs chunked
+  --min-usd MIN_USD
+  --jsonl JSONL         ghi thêm mỗi sự kiện 1 dòng JSON vào file này (log
+                        machine-readable)
+  --api-url API_URL     base URL của alpha-engine API
+                        (wallets/settings/trades/tracked-cas)
+  --track               tự POST CA của mọi tx BUY vào API để auto-add tracking
+                        (mặc định tắt)
+  --confirmations CONFIRMATIONS
+                        số block xác nhận trước khi emit (Base ~2s, BSC
+                        ~3s/block)
+  --chunk CHUNK         bề rộng block-range mỗi eth_getLogs (tự halve khi
+                        provider chê)
+  --poll-sleep POLL_SLEEP
+                        feed poll: nghỉ giữa các vòng quét (giây)

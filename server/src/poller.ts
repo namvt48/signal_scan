@@ -819,15 +819,16 @@ const holdingsKickInFlight = new Set<Chain>();
  * the DB already knows. Coalesced per chain so a burst of inserts costs one
  * refresh, not one per CA.
  *
- * sol only: it is the only chain with a credit-free holdings source, so kicking the
- * others here would double their credit burn (1 credit per wallet×CA) against
- * simply waiting for the already-scheduled sweep to cover the new CA.
+ * Every chain is kicked (T5, plan evm-base-bsc): holdings are credit-free on all
+ * of them — sol via Solana getTokenAccountsByOwner, base/bsc via ONE Multicall3
+ * eth_call per wallet. The old sol-only gate protected the Nansen credit door,
+ * which EVM chains no longer use.
  */
 export function kickWalletHoldingsFor(cas: readonly { address: string; chain: Chain }[]): void {
   if (!pollerDeps) return;
   const deps = pollerDeps;
   for (const chain of new Set(cas.map((c) => c.chain))) {
-    if (chain !== 'sol' || holdingsKickInFlight.has(chain)) continue;
+    if (holdingsKickInFlight.has(chain)) continue;
     holdingsKickInFlight.add(chain);
     void (async () => {
       try {

@@ -94,12 +94,13 @@ export interface SnapshotRow {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS wallets (
   id TEXT PRIMARY KEY,
-  address TEXT NOT NULL UNIQUE,
+  address TEXT NOT NULL,
   name TEXT NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]',
-  chain TEXT NOT NULL,
+  chain TEXT NOT NULL DEFAULT 'sol',
   source TEXT NOT NULL DEFAULT '',
-  clan TEXT
+  clan TEXT,
+  UNIQUE(address, chain)
 );
 CREATE TABLE IF NOT EXISTS tracked_cas (
   id TEXT PRIMARY KEY,
@@ -152,7 +153,8 @@ CREATE TABLE IF NOT EXISTS wallet_token_state (
   ca TEXT,
   balance_usd REAL,
   token_amount REAL NOT NULL DEFAULT 0,
-  PRIMARY KEY (wallet_id, ca),
+  chain TEXT NOT NULL DEFAULT 'sol',
+  PRIMARY KEY (wallet_id, ca, chain),
   FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS wallet_trades (
@@ -165,7 +167,8 @@ CREATE TABLE IF NOT EXISTS wallet_trades (
   price REAL,
   tx TEXT,
   source TEXT NOT NULL DEFAULT 'nansen',
-  UNIQUE(wallet_id, ca, tx, side),
+  chain TEXT NOT NULL DEFAULT 'sol',
+  UNIQUE(wallet_id, ca, chain, tx, side),
   FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ca ON wallet_trades(ca, side);
@@ -233,6 +236,80 @@ export function open(path: string): void {
   if (!walletCols.includes('clan')) {
     instance.exec('ALTER TABLE wallets ADD COLUMN clan TEXT');
     instance.exec("UPDATE wallets SET clan = 'a' WHERE clan IS NULL");
+  }
+  // T3 (evm-base-bsc): chain-aware wallet keys — SQLite can't drop UNIQUE/PK via
+  // ALTER, so rebuild the 3 tables (copy with chain='sol') in ONE transaction
+  // under foreign_keys=OFF (pragma is a no-op inside a transaction). Must run
+  // after the ALTERs above so token_amount/source/clan exist to copy. Trigger:
+  // pre-T3 DBs lack wallet_token_state.chain; fresh/re-opened DBs have it → no-op.
+  const wtsHasChain = (instance.pragma('table_info(wallet_token_state)') as { name: string }[]).some(
+    (c) => c.name === 'chain',
+  );
+  if (!wtsHasChain) {
+    const db = instance;
+    db.pragma('foreign_keys = OFF');
+    try {
+      const rebuildWalletTables = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE wallets_new (
+            id TEXT PRIMARY KEY,
+            address TEXT NOT NULL,
+            name TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            chain TEXT NOT NULL DEFAULT 'sol',
+            source TEXT NOT NULL DEFAULT '',
+            clan TEXT,
+            UNIQUE(address, chain)
+          );
+          INSERT INTO wallets_new (id, address, name, tags, chain, source, clan)
+            SELECT id, address, name, tags, COALESCE(chain, 'sol'), source, clan FROM wallets;
+          DROP TABLE wallets;
+          ALTER TABLE wallets_new RENAME TO wallets;
+
+          CREATE TABLE wallet_token_state_new (
+            wallet_id TEXT,
+            ca TEXT,
+            balance_usd REAL,
+            token_amount REAL NOT NULL DEFAULT 0,
+            chain TEXT NOT NULL DEFAULT 'sol',
+            PRIMARY KEY (wallet_id, ca, chain),
+            FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
+          );
+          INSERT INTO wallet_token_state_new (wallet_id, ca, balance_usd, token_amount, chain)
+            SELECT wallet_id, ca, balance_usd, token_amount, 'sol' FROM wallet_token_state;
+          DROP TABLE wallet_token_state;
+          ALTER TABLE wallet_token_state_new RENAME TO wallet_token_state;
+
+          CREATE TABLE wallet_trades_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_id TEXT,
+            ca TEXT,
+            ts INTEGER,
+            side TEXT CHECK(side IN ('buy','sell')),
+            amount_usd REAL,
+            price REAL,
+            tx TEXT,
+            source TEXT NOT NULL DEFAULT 'nansen',
+            chain TEXT NOT NULL DEFAULT 'sol',
+            UNIQUE(wallet_id, ca, chain, tx, side),
+            FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
+          );
+          INSERT INTO wallet_trades_new (id, wallet_id, ca, ts, side, amount_usd, price, tx, source, chain)
+            SELECT id, wallet_id, ca, ts, side, amount_usd, price, tx, source, 'sol' FROM wallet_trades;
+          DROP TABLE wallet_trades;
+          ALTER TABLE wallet_trades_new RENAME TO wallet_trades;
+
+          CREATE INDEX IF NOT EXISTS idx_trades_ca ON wallet_trades(ca, side);
+        `);
+      });
+      rebuildWalletTables();
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+    const fkViolations = db.pragma('foreign_key_check') as unknown[];
+    if (fkViolations.length > 0) {
+      throw new Error(`wallet chain migration: foreign_key_check found ${fkViolations.length} violation(s)`);
+    }
   }
   // One-time LF re-resolve (user 2026-09-11): the LF rule became "the exchange
   // chart's LEFTMOST point", so every stored genesis_bal is stale — and stale is
@@ -333,8 +410,9 @@ export function getWallet(id: string): WalletRow | undefined {
   return getDb().prepare('SELECT * FROM wallets WHERE id = ?').get(id) as WalletRow | undefined;
 }
 
-export function findWalletByAddress(address: string): WalletRow | undefined {
-  return getDb().prepare('SELECT * FROM wallets WHERE address = ?').get(address) as
+/** Identity key is (address, chain) — the same address on 2 chains = 2 wallets (T4). */
+export function findWalletByAddress(address: string, chain: Chain): WalletRow | undefined {
+  return getDb().prepare('SELECT * FROM wallets WHERE address = ? AND chain = ?').get(address, chain) as
     | WalletRow
     | undefined;
 }
@@ -376,8 +454,8 @@ export function isChain(v: unknown): v is Chain {
 }
 
 /**
- * Server-side CSV import: validates each row (boundary), dedupes by address via
- * INSERT OR IGNORE. `row` = index in the input array (matches the frontend
+ * Server-side CSV import: validates each row (boundary), dedupes by (address, chain)
+ * via INSERT OR IGNORE. `row` = index in the input array (matches the frontend
  * ImportResult contract). Single transaction for the whole batch.
  */
 export function importWallets(

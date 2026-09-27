@@ -139,8 +139,9 @@ test('pacedFor: a slow request consumes its slot instead of adding the gap on to
 
 // Fast CA→wallet attach (A): on insert, refresh holdings immediately so the linked
 // wallet's balance lands in ~1s instead of waiting out the 15m walletSweep. Only the
-// wallets the watch BUY already linked are read; coalesced per chain, sol-only.
-test("kickWalletHoldingsFor: reads only the CAs' linked wallets, coalesces per chain, skips non-sol", async () => {
+// wallets the watch BUY already linked are read; coalesced per chain. Every chain
+// kicks (T5): sol via Solana RPC, base/bsc via EVM RPC.
+test("kickWalletHoldingsFor: reads only the CAs' linked wallets, coalesces per chain, fires on base too", async () => {
   const calls: string[] = [];
   const provider: MarketDataProvider = {
     name: 'nansen',
@@ -150,29 +151,33 @@ test("kickWalletHoldingsFor: reads only the CAs' linked wallets, coalesces per c
     metric: async () => ({}),
     walletTokenHoldings: async (wallet) => {
       calls.push(wallet);
-      return wallet === 'hold-addr' ? [{ ca: 'CA-HOLD', amount: 777 }] : [];
+      if (wallet === 'hold-addr') return [{ ca: 'CA-HOLD', amount: 777 }];
+      if (wallet === 'hold-base') return [{ ca: 'CA-BASE', amount: 55 }];
+      return [];
     },
   };
   setPollerDeps(provider, {} as never);
   const solId = insertWallet({ address: 'hold-addr', name: 'HOLD1', tags: [], chain: 'sol', source: 'test' }).id;
   insertWallet({ address: 'idle-addr', name: 'IDLE', tags: [], chain: 'sol', source: 'test' });
-  insertWallet({ address: 'hold-eth', name: 'HOLD-ETH', tags: [], chain: 'eth', source: 'test' });
+  const baseId = insertWallet({ address: 'hold-base', name: 'HOLD-BASE', tags: [], chain: 'base', source: 'test' }).id;
   // The watch BUY IS the link (signals.trackedByNames) — the only thing that puts
   // this wallet in scope, which is why the kick never needs the other wallets.
   insertTrades(solId, [{ tx: 'tx-link', ts: Date.now(), side: 'buy', ca: 'CA-HOLD', chain: 'sol', amountUsd: 1, price: 1 }], 'watch');
+  insertTrades(baseId, [{ tx: 'tx-link-base', ts: Date.now(), side: 'buy', ca: 'CA-BASE', chain: 'base', amountUsd: 1, price: 1 }], 'watch');
 
   kickWalletHoldingsFor([{ address: 'CA-HOLD', chain: 'sol' }]);
   kickWalletHoldingsFor([{ address: 'CA-HOLD-2', chain: 'sol' }]); // same chain, still in flight
-  kickWalletHoldingsFor([{ address: 'CA-ETH', chain: 'eth' }]);
+  kickWalletHoldingsFor([{ address: 'CA-BASE', chain: 'base' }]); // other chain → own in-flight slot
 
-  const row = () =>
-    getDb().prepare('SELECT token_amount FROM wallet_token_state WHERE wallet_id = ? AND ca = ?').get(solId, 'CA-HOLD') as
+  const state = (id: string, ca: string) =>
+    getDb().prepare('SELECT token_amount FROM wallet_token_state WHERE wallet_id = ? AND ca = ?').get(id, ca) as
       | { token_amount: number }
       | undefined;
-  for (let i = 0; i < 100 && !row(); i++) await new Promise((r) => setTimeout(r, 5));
+  for (let i = 0; i < 100 && !(state(solId, 'CA-HOLD') && state(baseId, 'CA-BASE')); i++) await new Promise((r) => setTimeout(r, 5));
 
-  assert.equal(row()?.token_amount, 777, 'the holding was not attached immediately');
+  assert.equal(state(solId, 'CA-HOLD')?.token_amount, 777, 'the holding was not attached immediately');
+  assert.equal(state(baseId, 'CA-BASE')?.token_amount, 55, 'the base kick never landed — non-sol chains must fire too');
   assert.equal(calls.filter((a) => a === 'hold-addr').length, 1, 'a second kick for the same chain must coalesce');
   assert.equal(calls.filter((a) => a === 'idle-addr').length, 0, 'a wallet with no watch BUY link must not be queried');
-  assert.equal(calls.filter((a) => a === 'hold-eth').length, 0, 'the non-sol credit door must be skipped');
+  assert.equal(calls.filter((a) => a === 'hold-base').length, 1, 'the base kick fires exactly once');
 });

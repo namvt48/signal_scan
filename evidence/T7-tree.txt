@@ -1,0 +1,35 @@
+T7 — watchers/ package tree (generated 2026-09-27T12:02:49+07:00, TZ Asia/Ho_Chi_Minh)
+repo: ee47418 | python: Python 3.12.7
+
+== find watchers -name '*.py' | sort, with line counts ==
+   218  watchers/common/config.py
+   220  watchers/common/emit.py
+     1  watchers/common/__init__.py
+   206  watchers/common/price.py
+    38  watchers/common/state.py
+     7  watchers/__init__.py
+   990  watchers/sol/classify.py
+   363  watchers/sol/feed.py
+     1  watchers/sol/__init__.py
+     6  watchers/sol/__main__.py
+   122  watchers/sol/main.py
+
+== totals ==
+ 2172 total
+original monolith (pre-T7, git HEAD): 2057 lines
+scripts/wallet_watch.py now (compat shim): 92 lines
+
+== git status (new/changed for T7) ==
+ M scripts/wallet_watch.py
+?? watchers/
+
+== partition map (module -> owns) ==
+watchers/common/config.py   HERE, ICT, RPC_*, http_json, rpc, min_usd, _api_url, _track, quotes_map, load_config_from_api
+watchers/common/state.py    HEARTBEAT, _beat, STATE_PATH, load_state, save_state
+watchers/common/price.py    _info, _supply, _sol_px, sol_price, gmgn_info, token_info, _warm_prices, get_price_usd (NEW seam)
+watchers/common/emit.py     _jsonl, jl_write/rotate, track_*, watch_trade_*, _fq, fmt, post_trade (NEW seam)
+watchers/sol/classify.py    TIER_A/B, detect_swaps, detect_events, _legs_with_roles, _swap_event, ...
+watchers/sol/feed.py        _emitted, _handle_tx, run_block_feed, run_ws_feed
+watchers/sol/main.py        load_lines, main
+watchers/sol/__main__.py    entrypoint: python3 -m watchers.sol
+scripts/wallet_watch.py     flat-namespace compat shim (no logic)

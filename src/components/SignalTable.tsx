@@ -1,8 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
+import { CHAIN_LINKS } from '../chain';
 import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN } from '../config';
-import type { NansenThresholds, TokenSignal, TrackedWalletStat } from '../types';
+import type { Chain, NansenThresholds, TokenSignal, TrackedWalletStat } from '../types';
 import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
 import { CheckSquare, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TokenAvatar, walletNameClass } from './ui';
 
@@ -98,10 +99,10 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
 }
 
 /* CA cell: opens the token page on GMGN in a new tab. */
-function CaCell({ ca }: { ca: string }) {
+function CaCell({ ca, chain }: { ca: string; chain: Chain }) {
   return (
     <a
-      href={`https://gmgn.ai/sol/token/${ca}`}
+      href={`https://gmgn.ai/${CHAIN_LINKS[chain].gmgnSlug}/token/${ca}`}
       target="_blank"
       rel="noopener noreferrer"
       title={`Open ${ca} on GMGN`}
@@ -469,7 +470,7 @@ export default function SignalTable({ refreshKey }: { refreshKey?: number }) {
                       {s.marketCap !== undefined ? usd(s.marketCap) : '—'}
                     </Td>
                     <Td className="w-24 text-center">
-                      <CaCell ca={s.ca} />
+                      <CaCell ca={s.ca} chain={s.chain} />
                     </Td>
                     <Td className="w-96">
                       {s.trackedWallets.length === 0 ? (

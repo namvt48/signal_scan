@@ -16,6 +16,8 @@
 // chromium). Pure logic is transport-agnostic and unit-tested.
 
 import type { Chain } from '../shared/chain.js';
+import { chainSlugs } from '../shared/chain-slugs.js';
+import { EvmRpcClient } from './evm.js';
 import { solanaRpcEndpoints, SolanaRpcClient, type AssetInfo } from './solana.js';
 import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo, WalletActivity, WalletTokenHolding } from './provider.js';
 import { log, timed } from '../log.js';
@@ -90,10 +92,7 @@ export function hourlyStatsBody(
 }
 
 function nansenWebChain(chain: string): string {
-  const map: Record<string, string> = { sol: 'solana' };
-  const mapped = map[chain];
-  if (!mapped) throw new Error(`nansen crawl: unsupported chain ${chain}`);
-  return mapped;
+  return chainSlugs(chain).nansen;
 }
 
 export function holdersGiniBody(ca: string, chain: string): unknown {
@@ -498,10 +497,7 @@ export function mapTokenInformation(r: TokenInformation): TokenInformationPatch 
 }
 
 function nansenApiChain(chain: string): string {
-  const map: Record<string, string> = { sol: 'solana' };
-  const mapped = map[chain];
-  if (!mapped) throw new Error(`nansen api: unsupported chain ${chain}`);
-  return mapped;
+  return chainSlugs(chain).nansen;
 }
 
 /** Pure: dex-trades rows → WalletActivity, filtered to tracked CAs (logic moved from the old nansenApiSweep). */
@@ -531,8 +527,9 @@ export function mapDexTradesToActivities(rows: NansenTradeRow[], caSet: Readonly
 // ---------------------------------------------------------------------------
 // NansenMarketProvider — THE live provider since 2026-09-09 (GMGN retired).
 // Free app-questions door (browser transport, injected PostJson) for token
-// metrics + top-100 holders; official credit API for NON-SOL wallet balances only
-// (wallet trades moved to the free wp4t-transactions door 2026-09-17).
+// metrics + top-100 holders; official credit API for token-information/flows.
+// Wallet HOLDINGS are credit-free on every chain: sol via Solana RPC, base/bsc
+// via one Multicall3 eth_call per wallet (plan evm-base-bsc D5).
 
 export class NansenMarketProvider implements MarketDataProvider {
   readonly name = 'nansen';
@@ -544,10 +541,10 @@ export class NansenMarketProvider implements MarketDataProvider {
     // Default builds the client from SOLANA_RPC_URL/RPC_HTTP; injectable so
     // tests can point it at a stub endpoint.
     private readonly solanaRpc: SolanaRpcClient = new SolanaRpcClient(solanaRpcEndpoints()),
+    // Default builds from BASE_RPC_URL/BSC_RPC_URL + keyless fallback; injectable
+    // so tests can point it at stub endpoints.
+    private readonly evmRpc: EvmRpcClient = new EvmRpcClient(),
   ) {}
-
-  /** chains already reported as still riding the credit door — one warn each. */
-  private readonly creditChainsWarned = new Set<string>();
 
   private async ask(url: string, body: unknown): Promise<unknown> {
     const { status, json } = await this.postJson(url, body);
@@ -661,11 +658,6 @@ export class NansenMarketProvider implements MarketDataProvider {
     }
   }
 
-  private requireApi(): NansenApiClient {
-    if (!this.api) throw new Error('NANSEN_API_KEY not set — wallet data unavailable');
-    return this.api;
-  }
-
   /**
    * Holdings in TOKEN UNITS for the (wallet, CA) pairs asked for — one query per
    * pair, never the wallet's whole token-account list (user 2026-09-23: "query cặp
@@ -679,12 +671,14 @@ export class NansenMarketProvider implements MarketDataProvider {
    * needs that 0 to delete the stale row.
    *
    * No `cas` → every tracked CA on the wallet's chain (the broad legacy call).
-   * Non-sol → Nansen credit path (currentBalance, 1 credit per pair); the chain is
-   * logged ONCE so the credit burn stays visible, never silent.
+   * Non-sol (base/bsc) → EVM JSON-RPC (providers/evm.ts): ONE Multicall3 eth_call
+   * per wallet batches balanceOf for every asked CA plus decimals() for the
+   * uncached ones — credit-free, same 0-never-dropped contract (plan D5; the
+   * Nansen credit door currentBalance is retired for these chains).
    */
   async walletTokenHoldings(wallet: string, chain: Chain, cas?: readonly string[]): Promise<WalletTokenHolding[]> {
     const wanted = cas ?? this.trackedCas().filter((c) => c.chain === chain).map((c) => c.address);
-    if (chain !== 'sol') return this.creditWalletHoldings(wallet, chain, wanted);
+    if (chain !== 'sol') return this.evmRpc.walletTokenHoldings(wallet, chain, wanted);
     const rows: WalletTokenHolding[] = [];
     for (const ca of wanted) {
       // Sum on the (rare) chance the wallet owns more than one account of this
@@ -694,20 +688,5 @@ export class NansenMarketProvider implements MarketDataProvider {
       rows.push({ ca, amount: [...byMint.values()].reduce((sum, v) => sum + v, 0) });
     }
     return rows;
-  }
-
-  /** Nansen credit door — the non-sol fallback, 1 credit per (wallet, CA) pair. */
-  private async creditWalletHoldings(wallet: string, chain: Chain, cas: readonly string[]): Promise<WalletTokenHolding[]> {
-    if (!this.creditChainsWarned.has(chain)) {
-      this.creditChainsWarned.add(chain);
-      log.warn(`[nansen] chain ${chain} has no RPC holdings source — falling back to the credit door (currentBalance, 1 credit/wallet×CA)`);
-    }
-    const api = this.requireApi();
-    const out: WalletTokenHolding[] = [];
-    for (const ca of cas) {
-      const b = await api.currentBalance(wallet, chain, ca);
-      if (b && b.valueUsd > 0) out.push({ ca, amount: b.tokenAmount });
-    }
-    return out;
   }
 }

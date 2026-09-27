@@ -136,7 +136,7 @@ test('assembleSignals: trackedWallets = watch-buy members only, per-wallet 24h s
   // the 24h stat window -> zero stats and lastTs 0. CT01's holding is NOT what qualifies it.
   assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CT01', 'CT02']);
   // CT02: balUsd key OMITTED (no wallet_token_state row) — deepStrictEqual fails on an undefined-valued key.
-  assert.deepEqual(sig.trackedWallets[1], { name: 'CT02', inflow: 0, buys: 0, sells: 0, lastTs: 0 });
+  assert.deepEqual(sig.trackedWallets[1], { name: 'CT02', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0 });
   // CT01: net 1000+2300−999; lastTs = newest watch TRADE (the sell); balUsd = 1e7 tokens × price 0.001.
   const ct01 = sig.trackedWallets[0];
   assert.ok(ct01);
@@ -188,7 +188,7 @@ test('trackedWallets: sell subtracts from wallet AND token net, counts, balUsd p
   assert.equal(buyer.balUsd, 1500);
   // (c) ... and OMITTED (key absent, not undefined) when never measured
   assert.ok(!('balUsd' in noBal), 'unmeasured balUsd must be absent, not undefined');
-  assert.deepEqual(noBal, { name: 'CTNET2', inflow: 250, buys: 1, sells: 0, lastTs: NOW - 600_000 });
+  assert.deepEqual(noBal, { name: 'CTNET2', tags: [], inflow: 250, buys: 1, sells: 0, lastTs: NOW - 600_000 });
 
   // (a)+(d) token total = Σ rows; CTNET3's excluded 4000 sell moves nothing
   assert.equal(sig.trackedInflow, 1250);

@@ -14,6 +14,7 @@ const CA = 'watchCa-source-001';
 let server: Server;
 let base = '';
 let walletId = '';
+let baseWalletId = '';
 
 async function post(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/wallet-watch/trades`, {
@@ -35,9 +36,18 @@ function sourceOf(tx: string): string | undefined {
   return row?.source;
 }
 
+function tradeRowOf(tx: string): { wallet_id: string; chain: string } | undefined {
+  return getDb().prepare('SELECT wallet_id, chain FROM wallet_trades WHERE tx = ?').get(tx) as
+    | { wallet_id: string; chain: string }
+    | undefined;
+}
+
 before(async () => {
   open(':memory:');
   walletId = insertWallet({ address: WALLET, name: 'CTW', tags: [], chain: 'sol', source: 'test' }).id;
+  // T4: the SAME address on another chain is a distinct wallet — resolution by
+  // (address, chain) must never cross them.
+  baseWalletId = insertWallet({ address: WALLET, name: 'CTW-base', tags: [], chain: 'base', source: 'test' }).id;
   server = createApp('test').listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -126,4 +136,34 @@ test('insertTrades: the watcher repost upgrades a wp4t row to source=watch (one 
   assert.equal(sourceOf('sig-both'), 'watch');
   const count = getDb().prepare('SELECT COUNT(*) AS n FROM wallet_trades WHERE tx = ?').get('sig-both') as { n: number };
   assert.equal(count.n, 1);
+});
+
+test('POST /api/wallet-watch/trades: chain=base resolves the base wallet and stores chain=base', async () => {
+  const res = await post(trade({ tx: 'sig-watch-base', chain: 'base' }));
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  const row = tradeRowOf('sig-watch-base');
+  assert.equal(row?.chain, 'base');
+  assert.equal(row?.wallet_id, baseWalletId);
+});
+
+test('POST /api/wallet-watch/trades: absent chain defaults to sol (deployed-daemon compat)', async () => {
+  const res = await post(trade({ tx: 'sig-watch-nochain' }));
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  const row = tradeRowOf('sig-watch-nochain');
+  assert.equal(row?.chain, 'sol');
+  assert.equal(row?.wallet_id, walletId);
+});
+
+test('POST /api/wallet-watch/trades: 400 on an unknown chain', async () => {
+  assert.equal((await post(trade({ chain: 'doge' }))).status, 400);
+  assert.equal((await post(trade({ chain: 123 }))).status, 400);
+  assert.equal((await post(trade({ chain: '' }))).status, 400);
+});
+
+test('POST /api/wallet-watch/trades: 404 when the address is only tracked on ANOTHER chain', async () => {
+  const res = await post(trade({ tx: 'sig-watch-bsc', chain: 'bsc' }));
+  assert.equal(res.status, 404);
+  assert.equal(tradeRowOf('sig-watch-bsc'), undefined);
 });

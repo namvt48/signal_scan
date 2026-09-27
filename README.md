@@ -22,7 +22,7 @@ npm run preview   # serve the production build locally
 Header is `address,name,tags,chain,source` with an OPTIONAL trailing `clan` column (legacy 5-column files still import).
 
 - `tags`: multiple tags inside one cell, separated by `;`
-- `chain`: one of `sol`
+- `chain`: one of `sol`, `base`, `bsc`
 - `clan` (optional): display-only label shown beside the wallet name (Wallet tab and the "Tracked by" rows). It never filters or routes anything.
 - Rows with an empty address or an unknown chain are skipped and shown with a reason in the import preview before committing.
 
