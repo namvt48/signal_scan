@@ -412,6 +412,27 @@ test('flowsSweep: a cached CA with a STALE series_at makes exactly 1 series fetc
   assert.equal(exchangeCalls, 0, 'a known genesis_bal keeps the LF write-once guard');
 });
 
+test('flowsSweep: a cached CA parked on info_at only (no series_at) still OWES its T100 — 1 fetch', async () => {
+  const ca = 'CA-FLOWS-MARKERLESS';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 });
+  // gini landed (info_at), so setupSweep now counts this CA done — but the credit series
+  // never did, and that pass is the CA's ONLY retry path. Parking it here leaves T100 at
+  // NULL forever, so this filter must key on the series marker, never on entry presence.
+  putSetupCacheEntry(entryFor(ca, { taken_at: now - HOUR, info_at: now - HOUR }));
+
+  await flowsSweep();
+
+  assert.equal(seriesCalls, 1, 'a markerless entry must still be retried by flowsSweep');
+  assert.equal(exchangeCalls, 0, 'the known genesis_bal keeps the LF write-once guard');
+});
+
 test('flowsSweep: a tracked CA with NO cache entry is setupSweep\'s job — 0 calls', async () => {
   const ca = 'CA-FLOWS-NOCACHE';
   open(':memory:');
