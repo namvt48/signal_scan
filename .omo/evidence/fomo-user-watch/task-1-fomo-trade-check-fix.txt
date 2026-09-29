@@ -1,0 +1,29 @@
+=== Task 1 fix — insertFomoTrade OR IGNORE -> ON CONFLICT(event_id) DO NOTHING — 2026-09-29T06:03:35Z ===
+Bug: INSERT OR IGNORE also swallowed CHECK violations, so type:'perp' via the accessor returned false silently.
+
+$ npx tsx _probe.ts   (live probe THROUGH the accessor)
+perp via accessor THREW: CHECK constraint failed: type IN ('buy','sell')
+buy first  -> true (expect true)
+buy replay -> false (expect false)
+fomo_trades rows -> 1 (expect 1: perp wrote nothing)
+
+$ cd server && npm run build
+
+> signal-scan-server@0.1.0 build
+> tsc
+
+build exit=0
+
+$ cd server && npm test   (full suite: tsx --test test/*.test.ts test/ratelimit/*.test.ts)
+...
+ℹ tests 379
+ℹ suites 0
+ℹ pass 379
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 28798.997857
+npm test exit=0
+
+(per-test lines elided: 379/379 pass reproduces via `cd server && npm test`)

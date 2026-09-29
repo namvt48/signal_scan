@@ -1019,7 +1019,7 @@ export interface FomoUserInput {
 
 export interface FomoTradeInput {
   fomo_user_id: string;
-  /** FOMO's stable event id — the idempotency key (INSERT OR IGNORE). */
+  /** FOMO's stable event id — the idempotency key (ON CONFLICT DO NOTHING). */
   event_id: string;
   /** Raw contract address — canonicalized (canonicalCa) before storing. */
   ca: string;
@@ -1195,14 +1195,19 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
 }
 
 /**
- * Idempotent on event_id (INSERT OR IGNORE): a replayed alert is a no-op. Returns
- * whether a row was actually created (false = the event_id already existed). ca is
- * canonicalized so it keys like the rest of the store.
+ * Idempotent on event_id via ON CONFLICT(event_id) DO NOTHING: a replayed alert is
+ * a no-op. NOT `OR IGNORE` — that also swallows CHECK/NOT-NULL violations and would
+ * mute the type CHECK backstop; DO NOTHING on event_id keeps the replay no-op while
+ * a bad `type` still throws. Returns whether a row was actually created (false =
+ * the event_id already existed). ca is canonicalized so it keys like the rest of
+ * the store.
  */
 export function insertFomoTrade(input: FomoTradeInput): boolean {
   const res = getDb()
     .prepare(
-      'INSERT OR IGNORE INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, price, token, ts, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, price, token, ts, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id) DO NOTHING`,
     )
     .run(
       input.fomo_user_id,

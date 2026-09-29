@@ -7,11 +7,14 @@ import Database from 'better-sqlite3';
 import {
   deleteFomoUser,
   findFomoUserByHandle,
+  findFomoUserByUserId,
   getDb,
   importFomoUsers,
   insertFomoTrade,
   insertFomoUser,
+  listFomoUsers,
   open,
+  updateFomoUser,
 } from '../src/db.js';
 
 const count = (table: string): number =>
@@ -32,7 +35,7 @@ test('(a) insertFomoUser: duplicate handle throws per the UNIQUE index', () => {
 });
 
 // (b) the same event_id inserted twice creates ONE row; the replay reports not-created.
-test('(b) insertFomoTrade: event_id is idempotent (INSERT OR IGNORE)', () => {
+test('(b) insertFomoTrade: event_id is idempotent (ON CONFLICT DO NOTHING)', () => {
   const user = insertFomoUser({ handle: '@bob', name: 'Bob' });
   const trade = { fomo_user_id: user.id, event_id: 'evt-1', ca: 'SoCa1', chain: 'sol' as const, type: 'buy' as const, usd_value: 1200, ts: 1_758_000_000_000 };
 
@@ -60,6 +63,26 @@ test('fomo_trades type CHECK rejects a perp-shaped insert (loud backstop)', () =
         .run(user.id, 'evt-perp', 'PerpCa', 'sol', 1, Date.now()),
     /CHECK/i,
   );
+});
+
+// The ACCESSOR must stay loud too: ON CONFLICT(event_id) DO NOTHING absorbs ONLY the
+// event_id replay — a bad `type` still throws (unlike INSERT OR IGNORE, which muted it).
+test('insertFomoTrade: a bad type throws through the accessor (CHECK not muted)', () => {
+  const user = insertFomoUser({ handle: '@perp2', name: 'Perp2' });
+  const before = count('fomo_trades');
+  assert.throws(
+    () =>
+      insertFomoTrade({
+        fomo_user_id: user.id,
+        event_id: 'evt-perp-acc',
+        ca: 'PerpCa2',
+        chain: 'sol',
+        type: 'perp' as never,
+        ts: 1,
+      }),
+    /CHECK/i,
+  );
+  assert.equal(count('fomo_trades'), before, 'no row was written');
 });
 
 // (c) deleting a fomo_users row cascades to its fomo_trades rows (FK ON DELETE CASCADE).
@@ -119,6 +142,46 @@ test('importFomoUsers: empty incoming fields never erase learned values', () => 
   const row = findFomoUserByHandle('@y');
   assert.equal(row?.user_id, 'u2', 'learned user_id survives an empty re-import');
   assert.equal(row?.clan, 'c2', 'learned clan survives an empty re-import');
+});
+
+test('listFomoUsers: returns every user, ordered by name', () => {
+  insertFomoUser({ handle: '@list-a', name: 'Zeta' });
+  insertFomoUser({ handle: '@list-b', name: 'Alpha' });
+
+  const all = listFomoUsers();
+  const handles = all.map((u) => u.handle);
+  assert.ok(handles.includes('@list-a'));
+  assert.ok(handles.includes('@list-b'));
+  const names = all.map((u) => u.name);
+  assert.deepEqual(names, [...names].sort(), 'rows come back ORDER BY name');
+});
+
+test('findFomoUserByUserId: finds by user_id, undefined for an unknown one', () => {
+  insertFomoUser({ handle: '@finder', name: 'Finder', user_id: 'u-find-1' });
+
+  assert.equal(findFomoUserByUserId('u-find-1')?.handle, '@finder');
+  assert.equal(findFomoUserByUserId('u-does-not-exist'), undefined);
+});
+
+test('updateFomoUser: PATCHes only the provided fields; unknown id returns undefined', () => {
+  const user = insertFomoUser({ handle: '@patch', name: 'Before', source: 'manual' });
+
+  const updated = updateFomoUser(user.id, { name: 'After', clan: 'c9', user_id: 'u9' });
+  assert.equal(updated?.name, 'After');
+  assert.equal(updated?.clan, 'c9');
+  assert.equal(updated?.user_id, 'u9');
+  assert.equal(updated?.handle, '@patch', 'untouched field preserved');
+  assert.equal(updated?.source, 'manual', 'untouched field preserved');
+
+  assert.equal(updateFomoUser('no-such-id', { name: 'Ghost' }), undefined);
+});
+
+test('updateFomoUser: changing handle to an existing handle throws UNIQUE', () => {
+  insertFomoUser({ handle: '@taken', name: 'Taken' });
+  const other = insertFomoUser({ handle: '@free', name: 'Free' });
+
+  assert.throws(() => updateFomoUser(other.id, { handle: '@taken' }), /UNIQUE/i);
+  assert.equal(findFomoUserByHandle('@free')?.name, 'Free', 'the failed update changed nothing');
 });
 
 // (e) a DB created before this change still opens (fomo tables added via IF NOT EXISTS).
