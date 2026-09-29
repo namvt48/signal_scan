@@ -1,4 +1,4 @@
-import { CHAINS, type Chain, type NansenThresholds, type Settings, type SettingsPatch, type Tier, type TokenSignal, type Wallet } from '../types';
+import { CHAINS, type Chain, type FomoUser, type NansenThresholds, type Settings, type SettingsPatch, type Tier, type TokenSignal, type Wallet } from '../types';
 import { restDataStore } from './restDataStore';
 
 // ---------------------------------------------------------------------------
@@ -28,12 +28,27 @@ export interface ParsedImportRow {
   reason?: string;
 }
 
+/** A FOMO watch-list row as produced by `parseFomoUsersCsv` / consumed by `importFomoUsers`. */
+export type FomoImportRow = Omit<FomoUser, 'id'>;
+
+/** One row of the FOMO CSV import preview: either valid data or a skip reason. */
+export interface ParsedFomoImportRow {
+  row: number;
+  data?: FomoImportRow;
+  reason?: string;
+}
+
 export interface DataStore {
   listWallets(): Promise<Wallet[]>;
   addWallet(input: Omit<Wallet, 'id'>): Promise<Wallet>;
   updateWallet(id: string, patch: Partial<Omit<Wallet, 'id'>>): Promise<Wallet>;
   deleteWallet(id: string): Promise<void>;
   importWallets(rows: ImportRow[]): Promise<ImportResult>;
+  listFomoUsers(): Promise<FomoUser[]>;
+  addFomoUser(input: Omit<FomoUser, 'id'>): Promise<FomoUser>;
+  updateFomoUser(id: string, patch: Partial<Omit<FomoUser, 'id'>>): Promise<FomoUser>;
+  deleteFomoUser(id: string): Promise<void>;
+  importFomoUsers(rows: FomoImportRow[]): Promise<ImportResult>;
   listSignals(allFactors?: boolean): Promise<TokenSignal[]>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
@@ -45,6 +60,7 @@ export interface DataStore {
 // ---------------------------------------------------------------------------
 
 const WALLET_KEY = 'signal_scan:wallets';
+const FOMO_USER_KEY = 'signal_scan:fomo_users';
 const SETTINGS_KEY = 'signal_scan:settings';
 const TIER_KEY = 'signal_scan:tiers';
 
@@ -138,6 +154,10 @@ export function byName(a: Wallet, b: Wallet): number {
   return a.name.localeCompare(b.name, undefined, { numeric: true });
 }
 
+export function byHandle(a: FomoUser, b: FomoUser): number {
+  return a.handle.localeCompare(b.handle, undefined, { numeric: true });
+}
+
 // --- CSV parsing (import) ---------------------------------------------------
 
 const CSV_HEADER = ['address', 'name', 'tags', 'chain', 'source'];
@@ -221,6 +241,54 @@ export function parseWalletsCsv(text: string): ParsedImportRow[] {
         chain: chainRaw,
         source: (cells[4] ?? '').trim(),
         clan: (cells[5] ?? '').trim(),
+      },
+    };
+  });
+}
+
+/**
+ * Parse + validate a FOMO users CSV. Header-driven (column order varies between
+ * the pre-pulled fomo/ exports): requires a `handle` column, maps
+ * `displayName`/`name` -> name, `clanName`/`clan` -> clan, and treats `userId`,
+ * `walletSolana`, `walletEvm` as optional. Strips a leading UTF-8 BOM.
+ * Throws when the `handle` column is missing.
+ */
+export function parseFomoUsersCsv(text: string): ParsedFomoImportRow[] {
+  const rows = parseCsv(text.replace(/^\uFEFF/, ''));
+  const header = rows[0]?.map((c) => c.trim().toLowerCase()) ?? [];
+  const col = (...names: string[]): number => {
+    for (const n of names) {
+      const i = header.indexOf(n);
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
+  const handleIdx = col('handle');
+  if (handleIdx === -1) throw new Error('CSV header must contain a "handle" column');
+  const nameIdx = col('name', 'displayname');
+  const clanIdx = col('clan', 'clanname');
+  const userIdIdx = col('userid');
+  const solIdx = col('walletsolana');
+  const evmIdx = col('walletevm');
+  const cell = (cells: string[], idx: number): string => (idx === -1 ? '' : (cells[idx] ?? '').trim());
+  return rows.slice(1).map((cells, i) => {
+    const rowNo = i + 2; // 1-based file line, header is line 1
+    if (cells.length <= handleIdx) return { row: rowNo, reason: 'malformed row (too few columns)' };
+    const handle = cell(cells, handleIdx);
+    if (!handle) return { row: rowNo, reason: 'handle is empty' };
+    const clan = cell(cells, clanIdx);
+    const userId = cell(cells, userIdIdx);
+    const walletSolana = cell(cells, solIdx);
+    const walletEvm = cell(cells, evmIdx);
+    return {
+      row: rowNo,
+      data: {
+        handle,
+        name: cell(cells, nameIdx),
+        ...(clan ? { clan } : {}),
+        ...(userId ? { userId } : {}),
+        ...(walletSolana ? { walletSolana } : {}),
+        ...(walletEvm ? { walletEvm } : {}),
       },
     };
   });
@@ -409,6 +477,41 @@ export const localDataStore: DataStore = {
     const list = read<Wallet>(WALLET_KEY, SEED_WALLETS);
     const added: Wallet[] = rows.map((r) => ({ id: uid(), ...r }));
     persist(WALLET_KEY, [...list, ...added]);
+    return { added: added.length, skipped: [] };
+  },
+
+  async listFomoUsers(): Promise<FomoUser[]> {
+    return read<FomoUser>(FOMO_USER_KEY, []).slice().sort(byHandle);
+  },
+
+  async addFomoUser(input: Omit<FomoUser, 'id'>): Promise<FomoUser> {
+    const user: FomoUser = { id: uid(), ...input };
+    persist(FOMO_USER_KEY, [...read<FomoUser>(FOMO_USER_KEY, []), user]);
+    return user;
+  },
+
+  async updateFomoUser(id: string, patch: Partial<Omit<FomoUser, 'id'>>): Promise<FomoUser> {
+    const list = read<FomoUser>(FOMO_USER_KEY, []);
+    const idx = list.findIndex((u) => u.id === id);
+    if (idx === -1) throw new Error(`FomoUser ${id} not found`);
+    const updated: FomoUser = { ...list[idx], ...patch };
+    const next = list.slice();
+    next[idx] = updated;
+    persist(FOMO_USER_KEY, next);
+    return updated;
+  },
+
+  async deleteFomoUser(id: string): Promise<void> {
+    persist(
+      FOMO_USER_KEY,
+      read<FomoUser>(FOMO_USER_KEY, []).filter((u) => u.id !== id),
+    );
+  },
+
+  async importFomoUsers(rows: FomoImportRow[]): Promise<ImportResult> {
+    const list = read<FomoUser>(FOMO_USER_KEY, []);
+    const added: FomoUser[] = rows.map((r) => ({ id: uid(), ...r }));
+    persist(FOMO_USER_KEY, [...list, ...added]);
     return { added: added.length, skipped: [] };
   },
 

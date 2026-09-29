@@ -2,8 +2,8 @@
 // deployments). Same contract as the localStorage implementation; components
 // cannot tell them apart.
 
-import type { Chain, Settings, SettingsPatch, Tier, TokenSignal, Wallet } from '../types';
-import { byName, type DataStore, type ImportResult, type ImportRow } from './dataStore';
+import type { Chain, FomoUser, Settings, SettingsPatch, Tier, TokenSignal, Wallet } from '../types';
+import { byHandle, byName, type DataStore, type FomoImportRow, type ImportResult, type ImportRow } from './dataStore';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
 
@@ -68,6 +68,31 @@ export const restDataStore: DataStore = {
 
   async importWallets(rows: ImportRow[]): Promise<ImportResult> {
     return request<ImportResult>('/wallets/import', json('POST', { rows }));
+  },
+
+  async listFomoUsers(): Promise<FomoUser[]> {
+    const users = await request<FomoUser[]>('/fomo-users');
+    return users.slice().sort(byHandle);
+  },
+
+  async addFomoUser(input: Omit<FomoUser, 'id'>): Promise<FomoUser> {
+    return request<FomoUser>('/fomo-users', json('POST', input));
+  },
+
+  async updateFomoUser(id: string, patch: Partial<Omit<FomoUser, 'id'>>): Promise<FomoUser> {
+    return request<FomoUser>(`/fomo-users/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  },
+
+  async deleteFomoUser(id: string): Promise<void> {
+    await request<void>(`/fomo-users/${id}`, { method: 'DELETE' });
+  },
+
+  async importFomoUsers(rows: FomoImportRow[]): Promise<ImportResult> {
+    return request<ImportResult>('/fomo-users/import', json('POST', { rows }));
   },
 
   async listSignals(allFactors?: boolean): Promise<TokenSignal[]> {

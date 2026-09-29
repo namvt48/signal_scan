@@ -15,6 +15,23 @@ export interface Wallet {
   clan?: string;
 }
 
+/** One FOMO trader on the watch list (mirrors server `fomo_users`). */
+export interface FomoUser {
+  id: string;
+  /** FOMO handle — the identity the alert stream matches on. Unique. */
+  handle: string;
+  /** Display name (CSV `displayName`); may be empty. */
+  name: string;
+  /** Display-only clan label (CSV `clanName`). Absent/empty = unlabelled. */
+  clan?: string;
+  /** FOMO user id; absent until learned from the stream or seeded from CSV. */
+  userId?: string;
+  walletSolana?: string;
+  walletEvm?: string;
+  /** Where the row came from ('manual', 'csv', …). Server defaults to 'manual'. */
+  source?: string;
+}
+
 export interface NansenSetup {
   /** How many of the 3 Nansen setups hit (fresh wallet, T100 decrease, low float). */
   score: number;
@@ -59,6 +76,18 @@ export interface TrackedWalletStat {
   /** Current token balance USD for this (wallet, CA) — ABSENT when never measured. */
   balUsd?: number;
   /** Epoch ms of the wallet's newest watch trade for this CA; 0 = none. */
+  lastTs: number;
+}
+
+/** One watched FOMO trader's activity on a token (large trades only; buyUsd is BUY size, never net/PnL). */
+export interface FomoUserStat {
+  handle: string;
+  name?: string;
+  clan?: string;
+  buyUsd: number;
+  buys: number;
+  sells: number;
+  trades: number;
   lastTs: number;
 }
 

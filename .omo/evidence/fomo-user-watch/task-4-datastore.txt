@@ -1,0 +1,51 @@
+=== npm run build ===
+
+> signal-scan@0.1.0 build
+> tsc && vite build
+
+vite v6.4.3 building for production...
+transforming...
+✓ 4599 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                                        0.79 kB │ gzip:   0.49 kB
+dist/assets/ibm-plex-mono-vietnamese-500-normal-C8zxqsMH.woff          5.62 kB
+dist/assets/ibm-plex-mono-vietnamese-400-normal-DDuiU_S-.woff          5.62 kB
+dist/assets/ibm-plex-mono-vietnamese-600-normal-iLQfcSjf.woff          5.71 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-500-normal-BIfNGwUT.woff        5.77 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-600-normal-9HEixskS.woff        5.79 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-400-normal-DMdlQ8Kv.woff        5.82 kB
+dist/assets/ibm-plex-mono-vietnamese-400-normal-BulugwFq.woff2         5.87 kB
+dist/assets/ibm-plex-mono-vietnamese-500-normal-DZ4AoWbu.woff2         6.04 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-400-normal-xuaO2J-f.woff2       6.91 kB
+dist/assets/ibm-plex-mono-vietnamese-600-normal-D2EvbN8M.woff2         6.93 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-500-normal-BqneJy0T.woff2       6.97 kB
+dist/assets/ibm-plex-mono-cyrillic-400-normal-CEL4l2ZJ.woff            7.20 kB
+dist/assets/ibm-plex-mono-cyrillic-500-normal-Ael50iVv.woff            7.21 kB
+dist/assets/ibm-plex-mono-cyrillic-600-normal-fLZuRloM.woff            7.27 kB
+dist/assets/ibm-plex-mono-cyrillic-ext-600-normal-V-xxqcpd.woff2       7.69 kB
+dist/assets/plus-jakarta-sans-vietnamese-wght-normal-qRpaaN48.woff2    8.35 kB
+dist/assets/ibm-plex-mono-cyrillic-400-normal-BSMlKf0J.woff2           8.36 kB
+dist/assets/ibm-plex-mono-cyrillic-500-normal-Bq9vWWag.woff2           8.46 kB
+dist/assets/ibm-plex-mono-cyrillic-600-normal-CTOM6hUh.woff2           9.35 kB
+dist/assets/ibm-plex-mono-latin-ext-400-normal-D3D2R8hC.woff          11.77 kB
+dist/assets/ibm-plex-mono-latin-ext-500-normal-CZ70TYgx.woff          11.77 kB
+dist/assets/ibm-plex-mono-latin-ext-600-normal-DmB0ttJJ.woff          11.83 kB
+dist/assets/ibm-plex-mono-latin-400-normal-CvHOgSBP.woff              13.14 kB
+dist/assets/ibm-plex-mono-latin-500-normal-CB9ihrfo.woff              13.16 kB
+dist/assets/ibm-plex-mono-latin-600-normal-DWFSQ4vo.woff              13.21 kB
+dist/assets/ibm-plex-mono-latin-ext-400-normal-BmRBH3aV.woff2         13.35 kB
+dist/assets/ibm-plex-mono-latin-ext-500-normal-CAhNIIs5.woff2         13.43 kB
+dist/assets/ibm-plex-mono-latin-ext-600-normal-D38SheWl.woff2         14.33 kB
+dist/assets/ibm-plex-mono-latin-400-normal-DMJ8VG8y.woff2             14.71 kB
+dist/assets/ibm-plex-mono-latin-500-normal-DSY6xOcd.woff2             14.89 kB
+dist/assets/ibm-plex-mono-latin-600-normal-BgSNZQsw.woff2             15.62 kB
+dist/assets/plus-jakarta-sans-latin-ext-wght-normal-DmpS2jIq.woff2    21.73 kB
+dist/assets/plus-jakarta-sans-latin-wght-normal-eXO_dkmS.woff2        27.35 kB
+dist/assets/index-BUHFNval.css                                        43.71 kB │ gzip:  10.91 kB
+dist/assets/index-CCN7QtG8.js                                        392.12 kB │ gzip: 104.35 kB
+✓ built in 4.84s
+exit=0
+
+=== npx tsc --noEmit ===
+exit=0
