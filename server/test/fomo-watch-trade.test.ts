@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { getDb, insertFomoUser, open } from '../src/db.js';
+import { getDb, findTrackedCa, insertFomoUser, listTrackedCas, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
 
@@ -12,6 +12,8 @@ const JSON_HEADERS = { 'content-type': 'application/json', authorization: `Beare
 const HANDLE = 'fomo-trader-1';
 const USER_ID = 'fomo-uid-1';
 const CA = 'FomoCaSource001';
+const BUY_CA = 'FomoBuyNewCa001';
+const SELL_CA = 'FomoSellNewCa001';
 
 let auth: TestAuth;
 let server: Server;
@@ -181,4 +183,30 @@ test('POST /api/fomo-watch/trades: 401 without a token, 403 for a viewer', async
 
   assert.equal(rowOf('evt-fomo-anon'), undefined);
   assert.equal(rowOf('evt-fomo-viewer'), undefined);
+});
+
+test('POST /api/fomo-watch/trades: a BUY enqueues the CA into tracked_cas exactly once', async () => {
+  const res = await post(trade({ eventId: 'evt-fomo-buy-new', tokenAddress: BUY_CA }));
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+
+  const tracked = findTrackedCa(BUY_CA, 'sol');
+  assert.equal(tracked?.note, 'fomo');
+  assert.equal(tracked?.status, 'queued');
+  assert.equal(tracked?.entry_usd, 2985);
+  assert.equal(listTrackedCas().filter((r) => r.address === BUY_CA && r.chain === 'sol').length, 1);
+});
+
+test('POST /api/fomo-watch/trades: a repeat BUY (same eventId) adds no second tracked_cas row', async () => {
+  const res = await post(trade({ eventId: 'evt-fomo-buy-new', tokenAddress: BUY_CA }));
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 0);
+  assert.equal(listTrackedCas().filter((r) => r.address === BUY_CA && r.chain === 'sol').length, 1);
+});
+
+test('POST /api/fomo-watch/trades: a SELL of an untracked CA adds no tracked_cas row', async () => {
+  const res = await post(trade({ eventId: 'evt-fomo-sell-new', type: 'sell', tokenAddress: SELL_CA }));
+  assert.equal(res.status, 200);
+  assert.equal(findTrackedCa(SELL_CA, 'sol'), undefined);
+  assert.equal(listTrackedCas().some((r) => r.address === SELL_CA && r.chain === 'sol'), false);
 });

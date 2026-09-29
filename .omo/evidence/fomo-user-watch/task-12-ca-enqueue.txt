@@ -1,0 +1,46 @@
+$ cd server && npx tsx --test test/fomo-watch-trade.test.ts
+
+2026-09-29T10:15:26.901Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=6
+✔ POST /api/fomo-watch/trades: a valid body creates exactly one row with the right fields (89.481101ms)
+2026-09-29T10:15:26.916Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+✔ POST /api/fomo-watch/trades: reposting the SAME eventId is a 200 no-op (6.726805ms)
+2026-09-29T10:15:26.921Z INFO  [api] method=POST path=/api/fomo-watch/trades status=404 dur=1
+✔ POST /api/fomo-watch/trades: unknown handle/userId is 404 and inserts nothing (6.539299ms)
+2026-09-29T10:15:26.927Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+2026-09-29T10:15:26.930Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+✔ POST /api/fomo-watch/trades: userId wins over trader; handle-only falls back to trader (7.345629ms)
+2026-09-29T10:15:26.934Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=0
+2026-09-29T10:15:26.936Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=0
+2026-09-29T10:15:26.940Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=1
+2026-09-29T10:15:26.948Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=1
+2026-09-29T10:15:26.951Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=1
+✔ POST /api/fomo-watch/trades: 400 on a bad or unmapped chain (20.452263ms)
+2026-09-29T10:15:26.954Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=1
+2026-09-29T10:15:26.955Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=0
+✔ POST /api/fomo-watch/trades: 400 on type perp/thesis and nothing is stored (4.308842ms)
+2026-09-29T10:15:26.958Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=0
+2026-09-29T10:15:26.960Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=1
+2026-09-29T10:15:26.961Z INFO  [api] method=POST path=/api/fomo-watch/trades status=400 dur=0
+✔ POST /api/fomo-watch/trades: 400 on a missing/empty eventId or identity (5.599871ms)
+2026-09-29T10:15:26.964Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+2026-09-29T10:15:26.966Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+✔ POST /api/fomo-watch/trades: usdValue/price optional → NULL; a negative sell PnL is legal (4.45427ms)
+2026-09-29T10:15:26.969Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+✔ POST /api/fomo-watch/trades: ca is canonicalized (EVM folded, sol verbatim) (2.900314ms)
+2026-09-29T10:15:26.971Z INFO  [api] method=POST path=/api/fomo-watch/trades status=401 dur=0
+2026-09-29T10:15:26.980Z INFO  [api] method=POST path=/api/fomo-watch/trades status=403 dur=3
+✔ POST /api/fomo-watch/trades: 401 without a token, 403 for a viewer (11.767809ms)
+2026-09-29T10:15:26.983Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=0
+✔ POST /api/fomo-watch/trades: a BUY enqueues the CA into tracked_cas exactly once (2.466665ms)
+2026-09-29T10:15:26.985Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=0
+✔ POST /api/fomo-watch/trades: a repeat BUY (same eventId) adds no second tracked_cas row (2.19684ms)
+2026-09-29T10:15:26.988Z INFO  [api] method=POST path=/api/fomo-watch/trades status=200 dur=1
+✔ POST /api/fomo-watch/trades: a SELL of an untracked CA adds no tracked_cas row (2.397609ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 13
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 911.84783

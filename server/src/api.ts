@@ -738,8 +738,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
 
   // FOMO alert ingest (daemon → POST /api/fomo-watch/trades). ONE trade per
   // request — survivors are posted individually. Reposting is a no-op:
-  // UNIQUE(event_id) via insertFomoTrade's ON CONFLICT DO NOTHING. No FOMO path
-  // may touch wallet state — no kickWalletRow here, ever.
+  // UNIQUE(event_id) via insertFomoTrade's ON CONFLICT DO NOTHING. A BUY DOES
+  // enqueue the CA for tracking (insertTrackedCa + kickCAs) so the poller picks
+  // it up; that is tracked-CA state, NOT wallet state. No FOMO path may touch
+  // wallet state — no wallet_trades / insertTrades / kickWalletRow here, ever.
   app.post('/api/fomo-watch/trades', (req, res) => {
     const parsed = parseFomoWatchTradeBody(req.body);
     if (isParseError(parsed)) {
@@ -768,6 +770,12 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       token: parsed.token ?? null,
       ts: parsed.ts,
     });
+    // A watched user's BUY pulls the CA into the tracked queue (user 2026-09-29):
+    // only when it is genuinely new, so a repeat alert never re-kicks the poller.
+    if (parsed.type === 'buy' && !findTrackedCa(parsed.ca, parsed.chain)) {
+      const row = insertTrackedCa({ address: parsed.ca, chain: parsed.chain, note: 'fomo', entryUsd: parsed.usdValue ?? undefined });
+      kickCAs([{ address: row.address, chain: row.chain }]);
+    }
     res.json({ inserted: created ? 1 : 0 });
   });
 
