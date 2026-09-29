@@ -195,6 +195,48 @@ CREATE TABLE IF NOT EXISTS token_tiers (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (ca, chain)
 );
+
+-- FOMO watch-list: a second, FOMO-specific set of tracked users beside wallets.
+-- Both tables are born here (CREATE TABLE IF NOT EXISTS), so a DB created before
+-- this change gains them on the next open() with no ALTER/rebuild — the guard for
+-- an existing DB is the IF NOT EXISTS itself (nothing to migrate: no prior shape).
+CREATE TABLE IF NOT EXISTS fomo_users (
+  id TEXT PRIMARY KEY,
+  handle TEXT NOT NULL,
+  user_id TEXT,
+  name TEXT NOT NULL DEFAULT '',
+  clan TEXT,
+  wallet_solana TEXT,
+  wallet_evm TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fomo_users_handle ON fomo_users(handle);
+CREATE INDEX IF NOT EXISTS idx_fomo_users_user_id ON fomo_users(user_id);
+
+-- FOMO buy/sell alerts. event_id is the idempotency key (unique across the
+-- 102-alert capture). ca is CANONICALIZED (canonicalCa) so \${chain}:\${ca} keys line up
+-- with tracked_cas/allTokenStates. usd_value is TYPE-DEPENDENT: for a buy it is
+-- the post-fill position size, for a sell it is signed realised PnL — never sum
+-- or compare across types. type CHECK is a loud backstop: perp/thesis/listing are
+-- dropped BEFORE insert, so only buy/sell ever reach here.
+CREATE TABLE IF NOT EXISTS fomo_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('buy','sell')),
+  usd_value REAL,
+  price REAL,
+  token TEXT,
+  ts INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'fomo',
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fomo_trades_event_id ON fomo_trades(event_id);
+CREATE INDEX IF NOT EXISTS idx_fomo_trades_ca_chain_ts ON fomo_trades(ca, chain, ts);
+CREATE INDEX IF NOT EXISTS idx_fomo_trades_user_ts ON fomo_trades(fomo_user_id, ts);
 `;
 
 let instance: Database.Database | null = null;
@@ -946,6 +988,180 @@ export function setSetting(key: string, value: string): void {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     )
     .run(key, value);
+}
+
+// --- fomo watch-list --------------------------------------------------------
+// A second watch-list beside wallets: FOMO users + their captured buy/sell alerts.
+
+export interface FomoUserRow {
+  id: string;
+  handle: string;
+  /** Learned from the stream or seeded from CSV — NULL until known. */
+  user_id: string | null;
+  name: string;
+  /** Display-only label beside the name (mirrors wallets.clan). Never filters/routes. */
+  clan: string | null;
+  wallet_solana: string | null;
+  wallet_evm: string | null;
+  source: string;
+  created_at: number;
+}
+
+export interface FomoUserInput {
+  handle: string;
+  user_id?: string | null;
+  name?: string;
+  clan?: string | null;
+  wallet_solana?: string | null;
+  wallet_evm?: string | null;
+  source?: string;
+}
+
+export interface FomoTradeInput {
+  fomo_user_id: string;
+  /** FOMO's stable event id — the idempotency key (INSERT OR IGNORE). */
+  event_id: string;
+  /** Raw contract address — canonicalized (canonicalCa) before storing. */
+  ca: string;
+  chain: Chain;
+  /** FOMO's alertType, narrowed to the only two we persist (perp/thesis/listing dropped upstream). */
+  type: 'buy' | 'sell';
+  /** TYPE-DEPENDENT: buy → post-fill position size, sell → signed realised PnL. Never sum across types. */
+  usd_value?: number | null;
+  price?: number | null;
+  /** Ticker symbol. */
+  token?: string | null;
+  /** FOMO's publish time, epoch ms. */
+  ts: number;
+  source?: string;
+}
+
+export function listFomoUsers(): FomoUserRow[] {
+  return getDb().prepare('SELECT * FROM fomo_users ORDER BY name').all() as FomoUserRow[];
+}
+
+export function findFomoUserByHandle(handle: string): FomoUserRow | undefined {
+  return getDb().prepare('SELECT * FROM fomo_users WHERE handle = ?').get(handle) as FomoUserRow | undefined;
+}
+
+export function findFomoUserByUserId(userId: string): FomoUserRow | undefined {
+  return getDb().prepare('SELECT * FROM fomo_users WHERE user_id = ?').get(userId) as FomoUserRow | undefined;
+}
+
+export function insertFomoUser(input: FomoUserInput): FomoUserRow {
+  const row: FomoUserRow = {
+    id: randomUUID(),
+    handle: input.handle,
+    user_id: input.user_id ?? null,
+    name: input.name ?? '',
+    clan: input.clan ?? null,
+    wallet_solana: input.wallet_solana ?? null,
+    wallet_evm: input.wallet_evm ?? null,
+    source: input.source ?? 'manual',
+    created_at: Date.now(),
+  };
+  getDb()
+    .prepare(
+      'INSERT INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(row.id, row.handle, row.user_id, row.name, row.clan, row.wallet_solana, row.wallet_evm, row.source, row.created_at);
+  return row;
+}
+
+/**
+ * PATCH by id: only the provided fields are written (column names are literals,
+ * values bound — no injection). Returns the row after the update, or undefined if
+ * the id does not exist. A no-op `next` leaves the row untouched.
+ */
+export function updateFomoUser(id: string, next: Partial<FomoUserInput>): FomoUserRow | undefined {
+  const sets: string[] = [];
+  const values: (string | number | null)[] = [];
+  if (next.handle !== undefined) { sets.push('handle = ?'); values.push(next.handle); }
+  if (next.user_id !== undefined) { sets.push('user_id = ?'); values.push(next.user_id); }
+  if (next.name !== undefined) { sets.push('name = ?'); values.push(next.name); }
+  if (next.clan !== undefined) { sets.push('clan = ?'); values.push(next.clan); }
+  if (next.wallet_solana !== undefined) { sets.push('wallet_solana = ?'); values.push(next.wallet_solana); }
+  if (next.wallet_evm !== undefined) { sets.push('wallet_evm = ?'); values.push(next.wallet_evm); }
+  if (next.source !== undefined) { sets.push('source = ?'); values.push(next.source); }
+  if (sets.length > 0) {
+    getDb().prepare(`UPDATE fomo_users SET ${sets.join(', ')} WHERE id = ?`).run(...values, id);
+  }
+  return getDb().prepare('SELECT * FROM fomo_users WHERE id = ?').get(id) as FomoUserRow | undefined;
+}
+
+export function deleteFomoUser(id: string): void {
+  // FK ON DELETE CASCADE cleans fomo_trades.
+  getDb().prepare('DELETE FROM fomo_users WHERE id = ?').run(id);
+}
+
+/**
+ * Server-side CSV/import: validates each row (boundary), dedupes by handle via
+ * INSERT OR IGNORE. `row` = index in the input array (matches the importWallets
+ * ImportResult contract). Single transaction for the whole batch.
+ */
+export function importFomoUsers(
+  rows: readonly FomoUserInput[],
+): { added: number; skipped: { row: number; reason: string }[] } {
+  const db = getDb();
+  const ins = db.prepare(
+    'INSERT OR IGNORE INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  );
+  let added = 0;
+  const skipped: { row: number; reason: string }[] = [];
+  const run = db.transaction((items: readonly FomoUserInput[]) => {
+    const now = Date.now();
+    items.forEach((r, i) => {
+      const handle = (r.handle ?? '').trim();
+      if (!handle) {
+        skipped.push({ row: i, reason: 'handle is empty' });
+        return;
+      }
+      const res = ins.run(
+        randomUUID(),
+        handle,
+        r.user_id ?? null,
+        (r.name ?? '').trim(),
+        r.clan ?? null,
+        r.wallet_solana ?? null,
+        r.wallet_evm ?? null,
+        (r.source ?? '').trim() || 'manual',
+        now,
+      );
+      if (res.changes === 0) {
+        skipped.push({ row: i, reason: 'duplicate handle' });
+      } else {
+        added += 1;
+      }
+    });
+  });
+  run(rows);
+  return { added, skipped };
+}
+
+/**
+ * Idempotent on event_id (INSERT OR IGNORE): a replayed alert is a no-op. Returns
+ * whether a row was actually created (false = the event_id already existed). ca is
+ * canonicalized so it keys like the rest of the store.
+ */
+export function insertFomoTrade(input: FomoTradeInput): boolean {
+  const res = getDb()
+    .prepare(
+      'INSERT OR IGNORE INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, price, token, ts, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(
+      input.fomo_user_id,
+      input.event_id,
+      canonicalCa(input.ca, input.chain),
+      input.chain,
+      input.type,
+      input.usd_value ?? null,
+      input.price ?? null,
+      input.token ?? null,
+      input.ts,
+      input.source ?? 'fomo',
+      Date.now(),
+    );
+  return res.changes > 0;
 }
 
 // --- seed (mock mode only) -------------------------------------------------
