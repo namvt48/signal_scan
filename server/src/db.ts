@@ -1094,19 +1094,57 @@ export function deleteFomoUser(id: string): void {
   getDb().prepare('DELETE FROM fomo_users WHERE id = ?').run(id);
 }
 
+/** Shared import report. `updated` is ADDITIVE: only the fomo upsert import sets
+ *  it; importWallets keeps returning {added, skipped} exactly as before. */
+export interface ImportResult {
+  added: number;
+  skipped: { row: number; reason: string }[];
+  /** Rows that matched an existing handle and enriched at least one field. */
+  updated?: number;
+}
+
+/** The columns a fomo re-import may enrich, read back for the changed-field check. */
+interface FomoUserEnrichable {
+  user_id: string | null;
+  name: string;
+  clan: string | null;
+  wallet_solana: string | null;
+  wallet_evm: string | null;
+}
+
+const nonEmpty = (v: string | null | undefined): string | null => {
+  const s = (v ?? '').trim();
+  return s === '' ? null : s;
+};
+
 /**
- * Server-side CSV/import: validates each row (boundary), dedupes by handle via
- * INSERT OR IGNORE. `row` = index in the input array (matches the importWallets
- * ImportResult contract). Single transaction for the whole batch.
+ * Server-side CSV import, staged: fomo CSVs arrive in batches and a LATER batch
+ * (e.g. itsalita_following.csv, which carries userId) must ENRICH a handle an
+ * EARLIER batch (leaderboard_24h.csv, no userId column) already created. So this
+ * is a real upsert: on a duplicate handle it fills user_id/name/clan/wallet_*
+ * from non-empty incoming values and NEVER blanks an existing value with an empty
+ * one (COALESCE(NULLIF(excluded,''), col) — NULL and '' both mean "not provided").
+ * source/id/created_at belong to the first insert and are never overwritten.
+ * `row` = index in the input array (the importWallets ImportResult contract).
+ * Single transaction for the whole batch.
  */
-export function importFomoUsers(
-  rows: readonly FomoUserInput[],
-): { added: number; skipped: { row: number; reason: string }[] } {
+export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
   const db = getDb();
-  const ins = db.prepare(
-    'INSERT OR IGNORE INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  const prev = db.prepare(
+    'SELECT user_id, name, clan, wallet_solana, wallet_evm FROM fomo_users WHERE handle = ?',
+  );
+  const upsert = db.prepare(
+    `INSERT INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(handle) DO UPDATE SET
+       user_id = COALESCE(NULLIF(excluded.user_id, ''), fomo_users.user_id),
+       name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE fomo_users.name END,
+       clan = COALESCE(NULLIF(excluded.clan, ''), fomo_users.clan),
+       wallet_solana = COALESCE(NULLIF(excluded.wallet_solana, ''), fomo_users.wallet_solana),
+       wallet_evm = COALESCE(NULLIF(excluded.wallet_evm, ''), fomo_users.wallet_evm)`,
   );
   let added = 0;
+  let updated = 0;
   const skipped: { row: number; reason: string }[] = [];
   const run = db.transaction((items: readonly FomoUserInput[]) => {
     const now = Date.now();
@@ -1116,26 +1154,44 @@ export function importFomoUsers(
         skipped.push({ row: i, reason: 'handle is empty' });
         return;
       }
-      const res = ins.run(
+      const next: FomoUserEnrichable = {
+        user_id: nonEmpty(r.user_id),
+        name: (r.name ?? '').trim(),
+        clan: nonEmpty(r.clan),
+        wallet_solana: nonEmpty(r.wallet_solana),
+        wallet_evm: nonEmpty(r.wallet_evm),
+      };
+      const before = prev.get(handle) as FomoUserEnrichable | undefined;
+      upsert.run(
         randomUUID(),
         handle,
-        r.user_id ?? null,
-        (r.name ?? '').trim(),
-        r.clan ?? null,
-        r.wallet_solana ?? null,
-        r.wallet_evm ?? null,
+        next.user_id,
+        next.name,
+        next.clan,
+        next.wallet_solana,
+        next.wallet_evm,
         (r.source ?? '').trim() || 'manual',
         now,
       );
-      if (res.changes === 0) {
-        skipped.push({ row: i, reason: 'duplicate handle' });
-      } else {
+      if (!before) {
         added += 1;
+        return;
+      }
+      const changed =
+        (next.user_id !== null && next.user_id !== before.user_id) ||
+        (next.name !== '' && next.name !== before.name) ||
+        (next.clan !== null && next.clan !== before.clan) ||
+        (next.wallet_solana !== null && next.wallet_solana !== before.wallet_solana) ||
+        (next.wallet_evm !== null && next.wallet_evm !== before.wallet_evm);
+      if (changed) {
+        updated += 1;
+      } else {
+        skipped.push({ row: i, reason: 'duplicate handle (no new fields)' });
       }
     });
   });
   run(rows);
-  return { added, skipped };
+  return { added, updated, skipped };
 }
 
 /**

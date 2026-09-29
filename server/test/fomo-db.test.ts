@@ -89,6 +89,38 @@ test('(d) importFomoUsers: skips empty handle with a reason, imports the valid r
   assert.ok(findFomoUserByHandle('@erin'), 'the valid row was imported');
 });
 
+// Upsert enrichment: a later CSV stage (userId column) fills the user_id of a
+// handle an earlier stage (no userId column) already created.
+test('importFomoUsers: re-import enriches user_id on an existing handle (updated, not skipped)', () => {
+  const first = importFomoUsers([{ handle: '@x', name: 'X' }]);
+  assert.equal(first.added, 1);
+  assert.equal(first.updated, 0);
+
+  const second = importFomoUsers([{ handle: '@x', user_id: 'u1' }]);
+  assert.equal(second.added, 0);
+  assert.equal(second.updated, 1);
+  assert.deepEqual(second.skipped, []);
+
+  const rows = getDb()
+    .prepare('SELECT id, name, user_id FROM fomo_users WHERE handle = ?')
+    .all('@x') as { id: string; name: string; user_id: string | null }[];
+  assert.equal(rows.length, 1, 'still exactly ONE row');
+  assert.equal(rows[0].user_id, 'u1', 'user_id enriched by the later stage');
+  assert.equal(rows[0].name, 'X', 'existing name preserved');
+});
+
+test('importFomoUsers: empty incoming fields never erase learned values', () => {
+  importFomoUsers([{ handle: '@y', user_id: 'u2', clan: 'c2' }]);
+
+  const again = importFomoUsers([{ handle: '@y', user_id: '', clan: '', name: '' }]);
+  assert.equal(again.updated, 0);
+  assert.deepEqual(again.skipped, [{ row: 0, reason: 'duplicate handle (no new fields)' }]);
+
+  const row = findFomoUserByHandle('@y');
+  assert.equal(row?.user_id, 'u2', 'learned user_id survives an empty re-import');
+  assert.equal(row?.clan, 'c2', 'learned clan survives an empty re-import');
+});
+
 // (e) a DB created before this change still opens (fomo tables added via IF NOT EXISTS).
 test('(e) open(): a pre-change DB gains the fomo tables without throwing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fomo-pre-'));

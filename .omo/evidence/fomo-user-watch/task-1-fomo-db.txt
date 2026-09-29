@@ -1,0 +1,27 @@
+=== Task 1 QA (happy) — 2026-09-29T05:34:10Z — importFomoUsers is now a real UPSERT ===
+$ cd server && npm run build
+
+> signal-scan-server@0.1.0 build
+> tsc
+
+build exit=0
+
+$ cd server && npx tsx --test test/fomo-db.test.ts
+✔ (a) insertFomoUser: duplicate handle throws per the UNIQUE index (2.755162ms)
+✔ (b) insertFomoTrade: event_id is idempotent (INSERT OR IGNORE) (0.546582ms)
+✔ insertFomoTrade: EVM ca is canonicalized to lowercase before storing (0.371932ms)
+✔ fomo_trades type CHECK rejects a perp-shaped insert (loud backstop) (0.371162ms)
+✔ (c) deleteFomoUser: cascades to fomo_trades (0.553934ms)
+✔ (d) importFomoUsers: skips empty handle with a reason, imports the valid row (1.97076ms)
+✔ importFomoUsers: re-import enriches user_id on an existing handle (updated, not skipped) (0.62035ms)
+✔ importFomoUsers: empty incoming fields never erase learned values (0.627157ms)
+✔ (e) open(): a pre-change DB gains the fomo tables without throwing (20.335802ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 364.389018
+test exit=0
