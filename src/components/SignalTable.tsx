@@ -2,8 +2,8 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
-import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN } from '../config';
-import { TIERS, type Chain, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
+import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN, SHOW_FOMO } from '../config';
+import { TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
 import { CheckSquare, Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { useAuth } from '../auth/use-auth';
@@ -35,6 +35,20 @@ function SetupValue({ value, pass }: { value: string; pass: boolean }) {
 const WALLET_COLS: readonly string[] = SHOW_CLAN
   ? ['30%', '12%', '15%', '11%', '17%', '15%']
   : ['34%', '17%', '13%', '19%', '17%'];
+
+/*
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Age.
+ * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
+ * line up row for row.
+ */
+const FOMO_COLS: readonly string[] = SHOW_CLAN
+  ? ['32%', '14%', '16%', '22%', '16%']
+  : ['40%', '20%', '20%', '20%'];
+
+/** The FOMO column adds exactly one to every column-count site when shipped. */
+const FOMO_EXTRA = SHOW_FOMO ? 1 : 0;
+/** Base table min-width (1928px) plus the new 384px FOMO column when shipped. */
+const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2312px]' : 'min-w-[1928px]';
 
 /**
  * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
@@ -92,6 +106,62 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
               {usd(w.inflow)}
             </td>
             <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(w.lastTs)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/*
+ * FOMO breakdown rows (User / Clan? / Trades / Buy $ / Age), sibling of WalletTable.
+ * `buyUsd` is Σ large-BUY size, never net inflow/PnL — the header says so. Newest
+ * trade first; long handles truncate; numerics right-aligned mono like the wallet rows.
+ */
+function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: boolean }) {
+  const rows = [...users].sort((a, b) => b.lastTs - a.lastTs);
+  return (
+    <table className="w-full table-fixed border-collapse">
+      <colgroup>
+        {FOMO_COLS.map((w, i) => (
+          <col key={i} style={{ width: w }} />
+        ))}
+      </colgroup>
+      {head && (
+        <thead>
+          <tr className="font-mono text-[9px] font-bold uppercase tracking-[0.03em] text-[#9AA79C]">
+            <th className="pb-1 pr-3 text-left">User</th>
+            {SHOW_CLAN && <th className="pb-1 pr-3 text-left">Clan</th>}
+            <th className="pb-1 pr-3 text-right">Trades</th>
+            <th className="pb-1 pr-3 text-right">Buy $</th>
+            <th className="pb-1 pl-1 text-left">Age</th>
+          </tr>
+        </thead>
+      )}
+      <tbody>
+        {rows.map((u) => (
+          <tr key={u.handle}>
+            <td className="py-1 pr-3 text-[11px]">
+              <span className="block truncate font-medium text-ink" title={u.name || u.handle}>
+                {u.handle}
+              </span>
+            </td>
+            {SHOW_CLAN && (
+              <td className="py-1 pr-3 text-[10.5px]">
+                {u.clan ? (
+                  <span className="block truncate font-mono text-ink2" title={u.clan}>
+                    {u.clan}
+                  </span>
+                ) : (
+                  <span className="text-muted">—</span>
+                )}
+              </td>
+            )}
+            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2">{u.trades}</td>
+            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-ink2" title="Σ large BUY sizes — not net inflow/PnL">
+              {usd(u.buyUsd)}
+            </td>
+            <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
         ))}
       </tbody>
@@ -292,12 +362,15 @@ function SignalHead({
   sort = null,
   onSort,
   allFactors = false,
+  hasFomo = false,
 }: {
   thresholds?: NansenThresholds | null;
   sort?: SortState;
   onSort?: (key: SortKey) => void;
   /* Debug-only: the STT column renders only while the allFactors flag is on. */
   allFactors?: boolean;
+  /* FOMO column header only draws its sub-line once at least one visible row has users. */
+  hasFomo?: boolean;
 }) {
   return (
     <tr>
@@ -329,6 +402,25 @@ function SignalHead({
           <span className="pl-1 text-left">Age</span>
         </span>
       </Th>
+      {SHOW_FOMO && (
+        <Th
+          className="w-96 text-center!"
+          title="FOMO watch-list activity — large trades only. Buy $ is the sum of large BUY sizes, not net inflow or PnL."
+        >
+          FOMO by
+          {hasFomo && (
+            <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
+              <span className="text-left">User</span>
+              {SHOW_CLAN && <span className="text-left">Clan</span>}
+              <span className="pr-3 text-right">Trades</span>
+              <span className="pr-3 text-right" title="Σ large BUY sizes — not net inflow/PnL">
+                Buy $
+              </span>
+              <span className="pl-1 text-left">Age</span>
+            </span>
+          )}
+        </Th>
+      )}
       <SortTh
         label="Top100"
         col="t100"
@@ -382,6 +474,7 @@ export default function SignalTable({
   const [signals, setSignals] = useState<TokenSignal[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [walletsPopup, setWalletsPopup] = useState<TokenSignal | null>(null);
+  const [fomoPopup, setFomoPopup] = useState<TokenSignal | null>(null);
   const allFactors = useAllFactors();
   // Tier edits are admin-only (server also enforces); viewers see a read-only badge.
   const { role } = useAuth();
@@ -429,11 +522,11 @@ export default function SignalTable({
   if (!signals) {
     return (
       <TableShell>
-        <table className="table-fixed w-full min-w-[1928px] border-collapse text-left">
+        <table className={`table-fixed w-full ${TABLE_MIN_W} border-collapse text-left`}>
           <thead>
             <SignalHead allFactors={allFactors} />
           </thead>
-          <SkeletonRows rows={8} cols={allFactors ? 16 : 15} />
+          <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
         </table>
       </TableShell>
     );
@@ -561,7 +654,9 @@ export default function SignalTable({
         ];
 
   const ratedEmpty = mode === 'rated' && visible.length === 0;
-  const colCount = allFactors ? 16 : 15;
+  // FOMO header sub-line appears only once some visible CA actually has watched users.
+  const hasFomo = SHOW_FOMO && visible.some((s) => s.fomoUsers.length > 0);
+  const colCount = (allFactors ? 16 : 15) + FOMO_EXTRA;
 
   return (
     <div className="w-full">
@@ -657,13 +752,14 @@ export default function SignalTable({
       ) : (
         <div className="frame">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1928px] table-fixed border-collapse text-left">
+            <table className={`w-full ${TABLE_MIN_W} table-fixed border-collapse text-left`}>
               <thead>
                 <SignalHead
                   thresholds={thresholds}
                   sort={mode === 'rated' ? null : sort}
                   onSort={mode === 'rated' ? undefined : toggleSort}
                   allFactors={allFactors}
+                  hasFomo={hasFomo}
                 />
               </thead>
               <tbody className="[&>tr:last-child>td]:border-b-0">
@@ -727,6 +823,27 @@ export default function SignalTable({
                             </div>
                           )}
                         </Td>
+                        {SHOW_FOMO && (
+                          <Td className="w-96">
+                            {s.fomoUsers.length === 0 ? (
+                              <Pill active={false}>none</Pill>
+                            ) : (
+                              <div className="min-w-0">
+                                <FomoTable users={s.fomoUsers.slice(0, 3)} />
+                                {s.fomoUsers.length > 3 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setFomoPopup(s)}
+                                    className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
+                                    title="Xem toàn bộ FOMO user đã trade token này"
+                                  >
+                                    +{s.fomoUsers.length - 3} more
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </Td>
+                        )}
                         <Td className={`w-24 ${NS_CELL} ${NS_START}`}>
                           <SetupValue value={s.nansen.t100?.multiple !== undefined ? fmtNum(s.nansen.t100.multiple) : '—'} pass={s.nansen.pass.t100} />
                         </Td>
@@ -771,6 +888,16 @@ export default function SignalTable({
         >
           <div className="max-h-72 overflow-auto">
             <WalletTable wallets={walletsPopup.trackedWallets} head />
+          </div>
+        </Modal>
+      )}
+      {SHOW_FOMO && fomoPopup && (
+        <Modal
+          title={`FOMO by — ${fomoPopup.symbol ?? fomoPopup.ca} (${fomoPopup.fomoUsers.length} users)`}
+          onClose={() => setFomoPopup(null)}
+        >
+          <div className="max-h-72 overflow-auto">
+            <FomoTable users={fomoPopup.fomoUsers} head />
           </div>
         </Modal>
       )}
