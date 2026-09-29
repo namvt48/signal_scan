@@ -101,6 +101,8 @@ export interface TokenSignal {
   iconUrl?: string;
   /** Tracked wallets interacting with this token, sorted by name by the server. */
   trackedWallets: TrackedWalletStat[];
+  /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
+  fomoUsers: FomoUserStat[];
   nansen: NansenSetup;
   holders: number;
   /** Market cap USD (price × circulating supply); absent until a sweep writes one. */

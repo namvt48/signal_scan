@@ -309,7 +309,7 @@ const SEED_WALLETS: Wallet[] = [
 
 // Sorted at seed level by Nansen score desc, then tracked inflow desc.
 const SEED_TS = Date.parse('2026-09-23T00:00:00Z');
-const SEED_RAW: Omit<TokenSignal, 'trackedActivityAt'>[] = [
+const SEED_RAW: Omit<TokenSignal, 'trackedActivityAt' | 'fomoUsers'>[] = [
   {
     id: 'sig-1',
     ca: '0x9aF2cB47dE81a3F6b5C04d9E17f2A83b6C5d1E7c2',
@@ -438,7 +438,7 @@ const SEED_RAW: Omit<TokenSignal, 'trackedActivityAt'>[] = [
 
 // Mock mirror of the server payload: descending activity timestamps keep the seed order
 // above identical under the default newest-activity-first sort.
-const SEED_SIGNALS: TokenSignal[] = SEED_RAW.map((s, i) => ({ ...s, trackedActivityAt: SEED_TS - i * 600_000 }));
+const SEED_SIGNALS: TokenSignal[] = SEED_RAW.map((s, i) => ({ ...s, fomoUsers: [], trackedActivityAt: SEED_TS - i * 600_000 }));
 
 // --- Implementation ----------------------------------------------------------
 

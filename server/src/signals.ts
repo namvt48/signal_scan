@@ -50,6 +50,18 @@ export interface TrackedWalletStat {
   lastTs: number;
 }
 
+/** One watched FOMO trader's activity on a token (large trades only; buyUsd is BUY size, never net/PnL). */
+export interface FomoUserStat {
+  handle: string;
+  name?: string;
+  clan?: string;
+  buyUsd: number;
+  buys: number;
+  sells: number;
+  trades: number;
+  lastTs: number;
+}
+
 /** mirrors TokenSignal in src/types.ts (tier = the user-set per-CA rating, null = unrated) */
 export interface TokenSignal {
   id: string;
@@ -61,6 +73,8 @@ export interface TokenSignal {
    * Absent until the sweep lands one — the FE renders its fallback instead. */
   iconUrl?: string;
   trackedWallets: TrackedWalletStat[];
+  /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
+  fomoUsers: FomoUserStat[];
   nansen: NansenSetup;
   holders: number;
   /** Market cap USD (price × circulating supply); absent until a sweep writes one. */
@@ -223,6 +237,130 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
       sells,
       lastTs,
       ...(balUsd != null ? { balUsd } : {}),
+    };
+    const key = `${chain}:${ca}`;
+    const list = out.get(key);
+    if (list) list.push(stat);
+    else out.set(key, [stat]);
+  }
+  return out;
+}
+
+/** Raw SQLite row behind fomoUserStats — name is '' and clan NULL when unset. */
+interface FomoUserStatRow {
+  handle: string;
+  name: string;
+  clan: string | null;
+  buyUsd: number;
+  buys: number;
+  sells: number;
+  trades: number;
+  lastTs: number;
+}
+
+/**
+ * Per-user FOMO stats for one CA — the fomo mirror of trackedWalletStats, with
+ * the same membership-vs-stats-window split.
+ *
+ * MEMBERSHIP mirrors `Tracked by` (ever-bought): a user is listed ONLY on a
+ * type='buy' fomo_trades row for this (ca, chain) — EVER, with NO time bound —
+ * so a user whose newest buy is older than the stats window appears with zero
+ * stats and lastTs 0, and a user with ONLY sells never appears (its sells
+ * uncounted). Scoped to ONE (chain, ca) identity: the same ca string on two
+ * chains must not pool the other chain's users or trades.
+ *
+ * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd sums BUY
+ * rows only: a buy's usd_value is the post-fill position size while a sell's is
+ * signed realised PnL — different quantities that must never be combined
+ * (fomo_trades DDL), so NO net/inflow figure exists here on purpose.
+ *
+ * Rows are ordered newest-trade-first, so a member with no trade inside the
+ * stats window (lastTs 0) sinks below the active ones. name '' / clan NULL
+ * omit their keys (FE renders the handle alone).
+ */
+export function fomoUserStats(ca: string, chain: string, now: number): FomoUserStat[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT u.handle AS handle,
+              u.name AS name,
+              u.clan AS clan,
+              COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
+              SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
+              COUNT(t.id) AS trades,
+              COALESCE(MAX(t.ts), 0) AS lastTs
+         FROM fomo_users u
+         LEFT JOIN fomo_trades t
+           ON t.fomo_user_id = u.id AND t.ca = @ca AND t.chain = @chain AND t.ts >= @statSince
+        WHERE EXISTS (SELECT 1 FROM fomo_trades b
+                       WHERE b.fomo_user_id = u.id AND b.ca = @ca AND b.chain = @chain
+                         AND b.type = 'buy')
+        GROUP BY u.id
+        ORDER BY lastTs DESC, u.handle`,
+    )
+    .all({ ca, chain, statSince: now - 86_400_000 }) as FomoUserStatRow[];
+  return rows.map(({ handle, name, clan, buyUsd, buys, sells, trades, lastTs }) => ({
+    handle,
+    ...(name !== '' ? { name } : {}),
+    ...(clan != null && clan !== '' ? { clan } : {}),
+    buyUsd,
+    buys,
+    sells,
+    trades,
+    lastTs,
+  }));
+}
+
+/**
+ * Batched fomoUserStats for the /api/signals pass (N+1 fix): ONE query for
+ * every CA, keyed `${chain}:${ca}` — the same identity tracked_cas is unique
+ * on, and the same equality the per-CA `@ca`/`@chain` binds use.
+ * Membership comes from a `members` CTE — NOT from joining the windowed trades —
+ * and is ever-bought (no time window), so a member with no trade inside the 24h
+ * stat window keeps its zero-stat row, exactly like the per-CA LEFT JOIN.
+ * Per-CA row order (lastTs DESC, u.handle) is preserved via ORDER BY m.chain,
+ * m.ca first, then the split into per-CA arrays. A CA with no members is
+ * ABSENT — callers read `map.get(`${chain}:${ca}`) ?? []`, matching the per-CA
+ * empty list.
+ */
+export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
+  const rows = getDb()
+    .prepare(
+      `WITH members AS (
+         SELECT DISTINCT b.chain AS chain, b.ca AS ca, b.fomo_user_id AS fomo_user_id
+           FROM fomo_trades b
+          WHERE b.type = 'buy')
+       SELECT m.chain AS chain,
+              m.ca AS ca,
+              u.handle AS handle,
+              u.name AS name,
+              u.clan AS clan,
+              COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
+              SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
+              COUNT(t.id) AS trades,
+              COALESCE(MAX(t.ts), 0) AS lastTs
+         FROM members m
+         JOIN fomo_users u ON u.id = m.fomo_user_id
+         LEFT JOIN fomo_trades t
+           ON t.fomo_user_id = m.fomo_user_id AND t.ca = m.ca AND t.chain = m.chain AND t.ts >= @statSince
+        GROUP BY m.chain, m.ca, m.fomo_user_id
+        ORDER BY m.chain, m.ca, lastTs DESC, u.handle`,
+    )
+    .all({ statSince: now - 86_400_000 }) as (FomoUserStatRow & { ca: string; chain: string })[];
+  const out = new Map<string, FomoUserStat[]>();
+  for (const { chain, ca, handle, name, clan, buyUsd, buys, sells, trades, lastTs } of rows) {
+    // Same conditional spreads (and key order) as fomoUserStats — the JSON
+    // response must stay byte-identical.
+    const stat: FomoUserStat = {
+      handle,
+      ...(name !== '' ? { name } : {}),
+      ...(clan != null && clan !== '' ? { clan } : {}),
+      buyUsd,
+      buys,
+      sells,
+      trades,
+      lastTs,
     };
     const key = `${chain}:${ca}`;
     const list = out.get(key);
@@ -419,6 +557,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
   const tokenStates = allTokenStates();
   const holdingByCa = sumHoldingAmountByCa();
   const walletStatsByCa = trackedWalletStatsByCa(now);
+  const fomoStatsByCa = fomoUserStatsByCa(now);
   for (const c of listTrackedCas()) {
     const st = tokenStates.get(`${c.chain}:${c.address}`);
     const symbol = st?.symbol != null ? sanitizeSymbol(st.symbol) : '';
@@ -453,6 +592,9 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
     // so the token figure can never drift from what the rows add up to.
     const trackedWallets = walletStatsByCa.get(`${c.chain}:${c.address}`) ?? [];
     const trackedInflow = trackedWallets.reduce((sum, w) => sum + w.inflow, 0);
+    // The FOMO watch list rides along but never feeds trackedInflow/ordering —
+    // separate list, separate stats, no leakage into the wallet score path.
+    const fomoUsers = fomoStatsByCa.get(`${c.chain}:${c.address}`) ?? [];
 
     // Factor math lives in nansenScore (single source of truth, shared with the
     // poller's zero-score rejection gate) — output unchanged.
@@ -465,6 +607,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       ...(symbol !== '' ? { symbol } : {}),
       ...(st?.icon_url != null && st.icon_url !== '' ? { iconUrl: st.icon_url } : {}),
       trackedWallets,
+      fomoUsers,
       nansen: {
         score: ns.score,
         pass: { fresh: ns.freshPass, t100: ns.t100Pass, lf: ns.lfPass },

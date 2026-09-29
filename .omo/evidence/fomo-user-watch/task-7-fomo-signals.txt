@@ -1,0 +1,59 @@
+# Task 7 evidence — fomo-signals test run
+# date: 2026-09-29T13:18:59+07:00
+# cmd: cd server && npx tsx --test test/fomo-signals.test.ts test/signals.test.ts test/assemble-signals-batch.test.ts
+
+✔ allTokenStates matches getTokenState for every tracked CA (canonicalCa parity) (2.596513ms)
+✔ sumHoldingAmountByCa matches sumHoldingAmount for every tracked CA (0.842613ms)
+✔ trackedWalletStatsByCa matches trackedWalletStats for every tracked CA (1.619652ms)
+✔ member with no trade in the 24h window keeps its zero-stat row + balUsd (LEFT JOIN lock) (0.989681ms)
+✔ fomoUserStats: buyUsd sums BUYS only — the sell usd_value (realised PnL) is neither added nor subtracted (3.111852ms)
+✔ fomoUserStats: a buy older than 24h still lists the user with zero stats (ever-bought membership) (0.514028ms)
+✔ fomoUserStats: a sell-only user is NOT listed (membership is ever-bought) (0.418683ms)
+✔ fomoUserStats: the same ca on two chains does not pool (0.608556ms)
+✔ fomoUserStatsByCa matches fomoUserStats for every tracked CA (1.37553ms)
+✔ assembleSignals: fomoUsers populated; FOMO trades leak nothing into the tracked-wallet path (3.104489ms)
+✔ assembleSignals: fresh%, pass-based score, t100, lf for CA_A (4.675824ms)
+✔ assembleSignals: holding% is the token-amount share of supply, inflow is 24h NET buys − sells (2.068758ms)
+✔ insertTrades dedupes on (wallet, ca, tx, side) — inflow unchanged (3.15589ms)
+✔ assembleSignals: trackedWallets = watch-buy members only, per-wallet 24h stats (3.141796ms)
+✔ trackedWallets: sell subtracts from wallet AND token net, counts, balUsd present/omitted, sell-only wallet absent (3.282616ms)
+✔ trackedWallets: an UNPRICED holding emits no balUsd (FE "—"), never a fake $0 (3.748229ms)
+✔ trackedWallets and trackedInflow read only source='watch' trades (2.161139ms)
+✔ trackedWallets: a watch buy INSIDE the window is returned (2.12344ms)
+✔ trackedWalletStats: a watch buy OLDER than TRACKED_BY_WINDOW_MS still lists the wallet (ever-bought membership), inflow 0 + balUsd (2.937575ms)
+✔ assembleSignals: genesis_bal null -> lf absent; holders=0 -> fresh absent; holding from amount/supply (1.906508ms)
+✔ trackedWallets: an 8d-old watch buy lists its wallet with zero 24h stats (ever-bought) (1.925382ms)
+✔ sumHoldingAmount: counts a CA’s holders, never an unlinked wallet’s leftover rows (1.081992ms)
+✔ trackedWallets: a wallet holding a CA with NO token_state is NOT returned (holding no longer lights it up) (2.071801ms)
+✔ assembleSignals: rows order by NEWEST tracked inflow first — the amount is ignored (2.39335ms)
+✔ assembleSignals: a member SELL lifts its CA above a CA whose buy is older (2.264783ms)
+✔ computeT100Pct pairs newest snapshot with newest one older than the window (0.839842ms)
+✔ computeT100Pct: no previous snapshot in window -> undefined (0.849369ms)
+✔ signals exist for tracked CAs without token_state as zeros (2.079845ms)
+✔ computeBalanceRanges: peak/trough per window, exchanges included, empty windows absent (1.15825ms)
+✔ upsertTokenInfo: tokenSweep pass (no bal/t100) must not wipe precomputed columns (1.051293ms)
+✔ updateTokenAnalytics: authoritative write — undefined clears stale window values (1.1298ms)
+✔ assembleSignals: t100 multiple + genesis_bal pass through from token_state (2.620407ms)
+✔ assembleSignals LF gate: failing value hidden at default, revealed by allFactors; below band floor → no pass (5.410229ms)
+✔ assembleSignals: pass flags track the live thresholds — a PUT re-scores the same token (8.469538ms)
+✔ assembleSignals: T100 gate flips on t100_multiple; LF gate flips at both band edges (9.846034ms)
+✔ upsertTokenInfo: genesis_bal COALESCE — Nansen pass (omitted) keeps the holders-slot value (0.889863ms)
+✔ assembleSignals: live GMGN holders win; the Nansen gini count is the fallback (user 2026-09-24) (3.921888ms)
+✔ upsertTokenInfo: Nansen pass (freshCount/top10Rate omitted) COALESCE-keeps last values (1.093419ms)
+✔ upsertTokenInfo: deployed_at write-once — later upserts without the value keep it (0.853641ms)
+✔ sanitizeSymbol: strips emoji embedded in raw token tickers (0.509436ms)
+✔ assembleSignals: emits the SANITIZED symbol, not the raw emoji ticker (2.145088ms)
+ℹ tests 41
+ℹ suites 0
+ℹ pass 41
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 315.891356
+tsx-test-exit:0
+
+# cmd: cd server && npx tsc --noEmit
+server-tsc-exit:0
+# cmd: npx tsc --noEmit (root, FE mirror)
+root-tsc-exit:0
