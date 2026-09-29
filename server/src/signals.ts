@@ -2,12 +2,13 @@
 // frontend never imports server modules, so the small shape is duplicated on
 // purpose — keep the two in sync when the contract changes).
 
-import { T100_WINDOW_MS, TRACKED_BY_WINDOW_MS } from './config.js';
-import { earliestSnapshotAt, getDb, getTokenState, latestSnapshot, latestWatchTradeTsByCa, listTrackedCas, snapshotAtOrBefore, snapshotsSince, type TokenStateRow } from './db.js';
+import { T100_WINDOW_MS } from './config.js';
+import { allTokenStates, earliestSnapshotAt, getDb, latestSnapshot, latestWatchTradeTsByCa, listTiers, listTrackedCas, snapshotAtOrBefore, snapshotsSince, type TokenStateRow } from './db.js';
 import { getDebugAllFactors, getThresholds, type NansenThresholds } from './settings.js';
 import { t100Decrease } from './snapshot.js';
 import type { HolderRow } from './providers/provider.js';
 import type { Chain } from './shared/chain.js';
+import type { Tier } from './shared/tier.js';
 
 /** mirrors NansenSetup in src/types.ts */
 export interface NansenSetup {
@@ -49,7 +50,7 @@ export interface TrackedWalletStat {
   lastTs: number;
 }
 
-/** mirrors TokenSignal in src/types.ts (tier widened to null — spec column 8 is N/A for v0) */
+/** mirrors TokenSignal in src/types.ts (tier = the user-set per-CA rating, null = unrated) */
 export interface TokenSignal {
   id: string;
   ca: string;
@@ -75,7 +76,7 @@ export interface TokenSignal {
   volume24h: number;
   /** Trailing-1h DEX volume, USD. Absent until the 1h door lands a value (never a fake 0). */
   volume1h?: number;
-  tier: 'S' | 'A' | 'B' | null;
+  tier: Tier | null;
   balanceRange?: { d1?: BalRange; d7?: BalRange; d30?: BalRange };
 }
 
@@ -112,10 +113,12 @@ function parseTags(raw: string): string[] {
  * name-list + gross-buy-sum pair (contract change 2026-09-24: the FE
  * renders per-wallet rows, and inflow goes NET = buys − sells).
  *
- * MEMBERSHIP unchanged (user 2026-09-22, verbatim: "giờ chỉ có một nguồn là
+ * MEMBERSHIP provenance unchanged (user 2026-09-22, verbatim: "giờ chỉ có một nguồn là
  * detect buy bằng wallet watch thì mới thêm wallet và CA đó vào, từ đó bắt đầu
  * tính inflow, không backfill lại lịch sử"): a wallet is listed ONLY on a
- * a source='watch' BUY inside TRACKED_BY_WINDOW_MS — the wallet_watch Solana-RPC
+ * source='watch' BUY — now EVER-BOUGHT (permanent, no time window; the old 7d
+ * TRACKED_BY_WINDOW_MS bound dropped an early buyer from the CA's `Tracked by`).
+ * The wallet_watch Solana-RPC
  * detector is the sole writer that lights it up, a merely-HOLDING wallet does
  * not qualify, and source='nansen'/retired-sweep rows never count (NO BACKFILL).
  * A sell-only wallet is absent and its sells uncounted.
@@ -129,8 +132,12 @@ function parseTags(raw: string): string[] {
  * Rows are ordered newest-trade-first (user 2026-09-24), so the wallet that just
  * bought OR sold leads its CA's list; a member with no trade inside the stats
  * window (lastTs 0) sinks below the active ones.
+ *
+ * Scoped to ONE (chain, ca) identity (user 2026-09-28): tracked_cas is
+ * UNIQUE(address, chain), so the same address tracked on two chains must not pool
+ * the other chain's members, trades or balances into this CA's rows.
  */
-export function trackedWalletStats(ca: string, now: number): TrackedWalletStat[] {
+export function trackedWalletStats(ca: string, chain: string, now: number): TrackedWalletStat[] {
   const rows = getDb()
     .prepare(
       `SELECT w.name AS name,
@@ -143,15 +150,15 @@ export function trackedWalletStats(ca: string, now: number): TrackedWalletStat[]
               MAX(s.balance_usd) AS balUsd
          FROM wallets w
          LEFT JOIN wallet_trades t
-           ON t.wallet_id = w.id AND t.ca = @ca AND t.source = 'watch' AND t.ts >= @statSince
-         LEFT JOIN wallet_token_state s ON s.wallet_id = w.id AND s.ca = @ca
-        WHERE EXISTS (SELECT 1 FROM wallet_trades b
-                       WHERE b.wallet_id = w.id AND b.ca = @ca
-                         AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= @memberSince)
-        GROUP BY w.id
-        ORDER BY lastTs DESC, w.name`,
+           ON t.wallet_id = w.id AND t.ca = @ca AND t.chain = @chain AND t.source = 'watch' AND t.ts >= @statSince
+         LEFT JOIN wallet_token_state s ON s.wallet_id = w.id AND s.ca = @ca AND s.chain = @chain
+         WHERE EXISTS (SELECT 1 FROM wallet_trades b
+                        WHERE b.wallet_id = w.id AND b.ca = @ca AND b.chain = @chain
+                          AND b.side = 'buy' AND b.source = 'watch')
+         GROUP BY w.id
+         ORDER BY lastTs DESC, w.name`,
     )
-    .all({ ca, statSince: now - 86_400_000, memberSince: now - TRACKED_BY_WINDOW_MS }) as TrackedWalletRow[];
+    .all({ ca, chain, statSince: now - 86_400_000 }) as TrackedWalletRow[];
   return rows.map(({ name, clan, tags, inflow, buys, sells, lastTs, balUsd }) => ({
     name,
     ...(clan != null && clan !== '' ? { clan } : {}),
@@ -165,23 +172,106 @@ export function trackedWalletStats(ca: string, now: number): TrackedWalletStat[]
 }
 
 /**
+ * Batched trackedWalletStats for the /api/signals pass (N+1 fix): ONE query for
+ * every CA, keyed `${chain}:${ca}` — the same identity tracked_cas is unique on,
+ * and the same equality the per-CA `@ca`/`@chain` binds use.
+ * Membership comes from a `members` CTE — NOT from joining the windowed trades —
+ * and is ever-bought (no time window), so a member with no trade inside the 24h
+ * stat window keeps its zero-stat row
+ * (inflow/buys/sells/lastTs 0, balUsd from wallet_token_state), exactly like the
+ * per-CA LEFT JOIN. Per-CA row order (lastTs DESC, w.name) is preserved via
+ * ORDER BY m.chain, m.ca first, then the split into per-CA arrays. A CA with no
+ * members is ABSENT — callers read `map.get(`${chain}:${ca}`) ?? []`, matching the
+ * per-CA empty list.
+ */
+export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletStat[]> {
+  const rows = getDb()
+    .prepare(
+      `WITH members AS (
+         SELECT DISTINCT b.chain AS chain, b.ca AS ca, b.wallet_id AS wallet_id
+           FROM wallet_trades b
+          WHERE b.side = 'buy' AND b.source = 'watch')
+       SELECT m.chain AS chain,
+              m.ca AS ca,
+              w.name AS name,
+              w.clan AS clan,
+              w.tags AS tags,
+              COALESCE(SUM(CASE WHEN t.side = 'buy' THEN t.amount_usd ELSE -t.amount_usd END), 0) AS inflow,
+              SUM(CASE WHEN t.side = 'buy' THEN 1 ELSE 0 END) AS buys,
+              SUM(CASE WHEN t.side = 'sell' THEN 1 ELSE 0 END) AS sells,
+              COALESCE(MAX(t.ts), 0) AS lastTs,
+              MAX(s.balance_usd) AS balUsd
+         FROM members m
+         JOIN wallets w ON w.id = m.wallet_id
+         LEFT JOIN wallet_trades t
+           ON t.wallet_id = m.wallet_id AND t.ca = m.ca AND t.chain = m.chain AND t.source = 'watch' AND t.ts >= @statSince
+         LEFT JOIN wallet_token_state s ON s.wallet_id = m.wallet_id AND s.ca = m.ca AND s.chain = m.chain
+        GROUP BY m.chain, m.ca, m.wallet_id
+        ORDER BY m.chain, m.ca, lastTs DESC, w.name`,
+    )
+    .all({ statSince: now - 86_400_000 }) as (TrackedWalletRow & { ca: string; chain: string })[];
+  const out = new Map<string, TrackedWalletStat[]>();
+  for (const { chain, ca, name, clan, tags, inflow, buys, sells, lastTs, balUsd } of rows) {
+    // Same conditional spreads (and key order) as trackedWalletStats — the JSON
+    // response must stay byte-identical.
+    const stat: TrackedWalletStat = {
+      name,
+      ...(clan != null && clan !== '' ? { clan } : {}),
+      tags: parseTags(tags),
+      inflow,
+      buys,
+      sells,
+      lastTs,
+      ...(balUsd != null ? { balUsd } : {}),
+    };
+    const key = `${chain}:${ca}`;
+    const list = out.get(key);
+    if (list) list.push(stat);
+    else out.set(key, [stat]);
+  }
+  return out;
+}
+
+/**
  * Σ current token amount (token units) for one CA, over the wallets that CA is
  * `Tracked by` only — same source='watch' BUY provenance as the trackedWalletStats
  * membership, so Tracked holding can never count a wallet the rows above do not
  * list (user 2026-09-23). The sweep no longer refreshes unlinked wallets, so their
- * leftover rows must not be summed.
+ * leftover rows must not be summed. Scoped to one (chain, ca) identity
+ * (user 2026-09-28) so the same address on another chain cannot inflate it.
  */
-export function sumHoldingAmount(ca: string): number {
+export function sumHoldingAmount(ca: string, chain: string): number {
   const row = getDb()
     .prepare(
       `SELECT COALESCE(SUM(s.token_amount), 0) AS total FROM wallet_token_state s
-        WHERE s.ca = ?
+        WHERE s.ca = ? AND s.chain = ?
           AND EXISTS (SELECT 1 FROM wallet_trades t
-                       WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca
+                       WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
                          AND t.side = 'buy' AND t.source = 'watch')`,
     )
-    .get(ca) as { total: number };
+    .get(ca, chain) as { total: number };
   return row.total;
+}
+
+/**
+ * Batched sumHoldingAmount for the /api/signals pass (N+1 fix): ONE GROUP BY
+ * over wallet_token_state keyed `${chain}:${ca}` (same equality as the per-CA
+ * `WHERE s.ca = ? AND s.chain = ?`). Filters are verbatim the per-CA ones — only
+ * wallets with ANY source='watch' BUY (NO time bound) are summed. A CA with no
+ * qualifying rows is ABSENT — callers read `map.get(`${chain}:${ca}`) ?? 0`,
+ * matching the per-CA COALESCE(SUM, 0).
+ */
+export function sumHoldingAmountByCa(): Map<string, number> {
+  const rows = getDb()
+    .prepare(
+      `SELECT s.chain AS chain, s.ca AS ca, COALESCE(SUM(s.token_amount), 0) AS total FROM wallet_token_state s
+        WHERE EXISTS (SELECT 1 FROM wallet_trades t
+                       WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
+                         AND t.side = 'buy' AND t.source = 'watch')
+        GROUP BY s.chain, s.ca`,
+    )
+    .all() as { chain: string; ca: string; total: number }[];
+  return new Map(rows.map((r) => [`${r.chain}:${r.ca}`, r.total]));
 }
 
 function parseHolders(json: string): HolderRow[] {
@@ -320,9 +410,17 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
   // next /api/signals without a restart.
   const th = getThresholds();
   const out: TokenSignal[] = [];
-  const lastActivityAt = latestWatchTradeTsByCa(now - 86_400_000, now - TRACKED_BY_WINDOW_MS);
+  const lastActivityAt = latestWatchTradeTsByCa(now - 86_400_000);
+  // User-set tiers (token_tiers) keyed `${chain}:${ca}` — one read for the whole pass.
+  const tierByCa = new Map(listTiers().map((t) => [`${t.chain}:${t.ca}`, t.tier] as const));
+  // Batched reads (N+1 fix): the former per-CA getTokenState / sumHoldingAmount /
+  // trackedWalletStats calls ran ~460 × 3 prepares+queries per request; each map
+  // below is ONE query and the loop is pure lookups. Output is byte-identical.
+  const tokenStates = allTokenStates();
+  const holdingByCa = sumHoldingAmountByCa();
+  const walletStatsByCa = trackedWalletStatsByCa(now);
   for (const c of listTrackedCas()) {
-    const st = getTokenState(c.address, c.chain);
+    const st = tokenStates.get(`${c.chain}:${c.address}`);
     const symbol = st?.symbol != null ? sanitizeSymbol(st.symbol) : '';
     // Debug "Show all factors" (user 2026-09-23) = the dash lists EVERY tracked CA:
     // the display gates below are the only thing that hides a row, so skip them
@@ -346,14 +444,14 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
 
     const supply = st?.supply ?? 0;
     const t100Pct = st?.t100_pct ?? undefined;
-    const holdingAmount = sumHoldingAmount(c.address);
+    const holdingAmount = holdingByCa.get(`${c.chain}:${c.address}`) ?? 0;
     // balance-based per spec column 6 (inflow/mc is forbidden); ≡ balance/supply
     // with price cancelled out (amount×price / price×supply). supply=0 → 0.
     const trackedHolding = supply > 0 ? (holdingAmount / supply) * 100 : 0;
 
     // One query feeds both the FE rows and the token total — Σ rows by contract,
     // so the token figure can never drift from what the rows add up to.
-    const trackedWallets = trackedWalletStats(c.address, now);
+    const trackedWallets = walletStatsByCa.get(`${c.chain}:${c.address}`) ?? [];
     const trackedInflow = trackedWallets.reduce((sum, w) => sum + w.inflow, 0);
 
     // Factor math lives in nansenScore (single source of truth, shared with the
@@ -389,7 +487,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       trackedHolding,
       volume24h: st?.volume24h ?? 0,
       ...(st?.vol_1h != null ? { volume1h: st.vol_1h } : {}),
-      tier: null,
+      tier: tierByCa.get(`${c.chain}:${c.address}`) ?? null,
       ...(st?.bal_peak_24h != null && st.bal_trough_24h != null
         ? {
             balanceRange: {

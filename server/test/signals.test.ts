@@ -2,7 +2,7 @@ import { before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb, getTokenState, insertTrackedCa, insertWallet, open } from '../src/db.js';
 import { insertSnapshot, insertTrades, replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, upsertTokenInfo } from '../src/ingest.js';
-import { assembleSignals, computeBalanceRanges, computeT100Pct, sanitizeSymbol, sumHoldingAmount } from '../src/signals.js';
+import { assembleSignals, computeBalanceRanges, computeT100Pct, sanitizeSymbol, sumHoldingAmount, trackedWalletStats } from '../src/signals.js';
 import { setDebugAllFactors, thresholdDefaults, updateThresholds } from '../src/settings.js';
 import type { HolderRow, TokenInfo, WalletActivity } from '../src/providers/provider.js';
 
@@ -64,17 +64,17 @@ before(() => {
     activity('tx2', 'buy', 2300, NOW - 900, CA_A),
     activity('tx3', 'sell', 999, NOW - 800, CA_A), // sells SUBTRACT from net inflow
   ], 'watch');
-  // CT02: old buy (2 days) — inside the 7d membership window, OUTSIDE the 24h
-  // stat window -> listed with zero stats (lastTs 0); no balance.
+  // CT02: old buy (2 days) — membership is ever-bought (no window), the buy is
+  // OUTSIDE the 24h stat window -> listed with zero stats (lastTs 0); no balance.
   insertTrades(w2Id, [activity('tx4', 'buy', 700, NOW - 2 * DAY, CA_A)], 'watch');
 
-  // CA_B: marketCap 0 + holders 0 -> every guarded path; CT02 buy is 8 days old (outside window).
+  // CA_B: marketCap 0 + holders 0 -> every guarded path; CT02's buy is source='nansen'.
   upsertTokenInfo(token(CA_B, { holders: 0, freshCount: 5, marketCap: 0 }));
   replaceWalletBalances(w1Id, 'sol', [{ ca: CA_A, amount: 1e7 }, { ca: CA_B, amount: 1000 }]);
   insertTrades(w2Id, [activity('tx5', 'buy', 400, NOW - 8 * DAY, CA_B)]);
   // CA_B's holding is only counted for a wallet the CA is Tracked by (sumHoldingAmount
-  // joins a watch buy). CT01's link is 8d old — outside the window, so `Tracked by`
-  // stays empty while the holding row still counts.
+  // joins a watch buy). CT01's watch buy is 8d old — membership is ever-bought, so
+  // CT01 IS a member with zero 24h stats.
   insertTrades(w1Id, [activity('tx6', 'buy', 400, NOW - 8 * DAY, CA_B)], 'watch');
 
   // CA_T snapshots for pairing: newest + one older than the 24h window.
@@ -131,9 +131,9 @@ test('assembleSignals: trackedWallets = watch-buy members only, per-wallet 24h s
   const sig = assembleSignals(NOW).find((s) => s.ca === CA_A);
   assert.ok(sig);
   // Single source (2026-09-22): a wallet lights this column up ONLY via a
-  // source='watch' buy inside the membership window. CT01's buys are seconds old;
-  // CT02's watcher buy is 2d old (<7d) — still a member, but its buy is outside
-  // the 24h stat window -> zero stats and lastTs 0. CT01's holding is NOT what qualifies it.
+  // source='watch' buy — ever-bought, no time window. CT01's buys are seconds old;
+  // CT02's watcher buy is 2d old — outside the 24h stat window -> zero stats and
+  // lastTs 0. CT01's holding is NOT what qualifies it.
   assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CT01', 'CT02']);
   // CT02: balUsd key OMITTED (no wallet_token_state row) — deepStrictEqual fails on an undefined-valued key.
   assert.deepEqual(sig.trackedWallets[1], { name: 'CT02', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0 });
@@ -157,7 +157,7 @@ test('trackedWallets: sell subtracts from wallet AND token net, counts, balUsd p
   insertTrackedCa({ address: CA_NET, chain: 'sol', note: '', entryUsd: 60 });
   upsertTokenInfo(token(CA_NET, { price: 0.5 }));
 
-  // CTNET1: membership buy 2d old (inside 7d, OUTSIDE 24h) + in-window buy & sell.
+  // CTNET1: membership buy 2d old (OUTSIDE the 24h stat window) + in-window buy & sell.
   insertTrades(wBuyer, [
     activity('txn1', 'buy', 2000, NOW - 2 * DAY, CA_NET),
     activity('txn2', 'buy', 1500, NOW - 3_600_000, CA_NET),
@@ -242,16 +242,20 @@ test('trackedWallets: a watch buy INSIDE the window is returned', () => {
   assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CTIN']);
 });
 
-test('trackedWallets: a watch buy OLDER than the window is NOT returned, even while holding', () => {
+test('trackedWalletStats: a watch buy OLDER than TRACKED_BY_WINDOW_MS still lists the wallet (ever-bought membership), inflow 0 + balUsd', () => {
   const CA_Q = 'caQ-out-of-window-019';
   const wOld = insertWallet({ address: 'wallet-addr-old', name: 'CTOLD', tags: [], chain: 'sol', source: 'test' }).id;
   insertTrackedCa({ address: CA_Q, chain: 'sol', note: '', entryUsd: 60 });
+  upsertTokenInfo(token(CA_Q, { price: 0.002 }));
   insertTrades(wOld, [activity('txq1', 'buy', 300, NOW - 8 * DAY, CA_Q)], 'watch');
-  // Holds too: the holding half used to rescue this row. It no longer does.
   replaceWalletBalances(wOld, 'sol', [{ ca: CA_Q, amount: 5e6 }]);
   const sig = assembleSignals(NOW).find((s) => s.ca === CA_Q);
   assert.ok(sig);
-  assert.deepEqual(sig.trackedWallets.map((w) => w.name), []);
+  assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CTOLD']);
+  // Zero 24h stats, but balUsd from the measured holding (5e6 × 0.002).
+  assert.deepEqual(sig.trackedWallets[0], { name: 'CTOLD', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 1e4 });
+  // The exported fn must agree with the assembled column.
+  assert.deepEqual(trackedWalletStats(CA_Q, 'sol', NOW), sig.trackedWallets);
 });
 
 test('assembleSignals: genesis_bal null -> lf absent; holders=0 -> fresh absent; holding from amount/supply', () => {
@@ -268,12 +272,18 @@ test('assembleSignals: genesis_bal null -> lf absent; holders=0 -> fresh absent;
   assert.equal(sig.tier, null);
 });
 
-test('trackedWallets: a holding wallet outside the window is NOT returned', () => {
+test('trackedWallets: an 8d-old watch buy lists its wallet with zero 24h stats (ever-bought)', () => {
   const sig = assembleSignals(NOW).find((s) => s.ca === CA_B);
   assert.ok(sig);
-  // CT01 HOLDS CA_B (token_amount 1000) and its watch buy is 8d old (> 7d window);
-  // CT02's CA_B buy is 8d old too and it holds nothing -> nobody qualifies.
-  assert.deepEqual(sig.trackedWallets.map((w) => w.name), []);
+  // CT01's watch buy is 8d old — ever-bought membership keeps it listed with zero
+  // stats; CT02's CA_B buy is source='nansen' -> still excluded.
+  assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CT01']);
+  const ct01 = sig.trackedWallets[0];
+  assert.ok(ct01);
+  assert.equal(ct01.inflow, 0);
+  assert.equal(ct01.lastTs, 0);
+  // CA_B holding 1000 × price 0.001.
+  assert.equal(ct01.balUsd, 1);
 });
 
 test('sumHoldingAmount: counts a CA’s holders, never an unlinked wallet’s leftover rows', () => {
@@ -281,9 +291,9 @@ test('sumHoldingAmount: counts a CA’s holders, never an unlinked wallet’s le
   insertTrackedCa({ address: CA_H, chain: 'sol', note: '' });
   const wUn = insertWallet({ address: 'wallet-addr-unlinked-h', name: 'CTUH', tags: [], chain: 'sol', source: 'test' }).id;
   replaceWalletBalances(wUn, 'sol', [{ ca: CA_H, amount: 7_000_000 }]);
-  assert.equal(sumHoldingAmount(CA_H), 0, 'an unlinked wallet holding must not be summed');
+  assert.equal(sumHoldingAmount(CA_H, 'sol'), 0, 'an unlinked wallet holding must not be summed');
   insertTrades(wUn, [activity('txh1', 'buy', 100, NOW - DAY, CA_H)], 'watch');
-  assert.equal(sumHoldingAmount(CA_H), 7_000_000, 'a linked holder must be summed');
+  assert.equal(sumHoldingAmount(CA_H, 'sol'), 7_000_000, 'a linked holder must be summed');
 });
 
 test('trackedWallets: a wallet holding a CA with NO token_state is NOT returned (holding no longer lights it up)', () => {

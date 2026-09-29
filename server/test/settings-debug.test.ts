@@ -5,16 +5,22 @@ import type { Server } from 'node:http';
 import { getSetting, open } from '../src/db.js';
 import { DEBUG_ALL_FACTORS_KEY, getDebugAllFactors, getThresholds, setDebugAllFactors } from '../src/settings.js';
 import { createApp } from '../src/api.js';
+// AUTH CONTRACT v1: PUT /api/settings is admin-only — sign a REAL admin ID token
+// against the testkit's local JWKS (production middleware path, no bypass).
+import { createTestAuth } from './auth-testkit.js';
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
 
+let adminAuth = '';
 let server: Server;
 let base = '';
+
+const getSettings = (): Promise<Response> => fetch(`${base}/api/settings`, { headers: { authorization: adminAuth } });
 
 async function put(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/settings`, {
     method: 'PUT',
-    headers: JSON_HEADERS,
+    headers: { ...JSON_HEADERS, authorization: adminAuth },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };
@@ -23,7 +29,9 @@ async function put(body: unknown): Promise<{ status: number; json: any }> {
 before(async () => {
   open(':memory:');
   setDebugAllFactors(false); // normalize: don't depend on leftover persisted state
-  server = createApp('test').listen(0);
+  const auth = await createTestAuth();
+  adminAuth = `Bearer ${await auth.signToken(auth.adminEmail)}`;
+  server = createApp('test', auth.deps).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -33,7 +41,7 @@ after(() => {
 });
 
 test('GET /api/settings exposes debug.allFactors=false by default, alongside values+defaults', async () => {
-  const res = await fetch(`${base}/api/settings`);
+  const res = await getSettings();
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.deepEqual(Object.keys(body.debug), ['allFactors']);
@@ -49,7 +57,7 @@ test('PUT allFactors=true persists and round-trips through GET', async () => {
   assert.equal(putRes.status, 200);
   assert.equal(putRes.json.debug.allFactors, true);
 
-  const get = await fetch(`${base}/api/settings`);
+  const get = await getSettings();
   const getBody = await get.json();
   assert.equal(getBody.debug.allFactors, true);
   assert.equal(getDebugAllFactors(), true); // persistence-layer truth, read-per-call → no restart needed
@@ -91,7 +99,7 @@ test('PUT rejects the retired t100MinPct / lfMaxPct keys with 400', async () => 
     assert.equal(res.status, 400, `${JSON.stringify(bad)} must be rejected`);
     assert.equal(typeof res.json.error, 'string');
   }
-  const res = await fetch(`${base}/api/settings`);
+  const res = await getSettings();
   const body = await res.json();
   assert.equal(body.values.t100MinPct, undefined); // retired keys never come back
   assert.equal(body.values.lfMaxPct, undefined);

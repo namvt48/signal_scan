@@ -6,6 +6,9 @@ import { findWalletByAddress, getDb, insertWallet, open } from '../src/db.js';
 import { insertTrades, replaceWalletBalances } from '../src/ingest.js';
 import { createApp } from '../src/api.js';
 import type { WalletActivity } from '../src/providers/provider.js';
+// AUTH CONTRACT v1: POST/PATCH /api/wallets are admin-only — sign a REAL admin
+// ID token against the testkit's local JWKS (production middleware path, no bypass).
+import { createTestAuth } from './auth-testkit.js';
 
 // T4 (plan evm-base-bsc): the wallet identity key is (address, chain) —
 // wallets UNIQUE(address,chain), wallet_token_state PK(wallet_id,ca,chain),
@@ -15,7 +18,13 @@ import type { WalletActivity } from '../src/providers/provider.js';
 // never deletes the same wallet's base rows.
 
 const ADDR = '0x6A2f9C4e1B7d3F8a5E0c2D6b9A4f7C1e3D5b8E2a';
-const JSON_HEADERS = { 'content-type': 'application/json' };
+
+let adminAuth = '';
+
+const jsonHeaders = (): Record<string, string> => ({
+  'content-type': 'application/json',
+  authorization: adminAuth,
+});
 
 let server: Server;
 let base = '';
@@ -23,7 +32,7 @@ let base = '';
 async function postWallet(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/wallets`, {
     method: 'POST',
-    headers: JSON_HEADERS,
+    headers: jsonHeaders(),
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };
@@ -32,7 +41,7 @@ async function postWallet(body: unknown): Promise<{ status: number; json: any }>
 async function patchWallet(id: string, body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/wallets/${id}`, {
     method: 'PATCH',
-    headers: JSON_HEADERS,
+    headers: jsonHeaders(),
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };
@@ -45,7 +54,9 @@ const balanceRows = (walletId: string) =>
 
 before(async () => {
   open(':memory:');
-  server = createApp('test').listen(0);
+  const auth = await createTestAuth();
+  adminAuth = `Bearer ${await auth.signToken(auth.adminEmail)}`;
+  server = createApp('test', auth.deps).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });

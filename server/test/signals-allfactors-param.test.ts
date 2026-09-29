@@ -11,12 +11,15 @@ import { createApp } from '../src/api.js';
 const CA_FAIL = 'allf-fail-fresh-001';
 const CA_PASS = 'allf-pass-fresh-002';
 const CA_CHEAP = 'allf-below-minusd-003';
+// AUTH CONTRACT v1: GET /api/signals accepts the service role (via createApp
+// deps — static imports snapshot config before env in the body could apply).
+const SERVICE_TOKEN = 'signals-allfactors-service-token';
 
 let server: Server;
 let base = '';
 
 async function getSignals(query: string): Promise<TokenSignal[]> {
-  const res = await fetch(`${base}/api/signals${query}`);
+  const res = await fetch(`${base}/api/signals${query}`, { headers: { authorization: `Bearer ${SERVICE_TOKEN}` } });
   assert.equal(res.status, 200);
   return (await res.json()) as TokenSignal[];
 }
@@ -43,7 +46,7 @@ before(async () => {
   // fresh 1% < freshMinPct default 10 → value exists but FAILS the gate.
   updateTokenMetrics(CA_FAIL, 'sol', { nansenFreshPct: 1 });
   updateTokenMetrics(CA_PASS, 'sol', { nansenFreshPct: 50 });
-  server = createApp('test').listen(0);
+  server = createApp('test', { serviceToken: SERVICE_TOKEN }).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });

@@ -66,11 +66,19 @@ export const config = {
   // hourly-stats series) — are refreshed TOGETHER on ONE cadence (user 2026-09-22;
   // hourly since 2026-09-24), so the shared browser page carries them hourly.
   /** Setup-indicator cadence: gini + series + LF in one pass per CA. Also the
-   * freshness TTL of a setup cache entry (isSetupCacheFresh). */
-  pollSetupMs: num('POLL_SETUP_MS', 3_600_000),
+   * freshness TTL of a setup cache entry (isSetupCacheFresh). 6h (was 1h): every
+   * tgm/flows call costs 1 credit, and the setup T100 series on a token older
+   * than 7 days is DAILY data — an hourly re-fetch only re-reads the same buckets. */
+  pollSetupMs: num('POLL_SETUP_MS', 21_600_000),
   /** Retry cadence while a CA's setup is INCOMPLETE; a COMPLETE CA with a fresh
-   * cache entry sits out until that entry goes stale (POLL_SETUP_MS). */
+   * cache entry sits out until that entry goes stale (POLL_SETUP_MS). Also the
+   * setupSweep scheduler interval. */
   pollSetupRetryMs: num('POLL_SETUP_RETRY_MS', 3_600_000),
+  /** A token THIS young that has no data yet gets no faster than an hourly retry:
+   * Nansen has not indexed it yet, so a faster re-ask is pure spam. */
+  newTokenMinAgeMs: posNum('NEW_TOKEN_MIN_AGE_MS', 4 * 3_600_000),
+  /** Flat retry spacing for a too-new token (see newTokenMinAgeMs). */
+  newTokenRetryMs: posNum('NEW_TOKEN_RETRY_MS', 3_600_000),
   /** A CA added inside this window jumps the queue on every free sweep, so a
    * fresh add is not stuck behind a long paced list (user 2026-09-22). */
   newCaPriorityMs: num('NEW_CA_PRIORITY_MS', 3_600_000),
@@ -93,9 +101,10 @@ export const config = {
    * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
   /** Official tgm/flows (credit-only) refresh — T100 multiple, LF, the bal_* chart
-   * windows. Its own faster cadence (user 2026-09-24): credits are the only cost,
-   * no browser door, no rate limit. Deliberately separate from the gini cadence. */
-  pollFlowsMs: posNum('POLL_FLOWS_MS', 900_000),
+   * windows. 6h (was 15 min): each call costs 1 credit and the series on a token
+   * older than 7 days is DAILY data, so a faster re-fetch only re-reads the same
+   * buckets. Deliberately separate from the gini cadence. */
+  pollFlowsMs: posNum('POLL_FLOWS_MS', 21_600_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */
   nansenRetries: num('NANSEN_RETRIES', 6),
@@ -148,6 +157,19 @@ export const config = {
    * = this / the endpoint's weight, enforced by the rate-control layer
    * (ratelimit/spec.ts weightBucket for the 'gmgn' limiter). */
   gmgnPlanWeight: posNum('GMGN_PLAN_WEIGHT', 5),
+
+  // Auth (AUTH CONTRACT v1, src/auth.ts). All three default to '' = FAIL CLOSED:
+  // no project id → browser tokens rejected; no roles → nobody is admin/viewer;
+  // no service token → the daemon path is disabled. Never allow-by-default.
+  /** Firebase project whose Google ID tokens are accepted (aud/iss) — expected
+   * `trading-auth-67772`. Public JWKS verification only; no private key here. */
+  firebaseProjectId: str('FIREBASE_PROJECT_ID', ''),
+  /** `email:role` CSV ("a@b.com:admin,c@d.com:viewer") — roles admin|viewer,
+   * emails case-insensitive + trimmed, unknown role strings ignored. */
+  authUserRoles: str('AUTH_USER_ROLES', ''),
+  /** Static Bearer token for the wallet_watch daemon (role 'service'). A long
+   * random secret; compared in constant time (auth.ts matchServiceToken). */
+  serviceToken: str('SERVICE_TOKEN', ''),
   // Mốc backfill lịch sử trades (ISO date) — 'từ lúc token được phát hiện'.
   nansenBackfillFrom: str('NANSEN_BACKFILL_FROM', '2026-08-01'),
   crawlWsEndpoint: str('CRAWL_WS_ENDPOINT', 'ws://chrome:3000'),
@@ -182,14 +204,16 @@ export const T100_WINDOW_MS = num('T100_WINDOW_MS', 86_400_000);
 /** holder_snapshots older than this are pruned by the holders sweep. */
 export const SNAPSHOT_RETENTION_MS = num('SNAPSHOT_RETENTION_MS', 72 * 3_600_000);
 
-/** `trackedWallets` membership: wallets with a buy more recent than this window still count (Metis: 7d). */
+/** Retention window for pruneTrackedByNone (poller.ts) ONLY — a tracked CA whose
+ * members' watch buys are ALL older than this is dropped. NO LONGER feeds the
+ * `trackedWallets` column: wallet membership is ever-bought (permanent, no window). */
 export const TRACKED_BY_WINDOW_MS = num('TRACKED_BY_WINDOW_MS', 7 * 86_400_000);
 
 /** Auto-prune window (user 2026-09-20): a tracked CA with no tracked-wallet BUY
  * inflow inside this window — measured from the last inflow, or from added_at
  * when there is none — is deleted. Deliberately SEPARATE from
- * TRACKED_BY_WINDOW_MS, which also feeds the `trackedWallets` column and the Nansen
- * crawl window; shortening that one would silently narrow those too. */
+ * TRACKED_BY_WINDOW_MS, which feeds pruneTrackedByNone; shortening that one would
+ * silently narrow the prune too. */
 export const CA_INFLOW_WINDOW_MS = num('CA_INFLOW_WINDOW_MS', 48 * 3_600_000);
 
 // Nansen factor PASS thresholds (Metis placeholders awaiting T's sign-off —

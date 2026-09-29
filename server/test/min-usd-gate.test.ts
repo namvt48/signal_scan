@@ -11,6 +11,11 @@ const CA_LOW = 'caUsd-low-001';
 const CA_OK = 'caUsd-ok-002';
 const CA_NULL = 'caUsd-null-003';
 const CA_EDGE = 'caUsd-edge-004';
+// AUTH CONTRACT v1: POST /api/tracked-cas accepts the service role (the daemon's
+// path). Static imports snapshot config before this module body runs, so the
+// token goes in via createApp deps instead of env.
+const SERVICE_TOKEN = 'min-usd-gate-service-token';
+const AUTH_HEADER = { authorization: `Bearer ${SERVICE_TOKEN}` };
 
 function signalCas(): string[] {
   return assembleSignals().map((s) => s.ca);
@@ -26,7 +31,7 @@ before(async () => {
   insertTrackedCa({ address: CA_OK, chain: 'sol', note: '', entryUsd: 60 });
   insertTrackedCa({ address: CA_NULL, chain: 'sol', note: '' });
   insertTrackedCa({ address: CA_EDGE, chain: 'sol', note: '', entryUsd: 50 });
-  server = createApp('test').listen(0);
+  server = createApp('test', { serviceToken: SERVICE_TOKEN }).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -98,7 +103,7 @@ test('settings validation: t100MinMultiple >= 1, lf band absolute (>= 0, unbound
 async function postTrackedCa(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/tracked-cas`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...AUTH_HEADER },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json() };

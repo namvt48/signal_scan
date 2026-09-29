@@ -179,7 +179,7 @@ Definition of done cần evidence file cho từng mục (§7).
 - **R1** Nansen **free crawl** có thực sự nhận chain EVM (`base`/`bnb`) không — T2 chứng minh. Nếu KHÔNG ⇒ gini EVM cần nguồn khác (GMGN? bỏ cột? Nansen paid?) → mở lại quyết định. **→ RESOLVED 2026-09-27:** door (CDP) trả 200 cho `base` + `bnb` (cả 2 question, 2 lần chạy); control `notachain` → 400 kèm allowlist có `base`/`bnb`. Evidence: `evidence/T2b-nansen-evm-door.txt`, `evidence/T2-nansen-evm-probe.instanceA.json`. T6 UNBLOCKED.
 - **R2** Alchemy free WS `eth_subscribe` có trên **cả** Base và BNB Chain không; và `eth_getLogs` range cap per chain (Base block ~2s, BSC nhanh) → chunk size.
 - **R3** Reorg Base/BSC → số N confirmations an toàn; Sol dùng cơ chế riêng nên **không** port thẳng.
-- **R4** GMGN weight budget: 1 key dùng chung, Free **5 call/s** (`gmgn.ts:19-21`); 3 chain trên B tranh nhau → kiểm capacity, chấp nhận giảm cadence nếu cần.
+- **R4** GMGN weight budget: 1 key dùng chung, Free **5 call/s** (`gmgn.ts:19-21`); 3 chain trên B tranh nhau → kiểm capacity, chấp nhận giảm cadence nếu cần. **→ STALE 2026-09-27:** `MODE=gmgn` là NO-OP đã bỏ ⇒ chạy như nansen; nút cổ chai thật là door browser (~43 req/min) + Nansen credit key, KHÔNG phải weight GMGN. Evidence: `evidence/T2b-nansen-evm-door.txt`.
 - **R5** DexScreener rate limit (60-300/min) chia giữa watcher price + icon sweep → cache price.
 - **R6** `Multicall3` có mặt trên Base (có) và BSC (có) — verify địa chỉ trước khi hardcode.
 - **R7** Daemon EVM đọc "ví theo dõi" từ API: cần API trả ví theo chain (T4) — đảm bảo endpoint lọc/trả `chain`.
@@ -199,4 +199,48 @@ Definition of done cần evidence file cho từng mục (§7).
 
 ## 7. Evidence convention
 
-Repo **không phải git** ⇒ mọi bằng chứng ghi ra file dưới `evidence/` với tên như trên (T1..T11). Mỗi task Done ⇔ file evidence tồn tại + nội dung chứng minh acceptance. Không có evidence = chưa xong.
+Repo **là git** (`github.com/namvt48/signal_scan`, HEAD `4d50c04`) ⇒ mọi bằng chứng ghi ra file dưới `evidence/` với tên như trên (T1..T11). Mỗi task Done ⇔ file evidence tồn tại + nội dung chứng minh acceptance. Không có evidence = chưa xong.
+
+---
+
+## 8. Post-execution (2026-09-27)
+
+**Trạng thái:** T1–T11 ĐÃ LÀM trên repo (commit `4fc2da3` implement + `4d50c04` fix sau T8), đã push `origin/main`. Cột `[ ]` ở mục 4 là trạng thái lúc lập plan — mục này là nguồn đúng.
+
+- **T9** deploy B: containers `signal_scan_b-{api,chrome,web}-1` UP, port 8125, `make test INSTANCE=b` = 200; migrate schema DB mới OK. **systemd daemon EVM: HOÃN** (user: "chỉ cần test thôi chưa cần deploy luôn"). Host python 3.12.3 thiếu `websockets` + `pip` ⇒ daemon phải `--feed poll`.
+- **T11** deploy A: OK, zero data loss (backup `data/backup-preevm-20260927T085026.db`).
+- **T8** live E2E: PASS cả base + bsc trên B. Evidence: `evidence/T8-live.txt`.
+
+### 8.1 Hai bug thật, cùng gốc (địa chỉ hex HOA/thường) — đã sửa
+
+1. `watchers/common/price.py` — DexScreener trả **checksummed**, CA từ log **lowercase** ⇒ `_price_from_pairs` so khớp trượt ⇒ `get_price_usd()` = None ⇒ mọi trade EVM `usd=0.0`, gate `min_usd` (fail-open, `signals.ts:334`) vô hiệu. Fix `.lower()` 2 vế + regression test. Test cũ không bắt vì `scripts/test_evm_feed.py::_isolate` stub `feed.price.get_price_usd`. Evidence: `evidence/T8-price-bug.txt`.
+2. Server canonical CA — `token_state.ca`/`tracked_cas.address` lưu **checksummed**, holding từ `evm.ts` **lowercase** ⇒ `ingest.ts:250 getTokenState()` trượt ⇒ `balance_usd=NULL` cho **mọi** holding EVM. Fix `canonicalCa()` (**chỉ** địa chỉ đúng dạng EVM `0x`+40hex; sol base58 giữ nguyên văn) áp 8 biên DB (7 ở `db.ts` + `insertTrades`) — `insertTrades` bắt buộc vì UNIQUE key chứa `ca`: lệch dạng tạo row TRÙNG, không chỉ hỏng join. Migrate 4 row EVM trên B. Live: base `0.5782490496553385`, bsc `3518.793698288505` (= amount × price, khớp chính xác). Evidence: `evidence/T8-ca-casing-bug.txt`.
+
+### 8.2 Quyết định mới (user): SELL vẫn refresh, KHÔNG thành member
+
+`trackedCasForWallet` → **`watchedCasForWallet`**, bỏ `AND t.side='buy'` (`db.ts`). Đúng 1 caller = kick scope (`poller.ts:905`). **Membership KHÔNG đổi** (`signals.ts`/`trackedByPairs` vẫn BUY-only) ⇒ sell-only vẫn absent khỏi "Tracked by" (`signals.test.ts:314` giữ nguyên). Test mới: `server/test/wallet-kick-scope.test.ts`.
+
+### 8.3 BSC keyless RPC
+
+Daemon default `watchers/evm/feed.py` → `https://1rpc.io/bnb` (keyless DUY NHẤT chạy cả `eth_getLogs` + `eth_getTransactionReceipt`; giới hạn ~50 block/getLogs ⇒ `--chunk 50`; override `BSC_RPC_URL`). Keyless khác fail 1 trong 2: `bsc-dataseed` fail getLogs, `*.publicnode.com` fail receipt. `bsc-dataseed.binance.org` giữ ở **server** (`server/src/providers/evm.ts:41`) — server chỉ gọi `eth_call`, đã proven live. Evidence: `evidence/T8-bsc-rpc.txt`.
+
+### 8.4 Đính chính
+
+Claim "mất ~45% coverage do `0x278d858f…`" là **SAI** — truy nguồn ra **arbitrage bot** (gist phân loại Avalanche rank 3, selector `0xa00597a0` khớp basescan), allowlist loại nó là **ĐÚNG**. Đã retract trong `evidence/T8-bsc-rpc.txt`. 5 địa chỉ Base chưa nhận diện (1–2 tx/40) — rủi ro thấp.
+
+### 8.5 Cờ còn tồn (không chặn)
+
+- Nansen credit key cạn (403 Insufficient credits) trên A+B — user: "Để nguyên — chấp nhận degrade". `server/.env.example` còn ghi phải rotate key đã lộ.
+- Daemon bền vững: chạy qua systemd `wallet-watch.service` bằng venv `/opt/wallet-watch/venv` (có `websockets 17.1`). Host **system** python 3.12.3 thiếu `websockets`/`pip` — chỉ ảnh hưởng nếu chạy ngoài venv. KHÔNG còn là vấn đề.
+- `Makefile` **không ship `watchers/`** — phải `rsync -r watchers` thủ công.
+
+### 8.6 Đã deploy A (2026-09-27) — "deploy lại toàn bộ A"
+
+User: "oke deploy lại toàn bộ hệ thống A lên đi B không deploy, nhớ backup data trước".
+
+- **Backup trước** (TS `20260927T082818Z`): `data/backup-prefull-20260927T082818Z.db` · `/root/backup-opt-walletwatch-20260927T082818Z.tgz` · `/root/backup-wallet-watch.service-20260927T082818Z` · `/root/backup-A-env-20260927T082818Z`.
+- **Container (A)**: `make deploy` + `make up` → image mới build, `signal_scan-api-1` recreated; web HTTP 200:8124; `/api/health` `healthy:true`. Code mới trong container: `grep -c canonicalCa /app/src/shared/chain.ts`=1, `grep -c watchedCasForWallet /app/src/poller.ts`=2 (trước deploy = 0).
+- **Daemon Sol (A)**: thay monolith → `watchers/` package + shim 92 dòng (md5 `6bfdf7f9…`, = đúng file đang chạy). Smoke `import`/`--help`/`HERE=/opt/wallet-watch` PASS; `systemctl restart` → active, `NRestarts=0`, 0 traceback.
+- **E2E sau restart**: 2 row SELL mới (`wallet_trades` 32341→32344), log `15:32:14 SELL … ≈ $563.17` (price fix live). Data nguyên vẹn, **100% sol** (201/396/32344/397/484) ⇒ EVM paths inert trên A (D9 giữ).
+- **B KHÔNG deploy** (đúng lệnh). Evidence: `evidence/T11-instance-a.txt`.
+- Thay đổi 8.1/8.2/8.3 giờ **đã lên A**; trên **B vẫn chưa** (user chưa cho deploy B).

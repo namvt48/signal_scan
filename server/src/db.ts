@@ -7,6 +7,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { CHAINS, canonicalCa, type Chain } from './shared/chain.js';
+import { type Tier } from './shared/tier.js';
 import { config } from './config.js';
 import { MOCK_CA_POOL } from './providers/mock.js';
 
@@ -185,6 +186,15 @@ CREATE TABLE IF NOT EXISTS nansen_series (
 -- Runtime-adjustable settings (key/value strings). Currently holds the Nansen
 -- factor thresholds (freshMinPct/t100MinPct/lfMaxPct) that gate the X/3 score.
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- Per-CA user tier (S+/S/A+/A/B+/B). Absent row = unrated. Keyed like tracked_cas.
+CREATE TABLE IF NOT EXISTS token_tiers (
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  tier TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (ca, chain)
+);
 `;
 
 let instance: Database.Database | null = null;
@@ -388,23 +398,23 @@ export function watchedCasForWallet(walletId: string): string[] {
 
 /**
  * MAX(ts) of each CA's source='watch' trades — buy OR sell — inside the window,
- * restricted to MEMBER (wallet, CA) pairs (a wallet with a watch buy inside the
- * member window, the trackedWalletStats membership rule). This is the recency key
- * that orders the dashboard: a member's SELL bumps its CA exactly like a buy
- * (user 2026-09-24). Activity from a non-member wallet is ignored, so a CA with no
- * tracked wallet of its own keeps the 0 sentinel and sinks.
+ * restricted to MEMBER (wallet, CA) pairs (a wallet with ANY source='watch' buy —
+ * membership is ever-bought, no time window, the trackedWalletStats rule). This is
+ * the recency key that orders the dashboard: a member's SELL bumps its CA exactly
+ * like a buy (user 2026-09-24). Activity from a non-member wallet is ignored, so a
+ * CA with no tracked wallet of its own keeps the 0 sentinel and sinks.
  */
-export function latestWatchTradeTsByCa(sinceTs: number, memberSince: number): Map<string, number> {
+export function latestWatchTradeTsByCa(sinceTs: number): Map<string, number> {
   const rows = getDb()
     .prepare(
       `SELECT t.ca AS ca, MAX(t.ts) AS ts FROM wallet_trades t
         WHERE t.source = 'watch' AND t.ts >= @sinceTs
           AND EXISTS (SELECT 1 FROM wallet_trades b
                        WHERE b.wallet_id = t.wallet_id AND b.ca = t.ca
-                         AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= @memberSince)
+                         AND b.side = 'buy' AND b.source = 'watch')
         GROUP BY t.ca`,
     )
-    .all({ sinceTs, memberSince }) as { ca: string; ts: number }[];
+    .all({ sinceTs }) as { ca: string; ts: number }[];
   return new Map(rows.map((r) => [r.ca, r.ts]));
 }
 
@@ -609,6 +619,15 @@ export function deleteTrackedCa(id: string): void {
 }
 
 /**
+ * "This tracked CA carries no user tier" — the guard EVERY auto-delete path must
+ * carry. A CA the user rated is one they want kept, so the 48h inflow prune, the
+ * tracked-by-none prune and the zero-score gate must all spare it (user 2026-09-28).
+ * Defined once so the three paths cannot drift apart. Reads tracked_cas via the
+ * alias `t`, which every candidate query below uses.
+ */
+const NOT_TIERED = `NOT EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain)`;
+
+/**
  * Deletes CA-scoped market data whose CA is no longer tracked. EVERY prune path
  * must call this: a prune that removes the tracked_cas row but skips this leaves
  * the CA's token_state and (worse) wallet_token_state rows behind. The latter has
@@ -621,11 +640,19 @@ function sweepOrphanedCaData(): void {
     `DELETE FROM token_state WHERE NOT EXISTS (
        SELECT 1 FROM tracked_cas t WHERE t.address = token_state.ca AND t.chain = token_state.chain)`,
   ).run();
-  // wallet_token_state has no chain column (CHAINS is sol-only) — match the CA alone.
+  // wallet_token_state IS chain-scoped (PK wallet_id, ca, chain) — match the same
+  // (chain, ca) identity tracked_cas is unique on, otherwise a row for base:0xdup is
+  // kept alive by an unrelated tracked CA that merely shares the address.
   db.prepare(
     `DELETE FROM wallet_token_state WHERE NOT EXISTS (
-       SELECT 1 FROM tracked_cas t WHERE t.address = wallet_token_state.ca)`,
+       SELECT 1 FROM tracked_cas t
+        WHERE t.address = wallet_token_state.ca AND t.chain = wallet_token_state.chain)`,
   ).run();
+  // token_tiers is deliberately NOT swept here: the address→tier map is permanent
+  // ("nhớ lưu lại cái map address với tier lại, mỗi khi add mới CA thì check cái này").
+  // A CA pruned and later re-added must come back with its tier intact, so a tier row
+  // may outlive its tracked_cas row by design. Only an explicit PUT /api/tier with a
+  // null tier clears one (deleteTier).
 }
 
 /**
@@ -642,6 +669,9 @@ function sweepOrphanedCaData(): void {
  * data via sweepOrphanedCaData(). Wallet history (wallet_trades) is deliberately kept.
  *
  * Returns the dropped rows so the caller can log them — the DELETE is not undoable.
+ * A CA with a stored user tier is never a candidate. Every clause is scoped to the
+ * row's own (chain, ca) (user 2026-09-28): tracked_cas is UNIQUE(address, chain), so
+ * a position or a buy on base must never keep bsc:0x… alive.
  */
 export function pruneUntrackedCas(windowMs: number): TrackedCaRow[] {
   const db = getDb();
@@ -653,12 +683,14 @@ export function pruneUntrackedCas(windowMs: number): TrackedCaRow[] {
     .prepare(
         `SELECT t.* FROM tracked_cas t
         WHERE t.added_at <= ?
+          AND ${NOT_TIERED}
           AND NOT EXISTS (SELECT 1 FROM wallet_token_state s
-                           WHERE s.ca = t.address AND s.token_amount > 0
+                           WHERE s.ca = t.address AND s.chain = t.chain AND s.token_amount > 0
                              AND EXISTS (SELECT 1 FROM wallet_trades wt
-                                          WHERE wt.wallet_id = s.wallet_id AND wt.ca = s.ca
+                                          WHERE wt.wallet_id = s.wallet_id AND wt.ca = s.ca AND wt.chain = s.chain
                                             AND wt.side = 'buy' AND wt.source = 'watch'))
-          AND NOT EXISTS (SELECT 1 FROM wallet_trades w WHERE w.ca = t.address AND w.side = 'buy' AND w.ts >= ?)`,
+          AND NOT EXISTS (SELECT 1 FROM wallet_trades w
+                           WHERE w.ca = t.address AND w.chain = t.chain AND w.side = 'buy' AND w.ts >= ?)`,
     )
     .all(cutoff, since) as TrackedCaRow[];
   // Safe + deliberate: every token_state / wallet_token_state reader joins
@@ -678,6 +710,7 @@ export function pruneUntrackedCas(windowMs: number): TrackedCaRow[] {
  * wallet whose last buy is older is not a tracker), which is why pruneUntrackedCas
  * alone lets a backfilled `auto:BUY` row outlive its own window. `graceMs` spares a
  * just-added CA, since wallet_watch.py POSTs the CA a round-trip before its BUY.
+ * A CA with a stored user tier is never a candidate.
  */
 export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): TrackedCaRow[] {
   const db = getDb();
@@ -687,6 +720,7 @@ export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): Tra
     .prepare(
       `SELECT t.* FROM tracked_cas t
         WHERE t.added_at <= ?
+          AND ${NOT_TIERED}
           AND NOT EXISTS (SELECT 1 FROM wallet_trades b
                            WHERE b.ca = t.address AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= ?)`,
     )
@@ -721,7 +755,8 @@ export interface CaScoreGateRow {
  * EXCEPT those a tracked wallet still HOLDS (user 2026-09-25): a 0/3 symbol a `source='watch'`
  * wallet bought and never sold is not dead, and the CA is on the dashboard because of that
  * wallet. Dropping token_amount to 0 puts it back in the gate's scope on the next sweep.
- * Same holding rule as pruneUntrackedCas; wallet_token_state has no chain column (sol-only).
+ * Same holding rule as pruneUntrackedCas, scoped to the row's own (chain, ca).
+ * A CA with a stored user tier is never a candidate.
  */
 export function listCaScoreGateCandidates(): CaScoreGateRow[] {
   return getDb()
@@ -733,10 +768,11 @@ export function listCaScoreGateCandidates(): CaScoreGateRow[] {
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.ca = t.address AND s.chain = t.chain
         WHERE NOT EXISTS (SELECT 1 FROM wallet_token_state wts
-                           WHERE wts.ca = t.address AND wts.token_amount > 0
+                           WHERE wts.ca = t.address AND wts.chain = t.chain AND wts.token_amount > 0
                              AND EXISTS (SELECT 1 FROM wallet_trades wt
-                                          WHERE wt.wallet_id = wts.wallet_id AND wt.ca = wts.ca
-                                            AND wt.side = 'buy' AND wt.source = 'watch'))`,
+                                          WHERE wt.wallet_id = wts.wallet_id AND wt.ca = wts.ca AND wt.chain = wts.chain
+                                            AND wt.side = 'buy' AND wt.source = 'watch'))
+          AND ${NOT_TIERED}`,
     )
     .all() as CaScoreGateRow[];
 }
@@ -762,12 +798,53 @@ export function deleteTrackedCasByIds(ids: readonly string[]): number {
   return deleted;
 }
 
+// --- token tiers ------------------------------------------------------------
+
+/** One persisted user tier — keyed by canonical (ca, chain), like tracked_cas. */
+export interface TierRow {
+  ca: string;
+  chain: Chain;
+  tier: Tier;
+  updated_at: number;
+}
+
+export function listTiers(): TierRow[] {
+  return getDb().prepare('SELECT * FROM token_tiers').all() as TierRow[];
+}
+
+/** Upsert the user-set tier for a tracked CA (api.ts validates the tier value). */
+export function setTier(ca: string, chain: Chain, tier: Tier): void {
+  getDb()
+    .prepare(
+      `INSERT INTO token_tiers (ca, chain, tier, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(ca, chain) DO UPDATE SET tier = excluded.tier, updated_at = excluded.updated_at`,
+    )
+    .run(canonicalCa(ca, chain), chain, tier, Date.now());
+}
+
+/** Clearing a tier DELETES the row — absent row = unrated. */
+export function deleteTier(ca: string, chain: Chain): void {
+  getDb().prepare('DELETE FROM token_tiers WHERE ca = ? AND chain = ?').run(canonicalCa(ca, chain), chain);
+}
+
 // --- token_state ----------------------------------------------------------
 
 export function getTokenState(ca: string, chain: Chain): TokenStateRow | undefined {
   return getDb()
     .prepare('SELECT * FROM token_state WHERE ca = ? AND chain = ?')
     .get(canonicalCa(ca, chain), chain) as TokenStateRow | undefined;
+}
+
+/**
+ * Batched getTokenState for the /api/signals pass (N+1 fix): ONE full-table read
+ * keyed `${chain}:${ca}` — the key shape the assembleSignals loop and tierByCa use.
+ * Parity contract: tracked_cas addresses are canonical at insert and getTokenState
+ * matches `ca = canonicalCa(input)` by string equality, so a lookup with a tracked
+ * CA's `${chain}:${address}` resolves to the same row (or miss). Do NOT re-key.
+ */
+export function allTokenStates(): Map<string, TokenStateRow> {
+  const rows = getDb().prepare('SELECT * FROM token_state').all() as TokenStateRow[];
+  return new Map(rows.map((r) => [`${r.chain}:${r.ca}`, r]));
 }
 
 /** Newest fetched_at across token_state — health endpoint freshness signal. */

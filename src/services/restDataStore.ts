@@ -2,14 +2,37 @@
 // deployments). Same contract as the localStorage implementation; components
 // cannot tell them apart.
 
-import type { Settings, SettingsPatch, TokenSignal, Wallet } from '../types';
+import type { Chain, Settings, SettingsPatch, Tier, TokenSignal, Wallet } from '../types';
 import { byName, type DataStore, type ImportResult, type ImportRow } from './dataStore';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
 
+// Auth bridge, set once by AuthProvider. Keeping it here (rather than importing the
+// auth module) means the data layer never depends on React/Firebase.
+let tokenGetter: () => Promise<string | null> = async () => null;
+let onUnauthorized: () => void = () => {};
+
+/** Wired by AuthProvider: supplies the bearer token and reacts to a 401. */
+export function setAuthBridge(getToken: () => Promise<string | null>, handleUnauthorized: () => void): void {
+  tokenGetter = getToken;
+  onUnauthorized = handleUnauthorized;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
+  const token = await tokenGetter();
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    // Merge, never replace: json() and the inline PATCH literal set Content-Type.
+    headers: { ...(init?.headers ?? {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  });
   if (!res.ok) {
+    // No token / expired token: drop the session so the login wall returns.
+    if (res.status === 401) {
+      onUnauthorized();
+      throw new Error('Session expired — please sign in again.');
+    }
+    // The server sends a bare {error:'forbidden'}; say something a viewer understands.
+    if (res.status === 403) throw new Error('You do not have permission to do that.');
     const body = await res.text().catch(() => '');
     throw new Error(body || `HTTP ${res.status}`);
   }
@@ -57,5 +80,9 @@ export const restDataStore: DataStore = {
 
   async updateSettings(patch: SettingsPatch): Promise<Settings> {
     return request<Settings>('/settings', json('PUT', patch));
+  },
+
+  async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {
+    await request<void>('/tier', json('PUT', { ca, chain, tier }));
   },
 };

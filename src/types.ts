@@ -1,6 +1,9 @@
 export const CHAINS = ['sol', 'base', 'bsc'] as const;
 export type Chain = (typeof CHAINS)[number];
 
+export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B'] as const;
+export type Tier = (typeof TIERS)[number];
+
 export interface Wallet {
   id: string;
   address: string;
@@ -86,7 +89,7 @@ export interface TokenSignal {
   volume24h: number;
   /** Trailing-1h DEX volume, USD. Absent until the 1h sweep has written one. */
   volume1h?: number;
-  tier: 'S' | 'A' | 'B' | null;
+  tier: Tier | null;
   /** Balance-distribution extremes per lookback window (absent window = no snapshot data yet). */
   balanceRange?: { d1?: BalRange; d7?: BalRange; d30?: BalRange };
 }

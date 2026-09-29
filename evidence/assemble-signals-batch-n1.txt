@@ -1,0 +1,108 @@
+# assembleSignals N+1 elimination — verification evidence (2026-09-28)
+
+Task: replace per-CA queries in `assembleSignals` with batched reads. Pure perf
+refactor — `/api/signals` JSON byte-identical.
+
+Files changed (server/ only):
+- server/src/db.ts — added `allTokenStates()` (batched `getTokenState`)
+- server/src/signals.ts — added `sumHoldingAmountByCa()`, `trackedWalletStatsByCa()`; loop consumes maps
+- server/test/assemble-signals-batch.test.ts — new regression test (4 tests)
+
+Existing exported `getTokenState` / `sumHoldingAmount` / `trackedWalletStats`
+bodies untouched. No signature changes. No statement cache added.
+(server/src/api.ts diff in git status pre-existed this task — tier endpoints, not touched here.)
+
+## New SQL
+
+allTokenStates (db.ts):
+    SELECT * FROM token_state
+    -- Map key: `${chain}:${ca}` (raw row values); lookup `${c.chain}:${c.address}` —
+    -- exact parity with getTokenState's `WHERE ca = canonicalCa(?) AND chain = ?`.
+
+sumHoldingAmountByCa (signals.ts):
+    SELECT s.ca AS ca, COALESCE(SUM(s.token_amount), 0) AS total FROM wallet_token_state s
+      WHERE EXISTS (SELECT 1 FROM wallet_trades t
+                     WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca
+                       AND t.side = 'buy' AND t.source = 'watch')
+      GROUP BY s.ca
+
+trackedWalletStatsByCa (signals.ts):
+    WITH members AS (
+      SELECT DISTINCT b.ca AS ca, b.wallet_id AS wallet_id
+        FROM wallet_trades b
+       WHERE b.side = 'buy' AND b.source = 'watch' AND b.ts >= @memberSince)
+    SELECT m.ca AS ca, w.name AS name, w.clan AS clan, w.tags AS tags,
+           COALESCE(SUM(CASE WHEN t.side = 'buy' THEN t.amount_usd ELSE -t.amount_usd END), 0) AS inflow,
+           SUM(CASE WHEN t.side = 'buy' THEN 1 ELSE 0 END) AS buys,
+           SUM(CASE WHEN t.side = 'sell' THEN 1 ELSE 0 END) AS sells,
+           COALESCE(MAX(t.ts), 0) AS lastTs,
+           MAX(s.balance_usd) AS balUsd
+      FROM members m
+      JOIN wallets w ON w.id = m.wallet_id
+      LEFT JOIN wallet_trades t
+        ON t.wallet_id = m.wallet_id AND t.ca = m.ca AND t.source = 'watch' AND t.ts >= @statSince
+      LEFT JOIN wallet_token_state s ON s.wallet_id = m.wallet_id AND s.ca = m.ca
+     GROUP BY m.ca, m.wallet_id
+     ORDER BY m.ca, lastTs DESC, w.name
+
+## tsc (cd server && npx tsc --noEmit)
+
+    tsc exit: 0
+
+## npm test (cd server && npm test) — tail
+
+    ℹ tests 320
+    ℹ suites 0
+    ℹ pass 320
+    ℹ fail 0
+    ℹ cancelled 0
+    ℹ skipped 0
+    ℹ todo 0
+    ℹ duration_ms 28279.153601
+
+Baseline was 316 passing; +4 from test/assemble-signals-batch.test.ts. 0 failing.
+
+## Prod DB copy equivalence + timing
+
+Source: scp root@194.163.187.250:/root/signal_scan/data/backup-pretier-20260928T072709Z.db
+→ /tmp/opencode/prod_copy.db (36,298,752 bytes; chmod a-w, never opened).
+Work performed on a derived copy /tmp/opencode/prod_work.db (open() runs WAL +
+idempotent migrations — writes only to the derived copy, never the scp'd file,
+never prod). Throwaway script /tmp/opencode/prod-equiv.ts held a verbatim replica
+of the pre-change assembleSignals for the OLD side. Script + both DB files
+deleted afterwards.
+
+Raw output:
+
+    tracked CAs: 460
+    per-CA equivalence mismatches: 0
+    assembleSignals byte-identical (allFactors=false): true — 229920 vs 229920 bytes
+    assembleSignals byte-identical (allFactors=true): true — 375528 vs 375528 bytes
+    OLD assembleSignalsOld: 471.1, 457.8, 449.2, 474.9, 468.5 ms
+    NEW assembleSignals   : 126.9, 117.2, 113.8, 113.3, 110.7 ms
+    median OLD: 468.5 ms | median NEW: 113.8 ms | speedup: 4.1x
+    mismatch total: 0
+    script exit: 0
+
+Per-CA equivalence checked for ALL 460 tracked CAs:
+- allTokenStates().get(`${chain}:${address}`) vs getTokenState(address, chain) — JSON-equal
+- sumHoldingAmountByCa().get(ca) ?? 0 vs sumHoldingAmount(ca) — strict-equal
+- trackedWalletStatsByCa(now).get(ca) ?? [] vs trackedWalletStats(ca, now) — JSON-equal
+
+Full-response identity: JSON.stringify of old vs new assembleSignals identical
+byte-for-byte in both allFactors modes (229,920 / 375,528 bytes).
+
+Timing (this machine, warm cache): median 468.5 ms → 113.8 ms = 4.1x.
+Query count per request: ~1383 (3 + 460×3) → 6. Prod's 2.4–3.2s (slower CPU/disk)
+should scale down by roughly the same factor.
+
+## Regression test coverage (test/assemble-signals-batch.test.ts)
+
+1. allTokenStates vs getTokenState for every tracked CA + canonicalCa parity
+   (mixed-case EVM address on base resolves to the same row both ways).
+2. sumHoldingAmountByCa vs sumHoldingAmount for every tracked CA + explicit
+   values (non-member holding excluded; watch buy with no time bound counts).
+3. trackedWalletStatsByCa vs trackedWalletStats for every tracked CA.
+4. LEFT JOIN lock: member with NO trade in the 24h stat window keeps its
+   zero-stat row (inflow/buys/sells/lastTs 0) + balUsd; per-CA order
+   (lastTs DESC, name); conditional-spread shapes (clan/tags/balUsd).

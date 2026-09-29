@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes } from 'react';
 import { Check, Copy, Warning, X } from '@phosphor-icons/react';
+import { TIERS, type Tier } from '../types';
 
 // --- copy to clipboard (with non-secure-context fallback) -------------------
 
@@ -127,8 +128,11 @@ export function Select({ className = '', children, ...rest }: SelectHTMLAttribut
 // --- badges -----------------------------------------------------------------------
 
 const TIER_STYLES: Record<string, string> = {
+  'S+': 'border-pos/40 bg-good-ink text-pos',
   S: 'border-pos/40 bg-good-ink text-pos',
+  'A+': 'border-warn/40 bg-watch-ink text-warn',
   A: 'border-warn/40 bg-watch-ink text-warn',
+  'B+': 'border-neut/40 bg-surface2 text-neut',
   B: 'border-neut/40 bg-surface2 text-neut',
 };
 
@@ -155,6 +159,62 @@ export function TierBadge({ tier }: { tier: string | null }) {
     <span className={`inline-flex h-5 min-w-6 items-center justify-center rounded border px-1.5 font-mono text-xs ${TIER_STYLES[tier] ?? TIER_STYLES.B}`}>
       {tier}
     </span>
+  );
+}
+
+/** Native tier picker used in the table's Tier column. '' = unrated (−). */
+export function TierSelect({ tier, onChange, className = '' }: { tier: Tier | null; onChange: (tier: Tier | null) => void; className?: string }) {
+  return (
+    <select
+      value={tier ?? ''}
+      onChange={(e) => onChange(e.target.value === '' ? null : (e.target.value as Tier))}
+      aria-label="Tier"
+      data-tier={tier ?? ''}
+      className={`tier-select ${className}`}
+    >
+      <option value="">−</option>
+      {TIERS.map((t) => (
+        <option key={t} value={t}>
+          {t}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+type ChipVariant = 'default' | 'all' | 'nansen' | 'tier';
+
+/** Toggleable filter chip; variant + tier drive the reference chrome (.filter-chip). */
+export function Chip({
+  on,
+  onClick,
+  children,
+  title,
+  variant = 'default',
+  tier,
+}: {
+  on: boolean;
+  onClick: () => void;
+  children: ReactNode;
+  title?: string;
+  variant?: ChipVariant;
+  tier?: Tier;
+}) {
+  const cls = ['filter-chip'];
+  if (variant === 'all') cls.push('all');
+  if (variant === 'nansen') cls.push('nansen-chip');
+  cls.push(on ? 'on' : 'off');
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-pressed={on}
+      data-tier={variant === 'tier' ? (tier ?? '') : undefined}
+      className={cls.join(' ')}
+    >
+      {children}
+    </button>
   );
 }
 

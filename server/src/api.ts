@@ -4,10 +4,13 @@
 // address non-empty → 400; duplicate → 409).
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { CHAINS, type Chain } from './shared/chain.js';
+import { CHAINS, canonicalCa, type Chain } from './shared/chain.js';
+import { TIERS, isTier, type Tier } from './shared/tier.js';
+import { type AuthDeps, createAuthMiddleware } from './auth.js';
 import { config } from './config.js';
 import { limiters } from './ratelimit/index.js';
 import {
+  deleteTier,
   deleteTrackedCa,
   deleteWallet,
   findTrackedCa,
@@ -20,6 +23,7 @@ import {
   listTrackedCas,
   listWallets,
   maxTokenFetchedAt,
+  setTier,
   setTrackedCaEntryUsd,
   updateWallet,
   type ImportCandidate,
@@ -154,6 +158,18 @@ function parseTrackedCaBody(
   };
 }
 
+function parseTierBody(body: unknown): ParseResult<{ ca: string; chain: Chain; tier: Tier | null }> {
+  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+  const b = body as Record<string, unknown>;
+  const ca = strField(b, 'ca');
+  if (!ca) return { error: 'ca is required' };
+  if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+  const raw = b.tier;
+  if (raw === undefined || raw === null || raw === '') return { ca, chain: b.chain, tier: null };
+  if (!isTier(raw)) return { error: `tier must be one of ${TIERS.join(', ')} or null` };
+  return { ca, chain: b.chain, tier: raw };
+}
+
 /** One event a wallet-watch daemon detected (POST /api/wallet-watch/trades). */
 interface WatchTrade {
   wallet: string;
@@ -264,7 +280,7 @@ function parseImportRows(body: unknown): ImportCandidate[] | null {
   });
 }
 
-export function createApp(providerName: string): Express {
+export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   const app = express();
   app.use(express.json());
 
@@ -278,6 +294,10 @@ export function createApp(providerName: string): Express {
     next();
   });
 
+  // AUTH CONTRACT v1 (src/auth.ts): everything below except /api/health sits
+  // behind the Bearer gate; the policy table is deny-by-default.
+  app.use(createAuthMiddleware(authDeps));
+
   app.get('/api/health', (_req, res) => {
     res.json({
       mode: config.mode,
@@ -289,6 +309,18 @@ export function createApp(providerName: string): Express {
       doors: poolStatsOrNull(),
       ratelimit: limiters.snapshot(),
     });
+  });
+
+  // The FE's session probe: who the Bearer token authenticated as. The service
+  // token has no email identity → { email: null, role: 'service' }.
+  app.get('/api/me', (req, res) => {
+    const principal = req.principal;
+    if (!principal) {
+      // Unreachable: /api/me is gated. Defensive — never answer unauthenticated.
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.json({ email: principal.email, role: principal.role });
   });
 
   // allFactors is PER REQUEST (session-scoped per browser tab): the query param wins,
@@ -421,6 +453,25 @@ export function createApp(providerName: string): Express {
   app.delete('/api/tracked-cas/:id', (req, res) => {
     deleteTrackedCa(req.params.id);
     res.status(204).end();
+  });
+
+  // User-set tier for a tracked CA (dashboard Tier column). Absent/null tier clears it.
+  app.put('/api/tier', (req, res) => {
+    const parsed = parseTierBody(req.body);
+    if (isParseError(parsed)) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    if (!findTrackedCa(parsed.ca, parsed.chain)) {
+      res.status(404).json({ error: 'CA not tracked' });
+      return;
+    }
+    if (parsed.tier === null) {
+      deleteTier(parsed.ca, parsed.chain);
+    } else {
+      setTier(parsed.ca, parsed.chain, parsed.tier);
+    }
+    res.json({ ca: canonicalCa(parsed.ca, parsed.chain), chain: parsed.chain, tier: parsed.tier });
   });
 
   // wallet_watch (Solana RPC) detected event. BUY rows are what `Tracked by`

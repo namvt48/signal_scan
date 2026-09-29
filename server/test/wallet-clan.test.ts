@@ -60,7 +60,7 @@ test('trackedWalletStats exposes clan beside the name (a clan-b wallet is still 
   const now = Date.now();
   const act: WalletActivity = { tx: 'clan-sig-1', ts: now, side: 'buy', ca: CA, chain: 'sol', amountUsd: 120, price: 0.01 };
   assert.equal(insertTrades(bId, [act], 'watch'), 1);
-  const row = trackedWalletStats(CA, now).find((s) => s.name === 'CTB');
+  const row = trackedWalletStats(CA, 'sol', now).find((s) => s.name === 'CTB');
   assert.ok(row, 'the clan-b wallet must be listed — clan never filters rows');
   assert.equal(row?.clan, 'b');
 });

@@ -94,7 +94,7 @@ def track_event(e) -> None:
         req = urllib.request.Request(
             f"{config._api_url}/api/tracked-cas",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=config.api_headers(),
         )
         with urllib.request.urlopen(req, timeout=5):
             pass
@@ -168,7 +168,7 @@ def post_trade(trade: dict[str, Any]) -> None:
         req = urllib.request.Request(
             f"{config._api_url}/api/wallet-watch/trades",
             data=json.dumps(trade).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=config.api_headers(),
         )
         with urllib.request.urlopen(req, timeout=5):
             pass

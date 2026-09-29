@@ -21,6 +21,7 @@ nhưng cho phép đọc; pattern tương đương _seed(ww) của test_wallet_wa
 import importlib.util
 import os
 import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location(
@@ -230,5 +231,69 @@ assert (
     == 0.0
 )
 print("OK (f): watch_trade_body — buy có/không giá, sell có side, thiếu khoá → None")
+
+# ---------- (g) Bearer CHỈ gắn cho API của mình (server bật auth 2026-09-28) ----------
+
+setattr(ww, "_api_url", "http://127.0.0.1:8124")
+setattr(ww, "_service_token", "")
+assert ww._auth_headers("http://127.0.0.1:8124/api/wallets") == {}, (
+    "thiếu token ⇒ KHÔNG gửi header (server 401 — fail-closed, không fail-open)"
+)
+setattr(ww, "_service_token", "svc-tok")
+assert ww._auth_headers("http://127.0.0.1:8124/api/wallets") == {
+    "Authorization": "Bearer svc-tok"
+}, "request tới _api_url phải kèm Bearer"
+# Chốt an ninh: `http_json` dùng CHUNG cho Solana RPC (rpc() gọi nó) — thêm header
+# vô điều kiện là bơm token service ra provider công cộng.
+assert ww._auth_headers("https://mainnet.helius-rpc.com/?api-key=x") == {}, (
+    "TOKEN LEAK: không được gửi Authorization ra Solana RPC"
+)
+assert ww._auth_headers("https://solana-rpc.publicnode.com") == {}
+# --api-url của instance khác (vd B: 8125) vẫn phải khớp động theo _api_url
+setattr(ww, "_api_url", "http://127.0.0.1:8125")
+assert ww._auth_headers("http://127.0.0.1:8125/api/wallets") == {
+    "Authorization": "Bearer svc-tok"
+}, "phải khớp _api_url HIỆN HÀNH, không phải giá trị lúc import"
+print("OK (g): Bearer chỉ gắn cho _api_url; Solana RPC không dính token")
+
+# ---------- (h) 2 đường POST tự dựng Request trong emit.py phải kèm Bearer ----------
+
+# http_json KHÔNG phải đường duy nhất chạm API: emit.track_event / emit.post_trade
+# tự gọi urllib.request.urlopen. Thiếu token ở đây ⇒ sau khi bật auth daemon vẫn
+# GET được (tưởng khoẻ) mà ÂM THẦM ngừng ghi CA + trade — đúng loại lỗi im lặng.
+
+_seen_headers: list[dict[str, str]] = []
+
+
+class _Resp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _capture(req, timeout=None):
+    _seen_headers.append(dict(req.header_items()))
+    return _Resp()
+
+
+_real_urlopen = urllib.request.urlopen
+urllib.request.urlopen = _capture
+try:
+    setattr(ww, "_service_token", "svc-tok")
+    setattr(ww, "_api_url", "http://127.0.0.1:8124")
+    setattr(ww, "_track", True)
+    setattr(ww, "_posted_mints", set())
+    ww.track_event(ev)  # POST /api/tracked-cas
+    ww.post_trade(ww.watch_trade_body(ev))  # POST /api/wallet-watch/trades
+finally:
+    urllib.request.urlopen = _real_urlopen
+
+assert len(_seen_headers) == 2, f"phải bắt được 2 POST, got {len(_seen_headers)}"
+for h in _seen_headers:
+    assert h.get("Authorization") == "Bearer svc-tok", f"POST thiếu Bearer: {h}"
+    assert h.get("Content-type") == "application/json", h
+print("OK (h): cả 2 đường POST của emit.py đều kèm Bearer")
 
 print("PASS: toàn bộ test config-from-API")

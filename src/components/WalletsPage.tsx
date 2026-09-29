@@ -4,6 +4,7 @@ import { CHAINS, type Chain, type Wallet } from '../types';
 import { dataStore, parseWalletsCsv, type ImportRow, type ParsedImportRow } from '../services/dataStore';
 import { SHOW_CLAN } from '../config';
 import { Button, ConfirmDialog, CopyButton, EmptyState, ErrorState, IconButton, Modal, Select, SkeletonRows, TableShell, Td, TextField, Th, walletNameClass } from './ui';
+import { useAuth } from '../auth/use-auth';
 
 interface Draft {
   address: string;
@@ -119,6 +120,9 @@ export default function WalletsPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [tagDrafts, setTagDrafts] = useState<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
+  // Wallet writes are admin-only; the server also enforces this. Export stays open to all.
+  const { role } = useAuth();
+  const isAdmin = role === 'admin';
 
   useEffect(() => {
     let alive = true;
@@ -219,27 +223,31 @@ export default function WalletsPage() {
           <Button variant="ghost" onClick={() => downloadCsv(wallets)}>
             <Download size={14} /> Export CSV
           </Button>
-          <Button variant="ghost" onClick={() => fileRef.current?.click()}>
-            <Upload size={14} /> Import CSV
-          </Button>
-          <Button onClick={() => setModal('new')}>
-            <Plus size={14} /> Add wallet
-          </Button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept=".csv,text/csv"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void onImportFile(f);
-              e.target.value = '';
-            }}
-          />
+          {isAdmin && (
+            <>
+              <Button variant="ghost" onClick={() => fileRef.current?.click()}>
+                <Upload size={14} /> Import CSV
+              </Button>
+              <Button onClick={() => setModal('new')}>
+                <Plus size={14} /> Add wallet
+              </Button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onImportFile(f);
+                  e.target.value = '';
+                }}
+              />
+            </>
+          )}
         </div>
       </div>
 
-      {preview && (
+      {isAdmin && preview && (
         <div className="mb-4 rounded-lg border border-line bg-surface p-4">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-ink">Import preview</h2>
@@ -294,9 +302,11 @@ export default function WalletsPage() {
           title="No tracked wallets"
           hint="Add a wallet manually or import a CSV file to start correlating signals."
           action={
-            <Button onClick={() => setModal('new')}>
-              <Plus size={14} /> Add wallet
-            </Button>
+            isAdmin ? (
+              <Button onClick={() => setModal('new')}>
+                <Plus size={14} /> Add wallet
+              </Button>
+            ) : undefined
           }
         />
       ) : (
@@ -328,40 +338,48 @@ export default function WalletsPage() {
                       {w.tags.map((t) => (
                         <span key={t} className="inline-flex items-center gap-1 rounded border border-line bg-surface2 px-1.5 py-0.5 font-mono text-[11px] text-ink2">
                           {t}
-                          <button type="button" aria-label={`Remove tag ${t}`} onClick={() => void patchWallet(w.id, { tags: w.tags.filter((x) => x !== t) })} className="text-muted transition-colors hover:text-neg">
-                            ×
-                          </button>
+                          {isAdmin && (
+                            <button type="button" aria-label={`Remove tag ${t}`} onClick={() => void patchWallet(w.id, { tags: w.tags.filter((x) => x !== t) })} className="text-muted transition-colors hover:text-neg">
+                              ×
+                            </button>
+                          )}
                         </span>
                       ))}
-                      <input
-                        value={tagDrafts[w.id] ?? ''}
-                        aria-label={`Add tag for ${w.name}`}
-                        onChange={(e) => setTagDrafts({ ...tagDrafts, [w.id]: e.target.value })}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            void addTag(w);
-                          }
-                        }}
-                        placeholder="add tag"
-                        className="w-16 bg-transparent text-[11px] text-ink placeholder:text-muted focus:outline-none"
-                      />
-                      <button type="button" aria-label={`Submit tag for ${w.name}`} onClick={() => void addTag(w)} className="text-muted transition-colors hover:text-pos">
-                        <Plus size={11} />
-                      </button>
+                      {isAdmin && (
+                        <>
+                          <input
+                            value={tagDrafts[w.id] ?? ''}
+                            aria-label={`Add tag for ${w.name}`}
+                            onChange={(e) => setTagDrafts({ ...tagDrafts, [w.id]: e.target.value })}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                void addTag(w);
+                              }
+                            }}
+                            placeholder="add tag"
+                            className="w-16 bg-transparent text-[11px] text-ink placeholder:text-muted focus:outline-none"
+                          />
+                          <button type="button" aria-label={`Submit tag for ${w.name}`} onClick={() => void addTag(w)} className="text-muted transition-colors hover:text-pos">
+                            <Plus size={11} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </Td>
                   <Td className="font-mono uppercase">{w.chain}</Td>
                   <Td className="font-mono">{w.source || '-'}</Td>
                   <Td className="text-right">
-                    <span className="inline-flex justify-end gap-1">
-                      <IconButton aria-label={`Edit ${w.name}`} onClick={() => setModal(w)}>
-                        <PencilSimple size={14} />
-                      </IconButton>
-                      <IconButton aria-label={`Delete ${w.name}`} className="hover:text-neg" onClick={() => setConfirm(w)}>
-                        <Trash size={14} />
-                      </IconButton>
-                    </span>
+                    {isAdmin && (
+                      <span className="inline-flex justify-end gap-1">
+                        <IconButton aria-label={`Edit ${w.name}`} onClick={() => setModal(w)}>
+                          <PencilSimple size={14} />
+                        </IconButton>
+                        <IconButton aria-label={`Delete ${w.name}`} className="hover:text-neg" onClick={() => setConfirm(w)}>
+                          <Trash size={14} />
+                        </IconButton>
+                      </span>
+                    )}
                   </Td>
                 </tr>
               ))}

@@ -1,6 +1,6 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findTrackedCa, getDb, getTokenState, insertTrackedCa, insertWallet, open } from '../src/db.js';
+import { findTrackedCa, getDb, getTokenState, insertTrackedCa, insertWallet, open, setTier } from '../src/db.js';
 import { insertTrades, replaceWalletBalances } from '../src/ingest.js';
 import { zeroScoreGate } from '../src/poller.js';
 import { nansenScore } from '../src/signals.js';
@@ -11,6 +11,7 @@ const INCOMPLETE = 'caGate-incomplete'; // symbol NULL -> kept even at 0/3
 const ONE_PASS = 'caGate-onepass'; // full data, exactly 1/3 -> kept
 const HELD_DEAD = 'caGate-held-dead'; // full data 0/3, but a tracked wallet still HOLDS it
 const DUMPED_DEAD = 'caGate-dumped-dead'; // full data 0/3, wallet dumped -> back in scope
+const TIERED_DEAD = 'caGate-tiered-dead'; // full data 0/3 but user-rated -> never deleted
 
 let th: NansenThresholds;
 let holderId: string;
@@ -38,7 +39,7 @@ before(() => {
   open(':memory:');
   th = getThresholds();
   const v = factorValues();
-  for (const ca of [COMPLETE_DEAD, INCOMPLETE, ONE_PASS, HELD_DEAD, DUMPED_DEAD]) {
+  for (const ca of [COMPLETE_DEAD, INCOMPLETE, ONE_PASS, HELD_DEAD, DUMPED_DEAD, TIERED_DEAD]) {
     insertTrackedCa({ address: ca, chain: 'sol', note: 'gate test' });
   }
   // Given: one complete 0/3 row, one symbol-less 0/3 row, one complete 1/3 row.
@@ -49,6 +50,9 @@ before(() => {
   // what makes them out of scope, so the same data must delete once amount hits 0.
   insertState(HELD_DEAD, { symbol: 'HELD', fresh: v.failFresh, t100: v.failT100, lf: v.failLf });
   insertState(DUMPED_DEAD, { symbol: 'DUMP', fresh: v.failFresh, t100: v.failT100, lf: v.failLf });
+  // The same 0/3 data as COMPLETE_DEAD, but a stored tier puts it out of the gate's scope.
+  insertState(TIERED_DEAD, { symbol: 'TIER', fresh: v.failFresh, t100: v.failT100, lf: v.failLf });
+  setTier(TIERED_DEAD, 'sol', 'S+');
   holderId = insertWallet({ address: 'wallet-gate-holder', name: 'test_gate', tags: [], chain: 'sol', source: 'test' }).id;
   replaceWalletBalances(holderId, 'sol', [
     { ca: HELD_DEAD, amount: 1_000 },
@@ -113,6 +117,17 @@ test('zeroScoreGate: keeps a complete 0/3 CA a tracked wallet still holds (user 
   // Then: the position keeps it on the dashboard.
   assert.notEqual(findTrackedCa(HELD_DEAD, 'sol'), undefined);
   assert.notEqual(getTokenState(HELD_DEAD, 'sol'), undefined);
+});
+
+test('zeroScoreGate: keeps a complete 0/3 CA the user rated a tier (user 2026-09-28)', () => {
+  const s = nansenScore(getTokenState(TIERED_DEAD, 'sol'), th);
+  assert.equal(s.complete, true);
+  assert.equal(s.score, 0);
+
+  zeroScoreGate();
+
+  assert.notEqual(findTrackedCa(TIERED_DEAD, 'sol'), undefined);
+  assert.notEqual(getTokenState(TIERED_DEAD, 'sol'), undefined);
 });
 
 test('zeroScoreGate: deletes the same 0/3 CA once its wallet has dumped the position', () => {

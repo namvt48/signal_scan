@@ -8,6 +8,7 @@ import type { Chain } from './shared/chain.js';
 import {
   deleteSnapshotsBefore,
   deleteTrackedCasByIds,
+  findTrackedCa,
   getSetting,
   getTokenState,
   listCaScoreGateCandidates,
@@ -270,9 +271,11 @@ function isBackFill(rows: readonly TgmFlowsRow[]): boolean {
 }
 
 /**
- * The LF = the exchange chart's LEFTMOST point. Fetched every pass (not
- * write-once) and ALWAYS written — the leftmost is a deterministic read at a
- * fixed window (5/5 identical fetches), so the old ≥10% overwrite guard only ever
+ * The LF = the exchange chart's LEFTMOST point. Fetched only while UNKNOWN —
+ * applySeriesPass skips the 1-credit call once genesis_bal is set and the setup
+ * cache carries exchange points (the leftmost is a deterministic read at a fixed
+ * window, 5/5 identical fetches, so a repeat buys nothing). When it does run the
+ * value is ALWAYS written: the old ≥10% overwrite guard only ever
  * froze a stale value: GERI stored 758.56M while the chart read 824.2M (8.65%
  * off, under the guard) and could never heal. A fetch failure keeps the previous
  * value instead of clearing the column.
@@ -354,6 +357,16 @@ function needsSetup(c: CaTarget, now: number, th: NansenThresholds): boolean {
   return !nansenScore(getTokenState(c.address, c.chain), th).complete;
 }
 
+/** Too young to retry fast: Nansen indexes a fresh mint only after some hours, so
+ * a token whose age — deployed_at, or the CA's added_at while deploy is unknown —
+ * is under NEW_TOKEN_MIN_AGE_MS gets flat hourly spacing instead of the ladder /
+ * the 5-min essential gap re-ask. Neither timestamp known → NOT too-new, so a CA
+ * can never be throttled into a stuck state. */
+function isTooNewToken(address: string, chain: Chain, now: number): boolean {
+  const basis = getTokenState(address, chain)?.deployed_at ?? Date.parse(findTrackedCa(address, chain)?.added_at ?? '');
+  return Number.isFinite(basis) && now - basis < config.newTokenMinAgeMs;
+}
+
 /**
  * The setup pass — ONE paced walk over the CAs the pass still owes setup data to
  * (fresh% / T100 / LF / series). A CA that comes back EMPTY (brand-new token, no
@@ -390,7 +403,11 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
     if (entry && isSetupCacheFresh(entry, now)) setupMisses.delete(key);
     else {
       const misses = (setupMisses.get(key)?.misses ?? 0) + 1;
-      setupMisses.set(key, { misses, nextAt: Date.now() + setupRetryDelayMs(misses) });
+      // Too-new token: flat hourly spacing — Nansen has not indexed the mint yet,
+      // so the doubling ladder's fast early retries are pure credit spam. The
+      // first attempt on add (kickSetupEarly) is untouched; only RETRIES throttle.
+      const delayMs = isTooNewToken(c.address, c.chain, Date.now()) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
+      setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
     }
   });
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
@@ -552,10 +569,9 @@ function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: Bal
 /**
  * T100/bal/anchors for one CA, both read off the token's OWN FE rung span — one span
  * per token, the granularity the FE would actually be showing (user 2026-09-18) —
- * fetched as a deploy-clamped range (`seriesAtRung`). T100 and LF both always
- * overwrite from the fresh series. The LF costs a SECOND request per pass (budget
- * guard: the >80% interval warn in run(), tune POLL_HOT_MS / HOT_VOLUME_USD if it
- * fires).
+ * fetched as a deploy-clamped range (`seriesAtRung`). T100 always overwrites from
+ * the fresh series; the LF's second request is skipped once the value is known and
+ * cached (write-once credit guard in applySeriesPass).
  *
  * EXPORTED for the T4 early trigger and the rehydrate tests: awaits, one CA,
  * door-guarded by the file cache — while a FRESH entry exists this NEVER fetches
@@ -616,7 +632,15 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     }
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
-  const lf = await exchangeLf(ca, chain, st.deployed_at);
+  // LF write-once (credit guard): skip the 1-credit exchange fetch once genesis_bal
+  // is known AND the setup cache holds exchange points — the leftmost is a
+  // deterministic read, so re-asking buys nothing. The cached points MUST be
+  // carried into the returned entry: isStorable refuses an empty `exchange`, so
+  // returning [] would make putSetupCacheEntry reject the pass forever and
+  // setupSweep re-run on a permanently stale cache.
+  const prev = getSetupCacheEntry(ca, chain);
+  const haveLf = st.genesis_bal != null && prev !== undefined && prev.exchange.length > 0;
+  const lf = haveLf ? undefined : await exchangeLf(ca, chain, st.deployed_at);
   if (lf !== undefined) genesisBal = lf.total;
   updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, genesisBal, anchorAt, bal });
   return {
@@ -626,7 +650,7 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     window: fetched?.window ?? '',
     series_from: fetched?.from ?? Number.NaN,
     series: series ?? [],
-    exchange: lf?.points ?? [],
+    exchange: lf?.points ?? prev?.exchange ?? [],
     t100_pct: t100Pct ?? Number.NaN,
     t100_multiple: t100Multiple ?? Number.NaN,
     anchor_at: anchorAt ?? Number.NaN,
@@ -969,7 +993,15 @@ export function startPoller(provider: MarketDataProvider, nansenApi: NansenApiCl
     {
       name: 'essentialGapSweep',
       intervalMs: config.pollEssentialGapMs,
-      fn: () => metricSweep(provider, 'essential', config.pollEssentialGapMs, listCaTargetsMissingEssential(config.essentialGapWindowMs)),
+      // Too-new CAs are filtered out: a mint Nansen has not indexed yet gains
+      // nothing from a 5-min re-ask — the hourly essentialSweep covers it.
+      fn: () =>
+        metricSweep(
+          provider,
+          'essential',
+          config.pollEssentialGapMs,
+          listCaTargetsMissingEssential(config.essentialGapWindowMs).filter((c) => !isTooNewToken(c.address, c.chain, Date.now())),
+        ),
     },
     { name: 'volumeSweep', intervalMs: config.pollVolumeMs, fn: () => metricSweep(provider, 'volume', config.pollVolumeMs) },
     { name: 'flowsSweep', intervalMs: config.pollFlowsMs, fn: () => flowsSweep() },

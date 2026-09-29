@@ -63,6 +63,11 @@ quotes_map = dict(DEFAULT_QUOTES)  # main() nạp thêm từ quotes.txt
 min_usd = 0.5  # --min-usd: sự kiện có |P| và |value| đều dưới ngưỡng → bỏ
 _api_url = "http://127.0.0.1:8124"  # --api-url: base URL của alpha-engine API
 _track = False  # --track: auto-POST CA của tx BUY/SELL vào API (mặc định OFF)
+
+# Token service cho API signal_scan — server bật auth 2026-09-28 nên mọi request
+# tới _api_url phải kèm Bearer. Đọc từ env (systemd drop-in), KHÔNG hardcode vào
+# repo. Rỗng ⇒ không gửi header ⇒ server trả 401 — đúng, fail-closed.
+_service_token = os.environ.get("SIGNAL_SCAN_SERVICE_TOKEN", "").strip()
 _cfg_cli_min_usd: float = (
     min_usd  # giá trị --min-usd: fallback khi API settings chết/lỗi
 )
@@ -73,9 +78,26 @@ _CFG_REFRESH_S = 300.0  # ~5 phút: đổi config trên UI có hiệu lực khô
 # ---------- http/rpc ----------
 
 
+def _auth_headers(url):
+    """Bearer CHỈ cho API của mình. http_json còn phục vụ Solana RPC (rpc() gọi
+    cùng hàm này) — gửi token ra endpoint công cộng là lộ secret, nên phải chặn
+    bằng tiền tố URL chứ không thêm vô điều kiện."""
+    if _service_token and url.startswith(_api_url):
+        return {"Authorization": f"Bearer {_service_token}"}
+    return {}
+
+
+def api_headers():
+    """Content-Type + Bearer cho request tới API. emit.py tự dựng Request bằng
+    urllib (không qua http_json) nên phải dùng hàm này — bỏ sót thì sau khi bật
+    auth daemon vẫn GET được mà ÂM THẦM ngừng ghi CA/trade."""
+    return {"Content-Type": "application/json", **_auth_headers(_api_url)}
+
+
 def http_json(url, payload=None, timeout=20, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
     hdrs = {"User-Agent": "wallet-watch/1.0", "Content-Type": "application/json"}
+    hdrs.update(_auth_headers(url))
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs)

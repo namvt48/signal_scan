@@ -24,6 +24,9 @@ process.env.NANSEN_CRAWL = 'on';
 process.env.NEW_CA_PRIORITY_MS = '1000';
 process.env.DB_PATH = dbFile;
 process.env.SETUP_CACHE_FILE = join(dir, 'nansen-cache.json');
+// AUTH CONTRACT v1: POST /api/tracked-cas accepts the service role — the same
+// token the wallet_watch daemon sends. Env BEFORE the src imports (config snapshot).
+process.env.SERVICE_TOKEN = 'e2e-service-token';
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -174,7 +177,7 @@ let base = '';
 async function postTrackedCa(body: unknown): Promise<{ status: number; json: TrackedCaJson }> {
   const res = await fetch(`${base}/api/tracked-cas`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.SERVICE_TOKEN}` },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: (await res.json()) as TrackedCaJson };

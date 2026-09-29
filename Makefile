@@ -2,7 +2,7 @@
 # signal_scan — Makefile deploy lên server (194.163.187.250) qua docker compose
 #
 # 2 container (docker-compose.yml):
-#   web — nginx serve SPA + proxy /api/ -> api:3001 (publish port $(PORT))
+#   web — nginx serve SPA + proxy /api/ -> api:3001 (bind $(BIND):$(PORT))
 #   api — Node poller + SQLite + express (chỉ expose 3001 nội bộ, không publish)
 #
 # 2 instance song song: INSTANCE=a (mặc định, production) | INSTANCE=b (bản thứ 2).
@@ -27,8 +27,9 @@
 # - MODE=gmgn cần tạo server/.env TRÊN SERVER (từ server/.env.example) — file
 #   .env chứa secret nên KHÔNG được deploy copy tự động. Mặc định MODE=mock
 #   chạy full pipeline không cần key.
-# - Port 8124: chưa bị chiếm trên server (8123=qd-monitor, 8080=market-replay,
-#   8098=trading-monitor-frontend, 8000=risk-system, 5174=trading-dashboard).
+# - Instance a: port 8124 KHÔNG publish ra internet (BIND=127.0.0.1) — chỉ Caddy
+#   (host) và daemon (host, --api-url http://127.0.0.1:8124) vào được. Công khai
+#   duy nhất qua https://signal-scan.duckdns.org. Instance b vẫn 0.0.0.0:8125.
 # - UFW trên server hiện INACTIVE — docker publish port trực tiếp qua iptables.
 #   Target `firewall` vẫn chạy `ufw allow` (idempotent, có tác dụng khi ufw được
 #   bật sau này). Nếu từ ngoài vẫn không vào được → kiểm tra firewall panel
@@ -48,6 +49,10 @@ DATA_DIR  ?= data
 PROJECT   ?= signal_scan
 SHOW_CLAN ?= off
 TITLE     ?= signal_scan
+# Web bind loopback: Caddy + daemon đều ở host nên vẫn vào bình thường; IP:8124
+# từ ngoài bị chặn, chỉ còn https://$(DOMAIN).
+BIND      ?= 127.0.0.1
+DOMAIN    ?= signal-scan.duckdns.org
 else
 REMOTE_DIR ?= /root/signal_scan_$(INSTANCE)
 PORT      ?= 8125
@@ -55,11 +60,24 @@ DATA_DIR  ?= data-$(INSTANCE)
 PROJECT   ?= signal_scan_$(INSTANCE)
 SHOW_CLAN ?= on
 TITLE     ?= fomo
+# Instance b không có entry Caddy → giữ publish công khai như cũ.
+BIND      ?= 0.0.0.0
+DOMAIN    ?=
+endif
+
+# URL mà `make test` dùng để kiểm tra TỪ MÁY LOCAL.
+ifeq ($(DOMAIN),)
+BASE ?= http://$(SERVER):$(PORT)
+else
+BASE ?= https://$(DOMAIN)
 endif
 LEGACY_CONTAINER := signal_scan
 
 # Passed to every docker compose call so the two instances stay isolated.
-COMPOSE_ENV := PORT=$(PORT) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE)
+COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE)
+
+# Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
+FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
 
 FILES     := Dockerfile nginx.conf docker-compose.yml .dockerignore package.json package-lock.json tsconfig.json vite.config.ts index.html
 SSH       := ssh -o BatchMode=yes -o ConnectTimeout=10 $(HOST)
@@ -97,14 +115,15 @@ status:
 		curl -s -m 5 -o /dev/null -w 'HTTP %{http_code} — web localhost:$(PORT)\n' localhost:$(PORT)/ || echo 'web chưa phản hồi'; \
 		curl -s -m 5 localhost:$(PORT)/api/health && echo ' — /api/health OK (qua nginx)' || echo 'api chưa phản hồi qua nginx'"
 
-# health check TỪ MÁY LOCAL — đúng kịch bản 'xem từ ngoài qua internet'
+# health check TỪ MÁY LOCAL — đúng kịch bản 'xem từ ngoài qua internet'.
+# Instance a: qua https://$(DOMAIN) (port 8124 đã bị chặn khỏi internet).
 test:
-	@curl -s -m 8 -o /dev/null -w '== HTTP %{http_code} — http://$(SERVER):$(PORT)\n' http://$(SERVER):$(PORT)/ \
-		|| echo '== KHÔNG vào được từ ngoài — chạy: make firewall; nếu vẫn lỗi thì kiểm tra firewall panel của VPS provider'
-	@curl -s -m 8 http://$(SERVER):$(PORT)/api/health && echo ' — /api/health OK' || echo '== /api/health KHÔNG truy cập được từ ngoài'
+	@curl -s -m 8 -o /dev/null -w '== HTTP %{http_code} — $(BASE)/\n' $(BASE)/ \
+		|| echo '== KHÔNG vào được từ ngoài — nếu là instance a thì kiểm tra Caddy (systemctl status caddy); nếu là b thì kiểm tra firewall panel của VPS provider'
+	@curl -s -m 8 $(BASE)/api/health && echo ' — /api/health OK' || echo '== /api/health KHÔNG truy cập được từ ngoài'
 
 firewall:
-	$(SSH) "ufw allow $(PORT)/tcp >/dev/null 2>&1; ufw status verbose | head -5"
+	$(SSH) "for p in $(FIREWALL_PORTS); do ufw allow \$$p/tcp >/dev/null 2>&1; done; ufw status verbose | head -5"
 	@sleep 1
 	@$(MAKE) test
 

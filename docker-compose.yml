@@ -66,8 +66,14 @@ services:
       args:
         VITE_SHOW_CLAN: ${SHOW_CLAN:-off}
         VITE_TITLE: ${TITLE:-signal_scan}
+        VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+        VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+        VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
     ports:
-      - "${PORT:-8124}:80"
+      # Instance a bind 127.0.0.1 (BIND=127.0.0.1): chỉ Caddy + daemon (đều ở host)
+      # vào được; công khai duy nhất qua https://signal-scan.duckdns.org.
+      # Instance b giữ BIND=0.0.0.0 để còn truy cập qua IP:8125 (không có entry Caddy).
+      - "${BIND:-127.0.0.1}:${PORT:-8124}:80"
     logging: *default-logging
     depends_on:
       - api

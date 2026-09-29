@@ -7,7 +7,10 @@ import { insertTrades } from '../src/ingest.js';
 import { createApp } from '../src/api.js';
 import type { WalletActivity } from '../src/providers/provider.js';
 
-const JSON_HEADERS = { 'content-type': 'application/json' };
+// AUTH CONTRACT v1: this is the daemon's own route — the service token (via
+// createApp deps; static imports snapshot config before env in the body could apply).
+const SERVICE_TOKEN = 'wallet-watch-trade-service-token';
+const JSON_HEADERS = { 'content-type': 'application/json', authorization: `Bearer ${SERVICE_TOKEN}` };
 const WALLET = 'watch-wallet-addr-1';
 const CA = 'watchCa-source-001';
 
@@ -48,7 +51,7 @@ before(async () => {
   // T4: the SAME address on another chain is a distinct wallet — resolution by
   // (address, chain) must never cross them.
   baseWalletId = insertWallet({ address: WALLET, name: 'CTW-base', tags: [], chain: 'base', source: 'test' }).id;
-  server = createApp('test').listen(0);
+  server = createApp('test', { serviceToken: SERVICE_TOKEN }).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });

@@ -1,4 +1,4 @@
-import { CHAINS, type Chain, type NansenThresholds, type Settings, type SettingsPatch, type TokenSignal, type Wallet } from '../types';
+import { CHAINS, type Chain, type NansenThresholds, type Settings, type SettingsPatch, type Tier, type TokenSignal, type Wallet } from '../types';
 import { restDataStore } from './restDataStore';
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,7 @@ export interface DataStore {
   listSignals(allFactors?: boolean): Promise<TokenSignal[]>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
+  setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,28 @@ export interface DataStore {
 
 const WALLET_KEY = 'signal_scan:wallets';
 const SETTINGS_KEY = 'signal_scan:settings';
+const TIER_KEY = 'signal_scan:tiers';
+
+/** Stored tier overrides, keyed `${chain}:${ca}`. */
+function readTiers(): Record<string, Tier> {
+  try {
+    const raw = localStorage.getItem(TIER_KEY);
+    if (raw === null) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    return parsed as Record<string, Tier>;
+  } catch {
+    return {};
+  }
+}
+
+function writeTiers(map: Record<string, Tier>): void {
+  try {
+    localStorage.setItem(TIER_KEY, JSON.stringify(map));
+  } catch {
+    // storage blocked or full: keep working in-memory for this session
+  }
+}
 
 const DEFAULT_THRESHOLDS: NansenThresholds = { freshMinPct: 10, t100MinMultiple: 1.2, lfMin: 1000000, lfMax: 300000000, minUsd: 50, minMc: 0, maxMc: 0 };
 
@@ -390,7 +413,8 @@ export const localDataStore: DataStore = {
   },
 
   async listSignals(): Promise<TokenSignal[]> {
-    return SEED_SIGNALS;
+    const tiers = readTiers();
+    return SEED_SIGNALS.map((s) => ({ ...s, tier: tiers[`${s.chain}:${s.ca}`] ?? s.tier ?? null }));
   },
 
   async getSettings(): Promise<Settings> {
@@ -407,6 +431,14 @@ export const localDataStore: DataStore = {
       // storage blocked or full: keep working in-memory for this session
     }
     return { values, defaults: { ...DEFAULT_THRESHOLDS }, debug };
+  },
+
+  async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {
+    const map = readTiers();
+    const key = `${chain}:${ca}`;
+    if (tier === null) delete map[key];
+    else map[key] = tier;
+    writeTiers(map);
   },
 };
 
