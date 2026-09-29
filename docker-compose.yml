@@ -65,6 +65,9 @@ services:
       # Clan column is per-instance: Makefile passes SHOW_CLAN=on for instance b, off for a.
       args:
         VITE_SHOW_CLAN: ${SHOW_CLAN:-off}
+        # FOMO feature is per-instance: Makefile passes SHOW_FOMO=on for instance b only;
+        # instance a and local dev leave it unset (empty → flag off → code paths absent).
+        VITE_SHOW_FOMO: ${SHOW_FOMO:-}
         VITE_TITLE: ${TITLE:-signal_scan}
         VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
         VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}

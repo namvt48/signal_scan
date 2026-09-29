@@ -1,0 +1,46 @@
+# Task 3 QA (failure-path) — flag-off absence + positive control
+# date: 2026-09-29T12:44:29+07:00 | branch: feat/fomo-user-watch
+#
+# Why a positive control: tasks 8/9 (FOMO column UI, the code SHOW_FOMO will gate) do not
+# exist yet, so flag-off 'absence of FOMO column code' cannot be proven directly today.
+# Instead: temporary marker  if (SHOW_FOMO) console.log('FOMO_FLAG_MARKER')  added to
+# src/main.tsx (entry-reachable), built ON then OFF, marker removed afterwards.
+# This proves the VITE_SHOW_FOMO build-time gate itself: ON -> code present in dist,
+# OFF -> dead branch tree-shaken out (ABSENT, not hidden).
+
+===== CONTROL BUILD 1: flag ON — marker must be PRESENT =====
+$ VITE_SHOW_FOMO=on npm run build
+exit_code=0
+$ grep -rc 'FOMO_FLAG_MARKER' dist/assets/*.js
+1
+$ grep -o '.\{0,30\}FOMO_FLAG_MARKER.\{0,10\}' dist/assets/*.js | head -2
+ocument.title=Jp;console.log("FOMO_FLAG_MARKER");yp.crea
+
+===== CONTROL BUILD 2: flag OFF — marker must be ABSENT =====
+$ VITE_SHOW_FOMO= npm run build
+exit_code=0
+$ grep -rc 'FOMO_FLAG_MARKER' dist/assets/*.js
+0
+grep_exit=1  (1 = no match = marker tree-shaken away, EXPECTED)
+
+===== flag-off absence of FOMO column identifiers (current dist, flag OFF) =====
+$ grep -o '[a-zA-Z_:\"/.-]*fomo[a-zA-Z_:\"/.-]*' dist/assets/*.js | sort | uniq -c
+      1 "signal_scan:fomo_users"
+INTERPRETATION: the only lowercase 'fomo' hit is "signal_scan:fomo_users" — the task-2
+data-layer localStorage key, which is NOT gated by SHOW_FOMO (correct: task 3 gates no
+feature code yet). It appears identically in ON and OFF builds (bundle hash identical:
+  index-CCN7QtG8.js
+No FOMO column/UI code exists in dist in either build — nothing from tasks 8/9 is present.
+
+===== cleanup =====
+Temporary marker in src/main.tsx removed after this capture (verified: grep below).
+
+===== cleanup verification (post marker-removal) =====
+$ grep -rn FOMO_FLAG_MARKER src/ dist/ Dockerfile Makefile docker-compose.yml
+(no output — marker fully removed from source and build files)
+$ VITE_SHOW_FOMO= npm run build   # final clean rebuild
+exit_code=0
+$ grep -c FOMO_FLAG_MARKER dist/assets/*.js
+dist/assets/index-CCN7QtG8.js:0
+# Final bundle hash index-CCN7QtG8.js is IDENTICAL to the pre-control builds → marker
+# revert is byte-clean; dist/ contains no control residue.

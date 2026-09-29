@@ -8,5 +8,12 @@ export const ENTRY_VOLUME_THRESHOLD = 300_000;
  */
 export const SHOW_CLAN = import.meta.env.VITE_SHOW_CLAN === 'on';
 
+/**
+ * FOMO is a per-deployment feature. Only instance b builds with VITE_SHOW_FOMO=on;
+ * instance a and local dev leave it unset, so the FOMO column and its code paths are
+ * omitted entirely. Baked at build time — see Dockerfile ARG + Makefile.
+ */
+export const SHOW_FOMO = import.meta.env.VITE_SHOW_FOMO === 'on';
+
 /** Browser tab title. Instance b builds as "fomo"; local dev and instance a keep the repo name. */
 export const APP_TITLE = import.meta.env.VITE_TITLE || 'signal_scan';

@@ -7,6 +7,7 @@
 #
 # 2 instance song song: INSTANCE=a (mặc định, production) | INSTANCE=b (bản thứ 2).
 #   Cột Clan chỉ hiện ở instance b (SHOW_CLAN=on) — a build với off nên ẩn hẳn.
+#   FOMO chỉ bật ở instance b (SHOW_FOMO=on) — a/local không set nên code path vắng hẳn.
 #   Tab title cũng theo instance: a=signal_scan, b=fomo (TITLE).
 #
 # Cú pháp:
@@ -60,6 +61,7 @@ DATA_DIR  ?= data-$(INSTANCE)
 PROJECT   ?= signal_scan_$(INSTANCE)
 SHOW_CLAN ?= on
 TITLE     ?= fomo
+SHOW_FOMO ?= on
 # Instance b không có entry Caddy → giữ publish công khai như cũ.
 BIND      ?= 0.0.0.0
 DOMAIN    ?=
@@ -74,7 +76,7 @@ endif
 LEGACY_CONTAINER := signal_scan
 
 # Passed to every docker compose call so the two instances stay isolated.
-COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE)
+COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO)
 
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))

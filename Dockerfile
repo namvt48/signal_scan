@@ -9,6 +9,9 @@ ENV VITE_API_BASE=""
 # Clan column toggle: instance b builds with SHOW_CLAN=on, instance a with off (default).
 ARG VITE_SHOW_CLAN=""
 ENV VITE_SHOW_CLAN=$VITE_SHOW_CLAN
+# FOMO feature toggle: instance b builds with SHOW_FOMO=on, instance a leaves it unset.
+ARG VITE_SHOW_FOMO=""
+ENV VITE_SHOW_FOMO=$VITE_SHOW_FOMO
 # Tab title: instance b builds with fomo.
 ARG VITE_TITLE=signal_scan
 ENV VITE_TITLE=$VITE_TITLE
