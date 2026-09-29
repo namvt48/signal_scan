@@ -129,10 +129,16 @@ net inflow, and **not** profit/PnL. Adding a buy's `usdValue` to a sell's `usdVa
 a category error and is banned in the code: `buyUsd` is computed with
 `SUM(CASE WHEN type='buy' THEN usd_value END)` and nothing else.
 
+`Sell PnL` is a **separate** figure: the SUM of SELL `usdValue` over the last 24h, i.e.
+the sum of **signed realised PnL** (it may be negative). It is reported alongside
+`Buy $` and is **never** combined with it - there is no net/inflow number anywhere in
+the column or the API.
+
 `fomoUserStat` shape (mirrored on both sides): `handle`, optional `name`/`clan`,
-`buyUsd`, `buys`, `sells`, `trades`, `lastTs`. Membership is "ever had a `type='buy'`
-row for this (ca, chain)" - a trader with only sells for that coin does not appear, and
-a trader whose newest buy is older than 24h still appears with zero 24h stats.
+`buyUsd`, `sellPnlUsd`, `buys`, `sells`, `trades`, `lastTs`. Membership is "ever had a
+`type='buy'` row for this (ca, chain)" - a trader with only sells for that coin does
+not appear, and a trader whose newest buy is older than 24h still appears with zero
+24h stats.
 
 ---
 
@@ -322,6 +328,32 @@ CSV, and the raw alert sample) is at:
 - `evidence/2026-09-29-fomo-user-watch.md`
 
 Raw alert sample: `.omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl`.
+
+## 11. Amendment 2026-09-29 - two behaviour changes
+
+Two changes were added after the original build (todos 12 and 13 in the plan); the
+runbook above already reflects them.
+
+**A watched trader's BUY now enqueues its CA for tracking.** In
+`POST /api/fomo-watch/trades`, when the alert is a `type='buy'` and
+`findTrackedCa(ca, chain)` is falsy, the route calls
+`insertTrackedCa({ address, chain, note:'fomo', entryUsd })` then `kickCAs([...])`, so
+the normal poller starts tracking the token like any other tracked CA. It is guarded by
+`findTrackedCa`, so a repeat alert never re-kicks. This is **tracked-CA state, not
+wallet state**: `wallet_trades`, `insertTrades` and `kickWalletRow` remain untouched by
+the FOMO path. Only `buy` enqueues - a `sell` of an untracked CA adds nothing. There is
+no entry-size gate (per the user's request).
+
+**`Sell PnL` - a separate realised-PnL figure.** Each FOMO user row now reports
+`sellPnlUsd` (SUM of SELL `usd_value`, may be negative) in addition to `buyUsd`; the
+two are never combined. Rendered signed (`text-pos`/`text-neg`) inside the nested
+`FomoTable`, between `Buy $` and `Age`.
+
+**Out of scope (explicitly dropped by the user).** Tracking a FOMO user's **% holding**
+is impossible from this feed: a FOMO alert carries no wallet address, no token amount,
+and no price, so neither holdings nor supply can be derived. `trackedHolding` in the
+dashboard belongs to tracked **wallets** (nansen holdings + gmgn supply), a different
+data source.
 
 ## Source index
 
