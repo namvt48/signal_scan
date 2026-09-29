@@ -10,22 +10,30 @@ import { type AuthDeps, createAuthMiddleware } from './auth.js';
 import { config } from './config.js';
 import { limiters } from './ratelimit/index.js';
 import {
+  deleteFomoUser,
   deleteTier,
   deleteTrackedCa,
   deleteWallet,
+  findFomoUserByHandle,
   findTrackedCa,
   findWalletByAddress,
   getWallet,
+  importFomoUsers,
   importWallets,
+  insertFomoUser,
   insertTrackedCa,
   insertWallet,
   isChain,
+  listFomoUsers,
   listTrackedCas,
   listWallets,
   maxTokenFetchedAt,
   setTier,
   setTrackedCaEntryUsd,
+  updateFomoUser,
   updateWallet,
+  type FomoUserInput,
+  type FomoUserRow,
   type ImportCandidate,
   type TrackedCaRow,
   type WalletRow,
@@ -83,6 +91,33 @@ function toTrackedCa(row: TrackedCaRow) {
   };
 }
 
+/** FOMO user JSON DTO — the wire shape src/types.ts `FomoUser` / restDataStore
+ *  expect (camelCase). DB rows are snake_case; nullable columns are OMITTED (the
+ *  FE types them optional), never leaked as snake_case or null. */
+interface FomoUserJson {
+  id: string;
+  handle: string;
+  name: string;
+  clan?: string;
+  userId?: string;
+  walletSolana?: string;
+  walletEvm?: string;
+  source: string;
+}
+
+function toFomoUser(row: FomoUserRow): FomoUserJson {
+  return {
+    id: row.id,
+    handle: row.handle,
+    name: row.name,
+    ...(row.clan !== null ? { clan: row.clan } : {}),
+    ...(row.user_id !== null ? { userId: row.user_id } : {}),
+    ...(row.wallet_solana !== null ? { walletSolana: row.wallet_solana } : {}),
+    ...(row.wallet_evm !== null ? { walletEvm: row.wallet_evm } : {}),
+    source: row.source,
+  };
+}
+
 interface WalletBody {
   address: string;
   name: string;
@@ -135,6 +170,48 @@ function parseWalletPatch(body: unknown): ParseResult<Partial<WalletBody>> {
   }
   if (b.source !== undefined) patch.source = strField(b, 'source');
   if (b.clan !== undefined) patch.clan = strField(b, 'clan');
+  return patch;
+}
+
+/** POST /api/fomo-users body → db input. Accepts the camelCase DTO keys
+ *  restDataStore sends; `handle` required + trimmed (empty → 400), the rest are
+ *  optional strings. Unknown extra fields are ignored — never persisted. */
+function parseFomoUserBody(body: unknown): ParseResult<FomoUserInput> {
+  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+  const b = body as Record<string, unknown>;
+  const handle = strField(b, 'handle');
+  if (!handle) return { error: 'handle is required' };
+  const opt = (key: string): string | null => strField(b, key) || null;
+  const input: FomoUserInput = {
+    handle,
+    name: strField(b, 'name'),
+    user_id: opt('userId'),
+    clan: opt('clan'),
+    wallet_solana: opt('walletSolana'),
+    wallet_evm: opt('walletEvm'),
+  };
+  const source = opt('source');
+  if (source) input.source = source;
+  return input;
+}
+
+/** PATCH /api/fomo-users/:id — only provided camelCase keys are written
+ *  (mirrors parseWalletPatch); '' clears a nullable field. */
+function parseFomoUserPatch(body: unknown): ParseResult<Partial<FomoUserInput>> {
+  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+  const b = body as Record<string, unknown>;
+  const patch: Partial<FomoUserInput> = {};
+  if (b.handle !== undefined) {
+    const handle = strField(b, 'handle');
+    if (!handle) return { error: 'handle must be a non-empty string' };
+    patch.handle = handle;
+  }
+  if (b.name !== undefined) patch.name = strField(b, 'name');
+  if (b.userId !== undefined) patch.user_id = strField(b, 'userId') || null;
+  if (b.clan !== undefined) patch.clan = strField(b, 'clan') || null;
+  if (b.walletSolana !== undefined) patch.wallet_solana = strField(b, 'walletSolana') || null;
+  if (b.walletEvm !== undefined) patch.wallet_evm = strField(b, 'walletEvm') || null;
+  if (b.source !== undefined) patch.source = strField(b, 'source');
   return patch;
 }
 
@@ -280,6 +357,30 @@ function parseImportRows(body: unknown): ImportCandidate[] | null {
   });
 }
 
+/** POST /api/fomo-users/import body — the same { rows: [...] } envelope as
+ *  parseImportRows, rows being camelCase FomoImportRow (parseFomoUsersCsv output).
+ *  Junk entries are kept as empty-handle so `row` indices reference the caller's
+ *  array. The CSV parser emits no source → absent source stamps 'csv' (DDL
+ *  fomo_users.source); a caller-supplied source wins. */
+function parseFomoImportRows(body: unknown): FomoUserInput[] | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const rows = (body as Record<string, unknown>).rows;
+  if (!Array.isArray(rows)) return null;
+  return rows.map((r) => {
+    if (typeof r !== 'object' || r === null) return { handle: '', source: 'csv' };
+    const b = r as Record<string, unknown>;
+    return {
+      handle: strField(b, 'handle'),
+      name: strField(b, 'name'),
+      user_id: strField(b, 'userId') || null,
+      clan: strField(b, 'clan') || null,
+      wallet_solana: strField(b, 'walletSolana') || null,
+      wallet_evm: strField(b, 'walletEvm') || null,
+      source: strField(b, 'source') || 'csv',
+    };
+  });
+}
+
 export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   const app = express();
   app.use(express.json());
@@ -413,6 +514,62 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     res.json(importWallets(rows));
+  });
+
+  // FOMO watch-list: a FOMO user is NOT a wallet — own table, own accessors,
+  // never resolved through findWalletByAddress.
+  app.get('/api/fomo-users', (_req, res) => {
+    res.json(listFomoUsers().map(toFomoUser));
+  });
+
+  app.post('/api/fomo-users', (req, res) => {
+    const parsed = parseFomoUserBody(req.body);
+    if (isParseError(parsed)) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    if (findFomoUserByHandle(parsed.handle)) {
+      res.status(409).json({ error: 'fomo user handle already exists' });
+      return;
+    }
+    res.status(201).json(toFomoUser(insertFomoUser(parsed)));
+  });
+
+  app.patch('/api/fomo-users/:id', (req, res) => {
+    const parsed = parseFomoUserPatch(req.body);
+    if (isParseError(parsed)) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    // Identity key is `handle`: a change can collide with another row.
+    if (parsed.handle !== undefined) {
+      const other = findFomoUserByHandle(parsed.handle);
+      if (other && other.id !== req.params.id) {
+        res.status(409).json({ error: 'fomo user handle already exists' });
+        return;
+      }
+    }
+    const updated = updateFomoUser(req.params.id, parsed);
+    if (!updated) {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
+    res.json(toFomoUser(updated));
+  });
+
+  app.delete('/api/fomo-users/:id', (req, res) => {
+    // FK cascade cleans fomo_trades.
+    deleteFomoUser(req.params.id);
+    res.status(204).end();
+  });
+
+  app.post('/api/fomo-users/import', (req, res) => {
+    const rows = parseFomoImportRows(req.body);
+    if (!rows) {
+      res.status(400).json({ error: 'body must be { rows: [...] }' });
+      return;
+    }
+    res.json(importFomoUsers(rows));
   });
 
   app.get('/api/tracked-cas', (_req, res) => {

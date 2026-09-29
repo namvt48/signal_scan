@@ -1,0 +1,15 @@
+== POST handle:"" ==
+request:  POST /api/fomo-users {"handle":"","name":"Ghost"}
+2026-09-29T06:30:22.728Z INFO  [api] method=POST path=/api/fomo-users status=400 dur=8
+response: HTTP 400 {"error":"handle is required"}
+== POST handle:"   " (whitespace only, trims to empty) ==
+request:  POST /api/fomo-users {"handle":"   ","name":"Ghost"}
+2026-09-29T06:30:22.740Z INFO  [api] method=POST path=/api/fomo-users status=400 dur=1
+response: HTTP 400 {"error":"handle is required"}
+fomo_users rows after both empty-handle posts: {"n":0} (no silent insert, no 500)
+== POST with unknown extra fields ==
+request:  POST /api/fomo-users {"handle":"@extra","name":"E","bogus":"never-persisted","tags":["x"],"isAdmin":true}
+2026-09-29T06:30:22.745Z INFO  [api] method=POST path=/api/fomo-users status=201 dur=2
+response: HTTP 201 {"id":"abee87a2-8c12-4460-97cf-f6c5a0dd470c","handle":"@extra","name":"E","source":"manual"}
+stored row (SELECT *): {"id":"abee87a2-8c12-4460-97cf-f6c5a0dd470c","handle":"@extra","user_id":null,"name":"E","clan":null,"wallet_solana":null,"wallet_evm":null,"source":"manual","created_at":1790663422745}
+stored columns contain neither "bogus", "tags" nor "isAdmin" — unknown fields ignored, never persisted

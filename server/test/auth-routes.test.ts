@@ -3,9 +3,10 @@
 // stale entries. If this file fails, someone added a route without making an
 // explicit gating decision — list it in ROUTE_POLICY with its roles. Also pins
 // GET /api/health as explicitly public (monitors depend on it), and pins the
-// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md) — those six routes
-// are gated NOW but registered by tasks 5/6, so they sit on PENDING_ROUTES
-// until they land (see the self-cleaning rule below).
+// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md). The five
+// /api/fomo-users routes landed in task 5; only POST /api/fomo-watch/trades is
+// still gated-ahead-of-registration (task 6), so it sits on PENDING_ROUTES
+// until it lands (see the self-cleaning rule below).
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
@@ -40,19 +41,14 @@ function registeredRoutes(): Array<{ method: string; path: string }> {
 
 const key = (method: string, path: string): string => `${method} ${path}`;
 
-/** ROUTE_POLICY entries whose express routes do not exist YET: task 5 registers
- * the five /api/fomo-users routes, task 6 registers POST /api/fomo-watch/trades
- * (.omo/plans/fomo-user-watch.md). Gating them now is the point (deny-by-default
- * must never have a gap between "route lands" and "gate lands"); they are exempt
- * from the stale-entry check only until registered — the test below FAILS the
- * moment one lands, forcing its removal here, so the list shrinks to empty by
- * the end of wave 2 and the stale check regains full strength. */
+/** ROUTE_POLICY entries whose express routes do not exist YET: task 6 registers
+ * POST /api/fomo-watch/trades (.omo/plans/fomo-user-watch.md). Gating it now is
+ * the point (deny-by-default must never have a gap between "route lands" and
+ * "gate lands"); it is exempt from the stale-entry check only until registered —
+ * the test below FAILS the moment it lands, forcing its removal here, so the
+ * list shrinks to empty by the end of wave 2 and the stale check regains full
+ * strength. */
 const PENDING_ROUTES: ReadonlySet<string> = new Set([
-  'GET /api/fomo-users',
-  'POST /api/fomo-users',
-  'PATCH /api/fomo-users/:id',
-  'DELETE /api/fomo-users/:id',
-  'POST /api/fomo-users/import',
   'POST /api/fomo-watch/trades',
 ]);
 
@@ -100,9 +96,10 @@ test('no other route is public', () => {
 // --- FOMO gate matrix (task 2) ------------------------------------------------
 // Auth runs in the middleware, BEFORE route resolution, so 401 (anonymous) and
 // 403 (wrong role) are exact and route-independent TODAY. Gate-PASS outcomes are
-// asserted as "not refused" until tasks 5/6 register the routes (an authorized
-// request to an unregistered route 404s at the catch-all); each carries a TODO
-// naming the task that tightens it to the real 200/2xx.
+// asserted as real 2xx for the routes task 5 registered; the still-unregistered
+// POST /api/fomo-watch/trades is asserted as "not refused" (an authorized
+// request to an unregistered route 404s at the catch-all) and carries a TODO
+// naming task 6, which tightens it to the real 2xx.
 
 let auth: TestAuth;
 let server: Server;
@@ -148,7 +145,7 @@ const FOMO_ROUTES: ReadonlyArray<readonly [method: string, path: string]> = [
   ['POST', '/api/fomo-watch/trades'],
 ];
 
-/** The five ADMIN_ONLY fomo-users writes the viewer/service roles must never reach. */
+/** The four ADMIN_ONLY fomo-users writes the viewer/service roles must never reach. */
 const FOMO_ADMIN_WRITES: ReadonlyArray<readonly [method: string, path: string]> = [
   ['POST', '/api/fomo-users'],
   ['PATCH', '/api/fomo-users/some-id'],
@@ -205,10 +202,9 @@ test('service token: 403 on the admin-only fomo writes (least privilege)', async
 
 test('viewer token passes the GET /api/fomo-users gate', async () => {
   const res = await req('GET', '/api/fomo-users', { token: await auth.signToken(auth.viewerEmail) });
-  // TODO(task 5): tighten to assert.equal(res.status, 200) once GET /api/fomo-users
-  // is registered. Until then a gate-passed request 404s at the catch-all — the
-  // route-independent assertion is that the middleware did NOT refuse it.
-  assert.ok(res.status !== 401 && res.status !== 403, `viewer must pass the gate, got ${res.status}`);
+  // Task 5 registered the route: a gate pass is now the real 200 + JSON list.
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.json));
 });
 
 test('service token passes the POST /api/fomo-watch/trades gate (valid body)', async () => {
