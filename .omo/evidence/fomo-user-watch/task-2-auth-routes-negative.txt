@@ -1,0 +1,80 @@
+# task 2 NEGATIVE QA — 2026-09-29T12:46:39+07:00
+# fomo entry 'POST /api/fomo-watch/trades' TEMPORARILY removed from ROUTE_POLICY
+# cmd: cd server && npx tsx --test test/auth-routes.test.ts
+✔ every registered route appears in ROUTE_POLICY (an ungated route fails here) (105.118546ms)
+✔ ROUTE_POLICY has no stale entries (every entry is a registered route) (0.771381ms)
+✔ PENDING_ROUTES are still awaiting registration (remove each one here the moment its route lands) (0.611483ms)
+✔ GET /api/health is explicitly public in the policy table (0.231574ms)
+✔ no other route is public (0.37895ms)
+✖ resolveRouteAccess pins all six fomo gates to their exact roles (3.01731ms)
+2026-09-29T05:46:40.808Z INFO  [api] method=GET path=/api/fomo-users status=401 dur=5
+2026-09-29T05:46:40.835Z INFO  [api] method=POST path=/api/fomo-users status=401 dur=0
+2026-09-29T05:46:40.839Z INFO  [api] method=PATCH path=/api/fomo-users/some-id status=401 dur=1
+2026-09-29T05:46:40.841Z INFO  [api] method=DELETE path=/api/fomo-users/some-id status=401 dur=0
+2026-09-29T05:46:40.844Z INFO  [api] method=POST path=/api/fomo-users/import status=401 dur=1
+2026-09-29T05:46:40.846Z INFO  [api] method=POST path=/api/fomo-watch/trades status=401 dur=0
+✔ anonymous request: 401 on all six fomo routes (63.284939ms)
+2026-09-29T05:46:40.859Z INFO  [api] method=POST path=/api/fomo-users status=403 dur=4
+2026-09-29T05:46:40.862Z INFO  [api] method=PATCH path=/api/fomo-users/some-id status=403 dur=1
+2026-09-29T05:46:40.865Z INFO  [api] method=DELETE path=/api/fomo-users/some-id status=403 dur=1
+2026-09-29T05:46:40.872Z INFO  [api] method=POST path=/api/fomo-users/import status=403 dur=1
+✔ viewer token: 403 on the admin-only fomo writes (25.372218ms)
+2026-09-29T05:46:40.876Z INFO  [api] method=POST path=/api/fomo-users status=403 dur=1
+2026-09-29T05:46:40.877Z INFO  [api] method=PATCH path=/api/fomo-users/some-id status=403 dur=0
+2026-09-29T05:46:40.879Z INFO  [api] method=DELETE path=/api/fomo-users/some-id status=403 dur=0
+2026-09-29T05:46:40.881Z INFO  [api] method=POST path=/api/fomo-users/import status=403 dur=0
+✔ service token: 403 on the admin-only fomo writes (least privilege) (8.677848ms)
+2026-09-29T05:46:40.886Z INFO  [api] method=GET path=/api/fomo-users status=404 dur=1
+✔ viewer token passes the GET /api/fomo-users gate (4.846968ms)
+2026-09-29T05:46:40.888Z INFO  [api] method=POST path=/api/fomo-watch/trades status=403 dur=0
+✖ service token passes the POST /api/fomo-watch/trades gate (valid body) (2.169282ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 9
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 957.844792
+
+✖ failing tests:
+
+test at test/auth-routes.test.ts:171:1
+✖ resolveRouteAccess pins all six fomo gates to their exact roles (3.01731ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+  + null
+  - [
+  -   'admin',
+  -   'service'
+  - ]
+  
+      at TestContext.<anonymous> (/home/namvt/Desktop/dev-space/signal_scan/server/test/auth-routes.test.ts:177:10)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: [ 'admin', 'service' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at test/auth-routes.test.ts:214:1
+✖ service token passes the POST /api/fomo-watch/trades gate (valid body) (2.169282ms)
+  AssertionError [ERR_ASSERTION]: service token must pass the gate, got 403
+      at TestContext.<anonymous> (/home/namvt/Desktop/dev-space/signal_scan/server/test/auth-routes.test.ts:219:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+# EXIT=1

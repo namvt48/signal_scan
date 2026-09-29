@@ -123,6 +123,12 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'DELETE', path: '/api/tracked-cas/:id', access: ADMIN_ONLY },
   { method: 'PUT', path: '/api/tier', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/wallet-watch/trades', access: ADMIN_SERVICE }, // wallet_watch daemon
+  { method: 'GET', path: '/api/fomo-users', access: ALL_ROLES }, // the daemon reads it
+  { method: 'POST', path: '/api/fomo-users', access: ADMIN_ONLY },
+  { method: 'PATCH', path: '/api/fomo-users/:id', access: ADMIN_ONLY },
+  { method: 'DELETE', path: '/api/fomo-users/:id', access: ADMIN_ONLY },
+  { method: 'POST', path: '/api/fomo-users/import', access: ADMIN_ONLY },
+  { method: 'POST', path: '/api/fomo-watch/trades', access: ADMIN_SERVICE }, // fomo_watch daemon
 ];
 
 /** Route paths only contain `/`, word chars and `-`, so they embed into a

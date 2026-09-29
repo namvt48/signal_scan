@@ -2,11 +2,18 @@
 // app must appear in ROUTE_POLICY (src/auth.ts), and the table must hold no
 // stale entries. If this file fails, someone added a route without making an
 // explicit gating decision — list it in ROUTE_POLICY with its roles. Also pins
-// GET /api/health as explicitly public (monitors depend on it).
-import { test } from 'node:test';
+// GET /api/health as explicitly public (monitors depend on it), and pins the
+// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md) — those six routes
+// are gated NOW but registered by tasks 5/6, so they sit on PENDING_ROUTES
+// until they land (see the self-cleaning rule below).
+import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { open } from '../src/db.js';
 import { createApp } from '../src/api.js';
-import { ROUTE_POLICY } from '../src/auth.js';
+import { resolveRouteAccess, ROUTE_POLICY } from '../src/auth.js';
+import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
 
 interface RouteLayer {
   path: string;
@@ -33,9 +40,28 @@ function registeredRoutes(): Array<{ method: string; path: string }> {
 
 const key = (method: string, path: string): string => `${method} ${path}`;
 
+/** ROUTE_POLICY entries whose express routes do not exist YET: task 5 registers
+ * the five /api/fomo-users routes, task 6 registers POST /api/fomo-watch/trades
+ * (.omo/plans/fomo-user-watch.md). Gating them now is the point (deny-by-default
+ * must never have a gap between "route lands" and "gate lands"); they are exempt
+ * from the stale-entry check only until registered — the test below FAILS the
+ * moment one lands, forcing its removal here, so the list shrinks to empty by
+ * the end of wave 2 and the stale check regains full strength. */
+const PENDING_ROUTES: ReadonlySet<string> = new Set([
+  'GET /api/fomo-users',
+  'POST /api/fomo-users',
+  'PATCH /api/fomo-users/:id',
+  'DELETE /api/fomo-users/:id',
+  'POST /api/fomo-users/import',
+  'POST /api/fomo-watch/trades',
+]);
+
 test('every registered route appears in ROUTE_POLICY (an ungated route fails here)', () => {
   const routes = registeredRoutes();
-  assert.ok(routes.length >= ROUTE_POLICY.length, `router walk found only ${routes.length} routes — walk broken?`);
+  assert.ok(
+    routes.length >= ROUTE_POLICY.length - PENDING_ROUTES.size,
+    `router walk found only ${routes.length} routes — walk broken?`,
+  );
   const policy = new Set(ROUTE_POLICY.map((e) => key(e.method, e.path)));
   for (const r of routes) {
     assert.ok(policy.has(key(r.method, r.path)), `UNGATED ROUTE: ${key(r.method, r.path)} is missing from ROUTE_POLICY`);
@@ -45,7 +71,16 @@ test('every registered route appears in ROUTE_POLICY (an ungated route fails her
 test('ROUTE_POLICY has no stale entries (every entry is a registered route)', () => {
   const routes = new Set(registeredRoutes().map((r) => key(r.method, r.path)));
   for (const e of ROUTE_POLICY) {
-    assert.ok(routes.has(key(e.method, e.path)), `STALE policy entry: ${key(e.method, e.path)} is not registered`);
+    const k = key(e.method, e.path);
+    if (PENDING_ROUTES.has(k)) continue; // route lands in task 5/6 — see PENDING_ROUTES
+    assert.ok(routes.has(k), `STALE policy entry: ${k} is not registered`);
+  }
+});
+
+test('PENDING_ROUTES are still awaiting registration (remove each one here the moment its route lands)', () => {
+  const routes = new Set(registeredRoutes().map((r) => key(r.method, r.path)));
+  for (const k of PENDING_ROUTES) {
+    assert.ok(!routes.has(k), `${k} is now registered — REMOVE it from PENDING_ROUTES in this file (task 5/6)`);
   }
 });
 
@@ -60,4 +95,126 @@ test('no other route is public', () => {
     if (e.path === '/api/health') continue;
     assert.notEqual(e.access, 'public', `${key(e.method, e.path)} must require a role`);
   }
+});
+
+// --- FOMO gate matrix (task 2) ------------------------------------------------
+// Auth runs in the middleware, BEFORE route resolution, so 401 (anonymous) and
+// 403 (wrong role) are exact and route-independent TODAY. Gate-PASS outcomes are
+// asserted as "not refused" until tasks 5/6 register the routes (an authorized
+// request to an unregistered route 404s at the catch-all); each carries a TODO
+// naming the task that tightens it to the real 200/2xx.
+
+let auth: TestAuth;
+let server: Server;
+let base = '';
+
+before(async () => {
+  open(':memory:');
+  auth = await createTestAuth();
+  server = createApp('test', auth.deps).listen(0);
+  await new Promise((resolve) => server.once('listening', resolve));
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+
+after(() => {
+  server.close();
+});
+
+interface Reply {
+  status: number;
+  json: unknown;
+}
+
+async function req(method: string, path: string, opts: { token?: string; body?: unknown } = {}): Promise<Reply> {
+  const headers: Record<string, string> = {};
+  if (opts.token !== undefined) headers.authorization = `Bearer ${opts.token}`;
+  if (opts.body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(`${base}${path}`, {
+    method,
+    headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
+  const text = await res.text();
+  return { status: res.status, json: text === '' ? null : (JSON.parse(text) as unknown) };
+}
+
+/** Concrete request targets for the six gated routes (`:id` filled). */
+const FOMO_ROUTES: ReadonlyArray<readonly [method: string, path: string]> = [
+  ['GET', '/api/fomo-users'],
+  ['POST', '/api/fomo-users'],
+  ['PATCH', '/api/fomo-users/some-id'],
+  ['DELETE', '/api/fomo-users/some-id'],
+  ['POST', '/api/fomo-users/import'],
+  ['POST', '/api/fomo-watch/trades'],
+];
+
+/** The five ADMIN_ONLY fomo-users writes the viewer/service roles must never reach. */
+const FOMO_ADMIN_WRITES: ReadonlyArray<readonly [method: string, path: string]> = [
+  ['POST', '/api/fomo-users'],
+  ['PATCH', '/api/fomo-users/some-id'],
+  ['DELETE', '/api/fomo-users/some-id'],
+  ['POST', '/api/fomo-users/import'],
+];
+
+/** A body shaped for task 6's parser contract (captured FOMO schema), so this
+ * request stays valid once the route exists. */
+const FOMO_TRADE_BODY = {
+  eventId: 'evt-auth-routes-1',
+  trader: 'authkit-handle',
+  type: 'buy',
+  tokenAddress: 'authCa-fomo-001',
+  chain: 'sol',
+  ts: 1_758_000_000_000,
+  usdValue: 3000,
+};
+
+test('resolveRouteAccess pins all six fomo gates to their exact roles', () => {
+  assert.deepEqual(resolveRouteAccess('GET', '/api/fomo-users'), ['admin', 'viewer', 'service']);
+  assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-users'), ['admin']);
+  assert.deepEqual(resolveRouteAccess('PATCH', '/api/fomo-users/some-id'), ['admin']);
+  assert.deepEqual(resolveRouteAccess('DELETE', '/api/fomo-users/some-id'), ['admin']);
+  assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-users/import'), ['admin']);
+  assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-watch/trades'), ['admin', 'service']);
+});
+
+test('anonymous request: 401 on all six fomo routes', async () => {
+  for (const [method, path] of FOMO_ROUTES) {
+    const body = method === 'GET' || method === 'DELETE' ? undefined : {};
+    const res = await req(method, path, { body });
+    assert.equal(res.status, 401, `anonymous ${method} ${path} must be 401`);
+    assert.deepEqual(res.json, { error: 'unauthorized' });
+  }
+});
+
+test('viewer token: 403 on the admin-only fomo writes', async () => {
+  const viewer = await auth.signToken(auth.viewerEmail);
+  for (const [method, path] of FOMO_ADMIN_WRITES) {
+    const res = await req(method, path, { token: viewer, body: {} });
+    assert.equal(res.status, 403, `viewer ${method} ${path} must be 403`);
+    assert.deepEqual(res.json, { error: 'forbidden' });
+  }
+});
+
+test('service token: 403 on the admin-only fomo writes (least privilege)', async () => {
+  for (const [method, path] of FOMO_ADMIN_WRITES) {
+    const res = await req(method, path, { token: TEST_SERVICE_TOKEN, body: {} });
+    assert.equal(res.status, 403, `service ${method} ${path} must be 403`);
+    assert.deepEqual(res.json, { error: 'forbidden' });
+  }
+});
+
+test('viewer token passes the GET /api/fomo-users gate', async () => {
+  const res = await req('GET', '/api/fomo-users', { token: await auth.signToken(auth.viewerEmail) });
+  // TODO(task 5): tighten to assert.equal(res.status, 200) once GET /api/fomo-users
+  // is registered. Until then a gate-passed request 404s at the catch-all — the
+  // route-independent assertion is that the middleware did NOT refuse it.
+  assert.ok(res.status !== 401 && res.status !== 403, `viewer must pass the gate, got ${res.status}`);
+});
+
+test('service token passes the POST /api/fomo-watch/trades gate (valid body)', async () => {
+  const res = await req('POST', '/api/fomo-watch/trades', { token: TEST_SERVICE_TOKEN, body: FOMO_TRADE_BODY });
+  // TODO(task 6): tighten to a 2xx assertion once POST /api/fomo-watch/trades is
+  // registered (an untracked-trader 404 from the handler is also a gate pass).
+  // Removing the policy entry makes deny-by-default kick in → 403 → this fails.
+  assert.ok(res.status !== 401 && res.status !== 403, `service token must pass the gate, got ${res.status}`);
 });
