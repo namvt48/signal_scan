@@ -1,0 +1,130 @@
+F1 PLAN-COMPLIANCE AUDIT — fomo-user-watch
+Repo: /home/namvt/Desktop/dev-space/signal_scan
+Branch: feat/fomo-user-watch   HEAD: c45f6132657d4b33ad4e09b8213366ea2cd24953 ("docs: record the FOMO CA-enqueue and sellPnlUsd amendments")
+Plan: .omo/plans/fomo-user-watch.md (todos 1-13 + final wave F1-F4; todos 12/13 = amendments of 2026-09-29)
+Date: 2026-09-29 17:35 +07 (Asia/Ho_Chi_Minh)
+Auditor: sisyphus-junior (read-only: read/grep/glob + bash ls/git show/log/grep/wc only; no build, no test run, no tracked file edited, no commit; this verdict file is the only write)
+
+Method: for every todo — (a) the plan's acceptance-criterion command(s), (b) the evidence file(s) the plan names, (c) does the file exist AND contain that command's real output (test names/assertions cross-checked against the committed test source via `git show 2349c5e`/`b4df188`, not just filename match), (d) verdict. Evidence-capture convention noted: captures precede their commit by minutes (run QA -> capture -> commit), so a capture timestamped slightly before its todo's commit reflects the committed tree.
+
+================================================================
+PER-TODO FINDINGS
+================================================================
+
+TODO 1 — db.ts fomo_users/fomo_trades + accessors
+(a) `cd server && npm run build` exit 0; `cd server && npx tsx --test test/fomo-db.test.ts` with assertions (a)-(e)
+(b) task-1-fomo-db.txt (+ negative task-1-fomo-db-negative.txt; bonus task-1-fomo-trade-check-fix.txt)
+(c) EXISTS. Contains `npm run build` "build exit=0" and the tsx --test run: 9/9 pass, covering (a) duplicate-handle UNIQUE throw, (b) event_id idempotent, (c) FK cascade delete, (d) importFomoUsers empty-handle skip-with-reason, (e) pre-change DB opens without throwing. Negative file proves the type CHECK is load-bearing (widened CHECK -> perp insert accepted -> backstop test FAILS, exit=1). Follow-up fix file (OR IGNORE -> ON CONFLICT DO NOTHING) records the loud-CHECK probe + full `npm test` 379/379 at that state.
+(d) PASS
+
+TODO 2 — auth.ts ROUTE_POLICY for the six fomo routes
+(a) `cd server && npm run build` exit 0; `cd server && npx tsx --test test/auth-routes.test.ts` (viewer 200 GET/403 POST; service 2xx fomo-watch + 403 fomo-users; anonymous 401 on all six)
+(b) task-2-auth-routes.txt (+ task-2-auth-routes-negative.txt)
+(c) EXISTS. Contains the exact command, "# EXIT=0", 11/11 pass: "resolveRouteAccess pins all six fomo gates", "anonymous request: 401 on all six fomo routes", "viewer token: 403 on the admin-only fomo writes", "viewer token passes the GET gate", "service token passes the POST /api/fomo-watch/trades gate". Negative file: entry removed -> the service-gate test fails with 403 (EXIT=1) -> gate proven load-bearing, reverted. Build-gate note: file records the test only; server `npm run build` (script = `tsc`) at this state is covered by the equivalent `npx tsc --noEmit exit=0` capture in task-5-fomo-users.txt (13:30 +07, postdates e769edb <=12:50 +07) and by the HEAD-state controller attestation (see GATES section).
+(d) PASS
+
+TODO 3 — VITE_SHOW_FOMO build flag (Dockerfile + Makefile + config.ts)
+(a) `VITE_SHOW_FOMO= npm run build` exit 0 + grep shows no FOMO column code path; `VITE_SHOW_FOMO=on npm run build` exit 0; Makefile passes the flag for instance b only
+(b) task-3-flag-matrix.txt (+ task-3-flag-off-absence.txt)
+(c) EXISTS. Both builds exit_code=0; `grep -c 'fomo' dist/assets/*.js` = 1 line, honestly accounted as the ungated `signal_scan:fomo_users` localStorage key (UI code did not exist yet at capture time — stated in the file); `make -n deploy` vs `make -n deploy INSTANCE=b` show SHOW_FOMO empty for a, =on for b, port/bind/data-dir untouched; compose interpolation verified both states. Negative file: positive-control marker PRESENT in ON build / ABSENT (tree-shaken, grep_exit=1) in OFF build, marker reverted byte-clean (identical bundle hash). HEAD-state flag matrix re-proven raw in f4-scope-fidelity.txt (OFF 0 `FOMO by`/0 `Sell PnL`; ON 2/2).
+(d) PASS
+
+TODO 4 — DataStore contract + both implementations
+(a) `npm run build` exit 0 (tsc proves both impls satisfy the widened interface); QA capture includes `npx tsc --noEmit`
+(b) task-4-datastore.txt (+ task-4-datastore-negative.txt)
+(c) EXISTS. Full `npm run build` output, exit=0, plus `npx tsc --noEmit` exit=0. Negative file: deleteFomoUser removed from restDataStore -> TS2741 naming the missing property, exit=2; restored -> build exit=0.
+(d) PASS
+
+TODO 5 — /api/fomo-users CRUD + CSV import routes
+(a) `cd server && npm run build` exit 0; `cd server && npx tsx --test test/fomo-users.test.ts` (POST creates; dup 409; PATCH; DELETE 204 + cascade; import 1-added/1-skipped-with-reason; viewer 403; no token 401)
+(b) task-5-fomo-users.txt (+ task-5-fomo-users-negative.txt)
+(c) EXISTS. `npx tsc --noEmit exit=0` (server build script is exactly `tsc`, so this is the build gate, equal-or-stronger with --noEmit) and `npx tsx --test test/fomo-users.test.ts test/auth-routes.test.ts`: 27/27 pass, exit=0 — every plan-listed assertion appears by name (creates camelCase DTO, duplicate 409, empty handle 400, extra fields ignored, sorted list, PATCH user_id/name/clan, DELETE 204 + FK cascade, import added=1/skipped-with-reason, viewer 403, no-token 401). Negative file: handle:"" and whitespace -> 400 {error:"handle is required"}, rows=0; unknown fields never persisted (raw SELECT shown).
+(d) PASS
+
+TODO 6 — POST /api/fomo-watch/trades ingest + eventId dedupe
+(a) `cd server && npm run build` exit 0; `cd server && npx tsx --test test/fomo-watch-trade.test.ts` (one row with right fields; same eventId 200 no-op count stays 1; unknown identity 404 + nothing inserted; bad chain 400; perp/thesis 400 + nothing stored; 401/403)
+(b) task-6-fomo-watch-trade.txt (+ task-6-fomo-watch-trade-negative.txt)
+(c) EXISTS. The exact command, 10/10 pass, exit=0 — all six criterion assertions appear by name, plus canonicalisation and negative-sell-PnL legality. Negative file: missing eventId -> 400 and type:'perp'+null tokenAddress -> 400 with SELECT COUNT(*)=0 proof. Build gate at this state: covered by the HEAD-state server gates (GATES section); capture (13:42 +07) precedes commit 0017dc0 (13:46 +07) per the run->capture->commit convention.
+(d) PASS
+
+TODO 7 — FomoUserStat + fomoUserStatsByCa + TokenSignal.fomoUsers
+(a) `cd server && npm run build` exit 0 (mirrors in sync); `cd server && npx tsx --test test/fomo-signals.test.ts` (buyUsd===500 with sell 120 NOT added/subtracted; stale buy still listed zero-stats lastTs 0; sell-only NOT listed; two chains don't pool; byCa === per-CA)
+(b) task-7-fomo-signals.txt (+ task-7-no-leakage.txt)
+(c) EXISTS. `npx tsx --test test/fomo-signals.test.ts test/signals.test.ts test/assemble-signals-batch.test.ts`: 41/41 pass, tsx-test-exit:0, plus `server-tsc-exit:0` and `root-tsc-exit:0` — all five criterion assertions appear by name. No-leakage file: trackedWallets/trackedInflow/trackedActivityAt unchanged for a FOMO-only fixture; existing signals.test.ts passes UNMODIFIED (git diff empty); FomoUserStat mirror character-identical between server/src/signals.ts and src/types.ts.
+(d) PASS
+
+TODO 8 — FE FOMO watch-list surface behind SHOW_FOMO
+(a) `npm run build` exit 0 flag ON and OFF; Playwright QA (add via form; export CSV exact header; 2-row import -> 1 added + 1 skipped-with-reason; viewer sees no controls; flag-off shows no FOMO surface)
+(b) task-8-fomo-users-ui.png, task-8-export.csv, task-8-import-preview.png
+(c) EXIST. All three named artifacts present + two extras (task-8-flag-off.png, task-8-viewer-gating.png) covering the flag-off and viewer-gating criteria. All six files verified real PNGs (magic bytes). task-8-export.csv content verified: exact header `handle,name,clan,userId,walletSolana,walletEvm` + one data row (alpha,Alpha Trader,a,u-1001,...). Build ON/OFF at HEAD state: raw-captured in f4-scope-fidelity.txt (BUILD_OFF_EXIT=0 with 0 `FOMO by`; BUILD_ON_EXIT=0 with 2) — per-todo-state build output has no separate .omo capture (deviation D1-note, see below).
+(d) PASS
+
+TODO 9 — SignalTable `FOMO by` column behind SHOW_FOMO
+(a) `npm run build` exit 0 flag ON and OFF; Playwright QA (header + sub-grid + caveat tooltip; row shows handle/trades/buy $/age, NO balance cell; empty treatment; modal breakdown; newest-first; layout intact at both allFactors states)
+(b) task-9-fomo-column.png (+ task-9-empty-and-long.png)
+(c) EXIST. Both named artifacts present (223 KB / 219 KB, valid PNG magic). Build ON/OFF at HEAD: raw-captured in f4-scope-fidelity.txt as above; `Sell PnL` presence in the ON build (2 occurrences) additionally proves the todo-13 column addition renders. Same D1-note as todo 8 for per-todo-state build output.
+(d) PASS
+
+TODO 10 — watchers/fomo firehose daemon
+(a) mapping in runbook cites task-0-alert-sample.jsonl; `python3 -m pytest scripts/test_fomo_watch.py` (or confirmed repo runner) passes covering the 12 plan-listed fixture cases; live smoke `--once` with socket-connected line + >=1 parsed alert + state file updated
+(b) task-10-fomo-daemon.txt (+ task-10-fomo-daemon-negative.txt)
+(c) EXISTS. Happy file: both runners green (`python3 scripts/test_fomo_watch.py` PASS 70/70 EXIT=0 — the plain-script repo convention — and `python3 -m pytest ... -q` 1 passed EXIT=0); all 12 plan-listed coverage items enumerated; full field->contract map citing task-0-alert-sample.jsonl; `--once` smoke: DAEMON_EXIT=0, "# fomo socket connected", one survivor emitted (buy steph_2441 $ZCAT sol), server ingest log 200s, fomo_trades COUNT=1 with the exact row, handle-matching proven (user_id NULL), FOMO-specific state/heartbeat files written and shared wallet paths NOT written, key masked (`?key=***`) and absent from state. Negative file: FOMO_API_KEY unset -> exit=1, clean message, no traceback, no key echo; 4 malformed frames skipped, loop continued to the survivor. DEVIATION D2: the "live smoke against the socket" ran against a LOCAL in-process mock websocket (real `websockets` lib), with the skip of a live-key run EXPLICITLY disclosed in the file ("LIVE-KEY RUN: SKIPPED... no live-key run was faked"; key absent from env by policy). Live-key end-to-end proof is F3's mandate per the plan (F3 rejects mock-only QA) and remains pending — not hand-waved here.
+(d) PASS (with disclosed deviation D2; live-key proof deferred to F3 by plan design)
+
+TODO 11 — runbook + instance-b env wiring + evidence consolidation
+(a) docs/<date>-fomo-user-watch.md + evidence/<date>-fomo-user-watch.md exist; every referenced artifact exists; no key value anywhere; no new compose service / no instance-a change; daemon command copy-pasteable with --api-url matching instance b's 8125
+(b) task-11-runbook-check.txt (+ task-11-runbook-check-negative.txt)
+(c) EXISTS. Happy file: both docs OK (docs/2026-09-29-fomo-user-watch.md, evidence/2026-09-29-fomo-user-watch.md — both verified present on disk and committed at 11f6933, extended by c45f613); artifact-existence check 28 referenced / 0 missing + reverse completeness (all 28 referenced); key-leak scan clean (only non-secret `dummy-mock-key` placeholders, listed transparently); Makefile/docker-compose grep shows only the todo-3 wiring and exactly the pre-existing chrome/api/web services; runbook daemon commands verified with --api-url http://127.0.0.1:8125 = instance b's port; git status shows no .env/keys/data*. Negative file: deliberately broken reference -> check exit=1 FAIL as required, then fixed -> exit=0.
+(d) PASS
+
+TODO 12 (AMENDMENT — scrutinised) — watched BUY enqueues CA into tracked_cas
+(a) `cd server && npx tsx --test test/fomo-watch-trade.test.ts` asserting: BUY creates EXACTLY ONE tracked_cas row; repeat same-eventId BUY creates NO second row and does not throw; SELL creates NO row when CA not already tracked
+(b) task-12-ca-enqueue.txt (+ task-12-ca-enqueue-negative.txt)
+(c) EXISTS AND VERIFIED AGAINST COMMITTED SOURCE (git show 2349c5e). Evidence contains the exact command's real output: 13 tests, 13 pass, 0 fail, including the three required cases by name: "a BUY enqueues the CA into tracked_cas exactly once", "a repeat BUY (same eventId) adds no second tracked_cas row", "a SELL of an untracked CA adds no tracked_cas row". Committed test bodies confirm the assertions are real, not name-coincidence: exactly-one via `listTrackedCas().filter(address===BUY_CA && chain==='sol').length === 1` + `findTrackedCa(...).note === 'fomo'` + status 'queued' + entry_usd 2985 (from usdValue); repeat BUY -> `inserted: 0` and count still 1 (no throw); SELL -> `findTrackedCa(SELL_CA,'sol') === undefined` and `.some(...) === false`. Negative file contains the same command's output isolating the two negative cases (13/13 pass). Implementation diff matches the plan verbatim: guard `parsed.type === 'buy' && !findTrackedCa(...)` -> `insertTrackedCa({address, chain, note:'fomo', entryUsd})` + `kickCAs([...])`; no minUsd gate; no kick when already tracked; no enqueue on sell; wallet state untouched (comment lock: no wallet_trades/insertTrades/kickWalletRow).
+(d) PASS
+
+TODO 13 (AMENDMENT — scrutinised) — separate sellPnlUsd (server mirror + column)
+(a) `cd server && npx tsc --noEmit && npx tsx --test test/fomo-signals.test.ts` incl. SELL usd_value -200 -> sellPnlUsd === -200 with buyUsd unchanged, and Object.keys order lock; root `npx tsc --noEmit` + `VITE_SHOW_FOMO=on npm run build` exit 0 with `Sell PnL` present in dist/
+(b) task-13-sell-pnl.txt (+ task-13-sell-pnl-negative.txt)
+(c) EXISTS AND VERIFIED AGAINST COMMITTED SOURCE (git show b4df188). Evidence contains the real `npx tsx --test test/fomo-signals.test.ts` output: 7/7 pass, including "a NEGATIVE sell usd_value (realised loss) lands in sellPnlUsd and never touches buyUsd" and "buyUsd sums BUYS only — the sell usd_value (realised PnL) is neither added nor subtracted". Committed test bodies confirm: erin fixture buy 400 + sell -200 -> asserts `buyUsd === 400` (UNCHANGED), `sellPnlUsd === -200`, and `Object.keys(r) === ['handle','name','buyUsd','sellPnlUsd','buys','sells','trades','lastTs']` (order lock, sellPnlUsd immediately after buyUsd); alice case asserts sellPnlUsd 120 beside buyUsd 500 (never 620/380) with the same key-order lock; byCa parity asserted. Implementation diff matches the plan: `COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd` added to BOTH queries + both mapping objects; type mirrored in server/src/signals.ts and src/types.ts; FomoTable gains the `Sell PnL` column (signed text-pos/text-neg, title "Σ realised PnL on SELL rows — not sell volume"), FOMO_COLS extended 5->6 shares; OUTER column math untouched; never summed with buyUsd.
+    Root-side criterion commands: raw output at HEAD IS captured under .omo/evidence/fomo-user-watch/ — in f4-scope-fidelity.txt (assertion 1: root `npx tsc --noEmit` TSC_EXIT=0; assertion 2: OFF build exit 0 with 0 `FOMO by` / 0 `Sell PnL`; assertion 3: ON build exit 0 with 2 `FOMO by` / 2 `Sell PnL` = `Sell PnL` PRESENT in dist). Server-side `npx tsc --noEmit` half of the concatenated criterion: no raw capture at HEAD under .omo (tsx does not typecheck); recorded as the committed controller attestation — see GATES section, deviation D1.
+    Negative-file note (deviation D3): task-13-sell-pnl-negative.txt contains the negative-PnL test line, not the plan's QA-scenario "re-POST the same sell -> sellPnlUsd unchanged"; that dedupe semantic is nonetheless proven by captured output elsewhere ("reposting the SAME eventId is a 200 no-op" in task-6 and task-12 files, and the repeat-BUY tracked_cas test).
+(d) PASS (with documented deviations D1 server-tsc record location, D3 negative-scenario substitution)
+
+================================================================
+DEPENDENCY ORDER (plan: 1-2 -> 5/6/7 -> 8/9 -> 10 -> 11 -> 12/13)
+================================================================
+Commit timeline (author dates, +07) — HELD:
+  622225b feat(db) [1] -> 9a34b43 fix(db) upsert [1] -> e769edb feat(auth) [2] -> 0ae8443 feat(build) [3] 12:50:44 -> 37c302f feat(store) [4] 12:50:48 -> 17e92b0 chore(evidence) -> 1e12857 fix(db) CHECK [1] 13:06 -> 14675fa feat(api) fomo-users [5] 13:32:22 -> 51259cd feat(signals) [7] 13:32:22 -> 0017dc0 feat(api) ingest [6] 13:46:41 -> 289c243 feat(ui) watch-list [8] 13:46:41 -> 99fef9b feat(ui) column [9] 14:35:15 -> 77b29e9 feat(fomo) daemon [10] 14:35:24 -> (unrelated nansen/tier work + merge 4300d2b 16:59) -> 11f6933 docs [11] 17:01:04 -> 2349c5e [12] 17:15:34 -> b4df188 [13] 17:15:34 -> c45f613 docs 17:16:10.
+  1,2 precede 5/6/7; 5/6/7 precede 8/9; 8/9 precede 10; 10 precedes 11; 11 precedes 12/13. Wave-1 internal order (3,4 after 1,2) is irrelevant (declared parallel). Unrelated main-branch work merged between 10 and 11 does not violate the matrix.
+  Commit messages match the plan's `Commit:` lines one-for-one (feat(db)/feat(auth)/feat(build)/feat(store)/feat(api)x2/feat(signals)x2/feat(ui)x2/feat(watchers->"feat(fomo)"/docs). Minor: todo 10's message reads "feat(fomo): add the fomo firehose daemon" vs plan "feat(watchers): add fomo firehose watcher" — same scope, wording drift, not a compliance failure.
+
+================================================================
+CONTROLLER GATE VERIFICATION (per audit mandate)
+================================================================
+Gates stated as controller-produced: server `npx tsc --noEmit`; server `npm test` 437/437; root `npx tsc --noEmit`; root build OFF = 0 `FOMO by` / 0 `Sell PnL`; ON = 2 / 2.
+Verification result — recorded, but NOT where the audit mandate expected:
+  - The four task-12/13 evidence files (.omo/evidence/fomo-user-watch/task-12-ca-enqueue{,-negative}.txt, task-13-sell-pnl{,-negative}.txt) DO NOT contain these gate outputs (grep for "437", "noEmit", "tsc", "Sell PnL", "FOMO by": zero hits; file sizes confirm full-content review: 3575/314/879/231 bytes). They contain only the `npx tsx --test` runs.
+  - The gates ARE recorded in the committed evidence summary: evidence/2026-09-29-fomo-user-watch.md:116 (Task 13 section, committed in c45f613): "`npx tsc --noEmit` clean both sides; `npm run build` (root) with `VITE_SHOW_FOMO=off` = 0 `FOMO by` / 0 `Sell PnL`; with `=on` = 2 / 2; `server npm test` 437/437 pass" — explicitly attributed to the task-12/13 files' run session.
+  - The ROOT-side gates additionally have RAW captured output at HEAD inside .omo/evidence/fomo-user-watch/: f4-scope-fidelity.txt (sibling F4 audit, 17:22, HEAD c45f613): TSC_EXIT=0; BUILD_OFF_EXIT=0 with grep counts 0/0 (fomoUsers=1, the permitted additive seed); BUILD_ON_EXIT=0 with 2/2 — numbers match md:116 exactly, corroborating the controller record.
+  - The SERVER-side gates (tsc clean, npm test 437/437) have NO raw output persisted under .omo/evidence/fomo-user-watch/ (f4 explicitly did not run them — concurrent server DB writes forbidden during the final wave; same constraint this F1 audit operated under). Their record is the committed summary line above (deviation D1).
+
+================================================================
+DEVIATIONS / NOTES (documented, not hand-waved)
+================================================================
+D1 (record hygiene, RECOMMEND FIX): raw output of the HEAD-state server gates (`npx tsc --noEmit`, `npm test` 437/437) exists only as the committed one-line summary at evidence/2026-09-29-fomo-user-watch.md:116, not as a raw capture under .omo/evidence/fomo-user-watch/ (and not inside the task-12/13 txt files, contrary to the audit mandate's assumption). Fix = controller pastes the raw gate output into e.g. .omo/evidence/fomo-user-watch/task-13-gates.txt; no code/test change implied. Root-side gates are raw-captured (f4-scope-fidelity.txt). Corroboration for server health at HEAD: the tsx --test runs at 17:15 (13/13, 7/7) executed the same tree.
+D2 (todo 10): live-key socket smoke replaced by a disclosed local mock-socket smoke (FOMO_API_KEY unset by policy); disclosure is explicit in the evidence; live-key end-to-end is F3's mandate and still pending.
+D3 (todo 13): the named negative QA scenario (re-POST same sell -> sellPnlUsd unchanged) was substituted by the negative-PnL proof in task-13-sell-pnl-negative.txt; the dedupe semantic itself is captured via todo 6/12 evidence ("reposting the SAME eventId is a 200 no-op"; repeat-BUY adds no row).
+N1 (clerical): plan checkboxes for todos 12/13 remain "[ ]" in .omo/plans/fomo-user-watch.md although both are implemented, evidenced, and committed (2349c5e, b4df188) — tick them at handoff.
+N2: .omo/plans/ and .omo/drafts/ are intentionally uncommitted per the audit context — not counted as a failure. Extra artifacts beyond plan names (task-1-fomo-trade-check-fix.txt, task-8-flag-off.png, task-8-viewer-gating.png, task-0-*) strengthen, not weaken, the record.
+N3: task-3/task-4 bundle captures predate the UI todos (bundle index-CCN7QtG8.js, 392.12 kB) and are valid for their own todo states; the HEAD-state flag matrix is the f4 raw capture (OFF index-DX4Sb5io.js 392.34 kB vs ON index-C0nKMHwB.js 406.82 kB — the ~14.5 kB delta proves the gate strips FOMO code when OFF).
+
+================================================================
+SCOREBOARD
+================================================================
+todo 1  PASS | todo 2  PASS | todo 3  PASS | todo 4  PASS | todo 5  PASS | todo 6  PASS | todo 7  PASS
+todo 8  PASS | todo 9  PASS | todo 10 PASS (D2) | todo 11 PASS | todo 12 PASS | todo 13 PASS (D1,D3)
+Dependency order 1-2 -> 5/6/7 -> 8/9 -> 10 -> 11 -> 12/13: HELD.
+Failing todos: none.
+
+F1 VERDICT: PASS

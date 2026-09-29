@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { getDb, findTrackedCa, insertFomoUser, listTrackedCas, open } from '../src/db.js';
+import { getDb, deleteTrackedCa, findTrackedCa, insertFomoUser, listTrackedCas, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
 
@@ -14,6 +14,7 @@ const USER_ID = 'fomo-uid-1';
 const CA = 'FomoCaSource001';
 const BUY_CA = 'FomoBuyNewCa001';
 const SELL_CA = 'FomoSellNewCa001';
+const REPLAY_CA = 'FomoReplayCa001';
 
 let auth: TestAuth;
 let server: Server;
@@ -209,4 +210,17 @@ test('POST /api/fomo-watch/trades: a SELL of an untracked CA adds no tracked_cas
   assert.equal(res.status, 200);
   assert.equal(findTrackedCa(SELL_CA, 'sol'), undefined);
   assert.equal(listTrackedCas().some((r) => r.address === SELL_CA && r.chain === 'sol'), false);
+});
+
+test('POST /api/fomo-watch/trades: a replayed BUY whose CA was removed does not re-enqueue', async () => {
+  const first = await post(trade({ eventId: 'evt-fomo-replay', tokenAddress: REPLAY_CA }));
+  assert.equal(first.json.inserted, 1);
+  const row = findTrackedCa(REPLAY_CA, 'sol');
+  assert.ok(row);
+  deleteTrackedCa(row.id);
+
+  const replay = await post(trade({ eventId: 'evt-fomo-replay', tokenAddress: REPLAY_CA }));
+  assert.equal(replay.status, 200);
+  assert.equal(replay.json.inserted, 0);
+  assert.equal(findTrackedCa(REPLAY_CA, 'sol'), undefined);
 });

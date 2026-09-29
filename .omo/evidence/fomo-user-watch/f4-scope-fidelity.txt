@@ -1,0 +1,173 @@
+F4 SCOPE-FIDELITY AUDIT — instance-a (non-FOMO deployment)
+Repo: /home/namvt/Desktop/dev-space/signal_scan
+Branch: feat/fomo-user-watch
+HEAD: c45f6132657d4b33ad4e09b8213366ea2cd24953 (c45f613 "docs: record the FOMO CA-enqueue and sellPnlUsd amendments")
+Date: 2026-09-29 (Asia/Ho_Chi_Minh)
+Auditor: sisyphus-junior (read-only audit; no tracked source edited, no commit, no push; only the two authorized builds were run, strictly sequentially)
+
+============================================================
+ASSERTION 1 — npx tsc --noEmit at repo root exits 0
+============================================================
+$ npx tsc --noEmit; echo "TSC_EXIT=$?"
+TSC_EXIT=0
+(no diagnostics output)
+RESULT: PASS
+
+============================================================
+ASSERTION 2 — OFF build: VITE_SHOW_FOMO=off npm run build
+============================================================
+$ VITE_SHOW_FOMO=off npm run build
+BUILD_OFF_EXIT=0
+tail of build log:
+  dist/assets/plus-jakarta-sans-latin-ext-wght-normal-DmpS2jIq.woff2    21.73 kB
+  dist/assets/plus-jakarta-sans-latin-wght-normal-eXO_dkmS.woff2        27.35 kB
+  dist/assets/index-DxoKHWcX.css                                        44.06 kB │ gzip:  10.98 kB
+  dist/assets/index-DX4Sb5io.js                                        392.34 kB │ gzip: 104.47 kB
+  ✓ built in 5.23s
+
+Token counts on dist/assets/*.js (real captured output):
+$ grep -ro 'FOMO by' dist/assets/*.js | wc -l
+0
+$ grep -ro 'Sell PnL' dist/assets/*.js | wc -l
+0
+$ grep -ro 'fomoUsers' dist/assets/*.js | wc -l
+1
+$ grep -ro 'FOMO' dist/assets/*.js | wc -l   (extra sanity: any FOMO token at all)
+0
+
+Expected per task: FOMO by = 0, Sell PnL = 0, fomoUsers small (e.g. 1 — the additive empty seed).
+Prior-run baseline: OFF = 0 / 0 / 1. This run: OFF = 0 / 0 / 1 — exact match.
+The FOMO column is ABSENT from the OFF build; the only FOMO-related token is the
+single additive empty `fomoUsers` seed (1 occurrence), which carries no data
+(always-empty list) and changes no instance-a behaviour.
+RESULT: PASS
+
+============================================================
+ASSERTION 3 — ON build: VITE_SHOW_FOMO=on npm run build
+(run strictly AFTER the OFF build completed, not concurrently)
+============================================================
+$ VITE_SHOW_FOMO=on npm run build
+BUILD_ON_EXIT=0
+tail of build log:
+  dist/assets/plus-jakarta-sans-latin-ext-wght-normal-DmpS2jIq.woff2    21.73 kB
+  dist/assets/plus-jakarta-sans-latin-wght-normal-eXO_dkmS.woff2        27.35 kB
+  dist/assets/index-DxoKHWcX.css                                        44.06 kB │ gzip:  10.98 kB
+  dist/assets/index-C0nKMHwB.js                                        406.82 kB │ gzip: 106.63 kB
+  ✓ built in 4.89s
+
+Token counts on dist/assets/*.js (real captured output):
+$ grep -ro 'FOMO by' dist/assets/*.js | wc -l
+2
+$ grep -ro 'Sell PnL' dist/assets/*.js | wc -l
+2
+$ grep -ro 'fomoUsers' dist/assets/*.js | wc -l
+8
+
+Expected: FOMO by > 0 and Sell PnL > 0. Prior-run baseline: ON = 2 / 2.
+This run: ON = 2 / 2 — exact match (fomoUsers = 8 in ON build, unconstrained).
+Bundle-hash delta (OFF index-DX4Sb5io.js 392.34 kB vs ON index-C0nKMHwB.js 406.82 kB)
+confirms the gate strips ~14.5 kB of FOMO code when OFF.
+Note: dist/ is a build artifact and was left in the ON state (expected to be overwritten).
+RESULT: PASS
+
+============================================================
+ASSERTION 4a — No new docker-compose service
+============================================================
+$ git --no-pager diff main...HEAD -- docker-compose.yml
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 50adca2..077c874 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -65,6 +65,9 @@ services:
+       # Clan column is per-instance: Makefile passes SHOW_CLAN=on for instance b, off for a.
+       args:
+         VITE_SHOW_CLAN: ${SHOW_CLAN:-off}
++        # FOMO feature is per-instance: Makefile passes SHOW_FOMO=on for instance b only;
++        # instance a and local dev leave it unset (empty → flag off → code paths absent).
++        VITE_SHOW_FOMO: ${SHOW_FOMO:-}
+         VITE_TITLE: ${TITLE:-signal_scan}
+         VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+         VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+
+The entire diff is ONE hunk adding a build arg (VITE_SHOW_FOMO, defaulting to
+empty = OFF) to the existing frontend service. No `fomo:` service block, no new
+top-level service, no port/bind/volume/data-dir change. Instance a leaves
+SHOW_FOMO unset → flag off.
+$ git --no-pager diff main...HEAD -- docker-compose.yml | grep -E '^\+[[:space:]]+[a-zA-Z0-9_-]+:'
++        VITE_SHOW_FOMO: ${SHOW_FOMO:-}
+(only added key-like line is the nested build arg — not a service definition)
+RESULT: PASS
+
+============================================================
+ASSERTION 4b — No new npm runtime dependency
+============================================================
+$ git --no-pager diff main...HEAD -- package.json server/package.json
+(empty — exit 0, zero diff lines: neither package.json nor server/package.json
+was modified at all between main and HEAD, so no new `dependencies` entry exists)
+RESULT: PASS
+
+============================================================
+ASSERTION 5 — No new scoring/tier/gate change in server/src/signals.ts
+============================================================
+$ git --no-pager diff main...HEAD -- server/src/signals.ts
+DIFF_LINES=197 (hunks at @@ -50,6 +50,19 @@ / @@ -61,6 +74,8 @@ / @@ -232,6 +247,137 @@ /
+@@ -419,6 +565,7 @@ / @@ -453,6 +600,9 @@ / @@ -465,6 +615,7 @@)
+
+Removed lines (existing logic deleted/modified): REMOVED_COUNT=0 — the diff is
+PURELY ADDITIVE; no pre-existing line of signals.ts was changed or removed.
+
+Added-code scan for forbidden symbols:
+$ grep -vE '^\+\s*(//|\*|/\*)' <added lines> | grep -inE 'trackedInflow|trackedActivityAt|trackedHolding|score|gate'
+EXIT=1 (zero hits in added CODE lines)
+The only textual mentions of trackedInflow/score in the whole diff are two
+comment lines documenting non-interference:
+  +    // The FOMO watch list rides along but never feeds trackedInflow/ordering —
+  +    // separate list, separate stats, no leakage into the wallet score path.
+
+Added identifier histogram (what the diff actually introduces):
+      6 FomoUserStat      4 fomoUserStats      3 FomoUserStatRow
+      3 fomoUsers         2 fomoUserStatsByCa  2 fomoStatsByCa   (17 × 'fomo' word)
+Exactly the FOMO-only symbol family named in the task (FomoUserStat,
+fomoUserStats, fomoUserStatsByCa) plus their local wiring names.
+
+assembleSignals added lines (the only touches to the assembly path):
+  +  const fomoStatsByCa = fomoUserStatsByCa(now);
+  +    const fomoUsers = fomoStatsByCa.get(`${c.chain}:${c.address}`) ?? [];
+  +      fomoUsers,
+i.e. compute FOMO stats, attach an additive `fomoUsers` field (defaults to []
+when no FOMO rows exist — always empty on instance a, which has no FOMO data
+source). No trackedInflow / trackedActivityAt / trackedHolding / score / tier /
+gate expression was added, removed, or reordered.
+RESULT: PASS
+
+============================================================
+ASSERTION 6 — FOMO API key not in the repo
+============================================================
+$ git grep -n 'fapi_' -- .
+(empty — GIT_GREP_EXIT=1, no match in any tracked file in the working tree)
+RESULT: PASS
+
+MUST-ROTATE: the Binance futures API key that was previously exposed during
+development of this feature (the exposed key — value deliberately NOT recorded
+here or anywhere in this file) is no longer present in the repo, but exposure
+history means it MUST be treated as compromised and ROTATED in the Binance
+dashboard before/at deployment. Rotation is a required follow-up action item
+for the operator; this audit only certifies the key is absent from HEAD.
+
+============================================================
+SCOPE SUMMARY (plan .omo/plans/fomo-user-watch.md check F4, MUST-NOT block)
+============================================================
+- instance a keeps port/bind/data dir/scoring: PASS (compose diff adds only an
+  empty-default build arg; signals.ts purely additive with zero scoring touches)
+- /api/signals may only gain an additive always-empty fomoUsers field: PASS
+  (only added field is fomoUsers, defaults []; empty on instance a which has no
+  FOMO data feed; OFF build proves the UI column is fully stripped)
+- FOMO_EXTRA = SHOW_FOMO ? 1 : 0 gates one column: verified empirically via the
+  two builds (OFF: 0 'FOMO by' / 0 'Sell PnL'; ON: 2 / 2)
+- No concurrent builds (ran OFF to completion, then ON); no npm test / tsx --test
+  was run; no tracked source edited; nothing committed or pushed. Working-tree
+  modifications under .omo/ predate this audit (drafts/run-continuation files).
+
+Failing assertions: (none)
+
+F4 VERDICT: PASS

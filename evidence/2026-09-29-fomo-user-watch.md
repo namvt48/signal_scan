@@ -104,8 +104,8 @@ Every artifact below is checked to exist on disk by
 
 | Artifact | What it proves |
 |---|---|
-| `.omo/evidence/fomo-user-watch/task-12-ca-enqueue.txt` | `cd server && npx tsx --test test/fomo-watch-trade.test.ts` - 13/13 pass, incl. "a BUY enqueues the CA into tracked_cas exactly once" (note `fomo`, `entry_usd` from `usdValue`) and "a repeat BUY (same eventId) adds no second tracked_cas row". |
-| `.omo/evidence/fomo-user-watch/task-12-ca-enqueue-negative.txt` | Failure proof: "a SELL of an untracked CA adds no tracked_cas row" passes (`findTrackedCa` is `undefined`). |
+| `.omo/evidence/fomo-user-watch/task-12-ca-enqueue.txt` | `cd server && npx tsx --test test/fomo-watch-trade.test.ts` - 14/14 pass, incl. "a BUY enqueues the CA into tracked_cas exactly once" (note `fomo`, `entry_usd` from `usdValue`), "a repeat BUY (same eventId) adds no second tracked_cas row" and "a replayed BUY whose CA was removed does not re-enqueue". |
+| `.omo/evidence/fomo-user-watch/task-12-ca-enqueue-negative.txt` | Failure proof: "a SELL of an untracked CA adds no tracked_cas row" passes (`findTrackedCa` is `undefined`), plus the repeat-BUY and replayed-BUY no-op cases. |
 
 ## Task 13 - separate `sellPnlUsd` figure (amendment 2026-09-29)
 
@@ -113,7 +113,7 @@ Every artifact below is checked to exist on disk by
 |---|---|
 | `.omo/evidence/fomo-user-watch/task-13-sell-pnl.txt` | `cd server && npx tsx --test test/fomo-signals.test.ts` - 7/7 pass, incl. `sellPnlUsd===120` alongside `buyUsd===500` (never 620) and the `Object.keys` order lock `buyUsd, sellPnlUsd, buys, ...`. |
 | `.omo/evidence/fomo-user-watch/task-13-sell-pnl-negative.txt` | Failure proof: a NEGATIVE sell (`usd_value -200`) lands in `sellPnlUsd` as `-200` and leaves `buyUsd` at `400`; `fomoUserStatsByCa` matches the per-CA result. |
-| Root-level gates (in the two files above' run session): `npx tsc --noEmit` clean both sides; `npm run build` (root) with `VITE_SHOW_FOMO=off` = 0 `FOMO by` / 0 `Sell PnL`; with `=on` = 2 / 2; `server npm test` 437/437 pass. |
+| Root- and server-level gates, raw: `.omo/evidence/fomo-user-watch/task-13-gates.txt` — `cd server && npx tsc --noEmit` EXIT=0; `cd server && npm test` **438/438 pass**; root `npx tsc --noEmit` EXIT=0; `VITE_SHOW_FOMO=off npm run build` EXIT=0 with `FOMO by`=0 / `Sell PnL`=0 / `fomoUsers`=1 (the permitted additive seed); `VITE_SHOW_FOMO=on npm run build` EXIT=0 with `FOMO by`=2 / `Sell PnL`=2. (Root-side gates independently corroborated by the sibling F4 audit in `f4-scope-fidelity.txt`.) |
 
 ---
 

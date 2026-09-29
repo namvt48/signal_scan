@@ -771,8 +771,9 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       ts: parsed.ts,
     });
     // A watched user's BUY pulls the CA into the tracked queue (user 2026-09-29):
-    // only when it is genuinely new, so a repeat alert never re-kicks the poller.
-    if (parsed.type === 'buy' && !findTrackedCa(parsed.ca, parsed.chain)) {
+    // only for a genuinely NEW trade row and only when the CA is not already
+    // tracked, so a replayed alert is a strict no-op (no re-enqueue, no re-kick).
+    if (created && parsed.type === 'buy' && !findTrackedCa(parsed.ca, parsed.chain)) {
       const row = insertTrackedCa({ address: parsed.ca, chain: parsed.chain, note: 'fomo', entryUsd: parsed.usdValue ?? undefined });
       kickCAs([{ address: row.address, chain: row.chain }]);
     }

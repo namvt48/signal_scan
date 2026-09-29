@@ -338,11 +338,12 @@ runbook above already reflects them.
 `POST /api/fomo-watch/trades`, when the alert is a `type='buy'` and
 `findTrackedCa(ca, chain)` is falsy, the route calls
 `insertTrackedCa({ address, chain, note:'fomo', entryUsd })` then `kickCAs([...])`, so
-the normal poller starts tracking the token like any other tracked CA. It is guarded by
-`findTrackedCa`, so a repeat alert never re-kicks. This is **tracked-CA state, not
-wallet state**: `wallet_trades`, `insertTrades` and `kickWalletRow` remain untouched by
-the FOMO path. Only `buy` enqueues - a `sell` of an untracked CA adds nothing. There is
-no entry-size gate (per the user's request).
+the normal poller starts tracking the token like any other tracked CA. It fires only
+for a genuinely new trade row and only when the CA is not already tracked, so a
+replayed alert is a strict no-op (no re-enqueue, no re-kick). This is **tracked-CA
+state, not wallet state**: `wallet_trades`, `insertTrades` and `kickWalletRow` remain
+untouched by the FOMO path. Only `buy` enqueues - a `sell` of an untracked CA adds
+nothing. There is no entry-size gate (per the user's request).
 
 **`Sell PnL` - a separate realised-PnL figure.** Each FOMO user row now reports
 `sellPnlUsd` (SUM of SELL `usd_value`, may be negative) in addition to `buyUsd`; the
