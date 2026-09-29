@@ -24,17 +24,26 @@ export interface SetupCacheEntry {
   taken_at: number;
   /** Rung the series was fetched at (e.g. 'week') — the nansen_series replay key. */
   window: string;
-  /** Epoch ms of the requested window start (seriesFromMs, deploy-clamped). */
-  series_from: number;
-  /** Raw seriesAtRung points (hourly-stats, top_100_holders). */
+  /** Epoch ms of the requested window start (seriesFromMs, deploy-clamped).
+   * Optional: a marker-only entry (payload arrays empty) carries no window start. */
+  series_from?: number;
+  /** Raw seriesAtRung points (hourly-stats, top_100_holders). MAY be []. */
   series: SeriesPoint[];
-  /** Raw label='exchange' points (the exchangeLf request). */
+  /** Raw label='exchange' points (the exchangeLf request). MAY be []. */
   exchange: SeriesPoint[];
-  /** Derived token_state columns — written straight through on rehydrate (T3). */
-  t100_pct: number;
-  t100_multiple: number;
-  anchor_at: number;
-  genesis_bal: number;
+  /** Derived token_state columns — written straight through on rehydrate (T3).
+   * Optional: absent on a marker-only entry whose payload came back empty. */
+  t100_pct?: number;
+  t100_multiple?: number;
+  anchor_at?: number;
+  genesis_bal?: number;
+  /** Epoch ms we OBTAINED the gini/fresh% field — its own 6h TTL (isInfoFresh).
+   * Optional: absent at runtime means "never obtained" (stale); a legacy entry
+   * gets it backfilled from `taken_at` once, at load time (parseEntry). */
+  info_at?: number;
+  /** Epoch ms we OBTAINED the T100 series field — its own 12h TTL (isSeriesFresh).
+   * Optional: same load-time legacy backfill as info_at. */
+  series_at?: number;
 }
 
 const FILE_VERSION = 1;
@@ -100,33 +109,46 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
   if (!isRecord(v)) return undefined;
   const ca = v['ca'];
   const chain = v['chain'];
-  const window = v['window'];
+  const takenAt = v['taken_at'];
   if (typeof ca !== 'string' || ca === '') return undefined;
   if (!isChain(chain)) return undefined;
+  if (!isNum(takenAt)) return undefined;
+  const window = v['window'] === undefined ? '' : v['window'];
   if (typeof window !== 'string') return undefined;
-  const takenAt = v['taken_at'];
   const seriesFrom = v['series_from'];
   const t100Pct = v['t100_pct'];
   const t100Multiple = v['t100_multiple'];
   const anchorAt = v['anchor_at'];
   const genesisBal = v['genesis_bal'];
-  if (!isNum(takenAt) || !isNum(seriesFrom)) return undefined;
-  if (!isNum(t100Pct) || !isNum(t100Multiple) || !isNum(anchorAt) || !isNum(genesisBal)) return undefined;
-  const series = parsePoints(v['series']);
-  const exchange = parsePoints(v['exchange']);
+  const infoAt = v['info_at'];
+  const seriesAt = v['series_at'];
+  // Optional numerics: absent is fine (a marker-only entry carries no payload), but a
+  // PRESENT value must be finite — an entry with a NaN/Infinity field is dropped whole,
+  // never round-tripped (the original C3 intent).
+  for (const n of [seriesFrom, t100Pct, t100Multiple, anchorAt, genesisBal, infoAt, seriesAt]) {
+    if (n !== undefined && !isNum(n)) return undefined;
+  }
+  const series = v['series'] === undefined ? [] : parsePoints(v['series']);
+  const exchange = v['exchange'] === undefined ? [] : parsePoints(v['exchange']);
   if (!series || !exchange) return undefined;
   return {
     ca,
     chain,
     taken_at: takenAt,
     window,
-    series_from: seriesFrom,
+    series_from: isNum(seriesFrom) ? seriesFrom : undefined,
     series,
     exchange,
-    t100_pct: t100Pct,
-    t100_multiple: t100Multiple,
-    anchor_at: anchorAt,
-    genesis_bal: genesisBal,
+    t100_pct: isNum(t100Pct) ? t100Pct : undefined,
+    t100_multiple: isNum(t100Multiple) ? t100Multiple : undefined,
+    anchor_at: isNum(anchorAt) ? anchorAt : undefined,
+    genesis_bal: isNum(genesisBal) ? genesisBal : undefined,
+    // Marker = "we obtained this field at T". Entries written before Fix D carry no
+    // stamp, so backfill once at LOAD from taken_at — deploying this change then does
+    // not trigger a one-time re-crawl of the whole queue. Runtime absence stays
+    // authoritative (isInfoFresh/isSeriesFresh): no read-time taken_at fallback.
+    info_at: isNum(infoAt) ? infoAt : takenAt,
+    series_at: isNum(seriesAt) ? seriesAt : takenAt,
   };
 }
 
@@ -167,6 +189,12 @@ export function getSetupCacheEntry(ca: string, chain: Chain): SetupCacheEntry | 
   return entries.get(cacheKey(ca, chain));
 }
 
+/** Number of entries currently in the cache — hydrates from disk first (ensureLoaded). */
+export function setupCacheSize(): number {
+  ensureLoaded();
+  return entries.size;
+}
+
 /**
  * Upsert one record and persist the whole file atomically (tmp + rename, parent
  * dir created). A persist failure warns and keeps the in-memory entry (a cache
@@ -177,7 +205,7 @@ export function getSetupCacheEntry(ca: string, chain: Chain): SetupCacheEntry | 
 export function putSetupCacheEntry(entry: SetupCacheEntry): void {
   if (!isStorable(entry)) {
     log.warn(
-      `[setup-cache] skipped cache write for ${entry.chain}:${entry.ca.slice(0, 8) || '<empty>'} — incomplete pass (need finite derived fields + non-empty series/exchange)`,
+      `[setup-cache] skipped cache write for ${entry.chain}:${entry.ca.slice(0, 8) || '<empty>'} — unusable entry (need a non-empty ca, a known chain, a finite taken_at and no non-finite field)`,
     );
     return;
   }
@@ -189,6 +217,29 @@ export function putSetupCacheEntry(entry: SetupCacheEntry): void {
 /** Valid inside ONE setup cadence: `now - taken_at < POLL_SETUP_MS` — exactly POLL_SETUP_MS ⇒ stale (plan §4). */
 export function isSetupCacheFresh(entry: SetupCacheEntry, now: number): boolean {
   return now - entry.taken_at < config.pollSetupMs;
+}
+
+/** gini/fresh% freshness: the marker means "we OBTAINED this field at info_at".
+ * No marker ⇒ never obtained ⇒ stale — a series-only pass can never park a CA on
+ * the gini clock. (Legacy entries are backfilled once at LOAD — see parseEntry.) */
+export function isInfoFresh(e: SetupCacheEntry, now: number): boolean {
+  return e.info_at !== undefined && now - e.info_at < config.pollSetupMs;
+}
+
+/** T100-series freshness: marker = "we OBTAINED the series at series_at"; absent ⇒
+ * never obtained ⇒ stale (a legacy entry is backfilled once at LOAD, parseEntry). */
+export function isSeriesFresh(e: SetupCacheEntry, now: number): boolean {
+  return e.series_at !== undefined && now - e.series_at < config.pollFlowsMs;
+}
+
+/** Stamp one field's fetch clock on an existing entry and persist. No-op when the
+ * entry is absent (a gini success before the first series pass has nowhere to write). */
+export function stampSetupCacheField(ca: string, chain: Chain, field: 'info_at' | 'series_at', now: number): void {
+  ensureLoaded();
+  const entry = entries.get(cacheKey(ca, chain));
+  if (!entry) return;
+  entry[field] = now;
+  persist();
 }
 
 /**
@@ -221,21 +272,22 @@ function ensureLoaded(): void {
 }
 
 /** C3 guard: an entry parseEntry would silently DROP on the next load must never
- * reach the file — every numeric field finite (a NaN/±Infinity derived value
- * vanishes at reload) and both point arrays non-empty (plan setup-fill-on-add T3). */
+ * reach the file. Identity + a finite `taken_at` are all it takes: the ENTRY is
+ * where the per-field markers (info_at/series_at) live, so requiring a marker to
+ * create it was circular — stampSetupCacheField is a no-op with no entry, so a CA
+ * whose credit series came back empty could never be cached at all and was
+ * re-asked on every pass forever (user 2026-09-29: "từ giờ không CA nào lỗi").
+ * A PRESENT numeric field must still be finite (a NaN/±Infinity vanishes at reload). */
 function isStorable(e: SetupCacheEntry): boolean {
-  return (
-    e.ca !== '' &&
-    isChain(e.chain) &&
-    isNum(e.taken_at) &&
-    isNum(e.series_from) &&
-    isNum(e.t100_pct) &&
-    isNum(e.t100_multiple) &&
-    isNum(e.anchor_at) &&
-    isNum(e.genesis_bal) &&
-    e.series.length > 0 &&
-    e.exchange.length > 0
-  );
+  const numericsOk =
+    (e.series_from === undefined || isNum(e.series_from)) &&
+    (e.t100_pct === undefined || isNum(e.t100_pct)) &&
+    (e.t100_multiple === undefined || isNum(e.t100_multiple)) &&
+    (e.anchor_at === undefined || isNum(e.anchor_at)) &&
+    (e.genesis_bal === undefined || isNum(e.genesis_bal)) &&
+    (e.info_at === undefined || isNum(e.info_at)) &&
+    (e.series_at === undefined || isNum(e.series_at));
+  return e.ca !== '' && isChain(e.chain) && isNum(e.taken_at) && numericsOk;
 }
 
 function persist(): void {

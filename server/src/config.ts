@@ -79,6 +79,9 @@ export const config = {
   newTokenMinAgeMs: posNum('NEW_TOKEN_MIN_AGE_MS', 4 * 3_600_000),
   /** Flat retry spacing for a too-new token (see newTokenMinAgeMs). */
   newTokenRetryMs: posNum('NEW_TOKEN_RETRY_MS', 3_600_000),
+  /** Max CAs one setupSweep may query — each CA costs ≥1 credit, so a cold cache
+   * must trickle (capped per pass) rather than burst a full backfill. */
+  setupPassCap: posNum('SETUP_PASS_CAP', 40),
   /** A CA added inside this window jumps the queue on every free sweep, so a
    * fresh add is not stuck behind a long paced list (user 2026-09-22). */
   newCaPriorityMs: num('NEW_CA_PRIORITY_MS', 3_600_000),
@@ -101,10 +104,14 @@ export const config = {
    * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
   /** Official tgm/flows (credit-only) refresh — T100 multiple, LF, the bal_* chart
-   * windows. 6h (was 15 min): each call costs 1 credit and the series on a token
-   * older than 7 days is DAILY data, so a faster re-fetch only re-reads the same
-   * buckets. Deliberately separate from the gini cadence. */
-  pollFlowsMs: posNum('POLL_FLOWS_MS', 21_600_000),
+   * windows. Now ALSO the T100-series cache TTL (isSeriesFresh) AND the flowsSweep
+   * walk pace, so one knob means "series TTL = walk pace". 12h (owner 2026-09-29;
+   * was 24h / 6h / 15 min before): each call costs 1 credit, and only ~124 of 469
+   * tracked CAs hold a cache entry, so this knob sets the per-CA series spend
+   * directly (124 CAs ⇒ ~248 credits/day). A CA inside the TTL costs 0 — the setup
+   * sweep's 6h visit is what actually spends once the marker expires.
+   * Deliberately separate from the gini cadence (POLL_SETUP_MS, 6h, browser door — 0 credits). */
+  pollFlowsMs: posNum('POLL_FLOWS_MS', 43_200_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */
   nansenRetries: num('NANSEN_RETRIES', 6),

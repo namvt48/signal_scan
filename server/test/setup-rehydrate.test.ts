@@ -124,6 +124,8 @@ function sampleEntry(now: number, deployedAt: number): SetupCacheEntry {
     t100_multiple: 1.5,
     anchor_at: deployedAt,
     genesis_bal: 120,
+    info_at: now - 60_000,
+    series_at: now - 60_000,
   };
 }
 
@@ -215,14 +217,18 @@ test('rehydrate waits: a fresh entry with NO token_state row applies nothing and
   assert.equal(getTokenState(CA, CHAIN)?.t100_multiple, 1.5, 'the still-fresh entry applies on the later pass');
 });
 
-test('stale entry: age >= POLL_SETUP_MS refetches through the door and refreshes the file', async () => {
+test('stale entry: age >= POLL_FLOWS_MS refetches the series and refreshes the file', async () => {
   const file = tempCacheFile();
   open(':memory:');
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
   seedTokenRow(deployedAt);
   loadSetupCache(file);
-  putSetupCacheEntry({ ...sampleEntry(now, deployedAt), taken_at: now - config.pollSetupMs - 1_000 });
+  putSetupCacheEntry({
+    ...sampleEntry(now, deployedAt),
+    taken_at: now - config.pollFlowsMs - 1_000,
+    series_at: now - config.pollFlowsMs - 1_000,
+  });
   await installFakeDoor();
   installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now));
 

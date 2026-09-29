@@ -336,6 +336,18 @@ export function fiboDelayMs(n: number, baseMs: number): number {
   return a * baseMs;
 }
 
+/** Cumulative Nansen credit spend this process — incremented per SUCCESSFUL credit
+ * call by the `x-nansen-credits-cost` header. Lets a sweep log its own spend. */
+let creditSpend = 0;
+
+export function creditsSpent(): number {
+  return creditSpend;
+}
+
+export function resetCreditsSpent(): void {
+  creditSpend = 0;
+}
+
 export class NansenApiClient implements TokenFlowsClient {
   readonly name = 'nansen-api';
 
@@ -364,12 +376,24 @@ export class NansenApiClient implements TokenFlowsClient {
       body: JSON.stringify(body),
     });
     const json = (await res.json().catch(() => null)) as T | { error?: string; message?: string } | null;
-    const credits = res.headers.get('x-nansen-credits-remaining');
-    if (credits) log.debug('[nansen-api] credits remaining', { path, credits });
+    const costHeader = res.headers.get('x-nansen-credits-cost');
+    const remainingHeader = res.headers.get('x-nansen-credits-remaining');
+    const cost = costHeader === null ? undefined : Number(costHeader);
+    const remaining = remainingHeader === null ? undefined : Number(remainingHeader);
+    if (costHeader !== null) {
+      log.info('[nansen-credit]', {
+        path,
+        ...(cost !== undefined && Number.isFinite(cost) ? { cost } : {}),
+        ...(remaining !== undefined && Number.isFinite(remaining) ? { remaining } : {}),
+      });
+    } else if (remainingHeader !== null) {
+      log.debug('[nansen-api] credits remaining', { path, credits: remainingHeader });
+    }
     if (!res.ok || !json || 'error' in (json as object)) {
       const err = json as { error?: string; message?: string } | null;
       throw new HttpError(res.status, null, `nansen ${path} ${res.status}: ${err?.error ?? ''} ${err?.message ?? ''}`.slice(0, 200));
     }
+    if (cost !== undefined && Number.isFinite(cost)) creditSpend += cost;
     return json as T;
   }
 

@@ -132,6 +132,8 @@ body {
 .tier-select[data-tier="S+"], .tier-select[data-tier="S"]{ background-color:rgba(215,250,75,0.16); color:#6B7A1B; border-color:rgba(107,122,27,0.6); }
 .tier-select[data-tier="A+"], .tier-select[data-tier="A"]{ background-color:var(--c-good-ink); color:var(--c-pos); border-color:rgba(62,125,82,0.55); }
 .tier-select[data-tier="B+"], .tier-select[data-tier="B"]{ background-color:#EEF2EC; color:var(--c-ink2); border-color:rgba(63,74,66,0.45); }
+/* P — dashboard-only tier, visually distinct from the B slate. */
+.tier-select[data-tier="P"]{ background-color:#E7EBF3; color:#3B4A66; border-color:rgba(59,74,102,0.45); }
 .stat-row{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:30px; }
 .stat-tile{ background:var(--c-surface); border-radius:20px; padding:18px 20px; box-shadow:0 1px 2px rgba(15,20,17,0.08), 0 6px 16px -10px rgba(15,20,17,0.20); }
 .stat-tile.hi{ background:var(--c-dark); box-shadow:0 10px 24px -12px rgba(15,20,17,0.55); }

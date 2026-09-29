@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS nansen_series (
 -- factor thresholds (freshMinPct/t100MinPct/lfMaxPct) that gate the X/3 score.
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
--- Per-CA user tier (S+/S/A+/A/B+/B). Absent row = unrated. Keyed like tracked_cas.
+-- Per-CA user tier (S+/S/A+/A/B+/B/P). Absent row = unrated. Keyed like tracked_cas.
 CREATE TABLE IF NOT EXISTS token_tiers (
   ca TEXT NOT NULL,
   chain TEXT NOT NULL,

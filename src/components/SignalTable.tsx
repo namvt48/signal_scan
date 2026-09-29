@@ -3,7 +3,7 @@ import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
 import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN, SHOW_FOMO } from '../config';
-import { TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
+import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
 import { CheckSquare, Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { useAuth } from '../auth/use-auth';
@@ -220,7 +220,7 @@ function Hero({ count }: { count: number }) {
 }
 
 /* Rated tab: tier rank order (S+ → B) — the Rated table always sorts by this, never by column. */
-const TIER_RANK: Record<Tier, number> = { 'S+': 0, S: 1, 'A+': 2, A: 3, 'B+': 4, B: 5 };
+const TIER_RANK: Record<Tier, number> = { 'S+': 0, S: 1, 'A+': 2, A: 3, 'B+': 4, B: 5, P: 6 };
 
 /** Count of tokens in a tier group ('s' = S+/S, 'a' = A+/A, 'b' = B+/B). */
 const tieredCount = (list: TokenSignal[], g: 's' | 'a' | 'b') =>
@@ -486,7 +486,7 @@ export default function SignalTable({
   const [holdingOnly, setHoldingOnly] = useState(false);
   const [mcMin, setMcMin] = useState('');
   const [mcMax, setMcMax] = useState('');
-  const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(TIERS));
+  const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(RATED_TIERS));
 
   useEffect(() => {
     let alive = true;
@@ -554,7 +554,8 @@ export default function SignalTable({
   const extraActive = holdingOnly || mcMin.trim() !== '' || mcMax.trim() !== '';
   const filtered = base.filter((s) => nansenPass(s) && holdingPass(s) && mcPass(s));
 
-  const ratedAll = signals.filter((s): s is TokenSignal & { tier: Tier } => s.tier !== null);
+  // P is dashboard-only — it never enters the Rated tab (user 2026-09-29).
+  const ratedAll = signals.filter((s): s is TokenSignal & { tier: Tier } => s.tier !== null && s.tier !== 'P');
   // Rated is ALWAYS tier-ordered (S+ → B) — the column sort state does not apply.
   const ratedVisible = ratedAll
     .filter((s) => rankFilter.has(s.tier))
@@ -666,7 +667,7 @@ export default function SignalTable({
         <h2>{mode === 'rated' ? 'Rated watchlist' : 'Token watchlist'}</h2>
         <span className="meta">
           {mode === 'rated'
-            ? rankFilter.size < TIERS.length
+            ? rankFilter.size < RATED_TIERS.length
               ? `Showing ${visible.length}/${ratedAll.length} rated tokens (filtered by rank)`
               : `${ratedAll.length}/${signals.length} tokens tiered`
             : sort
@@ -678,10 +679,10 @@ export default function SignalTable({
       {mode === 'rated' ? (
         <div className="filter-row">
           <span className="filter-label">Filter by rank</span>
-          <Chip variant="all" on={rankFilter.size === TIERS.length} onClick={() => setRankFilter(new Set(TIERS))}>
+          <Chip variant="all" on={rankFilter.size === RATED_TIERS.length} onClick={() => setRankFilter(new Set(RATED_TIERS))}>
             All
           </Chip>
-          {TIERS.map((t) => (
+          {RATED_TIERS.map((t) => (
             <Chip key={t} variant="tier" tier={t} on={rankFilter.has(t)} onClick={() => toggleRank(t)}>
               {t}
             </Chip>

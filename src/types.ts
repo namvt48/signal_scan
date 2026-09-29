@@ -1,8 +1,10 @@
 export const CHAINS = ['sol', 'base', 'bsc'] as const;
 export type Chain = (typeof CHAINS)[number];
 
-export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B'] as const;
+export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B', 'P'] as const;
 export type Tier = (typeof TIERS)[number];
+/** Tiers shown on the Rated tab — P is dashboard-only, never enters Rated (user 2026-09-29). */
+export const RATED_TIERS = TIERS.filter((t) => t !== 'P');
 
 export interface Wallet {
   id: string;

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { extremesFromStats, fiboDelayMs, holdersGiniBody, hourlyStatsBody, NansenWebCrawler, parseGiniStats, type HourlyStatsRow, type PostJson } from '../src/providers/nansen.js';
+import { creditsSpent, resetCreditsSpent } from '../src/providers/nansen.js';
 
 test('fiboDelayMs: 1,1,2,3,5,8,13 × base (the credit-door retry spacing)', () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((n) => fiboDelayMs(n, 1_000)), [1_000, 1_000, 2_000, 3_000, 5_000, 8_000, 13_000]);
@@ -376,6 +377,28 @@ test('metric(essential): both doors empty still throws, so the sweep logs the CA
     await assert.rejects(provider.metric('caX', 'sol', 'essential'), /403/);
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('creditsSpent: x-nansen-credits-cost bumps the counter; a header-less response leaves it unchanged', async () => {
+  const origFetch = globalThis.fetch;
+  try {
+    resetCreditsSpent();
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: [{ token_amount: 1, price_usd: 1, value_usd: 1 }] }), {
+        status: 200,
+        headers: { 'x-nansen-credits-cost': '1', 'x-nansen-credits-remaining': '999' },
+      })) as typeof fetch;
+    await new NansenApiClient('key').currentBalance('W', 'sol', 'caX');
+    assert.equal(creditsSpent(), 1, 'a cost header of 1 must bump the spend counter by 1');
+
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: [{ token_amount: 1, price_usd: 1, value_usd: 1 }] }), { status: 200 })) as typeof fetch;
+    await new NansenApiClient('key').currentBalance('W', 'sol', 'caX');
+    assert.equal(creditsSpent(), 1, 'no cost header → the spend counter is unchanged');
+  } finally {
+    globalThis.fetch = origFetch;
+    resetCreditsSpent();
   }
 });
 

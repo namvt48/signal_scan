@@ -48,7 +48,7 @@ test('C1: put with NO prior load lazily loads — 3 on-disk entries + 1 put = 4,
   );
 
   // When the FIRST persist of the process happens without any load
-  putSetupCacheEntry(sampleEntry('d', 4));
+  putSetupCacheEntry({ ...sampleEntry('d', 4), info_at: 4, series_at: 4 });
 
   // Then all 4 entries are on disk — the pre-existing file was not overwritten
   const raw = JSON.parse(readFileSync(defaultFile, 'utf8')) as { entries: { ca: string }[] };
@@ -62,8 +62,8 @@ test('C2: prune against an EMPTY tracked set is a no-op — a DB reset cannot wi
   const file = join(dir, 'prune-empty.json');
   loadSetupCache(file);
   const now = Date.now();
-  putSetupCacheEntry(sampleEntry('keep1', now));
-  putSetupCacheEntry(sampleEntry('keep2', now - 60_000));
+  putSetupCacheEntry({ ...sampleEntry('keep1', now), info_at: now, series_at: now });
+  putSetupCacheEntry({ ...sampleEntry('keep2', now - 60_000), info_at: now - 60_000, series_at: now - 60_000 });
   const before = readFileSync(file, 'utf8');
 
   // When pruning against the empty set (exactly what a just-reset DB produces)
@@ -76,31 +76,40 @@ test('C2: prune against an EMPTY tracked set is a no-op — a DB reset cannot wi
   assert.equal(readFileSync(file, 'utf8'), before);
 });
 
-test('C3: unparseable entries are never stored — non-finite derived fields or empty point arrays are refused', () => {
+test('C3: entries parseEntry would drop are never stored — non-finite fields or empty ca', () => {
   // Given a loaded cache with one good entry
   const file = join(dir, 'refuse.json');
   loadSetupCache(file);
   const now = Date.now();
-  putSetupCacheEntry(sampleEntry('good', now));
+  // A marker is NOT required: the entry is where the markers live, and a CA whose
+  // first fetch came back empty must still be cacheable (else it can never park).
+  const marked = (ca: string, over: Partial<SetupCacheEntry> = {}): SetupCacheEntry => ({
+    ...sampleEntry(ca, now, over),
+    info_at: now,
+    series_at: now,
+  });
+  putSetupCacheEntry(marked('good'));
 
   // When persisting entries parseEntry would silently DROP on the next reload
-  putSetupCacheEntry(sampleEntry('nanPct', now, { t100_pct: Number.NaN }));
-  putSetupCacheEntry(sampleEntry('infMult', now, { t100_multiple: Number.POSITIVE_INFINITY }));
-  putSetupCacheEntry(sampleEntry('nanAnchor', now, { anchor_at: Number.NaN }));
-  putSetupCacheEntry(sampleEntry('nanGenesis', now, { genesis_bal: Number.NaN }));
-  putSetupCacheEntry(sampleEntry('nanTaken', now, { taken_at: Number.NaN }));
-  putSetupCacheEntry(sampleEntry('nanFrom', now, { series_from: Number.NaN }));
-  putSetupCacheEntry(sampleEntry('emptySeries', now, { series: [] }));
-  putSetupCacheEntry(sampleEntry('emptyExchange', now, { exchange: [] }));
-  putSetupCacheEntry(sampleEntry('', now, { ca: '' }));
+  putSetupCacheEntry(marked('nanPct', { t100_pct: Number.NaN }));
+  putSetupCacheEntry(marked('infMult', { t100_multiple: Number.POSITIVE_INFINITY }));
+  putSetupCacheEntry(marked('nanAnchor', { anchor_at: Number.NaN }));
+  putSetupCacheEntry(marked('nanGenesis', { genesis_bal: Number.NaN }));
+  putSetupCacheEntry(marked('nanTaken', { taken_at: Number.NaN }));
+  putSetupCacheEntry(marked('nanFrom', { series_from: Number.NaN }));
+  putSetupCacheEntry(marked('', { ca: '' }));
+  // ...while a markerless, payload-less entry IS storable (2026-09-29 root fix: every
+  // tracked CA must be able to persist its clock).
+  putSetupCacheEntry(sampleEntry('noMarker', now, { series: [], exchange: [] }));
 
-  // Then the in-memory map holds ONLY the good entry...
+  // Then the in-memory map holds the good entry and the markerless one...
   assert.equal(getSetupCacheEntry('good', 'sol')?.taken_at, now);
-  for (const ca of ['nanPct', 'infMult', 'nanAnchor', 'nanGenesis', 'nanTaken', 'nanFrom', 'emptySeries', 'emptyExchange', '']) {
+  for (const ca of ['nanPct', 'infMult', 'nanAnchor', 'nanGenesis', 'nanTaken', 'nanFrom', '']) {
     assert.equal(getSetupCacheEntry(ca, 'sol'), undefined, `${ca || '<empty>'} must be refused`);
   }
   // ...and the file agrees after a reload — nothing storable was lost, nothing droppable was kept
   const map = loadSetupCache(file);
-  assert.equal(map.size, 1);
+  assert.equal(map.size, 2);
   assert.equal(map.get('sol:good')?.t100_multiple, 1.42);
+  assert.notEqual(map.get('sol:noMarker'), undefined, 'the markerless entry survives the reload');
 });

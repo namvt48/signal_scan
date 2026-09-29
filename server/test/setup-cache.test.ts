@@ -35,6 +35,10 @@ function sampleEntry(ca: string, takenAt: number): SetupCacheEntry {
     t100_multiple: 1.42,
     anchor_at: takenAt - 7 * 86_400_000,
     genesis_bal: 128_890_000,
+    // New storable invariant: at least one marker must be set. A payload-bearing
+    // entry carries the series marker; taken_at is not a marker on its own.
+    info_at: takenAt,
+    series_at: takenAt,
   };
 }
 
@@ -57,7 +61,10 @@ test('round-trip: put → version-1 envelope on disk → load preserves every fi
   assert.equal(map.size, 1);
   assert.equal(cacheKey('caRT', 'sol'), 'sol:caRT'); // key format pinned for T3
   assert.ok(map.has('sol:caRT'));
-  assert.deepEqual(getSetupCacheEntry('caRT', 'sol'), e);
+  // sampleEntry already carries the Fix D markers; parseEntry keeps them verbatim
+  // (the legacy taken_at backfill for markerless entries is covered in
+  // setup-field-ttl.test.ts).
+  assert.deepEqual(getSetupCacheEntry('caRT', 'sol'), { ...e, info_at: e.taken_at, series_at: e.taken_at });
 });
 
 test('put upserts: second put for the same (ca, chain) replaces the record', () => {
@@ -125,7 +132,7 @@ test('corrupt / empty / wrong-envelope file: load → empty map, never throws', 
 });
 
 test('malformed entries are skipped; the valid sibling survives', () => {
-  // Given one good record, one missing a derived field, one with an unknown chain
+  // Given one good record, one with a non-finite derived field, one with an unknown chain
   const file = tmpFile();
   const good = sampleEntry('good', Date.now());
   const badDerived: Record<string, unknown> = { ...sampleEntry('badDerived', Date.now()), genesis_bal: null };
@@ -137,7 +144,8 @@ test('malformed entries are skipped; the valid sibling survives', () => {
 
   // Then only the well-formed entry is in the map
   assert.equal(map.size, 1);
-  assert.deepEqual(getSetupCacheEntry('good', 'sol'), good);
+  // A present non-finite field drops the whole entry; a valid entry keeps its markers.
+  assert.deepEqual(getSetupCacheEntry('good', 'sol'), { ...good, info_at: good.taken_at, series_at: good.taken_at });
   assert.equal(getSetupCacheEntry('badDerived', 'sol'), undefined);
   assert.equal(getSetupCacheEntry('badChain', 'sol'), undefined); // rejected at load → no key to find
 });
@@ -202,4 +210,44 @@ test('config: setupCacheFile defaults beside dbPath (prod DB_PATH=/data/… → 
   // The default must land in the SAME directory as the SQLite DB (bind mount ./data:/data),
   // so a DB reset and `make deploy` both leave the cache alive.
   assert.equal(config.setupCacheFile, join(dirname(config.dbPath), 'nansen-cache.json'));
+});
+
+// Decouple the CA crawl marker from the chart payload (2026-09-29): 343 CAs had
+// current numeric Nansen data but no cache entry only because isStorable demanded
+// non-empty series/exchange. A marker-carrying, payload-less entry must persist.
+test('marker-only entry: empty payload + both markers — put accepted, reload keeps them', () => {
+  const file = tmpFile();
+  loadSetupCache(file);
+  const now = Date.now();
+  const markerOnly: SetupCacheEntry = {
+    ca: 'caMarkerOnly',
+    chain: 'sol',
+    taken_at: now,
+    window: '',
+    series_from: undefined,
+    series: [],
+    exchange: [],
+    t100_pct: undefined,
+    t100_multiple: undefined,
+    anchor_at: undefined,
+    genesis_bal: undefined,
+    info_at: now - 1_000,
+    series_at: now - 2_000,
+  };
+
+  putSetupCacheEntry(markerOnly);
+
+  assert.notEqual(getSetupCacheEntry('caMarkerOnly', 'sol'), undefined, 'a marker-carrying payload-less entry is storable');
+  const reloaded = loadSetupCache(file).get('sol:caMarkerOnly');
+  assert.ok(reloaded, 'the marker-only entry survives a reload');
+  assert.equal(reloaded.info_at, now - 1_000, 'info_at marker intact');
+  assert.equal(reloaded.series_at, now - 2_000, 'series_at marker intact');
+  assert.deepEqual(reloaded.series, []);
+  assert.deepEqual(reloaded.exchange, []);
+  assert.equal(reloaded.series_from, undefined, 'an absent numeric stays undefined (never a NaN)');
+
+  // A present non-finite numeric is still refused — the original C3 intent holds.
+  const before = getSetupCacheEntry('caMarkerOnly', 'sol');
+  putSetupCacheEntry({ ...markerOnly, t100_pct: Number.NaN });
+  assert.deepEqual(getSetupCacheEntry('caMarkerOnly', 'sol'), before, 'a NaN field must not round-trip');
 });

@@ -31,15 +31,18 @@ import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
   getSetupCacheEntry,
-  isSetupCacheFresh,
+  isInfoFresh,
+  isSeriesFresh,
   pruneSetupCache,
   putSetupCacheEntry,
+  setupCacheSize,
+  stampSetupCacheField,
   type SetupCacheEntry,
 } from './setup-cache.js';
-import { type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
+import { creditsSpent, type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
 import { exchangeAnchorLf, RUNG_SPAN_DAYS, seriesReachesStart, t100Mdd } from './snapshot.js';
 import { nansenScore } from './signals.js';
-import { getThresholds, type NansenThresholds } from './settings.js';
+import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
 import { fetchIcons } from './providers/dexscreener.js';
 import { log } from './log.js';
@@ -348,13 +351,14 @@ function setupRetryDelayMs(misses: number): number {
   return Math.min(SETUP_RETRY_MAX_MS, Math.max(SETUP_RETRY_MIN_MS, config.pollSetupRetryMs * 2 ** misses));
 }
 
-/** Still owed setup data: no fresh cache entry yet, or one whose row is not complete. */
-function needsSetup(c: CaTarget, now: number, th: NansenThresholds): boolean {
+/** Still owed setup data: no cache entry, or one whose gini/fresh% field is past its
+ * 6h TTL. Gini has its own clock (isInfoFresh); the T100 series has its own 12h clock
+ * (isSeriesFresh) and refreshes independently via flowsSweep. */
+function needsSetup(c: CaTarget, now: number): boolean {
   const miss = setupMisses.get(cacheKey(c.address, c.chain));
   if (miss && now < miss.nextAt) return false;
   const cached = getSetupCacheEntry(c.address, c.chain);
-  if (!cached || !isSetupCacheFresh(cached, now)) return true;
-  return !nansenScore(getTokenState(c.address, c.chain), th).complete;
+  return !cached || !isInfoFresh(cached, now);
 }
 
 /** Too young to retry fast: Nansen indexes a fresh mint only after some hours, so
@@ -383,12 +387,30 @@ function isTooNewToken(address: string, chain: Chain, now: number): boolean {
  */
 export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   const now = Date.now();
-  const th = getThresholds();
-  const cas = newCasFirst(listTrackedCas()).filter((c) => needsSetup(c, now, th));
+  const tracked = listTrackedCas();
+  const all = newCasFirst(tracked).filter((c) => needsSetup(c, now));
+  if (tracked.length > 0 && setupCacheSize() === 0) {
+    log.warn('[poller] setup cache EMPTY with', tracked.length, 'tracked CA(s) — backfill capped per pass');
+  }
+  // A cold cache would otherwise backfill the whole queue in one pass — each CA
+  // costs ≥1 credit, so trickle: the cap bounds the burst, the rest wait the next pass.
+  const cas = all.slice(0, config.setupPassCap);
+  if (all.length > cas.length) {
+    log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
+  }
+  const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollSetupRetryMs, async (c) => {
     const key = cacheKey(c.address, c.chain);
     try {
-      updateTokenMetrics(c.address, c.chain, await provider.metric(c.address, c.chain, 'gini'));
+      const patch = await provider.metric(c.address, c.chain, 'gini');
+      updateTokenMetrics(c.address, c.chain, patch);
+      // Owner rule: the marker means "we OBTAINED the field", not "we called". A
+      // DAS-floor / not-indexed gini pass resolves with NO nansenFreshPct — stamping
+      // it would park the CA on the 6h clock with an empty field. Empty data must NOT
+      // stamp, so the CA keeps its retry ladder.
+      if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
+        stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
+      }
     } catch (e) {
       log.error('[poller] setupSweep gini', c.address, e);
     }
@@ -397,10 +419,10 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
     } catch (e) {
       log.error('[poller] setupSweep series', c.address, e);
     }
-    // A storable pass leaves a fresh cache entry — that is the CA's ticket to the
-    // 12h cadence. Anything else counts as a miss and doubles its next wait.
+    // A storable gini pass stamps info_at — that is the CA's ticket to the 6h
+    // cadence. Anything else counts as a miss and doubles its next wait.
     const entry = getSetupCacheEntry(c.address, c.chain);
-    if (entry && isSetupCacheFresh(entry, now)) setupMisses.delete(key);
+    if (entry && isInfoFresh(entry, now)) setupMisses.delete(key);
     else {
       const misses = (setupMisses.get(key)?.misses ?? 0) + 1;
       // Too-new token: flat hourly spacing — Nansen has not indexed the mint yet,
@@ -410,6 +432,7 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
       setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
     }
   });
+  log.info('[poller] setupSweep credit spend', creditsSpent() - spendBefore);
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
   // File-cache prune (plan setup-fill-on-add §4): drop entries whose CA left the
   // queue or aged past 7 cadences; the empty-set guard inside pruneSetupCache
@@ -554,6 +577,13 @@ function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: Bal
     log.info(`[setup-cache] fresh entry ${e.ca.slice(0, 8)} (${e.chain}) waits — token_state row not created yet`);
     return undefined;
   }
+  // Marker-only entry: no chart payload to replay. We must NOT fall through to
+  // updateTokenAnalytics — it writes `?? null`, so replaying an empty payload would
+  // WIPE bal_peak_*/bal_trough_* in token_state. The marker alone parks the CA.
+  if (e.series.length === 0) {
+    log.info(`[setup-cache] marker-only entry ${e.ca.slice(0, 8)} (${e.chain}) applied nothing — no payload to replay`);
+    return undefined;
+  }
   const bal = cacheSeriesWindows(e.ca, e.chain, e.series, e.taken_at);
   updateTokenAnalytics(e.ca, e.chain, {
     t100Pct: e.t100_pct,
@@ -581,7 +611,7 @@ function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: Bal
 export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
   const now = Date.now();
   const cached = getSetupCacheEntry(ca, chain);
-  if (cached && isSetupCacheFresh(cached, now)) {
+  if (cached && isSeriesFresh(cached, now)) {
     applySetupCacheEntry(cached); // applies when the row exists, else waits — never fetches
     return;
   }
@@ -589,29 +619,44 @@ export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
   if (entry) putSetupCacheEntry(entry);
 }
 
-/** Series-only refresh for flowsSweep: ALWAYS fetches, never reads or writes the
- * setup cache. That cache is setupSweep's clock — a 15-min writer would keep it
- * permanently fresh and gini (fresh%) would stop re-running entirely. */
-async function refreshSeriesData(ca: string, chain: Chain): Promise<void> {
-  await applySeriesPass(ca, chain, Date.now());
-}
-
 /**
  * Credit-only tgm/flows refresh on its own faster cadence (user 2026-09-24): T100
  * multiple, LF and the bal_* chart windows. No browser door — this is the REST
  * credit API — so it is paced against POLL_FLOWS_MS, not the door budget. Gini
  * (fresh%) stays on setupSweep's 1h cadence: the two refresh at different rates.
+ *
+ * Only CAs that still OWE a series are swept: an entry whose series_at marker is missing
+ * or past 12h. No entry at all is setupSweep's job — it owns the setup pass cap
+ * (config.setupPassCap) and the miss ladder (setupMisses). This is also the credit guard:
+ * refreshSeries honors the per-field series_at marker, so a fresh entry costs 0
+ * (and its LF write-once guard skips the exchange call). An always-fetch pass here
+ * ignores that marker and re-buys every CA's T100+LF forever (measured leak:
+ * 14 credits / 17 min ≈ 1170/day, 469 tracked CAs against only 124 cache entries).
+ *
+ * The old "a series write would keep gini permanently fresh" fear is gone with the
+ * split per-field markers: applySeriesPass stamps only series_at and carries
+ * info_at forward from prev?.info_at, so a flows write can never freeze gini's 6h
+ * clock.
+ *
+ * EXPORTED for the credit-leak regression tests (same test-seam precedent as
+ * setupSweep / refreshSeries / pacedFor).
  */
-async function flowsSweep(): Promise<void> {
+export async function flowsSweep(): Promise<void> {
   if (!flowsClient()) return;
-  const cas = newCasFirst(listTrackedCas());
+  const now = Date.now();
+  const cas = newCasFirst(listTrackedCas()).filter((c) => {
+    const e = getSetupCacheEntry(c.address, c.chain);
+    return e !== undefined && !isSeriesFresh(e, now);
+  });
+  const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollFlowsMs, async (c) => {
     try {
-      await refreshSeriesData(c.address, c.chain);
+      await refreshSeries(c.address, c.chain);
     } catch (e) {
       log.error('[poller] flowsSweep', c.address, e);
     }
   });
+  log.info('[poller] flowsSweep credit spend', creditsSpent() - spendBefore);
 }
 
 /** One flows pass: fetch the series → T100 multiple / LF / bal_* windows → DB.
@@ -633,13 +678,12 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
   // LF write-once (credit guard): skip the 1-credit exchange fetch once genesis_bal
-  // is known AND the setup cache holds exchange points — the leftmost is a
-  // deterministic read, so re-asking buys nothing. The cached points MUST be
-  // carried into the returned entry: isStorable refuses an empty `exchange`, so
-  // returning [] would make putSetupCacheEntry reject the pass forever and
-  // setupSweep re-run on a permanently stale cache.
+  // is known. `st.genesis_bal != null` already means the LF total was obtained; the
+  // old `prev.exchange.length > 0` requirement existed ONLY because isStorable
+  // refused an empty `exchange` — that invariant is gone, so requiring cached points
+  // would merely re-buy the same 1-credit call forever.
   const prev = getSetupCacheEntry(ca, chain);
-  const haveLf = st.genesis_bal != null && prev !== undefined && prev.exchange.length > 0;
+  const haveLf = st.genesis_bal != null && prev !== undefined;
   const lf = haveLf ? undefined : await exchangeLf(ca, chain, st.deployed_at);
   if (lf !== undefined) genesisBal = lf.total;
   updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, genesisBal, anchorAt, bal });
@@ -648,13 +692,21 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     chain,
     taken_at: now,
     window: fetched?.window ?? '',
-    series_from: fetched?.from ?? Number.NaN,
+    series_from: fetched?.from,
     series: series ?? [],
     exchange: lf?.points ?? prev?.exchange ?? [],
-    t100_pct: t100Pct ?? Number.NaN,
-    t100_multiple: t100Multiple ?? Number.NaN,
-    anchor_at: anchorAt ?? Number.NaN,
-    genesis_bal: genesisBal ?? Number.NaN,
+    t100_pct: t100Pct,
+    t100_multiple: t100Multiple,
+    anchor_at: anchorAt,
+    genesis_bal: genesisBal,
+    // Carry the previous series marker FIRST; a fresh non-empty series then stamps
+    // `now` over it. An empty pass therefore keeps prev.series_at (no fresh stamp,
+    // an existing marker is never lost).
+    ...(prev?.series_at !== undefined ? { series_at: prev.series_at } : {}),
+    ...(series !== undefined && series.length > 0 ? { series_at: now } : {}),
+    // Carry the gini stamp forward ONLY from prev.info_at: a series-only pass must
+    // not fabricate one, so an unstamped entry stays eligible for the gini re-ask.
+    ...(prev?.info_at !== undefined ? { info_at: prev.info_at } : {}),
   };
 }
 
@@ -787,9 +839,9 @@ async function crawlBalanceSeries(
   try {
     const now = Date.now();
     // Door guard (plan setup-fill-on-add §4): kickNansen must not refetch while a
-    // FRESH file-cache entry exists — apply it (row permitting) like refreshSeries.
+    // FRESH series exists — apply it (row permitting) like refreshSeries.
     const cached = getSetupCacheEntry(address, chain);
-    if (cached && isSetupCacheFresh(cached, now)) {
+    if (cached && isSeriesFresh(cached, now)) {
       const bal = applySetupCacheEntry(cached);
       return { bal: bal ?? {}, ok: bal !== undefined };
     }
