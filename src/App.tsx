@@ -4,10 +4,12 @@ import SignalTable from './components/SignalTable';
 // Token detail page DISABLED (2026-09-16) — re-enable import + state + branch below.
 // import TokenDetailPage from './components/TokenDetailPage';
 import WalletsPage from './components/WalletsPage';
+import FomoUsersPage from './components/FomoUsersPage';
 import SettingsPanel from './components/SettingsPanel';
 import { Button, IconButton } from './components/ui';
 import { AuthProvider } from './auth/auth-context';
 import { useAuth } from './auth/use-auth';
+import { SHOW_FOMO } from './config';
 
 type Tab = 'dashboard' | 'wallets' | 'rated';
 
@@ -192,7 +194,18 @@ function DashboardShell() {
             />
           </div>
         )}
-        {tab === 'wallets' && <WalletsPage />}
+        {tab === 'wallets' && (
+          <>
+            <WalletsPage />
+            {/* FOMO watch list is instance-b only: a sibling surface in the same tab,
+                behind SHOW_FOMO. Flag off → nothing renders (no tab, no heading, no button). */}
+            {SHOW_FOMO && (
+              <div className="mt-10">
+                <FomoUsersPage />
+              </div>
+            )}
+          </>
+        )}
       </main>
       {settingsOpen && (
         <SettingsPanel onClose={() => setSettingsOpen(false)} onSaved={() => setSettingsVersion((v) => v + 1)} />
