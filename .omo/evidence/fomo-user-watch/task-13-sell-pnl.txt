@@ -1,0 +1,17 @@
+$ cd server && npx tsx --test test/fomo-signals.test.ts
+
+✔ fomoUserStats: buyUsd sums BUYS only — the sell usd_value (realised PnL) is neither added nor subtracted (2.479784ms)
+✔ fomoUserStats: a buy older than 24h still lists the user with zero stats (ever-bought membership) (0.479615ms)
+✔ fomoUserStats: a sell-only user is NOT listed (membership is ever-bought) (0.409926ms)
+✔ fomoUserStats: the same ca on two chains does not pool (0.844731ms)
+✔ fomoUserStats: a NEGATIVE sell usd_value (realised loss) lands in sellPnlUsd and never touches buyUsd (1.259017ms)
+✔ fomoUserStatsByCa matches fomoUserStats for every tracked CA (1.844811ms)
+✔ assembleSignals: fomoUsers populated; FOMO trades leak nothing into the tracked-wallet path (3.11836ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 232.880658

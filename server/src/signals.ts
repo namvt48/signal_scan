@@ -50,12 +50,13 @@ export interface TrackedWalletStat {
   lastTs: number;
 }
 
-/** One watched FOMO trader's activity on a token (large trades only; buyUsd is BUY size, never net/PnL). */
+/** One watched FOMO trader's activity on a token (large trades only; buyUsd is BUY size and sellPnlUsd is SELL realised PnL — reported separately, never combined). */
 export interface FomoUserStat {
   handle: string;
   name?: string;
   clan?: string;
   buyUsd: number;
+  sellPnlUsd: number;
   buys: number;
   sells: number;
   trades: number;
@@ -252,6 +253,7 @@ interface FomoUserStatRow {
   name: string;
   clan: string | null;
   buyUsd: number;
+  sellPnlUsd: number;
   buys: number;
   sells: number;
   trades: number;
@@ -270,9 +272,11 @@ interface FomoUserStatRow {
  * chains must not pool the other chain's users or trades.
  *
  * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd sums BUY
- * rows only: a buy's usd_value is the post-fill position size while a sell's is
- * signed realised PnL — different quantities that must never be combined
- * (fomo_trades DDL), so NO net/inflow figure exists here on purpose.
+ * rows only (a buy's usd_value is the post-fill position size) and sellPnlUsd
+ * sums SELL rows only (a sell's usd_value is signed realised PnL). The two are
+ * reported SEPARATELY and are never combined into a net/inflow figure: a buy's
+ * usd_value (position size) and a sell's usd_value (PnL) are different
+ * quantities that must never be summed (fomo_trades DDL).
  *
  * Rows are ordered newest-trade-first, so a member with no trade inside the
  * stats window (lastTs 0) sinks below the active ones. name '' / clan NULL
@@ -285,6 +289,7 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
               u.name AS name,
               u.clan AS clan,
               COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
@@ -299,11 +304,12 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
         ORDER BY lastTs DESC, u.handle`,
     )
     .all({ ca, chain, statSince: now - 86_400_000 }) as FomoUserStatRow[];
-  return rows.map(({ handle, name, clan, buyUsd, buys, sells, trades, lastTs }) => ({
+  return rows.map(({ handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs }) => ({
     handle,
     ...(name !== '' ? { name } : {}),
     ...(clan != null && clan !== '' ? { clan } : {}),
     buyUsd,
+    sellPnlUsd,
     buys,
     sells,
     trades,
@@ -336,6 +342,7 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
               u.name AS name,
               u.clan AS clan,
               COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
@@ -349,7 +356,7 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
     )
     .all({ statSince: now - 86_400_000 }) as (FomoUserStatRow & { ca: string; chain: string })[];
   const out = new Map<string, FomoUserStat[]>();
-  for (const { chain, ca, handle, name, clan, buyUsd, buys, sells, trades, lastTs } of rows) {
+  for (const { chain, ca, handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs } of rows) {
     // Same conditional spreads (and key order) as fomoUserStats — the JSON
     // response must stay byte-identical.
     const stat: FomoUserStat = {
@@ -357,6 +364,7 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
       ...(name !== '' ? { name } : {}),
       ...(clan != null && clan !== '' ? { clan } : {}),
       buyUsd,
+      sellPnlUsd,
       buys,
       sells,
       trades,

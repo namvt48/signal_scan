@@ -37,13 +37,13 @@ const WALLET_COLS: readonly string[] = SHOW_CLAN
   : ['34%', '17%', '13%', '19%', '17%'];
 
 /*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Age.
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Age.
  * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
  * line up row for row.
  */
 const FOMO_COLS: readonly string[] = SHOW_CLAN
-  ? ['32%', '14%', '16%', '22%', '16%']
-  : ['40%', '20%', '20%', '20%'];
+  ? ['30%', '14%', '14%', '14%', '14%', '14%']
+  : ['32%', '17%', '17%', '17%', '17%'];
 
 /** The FOMO column adds exactly one to every column-count site when shipped. */
 const FOMO_EXTRA = SHOW_FOMO ? 1 : 0;
@@ -114,9 +114,10 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
 }
 
 /*
- * FOMO breakdown rows (User / Clan? / Trades / Buy $ / Age), sibling of WalletTable.
- * `buyUsd` is Σ large-BUY size, never net inflow/PnL — the header says so. Newest
- * trade first; long handles truncate; numerics right-aligned mono like the wallet rows.
+ * FOMO breakdown rows (User / Clan? / Trades / Buy $ / Sell PnL / Age), sibling of WalletTable.
+ * `buyUsd` is Σ large-BUY size and `sellPnlUsd` is Σ realised PnL on SELL rows — reported
+ * separately, never a net figure. Newest trade first; long handles truncate; numerics
+ * right-aligned mono like the wallet rows.
  */
 function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: boolean }) {
   const rows = [...users].sort((a, b) => b.lastTs - a.lastTs);
@@ -134,6 +135,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
             {SHOW_CLAN && <th className="pb-1 pr-3 text-left">Clan</th>}
             <th className="pb-1 pr-3 text-right">Trades</th>
             <th className="pb-1 pr-3 text-right">Buy $</th>
+            <th className="pb-1 pr-3 text-right">Sell PnL</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
@@ -160,6 +162,12 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
             <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2">{u.trades}</td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-ink2" title="Σ large BUY sizes — not net inflow/PnL">
               {usd(u.buyUsd)}
+            </td>
+            <td
+              className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${u.sellPnlUsd >= 0 ? 'text-pos' : 'text-neg'}`}
+              title="Σ realised PnL on SELL rows — not sell volume"
+            >
+              {usd(u.sellPnlUsd)}
             </td>
             <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
@@ -415,6 +423,9 @@ function SignalHead({
               <span className="pr-3 text-right">Trades</span>
               <span className="pr-3 text-right" title="Σ large BUY sizes — not net inflow/PnL">
                 Buy $
+              </span>
+              <span className="pr-3 text-right" title="Σ realised PnL on SELL rows — not sell volume">
+                Sell PnL
               </span>
               <span className="pl-1 text-left">Age</span>
             </span>

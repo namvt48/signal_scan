@@ -81,12 +81,17 @@ export interface TrackedWalletStat {
   lastTs: number;
 }
 
-/** One watched FOMO trader's activity on a token (large trades only; buyUsd is BUY size, never net/PnL). */
+/**
+ * One watched FOMO trader's activity on a token (large trades only). buyUsd is BUY size
+ * and sellPnlUsd is SELL realised PnL — reported separately, never combined into a net figure.
+ */
 export interface FomoUserStat {
   handle: string;
   name?: string;
   clan?: string;
   buyUsd: number;
+  /** Σ realised PnL on SELL rows. May be negative. NOT sell volume. */
+  sellPnlUsd: number;
   buys: number;
   sells: number;
   trades: number;

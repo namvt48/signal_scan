@@ -17,11 +17,13 @@ const NOW = Date.parse('2026-09-29T12:00:00Z');
 const CA_F = 'fomoCa-main-001'; // alice (in-window buy+sell), bob (stale buy), carol (sell-only)
 const CA_X = 'fomoCa-cross-002'; // same ca string on sol AND base — must not pool
 const CA_E = 'fomoCa-empty-003'; // tracked, no fomo trades -> fomoUsers []
+const CA_N = 'fomoCa-neg-004'; // erin: buy + negative sell (realised loss)
 
 let alice = '';
 let bob = '';
 let carol = '';
 let dave = '';
+let erin = '';
 
 function token(ca: string, chain: 'sol' | 'base' = 'sol'): TokenInfo {
   return {
@@ -47,11 +49,13 @@ before(() => {
   bob = insertFomoUser({ handle: '@bob' }).id; // name '' + clan NULL -> both keys omitted
   carol = insertFomoUser({ handle: '@carol', name: 'Carol' }).id;
   dave = insertFomoUser({ handle: '@dave', name: 'Dave' }).id;
+  erin = insertFomoUser({ handle: '@erin', name: 'Erin' }).id;
 
   insertTrackedCa({ address: CA_F, chain: 'sol', note: '', entryUsd: 60 });
   insertTrackedCa({ address: CA_X, chain: 'sol', note: '', entryUsd: 60 });
   insertTrackedCa({ address: CA_X, chain: 'base', note: '', entryUsd: 60 });
   insertTrackedCa({ address: CA_E, chain: 'sol', note: '', entryUsd: 60 });
+  insertTrackedCa({ address: CA_N, chain: 'sol', note: '', entryUsd: 60 });
   upsertTokenInfo(token(CA_F));
 
   // alice: in-window buy (500 = post-fill size) + sell (120 = realised PnL).
@@ -64,6 +68,9 @@ before(() => {
   // dave: the SAME ca string on two chains — each (ca, chain) identity stands alone.
   insertFomoTrade({ fomo_user_id: dave, event_id: 'fx-1', ca: CA_X, chain: 'sol', type: 'buy', usd_value: 100, ts: NOW - 600_000 });
   insertFomoTrade({ fomo_user_id: dave, event_id: 'fx-2', ca: CA_X, chain: 'base', type: 'buy', usd_value: 50, ts: NOW - 300_000 });
+  // erin: in-window buy + NEGATIVE sell (realised loss) — the sell must not reduce buyUsd.
+  insertFomoTrade({ fomo_user_id: erin, event_id: 'fn-1', ca: CA_N, chain: 'sol', type: 'buy', usd_value: 400, ts: NOW - 1_200_000 });
+  insertFomoTrade({ fomo_user_id: erin, event_id: 'fn-2', ca: CA_N, chain: 'sol', type: 'sell', usd_value: -200, ts: NOW - 1_000_000 });
 });
 
 test('fomoUserStats: buyUsd sums BUYS only — the sell usd_value (realised PnL) is neither added nor subtracted', () => {
@@ -73,8 +80,9 @@ test('fomoUserStats: buyUsd sums BUYS only — the sell usd_value (realised PnL)
 
   const a = rows[0];
   assert.ok(a);
-  // ANTI-CATEGORY-ERROR lock: 500 (buy size) — NOT 620 (500+120) and NOT 380 (500−120).
+  // ANTI-CATEGORY-ERROR lock: 500 (buy size), the sell's 120 lands in sellPnlUsd — NOT 620 (500+120) and NOT 380 (500−120).
   assert.equal(a.buyUsd, 500);
+  assert.equal(a.sellPnlUsd, 120);
   assert.equal(a.buys, 1);
   assert.equal(a.sells, 1);
   assert.equal(a.trades, 2);
@@ -84,20 +92,21 @@ test('fomoUserStats: buyUsd sums BUYS only — the sell usd_value (realised PnL)
     name: 'Alice',
     clan: 'fomolab',
     buyUsd: 500,
+    sellPnlUsd: 120,
     buys: 1,
     sells: 1,
     trades: 2,
     lastTs: NOW - 1_800_000,
   });
   // Key order must match the interface (JSON byte-stability).
-  assert.deepEqual(Object.keys(a), ['handle', 'name', 'clan', 'buyUsd', 'buys', 'sells', 'trades', 'lastTs']);
+  assert.deepEqual(Object.keys(a), ['handle', 'name', 'clan', 'buyUsd', 'sellPnlUsd', 'buys', 'sells', 'trades', 'lastTs']);
 });
 
 test('fomoUserStats: a buy older than 24h still lists the user with zero stats (ever-bought membership)', () => {
   const b = fomoUserStats(CA_F, 'sol', NOW).find((r) => r.handle === '@bob');
   // name ''/clan NULL -> keys OMITTED (deepStrictEqual fails on undefined-valued keys).
-  assert.deepStrictEqual(b, { handle: '@bob', buyUsd: 0, buys: 0, sells: 0, trades: 0, lastTs: 0 });
-  assert.deepEqual(Object.keys(b ?? {}), ['handle', 'buyUsd', 'buys', 'sells', 'trades', 'lastTs']);
+  assert.deepStrictEqual(b, { handle: '@bob', buyUsd: 0, sellPnlUsd: 0, buys: 0, sells: 0, trades: 0, lastTs: 0 });
+  assert.deepEqual(Object.keys(b ?? {}), ['handle', 'buyUsd', 'sellPnlUsd', 'buys', 'sells', 'trades', 'lastTs']);
 });
 
 test('fomoUserStats: a sell-only user is NOT listed (membership is ever-bought)', () => {
@@ -108,11 +117,23 @@ test('fomoUserStats: a sell-only user is NOT listed (membership is ever-bought)'
 
 test('fomoUserStats: the same ca on two chains does not pool', () => {
   assert.deepStrictEqual(fomoUserStats(CA_X, 'sol', NOW), [
-    { handle: '@dave', name: 'Dave', buyUsd: 100, buys: 1, sells: 0, trades: 1, lastTs: NOW - 600_000 },
+    { handle: '@dave', name: 'Dave', buyUsd: 100, sellPnlUsd: 0, buys: 1, sells: 0, trades: 1, lastTs: NOW - 600_000 },
   ]);
   assert.deepStrictEqual(fomoUserStats(CA_X, 'base', NOW), [
-    { handle: '@dave', name: 'Dave', buyUsd: 50, buys: 1, sells: 0, trades: 1, lastTs: NOW - 300_000 },
+    { handle: '@dave', name: 'Dave', buyUsd: 50, sellPnlUsd: 0, buys: 1, sells: 0, trades: 1, lastTs: NOW - 300_000 },
   ]);
+});
+
+test('fomoUserStats: a NEGATIVE sell usd_value (realised loss) lands in sellPnlUsd and never touches buyUsd', () => {
+  const [r] = fomoUserStats(CA_N, 'sol', NOW);
+  assert.ok(r);
+  assert.equal(r.buyUsd, 400);
+  assert.equal(r.sellPnlUsd, -200);
+  assert.equal(r.buys, 1);
+  assert.equal(r.sells, 1);
+  assert.deepEqual(Object.keys(r), ['handle', 'name', 'buyUsd', 'sellPnlUsd', 'buys', 'sells', 'trades', 'lastTs']);
+  const byCa = fomoUserStatsByCa(NOW).get(`sol:${CA_N}`);
+  assert.deepStrictEqual(byCa, [r]);
 });
 
 test('fomoUserStatsByCa matches fomoUserStats for every tracked CA', () => {
@@ -137,6 +158,7 @@ test('assembleSignals: fomoUsers populated; FOMO trades leak nothing into the tr
     name: 'Alice',
     clan: 'fomolab',
     buyUsd: 500,
+    sellPnlUsd: 120,
     buys: 1,
     sells: 1,
     trades: 2,
