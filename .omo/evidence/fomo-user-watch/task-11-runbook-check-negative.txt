@@ -1,0 +1,46 @@
+=== task-11 negative proof: existence check must FAIL on a missing reference ===
+2026-09-29T14:45:36+07:00
+
+## STEP 1 - deliberately reference a NON-EXISTENT artifact
+   temp index: /tmp/opencode/bad-index.s8xnTJ.md
+- broken ref: `.omo/evidence/fomo-user-watch/task-99-does-not-exist.txt`
+  FAIL .omo/evidence/fomo-user-watch/task-99-does-not-exist.txt (missing)
+   check exit=1  => FAILED as required
+
+## STEP 2 - fix the reference (point it at a real artifact)
+- broken ref: `.omo/evidence/fomo-user-watch/task-0-capture-summary.md`
+  OK   .omo/evidence/fomo-user-watch/task-0-capture-summary.md
+   check exit=0  => PASSED after fix
+
+## STEP 3 - the real committed index also PASSES the same check
+  OK   .omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl
+  OK   .omo/evidence/fomo-user-watch/task-0-capture-summary.md
+  OK   .omo/evidence/fomo-user-watch/task-10-fomo-daemon-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-10-fomo-daemon.txt
+  OK   .omo/evidence/fomo-user-watch/task-11-runbook-check-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-11-runbook-check.txt
+  OK   .omo/evidence/fomo-user-watch/task-1-fomo-db-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-1-fomo-db.txt
+  OK   .omo/evidence/fomo-user-watch/task-1-fomo-trade-check-fix.txt
+  OK   .omo/evidence/fomo-user-watch/task-2-auth-routes-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-2-auth-routes.txt
+  OK   .omo/evidence/fomo-user-watch/task-3-flag-matrix.txt
+  OK   .omo/evidence/fomo-user-watch/task-3-flag-off-absence.txt
+  OK   .omo/evidence/fomo-user-watch/task-4-datastore-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-4-datastore.txt
+  OK   .omo/evidence/fomo-user-watch/task-5-fomo-users-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-5-fomo-users.txt
+  OK   .omo/evidence/fomo-user-watch/task-6-fomo-watch-trade-negative.txt
+  OK   .omo/evidence/fomo-user-watch/task-6-fomo-watch-trade.txt
+  OK   .omo/evidence/fomo-user-watch/task-7-fomo-signals.txt
+  OK   .omo/evidence/fomo-user-watch/task-7-no-leakage.txt
+  OK   .omo/evidence/fomo-user-watch/task-8-export.csv
+  OK   .omo/evidence/fomo-user-watch/task-8-flag-off.png
+  OK   .omo/evidence/fomo-user-watch/task-8-fomo-users-ui.png
+  OK   .omo/evidence/fomo-user-watch/task-8-import-preview.png
+  OK   .omo/evidence/fomo-user-watch/task-8-viewer-gating.png
+  OK   .omo/evidence/fomo-user-watch/task-9-empty-and-long.png
+  OK   .omo/evidence/fomo-user-watch/task-9-fomo-column.png
+   check exit=0  => PASSED
+
+=== RESULT: PASS ===
