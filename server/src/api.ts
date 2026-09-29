@@ -15,11 +15,13 @@ import {
   deleteTrackedCa,
   deleteWallet,
   findFomoUserByHandle,
+  findFomoUserByUserId,
   findTrackedCa,
   findWalletByAddress,
   getWallet,
   importFomoUsers,
   importWallets,
+  insertFomoTrade,
   insertFomoUser,
   insertTrackedCa,
   insertWallet,
@@ -296,6 +298,67 @@ function parseWatchTradeBody(body: unknown): ParseResult<WatchTrade> {
     if (v === undefined) continue;
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
       return { error: `${key} must be a finite number >= 0` };
+    }
+    trade[key] = v;
+  }
+  return trade;
+}
+
+/** One FOMO alert the daemon kept (POST /api/fomo-watch/trades). Wire field
+ *  names are the CAPTURED alert schema (.omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl):
+ *  `chain` arrives ALREADY MAPPED to the Chain union (the daemon drops
+ *  solana/base/bsc outsiders), `type` is the narrowed `alertType`. */
+interface FomoWatchTrade {
+  eventId: string;
+  userId?: string;
+  trader?: string;
+  type: 'buy' | 'sell';
+  /** tokenAddress, canonicalized — keys like the wallet/tracked-CA store. */
+  ca: string;
+  chain: Chain;
+  ts: number;
+  usdValue?: number;
+  price?: number;
+  token?: string;
+}
+
+/**
+ * `eventId` is the idempotency key (UNIQUE on fomo_trades). At least one
+ * identity (`userId` or `trader` handle) must be present. `type` accepts ONLY
+ * buy/sell — perp/thesis/listing are rejected here as the boundary backstop
+ * even though the daemon already drops them; a perp row's null `tokenAddress`
+ * makes such a body doubly invalid. usdValue is TYPE-DEPENDENT (buy → post-fill
+ * size, sell → SIGNED realised PnL) so — unlike the wallet parser — a negative
+ * value is legal; both stay optional and store NULL. txHash is NEVER required
+ * (present on only 17/102 captured rows).
+ */
+function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
+  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+  const b = body as Record<string, unknown>;
+  const eventId = strField(b, 'eventId');
+  if (!eventId) return { error: 'eventId is required' };
+  const userId = strField(b, 'userId');
+  const trader = strField(b, 'trader');
+  if (!userId && !trader) return { error: 'userId or trader is required' };
+  const type = strField(b, 'type');
+  if (type !== 'buy' && type !== 'sell') return { error: "type must be 'buy' or 'sell'" };
+  const tokenAddress = strField(b, 'tokenAddress');
+  if (!tokenAddress) return { error: 'tokenAddress is required' };
+  if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+  const ts: unknown = b.ts;
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) {
+    return { error: 'ts must be a finite epoch-ms number > 0' };
+  }
+  const trade: FomoWatchTrade = { eventId, type, ca: canonicalCa(tokenAddress, b.chain), chain: b.chain, ts };
+  if (userId) trade.userId = userId;
+  if (trader) trade.trader = trader;
+  const token = strField(b, 'token');
+  if (token) trade.token = token;
+  for (const key of ['usdValue', 'price'] as const) {
+    const v: unknown = b[key];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      return { error: `${key} must be a finite number` };
     }
     trade[key] = v;
   }
@@ -671,6 +734,41 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     // One query, for the pair this event landed on.
     kickWalletRow(wallet, parsed.ca);
     res.json({ inserted });
+  });
+
+  // FOMO alert ingest (daemon → POST /api/fomo-watch/trades). ONE trade per
+  // request — survivors are posted individually. Reposting is a no-op:
+  // UNIQUE(event_id) via insertFomoTrade's ON CONFLICT DO NOTHING. No FOMO path
+  // may touch wallet state — no kickWalletRow here, ever.
+  app.post('/api/fomo-watch/trades', (req, res) => {
+    const parsed = parseFomoWatchTradeBody(req.body);
+    if (isParseError(parsed)) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    // A FOMO user is NOT a wallet — resolve through the fomo_users accessors
+    // only: userId (stable) first, handle (the 102/102-present fallback).
+    const user =
+      (parsed.userId !== undefined ? findFomoUserByUserId(parsed.userId) : undefined) ??
+      (parsed.trader !== undefined ? findFomoUserByHandle(parsed.trader) : undefined);
+    if (!user) {
+      // Inserting would violate the fomo_users FK (mirrors the wallet 404).
+      // The 404 is the daemon's "refresh my watch list" cue — not a blind retry.
+      res.status(404).json({ error: 'fomo user not tracked' });
+      return;
+    }
+    const created = insertFomoTrade({
+      fomo_user_id: user.id,
+      event_id: parsed.eventId,
+      ca: parsed.ca,
+      chain: parsed.chain,
+      type: parsed.type,
+      usd_value: parsed.usdValue ?? null,
+      price: parsed.price ?? null,
+      token: parsed.token ?? null,
+      ts: parsed.ts,
+    });
+    res.json({ inserted: created ? 1 : 0 });
   });
 
   /* Token detail page DISABLED (2026-09-16) — no /detail, no /balance-chart.

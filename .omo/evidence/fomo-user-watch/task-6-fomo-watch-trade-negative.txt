@@ -1,0 +1,7 @@
+$ cd server && npx tsx tmp-negative-probe.ts
+$ npx tsx tmp-negative-probe.ts  (open(':memory:') fixture, raw SELECT COUNT(*) proof)
+fomo_trades rows before: 0
+(a) eventId missing        → 400 {"error":"eventId is required"} | fomo_trades rows: 0
+(b) type:'perp' + null tokenAddress → 400 {"error":"type must be 'buy' or 'sell'"} | fomo_trades rows: 0
+PROOF: SELECT COUNT(*) FROM fomo_trades = 0 — both malformed bodies rejected at the boundary (400 {error}), zero rows stored.
+exit=0

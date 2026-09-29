@@ -3,15 +3,14 @@
 // stale entries. If this file fails, someone added a route without making an
 // explicit gating decision — list it in ROUTE_POLICY with its roles. Also pins
 // GET /api/health as explicitly public (monitors depend on it), and pins the
-// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md). The five
-// /api/fomo-users routes landed in task 5; only POST /api/fomo-watch/trades is
-// still gated-ahead-of-registration (task 6), so it sits on PENDING_ROUTES
-// until it lands (see the self-cleaning rule below).
+// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md). All six FOMO
+// routes are now registered (tasks 5+6), so PENDING_ROUTES is empty and the
+// stale-entry check runs at full strength.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { open } from '../src/db.js';
+import { insertFomoUser, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { resolveRouteAccess, ROUTE_POLICY } from '../src/auth.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
@@ -41,16 +40,12 @@ function registeredRoutes(): Array<{ method: string; path: string }> {
 
 const key = (method: string, path: string): string => `${method} ${path}`;
 
-/** ROUTE_POLICY entries whose express routes do not exist YET: task 6 registers
- * POST /api/fomo-watch/trades (.omo/plans/fomo-user-watch.md). Gating it now is
- * the point (deny-by-default must never have a gap between "route lands" and
- * "gate lands"); it is exempt from the stale-entry check only until registered —
- * the test below FAILS the moment it lands, forcing its removal here, so the
- * list shrinks to empty by the end of wave 2 and the stale check regains full
- * strength. */
-const PENDING_ROUTES: ReadonlySet<string> = new Set([
-  'POST /api/fomo-watch/trades',
-]);
+/** ROUTE_POLICY entries whose express routes do not exist YET (gated-ahead-of-
+ *  registration, so deny-by-default never has a gap between "route lands" and
+ *  "gate lands"). Empty since task 6 registered POST /api/fomo-watch/trades —
+ *  the self-cleaning test below keeps the mechanism honest for any future
+ *  entry: it FAILS the moment a listed route becomes registered. */
+const PENDING_ROUTES: ReadonlySet<string> = new Set();
 
 test('every registered route appears in ROUTE_POLICY (an ungated route fails here)', () => {
   const routes = registeredRoutes();
@@ -68,7 +63,7 @@ test('ROUTE_POLICY has no stale entries (every entry is a registered route)', ()
   const routes = new Set(registeredRoutes().map((r) => key(r.method, r.path)));
   for (const e of ROUTE_POLICY) {
     const k = key(e.method, e.path);
-    if (PENDING_ROUTES.has(k)) continue; // route lands in task 5/6 — see PENDING_ROUTES
+    if (PENDING_ROUTES.has(k)) continue; // gated ahead of registration — see PENDING_ROUTES
     assert.ok(routes.has(k), `STALE policy entry: ${k} is not registered`);
   }
 });
@@ -95,11 +90,8 @@ test('no other route is public', () => {
 
 // --- FOMO gate matrix (task 2) ------------------------------------------------
 // Auth runs in the middleware, BEFORE route resolution, so 401 (anonymous) and
-// 403 (wrong role) are exact and route-independent TODAY. Gate-PASS outcomes are
-// asserted as real 2xx for the routes task 5 registered; the still-unregistered
-// POST /api/fomo-watch/trades is asserted as "not refused" (an authorized
-// request to an unregistered route 404s at the catch-all) and carries a TODO
-// naming task 6, which tightens it to the real 2xx.
+// 403 (wrong role) are exact and route-independent TODAY. All six routes are
+// registered (tasks 5+6), so gate-PASS outcomes are asserted as real 2xx.
 
 let auth: TestAuth;
 let server: Server;
@@ -153,8 +145,7 @@ const FOMO_ADMIN_WRITES: ReadonlyArray<readonly [method: string, path: string]> 
   ['POST', '/api/fomo-users/import'],
 ];
 
-/** A body shaped for task 6's parser contract (captured FOMO schema), so this
- * request stays valid once the route exists. */
+/** A body shaped for the task-6 parser contract (captured FOMO schema). */
 const FOMO_TRADE_BODY = {
   eventId: 'evt-auth-routes-1',
   trader: 'authkit-handle',
@@ -208,9 +199,11 @@ test('viewer token passes the GET /api/fomo-users gate', async () => {
 });
 
 test('service token passes the POST /api/fomo-watch/trades gate (valid body)', async () => {
-  const res = await req('POST', '/api/fomo-watch/trades', { token: TEST_SERVICE_TOKEN, body: FOMO_TRADE_BODY });
-  // TODO(task 6): tighten to a 2xx assertion once POST /api/fomo-watch/trades is
-  // registered (an untracked-trader 404 from the handler is also a gate pass).
+  // Task 6 registered the route: the gate pass is now the real 200 + insert.
+  // The body's trader must be tracked or the handler 404s before inserting.
   // Removing the policy entry makes deny-by-default kick in → 403 → this fails.
-  assert.ok(res.status !== 401 && res.status !== 403, `service token must pass the gate, got ${res.status}`);
+  insertFomoUser({ handle: FOMO_TRADE_BODY.trader, name: 'Authkit Handle' });
+  const res = await req('POST', '/api/fomo-watch/trades', { token: TEST_SERVICE_TOKEN, body: FOMO_TRADE_BODY });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json, { inserted: 1 });
 });
