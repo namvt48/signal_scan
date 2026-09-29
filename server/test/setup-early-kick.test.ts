@@ -151,6 +151,8 @@ function sampleEntry(ca: string, now: number, deployedAt: number): SetupCacheEnt
     t100_multiple: 1.5,
     anchor_at: deployedAt,
     genesis_bal: 120,
+    info_at: now - 60_000,
+    series_at: now - 60_000,
   };
 }
 

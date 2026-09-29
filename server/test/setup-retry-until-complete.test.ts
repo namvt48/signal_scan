@@ -29,6 +29,7 @@ const CHAIN: Chain = 'sol';
 const DONE = 'CA-RETRY-DONE';
 const TODO = 'CA-RETRY-TODO';
 const EMPTY = 'CA-RETRY-EMPTY';
+const FRESH_INCOMPLETE = 'CA-RETRY-FRESH-INCOMPLETE';
 const DAY = 86_400_000;
 
 function flowRows(points: readonly (readonly [ageDays: number, total: number])[], now: number): TgmFlowsRow[] {
@@ -132,6 +133,8 @@ test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on
     t100_multiple: 1.5,
     anchor_at: now,
     genesis_bal: 120,
+    info_at: now,
+    series_at: now,
   });
 
   await setupSweep(provider);
@@ -142,6 +145,41 @@ test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(TODO), 1, 'now complete → on the 12h cadence, no further retry');
+});
+
+test('setup TTL authoritative: a FRESH cache entry with an INCOMPLETE row is NOT re-asked', async () => {
+  open(':memory:');
+  loadSetupCache(join(mkdtempSync(join(tmpdir(), 'setup-fresh-incomplete-')), 'nansen-cache.json'));
+  const now = Date.now();
+  await installFakeDoor();
+  const metricCalls = new Map<string, number>();
+  const provider = countingProvider(now, metricCalls);
+  setPollerDeps(provider, null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: FRESH_INCOMPLETE, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(FRESH_INCOMPLETE, now)); // creates the row; NO fresh%/t100/LF yet
+  putSetupCacheEntry({
+    ca: FRESH_INCOMPLETE,
+    chain: CHAIN,
+    taken_at: now,
+    window: 'week',
+    series_from: now - 7 * DAY,
+    series: [{ t: new Date(now - DAY).toISOString(), total: 700 }],
+    exchange: [{ t: new Date(now - DAY).toISOString(), total: 120 }],
+    t100_pct: 40,
+    t100_multiple: 1.5,
+    anchor_at: now,
+    genesis_bal: 120,
+    info_at: now,
+    series_at: now,
+  });
+
+  // Precondition: the row really IS incomplete (no T100/LF) — otherwise the
+  // old re-ask-every-pass rule would not have queried it either.
+  assert.equal(getTokenState(FRESH_INCOMPLETE, CHAIN)?.t100_multiple, null);
+  assert.equal(getTokenState(FRESH_INCOMPLETE, CHAIN)?.genesis_bal, null);
+
+  await setupSweep(provider);
+  assert.equal(metricCalls.get(FRESH_INCOMPLETE) ?? 0, 0, 'a FRESH cache entry means no setup — even when the row is still incomplete');
 });
 
 test('setup spam guard: a CA whose setup keeps coming back EMPTY backs off after one attempt', async () => {

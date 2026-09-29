@@ -57,7 +57,9 @@ test('round-trip: put → version-1 envelope on disk → load preserves every fi
   assert.equal(map.size, 1);
   assert.equal(cacheKey('caRT', 'sol'), 'sol:caRT'); // key format pinned for T3
   assert.ok(map.has('sol:caRT'));
-  assert.deepEqual(getSetupCacheEntry('caRT', 'sol'), e);
+  // parseEntry backfills the Fix D field markers on load for a legacy entry (no
+  // info_at/series_at on disk): both seed from taken_at, so a deploy re-crawls nothing.
+  assert.deepEqual(getSetupCacheEntry('caRT', 'sol'), { ...e, info_at: e.taken_at, series_at: e.taken_at });
 });
 
 test('put upserts: second put for the same (ca, chain) replaces the record', () => {
@@ -137,7 +139,8 @@ test('malformed entries are skipped; the valid sibling survives', () => {
 
   // Then only the well-formed entry is in the map
   assert.equal(map.size, 1);
-  assert.deepEqual(getSetupCacheEntry('good', 'sol'), good);
+  // Legacy markers backfilled from taken_at at load (Fix D) — see the round-trip test.
+  assert.deepEqual(getSetupCacheEntry('good', 'sol'), { ...good, info_at: good.taken_at, series_at: good.taken_at });
   assert.equal(getSetupCacheEntry('badDerived', 'sol'), undefined);
   assert.equal(getSetupCacheEntry('badChain', 'sol'), undefined); // rejected at load → no key to find
 });

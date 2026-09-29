@@ -95,7 +95,7 @@ function staleEntryWithLf(now: number, deployedAt: number): SetupCacheEntry {
   return {
     ca: CA,
     chain: CHAIN,
-    taken_at: now - config.pollSetupMs - 1_000,
+    taken_at: now - config.pollFlowsMs - 1_000,
     window: 'week',
     series_from: deployedAt,
     series: [

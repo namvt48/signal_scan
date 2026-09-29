@@ -35,6 +35,13 @@ export interface SetupCacheEntry {
   t100_multiple: number;
   anchor_at: number;
   genesis_bal: number;
+  /** Epoch ms we OBTAINED the gini/fresh% field — its own 6h TTL (isInfoFresh).
+   * Optional: absent at runtime means "never obtained" (stale); a legacy entry
+   * gets it backfilled from `taken_at` once, at load time (parseEntry). */
+  info_at?: number;
+  /** Epoch ms we OBTAINED the T100 series field — its own 24h TTL (isSeriesFresh).
+   * Optional: same load-time legacy backfill as info_at. */
+  series_at?: number;
 }
 
 const FILE_VERSION = 1;
@@ -110,6 +117,8 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
   const t100Multiple = v['t100_multiple'];
   const anchorAt = v['anchor_at'];
   const genesisBal = v['genesis_bal'];
+  const infoAt = v['info_at'];
+  const seriesAt = v['series_at'];
   if (!isNum(takenAt) || !isNum(seriesFrom)) return undefined;
   if (!isNum(t100Pct) || !isNum(t100Multiple) || !isNum(anchorAt) || !isNum(genesisBal)) return undefined;
   const series = parsePoints(v['series']);
@@ -127,6 +136,12 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
     t100_multiple: t100Multiple,
     anchor_at: anchorAt,
     genesis_bal: genesisBal,
+    // Marker = "we obtained this field at T". Entries written before Fix D carry no
+    // stamp, so backfill once at LOAD from taken_at — deploying this change then does
+    // not trigger a one-time re-crawl of the whole queue. Runtime absence stays
+    // authoritative (isInfoFresh/isSeriesFresh): no read-time taken_at fallback.
+    info_at: isNum(infoAt) ? infoAt : takenAt,
+    series_at: isNum(seriesAt) ? seriesAt : takenAt,
   };
 }
 
@@ -167,6 +182,12 @@ export function getSetupCacheEntry(ca: string, chain: Chain): SetupCacheEntry | 
   return entries.get(cacheKey(ca, chain));
 }
 
+/** Number of entries currently in the cache — hydrates from disk first (ensureLoaded). */
+export function setupCacheSize(): number {
+  ensureLoaded();
+  return entries.size;
+}
+
 /**
  * Upsert one record and persist the whole file atomically (tmp + rename, parent
  * dir created). A persist failure warns and keeps the in-memory entry (a cache
@@ -189,6 +210,29 @@ export function putSetupCacheEntry(entry: SetupCacheEntry): void {
 /** Valid inside ONE setup cadence: `now - taken_at < POLL_SETUP_MS` — exactly POLL_SETUP_MS ⇒ stale (plan §4). */
 export function isSetupCacheFresh(entry: SetupCacheEntry, now: number): boolean {
   return now - entry.taken_at < config.pollSetupMs;
+}
+
+/** gini/fresh% freshness: the marker means "we OBTAINED this field at info_at".
+ * No marker ⇒ never obtained ⇒ stale — a series-only pass can never park a CA on
+ * the gini clock. (Legacy entries are backfilled once at LOAD — see parseEntry.) */
+export function isInfoFresh(e: SetupCacheEntry, now: number): boolean {
+  return e.info_at !== undefined && now - e.info_at < config.pollSetupMs;
+}
+
+/** T100-series freshness: marker = "we OBTAINED the series at series_at"; absent ⇒
+ * never obtained ⇒ stale (a legacy entry is backfilled once at LOAD, parseEntry). */
+export function isSeriesFresh(e: SetupCacheEntry, now: number): boolean {
+  return e.series_at !== undefined && now - e.series_at < config.pollFlowsMs;
+}
+
+/** Stamp one field's fetch clock on an existing entry and persist. No-op when the
+ * entry is absent (a gini success before the first series pass has nowhere to write). */
+export function stampSetupCacheField(ca: string, chain: Chain, field: 'info_at' | 'series_at', now: number): void {
+  ensureLoaded();
+  const entry = entries.get(cacheKey(ca, chain));
+  if (!entry) return;
+  entry[field] = now;
+  persist();
 }
 
 /**
