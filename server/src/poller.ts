@@ -352,7 +352,7 @@ function setupRetryDelayMs(misses: number): number {
 }
 
 /** Still owed setup data: no cache entry, or one whose gini/fresh% field is past its
- * 6h TTL. Gini has its own clock (isInfoFresh); the T100 series has its own 24h clock
+ * 6h TTL. Gini has its own clock (isInfoFresh); the T100 series has its own 12h clock
  * (isSeriesFresh) and refreshes independently via flowsSweep. */
 function needsSetup(c: CaTarget, now: number): boolean {
   const miss = setupMisses.get(cacheKey(c.address, c.chain));
@@ -577,6 +577,13 @@ function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: Bal
     log.info(`[setup-cache] fresh entry ${e.ca.slice(0, 8)} (${e.chain}) waits — token_state row not created yet`);
     return undefined;
   }
+  // Marker-only entry: no chart payload to replay. We must NOT fall through to
+  // updateTokenAnalytics — it writes `?? null`, so replaying an empty payload would
+  // WIPE bal_peak_*/bal_trough_* in token_state. The marker alone parks the CA.
+  if (e.series.length === 0) {
+    log.info(`[setup-cache] marker-only entry ${e.ca.slice(0, 8)} (${e.chain}) applied nothing — no payload to replay`);
+    return undefined;
+  }
   const bal = cacheSeriesWindows(e.ca, e.chain, e.series, e.taken_at);
   updateTokenAnalytics(e.ca, e.chain, {
     t100Pct: e.t100_pct,
@@ -612,26 +619,35 @@ export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
   if (entry) putSetupCacheEntry(entry);
 }
 
-/** Series-only refresh for flowsSweep: ALWAYS fetches, never reads or writes the
- * setup cache. That cache is setupSweep's clock — a 15-min writer would keep it
- * permanently fresh and gini (fresh%) would stop re-running entirely. */
-async function refreshSeriesData(ca: string, chain: Chain): Promise<void> {
-  await applySeriesPass(ca, chain, Date.now());
-}
-
 /**
  * Credit-only tgm/flows refresh on its own faster cadence (user 2026-09-24): T100
  * multiple, LF and the bal_* chart windows. No browser door — this is the REST
  * credit API — so it is paced against POLL_FLOWS_MS, not the door budget. Gini
  * (fresh%) stays on setupSweep's 1h cadence: the two refresh at different rates.
+ *
+ * Only CAs that ALREADY have a setup-cache entry are swept: a CA with no entry is
+ * setupSweep's job — it owns the setup pass cap (config.setupPassCap) and the miss
+ * ladder (setupMisses). Flows must not touch them. This is also the credit guard:
+ * refreshSeries honors the per-field series_at marker, so a fresh entry costs 0
+ * (and its LF write-once guard skips the exchange call). An always-fetch pass here
+ * ignores that marker and re-buys every CA's T100+LF forever (measured leak:
+ * 14 credits / 17 min ≈ 1170/day, 469 tracked CAs against only 124 cache entries).
+ *
+ * The old "a series write would keep gini permanently fresh" fear is gone with the
+ * split per-field markers: applySeriesPass stamps only series_at and carries
+ * info_at forward from prev?.info_at, so a flows write can never freeze gini's 6h
+ * clock.
+ *
+ * EXPORTED for the credit-leak regression tests (same test-seam precedent as
+ * setupSweep / refreshSeries / pacedFor).
  */
-async function flowsSweep(): Promise<void> {
+export async function flowsSweep(): Promise<void> {
   if (!flowsClient()) return;
-  const cas = newCasFirst(listTrackedCas());
+  const cas = newCasFirst(listTrackedCas()).filter((c) => getSetupCacheEntry(c.address, c.chain) !== undefined);
   const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollFlowsMs, async (c) => {
     try {
-      await refreshSeriesData(c.address, c.chain);
+      await refreshSeries(c.address, c.chain);
     } catch (e) {
       log.error('[poller] flowsSweep', c.address, e);
     }
@@ -658,13 +674,12 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
   // LF write-once (credit guard): skip the 1-credit exchange fetch once genesis_bal
-  // is known AND the setup cache holds exchange points — the leftmost is a
-  // deterministic read, so re-asking buys nothing. The cached points MUST be
-  // carried into the returned entry: isStorable refuses an empty `exchange`, so
-  // returning [] would make putSetupCacheEntry reject the pass forever and
-  // setupSweep re-run on a permanently stale cache.
+  // is known. `st.genesis_bal != null` already means the LF total was obtained; the
+  // old `prev.exchange.length > 0` requirement existed ONLY because isStorable
+  // refused an empty `exchange` — that invariant is gone, so requiring cached points
+  // would merely re-buy the same 1-credit call forever.
   const prev = getSetupCacheEntry(ca, chain);
-  const haveLf = st.genesis_bal != null && prev !== undefined && prev.exchange.length > 0;
+  const haveLf = st.genesis_bal != null && prev !== undefined;
   const lf = haveLf ? undefined : await exchangeLf(ca, chain, st.deployed_at);
   if (lf !== undefined) genesisBal = lf.total;
   updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, genesisBal, anchorAt, bal });
@@ -673,15 +688,17 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     chain,
     taken_at: now,
     window: fetched?.window ?? '',
-    series_from: fetched?.from ?? Number.NaN,
+    series_from: fetched?.from,
     series: series ?? [],
     exchange: lf?.points ?? prev?.exchange ?? [],
-    t100_pct: t100Pct ?? Number.NaN,
-    t100_multiple: t100Multiple ?? Number.NaN,
-    anchor_at: anchorAt ?? Number.NaN,
-    genesis_bal: genesisBal ?? Number.NaN,
-    // series_at is stamped ONLY when the series actually came back with points —
-    // an empty pass must not look "obtained" (isStorable then refuses the entry).
+    t100_pct: t100Pct,
+    t100_multiple: t100Multiple,
+    anchor_at: anchorAt,
+    genesis_bal: genesisBal,
+    // Carry the previous series marker FIRST; a fresh non-empty series then stamps
+    // `now` over it. An empty pass therefore keeps prev.series_at (no fresh stamp,
+    // an existing marker is never lost).
+    ...(prev?.series_at !== undefined ? { series_at: prev.series_at } : {}),
     ...(series !== undefined && series.length > 0 ? { series_at: now } : {}),
     // Carry the gini stamp forward ONLY from prev.info_at: a series-only pass must
     // not fabricate one, so an unstamped entry stays eligible for the gini re-ask.

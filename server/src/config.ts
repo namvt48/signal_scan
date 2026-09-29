@@ -105,11 +105,13 @@ export const config = {
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
   /** Official tgm/flows (credit-only) refresh — T100 multiple, LF, the bal_* chart
    * windows. Now ALSO the T100-series cache TTL (isSeriesFresh) AND the flowsSweep
-   * walk pace, so one knob means "series TTL = walk pace". 24h (was 6h, 15 min
-   * before): each call costs 1 credit and the series on a token older than 7 days
-   * is DAILY data, so a faster re-fetch only re-reads the same buckets.
-   * Deliberately separate from the gini cadence (POLL_SETUP_MS, 6h). */
-  pollFlowsMs: posNum('POLL_FLOWS_MS', 86_400_000),
+   * walk pace, so one knob means "series TTL = walk pace". 12h (owner 2026-09-29;
+   * was 24h / 6h / 15 min before): each call costs 1 credit, and only ~124 of 469
+   * tracked CAs hold a cache entry, so this knob sets the per-CA series spend
+   * directly (124 CAs ⇒ ~248 credits/day). A CA inside the TTL costs 0 — the setup
+   * sweep's 6h visit is what actually spends once the marker expires.
+   * Deliberately separate from the gini cadence (POLL_SETUP_MS, 6h, browser door — 0 credits). */
+  pollFlowsMs: posNum('POLL_FLOWS_MS', 43_200_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */
   nansenRetries: num('NANSEN_RETRIES', 6),

@@ -1,7 +1,7 @@
 // Fix D regression (2026-09-29): per-field crawl TTL. The marker means "we actually
 // OBTAINED this field's data at T", not "we made a call at T" — empty data must not
 // stamp. gini/fresh% keeps the 6h clock (POLL_SETUP_MS); the T100 series gets its own
-// 24h clock (POLL_FLOWS_MS). Absence at runtime ⇒ never obtained ⇒ stale; legacy
+// 12h clock (POLL_FLOWS_MS). Absence at runtime ⇒ never obtained ⇒ stale; legacy
 // entries (no marker) are backfilled from taken_at ONCE at load, not at read time.
 // Env BEFORE the src imports (node:test = one process per file): the crawl gate is
 // forced, the retry ladder is flattened to its 60s floor so a clock-advanced pass can
@@ -22,7 +22,7 @@ import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } f
 import type { Chain } from '../src/shared/chain.js';
 import type { SetupCacheEntry } from '../src/setup-cache.js';
 
-const { open, insertTrackedCa } = await import('../src/db.js');
+const { getTokenState, open, insertTrackedCa } = await import('../src/db.js');
 const { upsertTokenInfo, updateTokenAnalytics } = await import('../src/ingest.js');
 const {
   getSetupCacheEntry,
@@ -33,7 +33,7 @@ const {
   stampSetupCacheField,
 } = await import('../src/setup-cache.js');
 const { DoorPool, setPoolForTest } = await import('../src/crawl.js');
-const { refreshSeries, setPollerDeps, setupSweep } = await import('../src/poller.js');
+const { flowsSweep, refreshSeries, setPollerDeps, setupSweep } = await import('../src/poller.js');
 const { config } = await import('../src/config.js');
 
 const CHAIN: Chain = 'sol';
@@ -159,7 +159,7 @@ function tempCache(): string {
 test('isInfoFresh / isSeriesFresh: TTL boundaries — no marker means never obtained', () => {
   const now = Date.now();
   const INFO = config.pollSetupMs; // 6h
-  const SERIES = config.pollFlowsMs; // 24h
+  const SERIES = config.pollFlowsMs; // 12h
 
   assert.equal(isInfoFresh(entryFor('a', { info_at: now - (INFO - 1) }), now), true);
   assert.equal(isInfoFresh(entryFor('b', { info_at: now - INFO }), now), false);
@@ -307,7 +307,7 @@ test('needsSetup: info_at 7h old re-asks gini even though series_at is fresh', a
   await setupSweep(provider);
 
   assert.equal(metricCalls.get(ca), 1, 'gini 7h old (> 6h TTL) must be re-asked');
-  assert.equal(seriesCalls, 0, 'series 1h old (< 24h TTL) applies from cache — no flows fetch');
+  assert.equal(seriesCalls, 0, 'series 1h old (< 12h TTL) applies from cache — no flows fetch');
 });
 
 test('refreshSeries: stale series_at fetches; inside the TTL it applies from cache', async () => {
@@ -321,12 +321,12 @@ test('refreshSeries: stale series_at fetches; inside the TTL it applies from cac
   upsertTokenInfo(info(ca, now));
   updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 }); // known LF → the exchange call is skipped
 
-  const young = config.pollFlowsMs - HOUR; // just inside the 24h TTL
+  const young = config.pollFlowsMs - HOUR; // just inside the 12h TTL
   putSetupCacheEntry(entryFor(ca, { taken_at: now - young, series_at: now - young }));
   await refreshSeries(ca, CHAIN);
   assert.equal(seriesCalls, 0, 'series_at inside the TTL is applied from cache, never fetched');
 
-  const old = config.pollFlowsMs + HOUR; // just past the 24h TTL
+  const old = config.pollFlowsMs + HOUR; // just past the 12h TTL
   putSetupCacheEntry(entryFor(ca, { taken_at: now - old, series_at: now - old }));
   await refreshSeries(ca, CHAIN);
   assert.equal(seriesCalls, 1, 'series_at past the TTL must trigger one T100 fetch');
@@ -359,7 +359,7 @@ test('round-trip: stampSetupCacheField writes both clocks to disk and reload kee
   const file = tempCache();
   loadSetupCache(file);
   const now = Date.now();
-  putSetupCacheEntry(entryFor('caRT', { taken_at: now - 30 * HOUR }));
+  putSetupCacheEntry(entryFor('caRT', { taken_at: now - 30 * HOUR, info_at: now - 30 * HOUR, series_at: now - 30 * HOUR }));
 
   stampSetupCacheField('caRT', CHAIN, 'info_at', now - 1_000);
   stampSetupCacheField('caRT', CHAIN, 'series_at', now - 2_000);
@@ -371,4 +371,146 @@ test('round-trip: stampSetupCacheField writes both clocks to disk and reload kee
   // stamping an absent entry is a silent no-op (a gini success before the first series pass)
   stampSetupCacheField('absent', CHAIN, 'info_at', now);
   assert.equal(getSetupCacheEntry('absent', CHAIN), undefined);
+});
+
+// Credit-leak regression (2026-09-29): flowsSweep walked ALL tracked CAs through an
+// ALWAYS-fetch series pass, ignoring the per-field series_at marker. A CA with a
+// fresh cache entry must cost ZERO credits; only a stale series_at may fetch.
+test('flowsSweep: a cached CA with a FRESH series_at makes 0 series and 0 exchange calls', async () => {
+  const ca = 'CA-FLOWS-FRESH';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  putSetupCacheEntry(entryFor(ca, { taken_at: now - HOUR, series_at: now - HOUR }));
+
+  await flowsSweep();
+
+  assert.equal(seriesCalls, 0, 'a fresh series_at is honored — no T100 fetch');
+  assert.equal(exchangeCalls, 0, 'a fresh pass costs no LF credit either');
+});
+
+test('flowsSweep: a cached CA with a STALE series_at makes exactly 1 series fetch', async () => {
+  const ca = 'CA-FLOWS-STALE';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 }); // known LF → write-once guard skips exchange
+  const staleAt = now - config.pollFlowsMs - HOUR;
+  putSetupCacheEntry(entryFor(ca, { taken_at: staleAt, series_at: staleAt }));
+
+  await flowsSweep();
+
+  assert.equal(seriesCalls, 1, 'a stale series_at must trigger exactly one T100 fetch');
+  assert.equal(exchangeCalls, 0, 'a known genesis_bal keeps the LF write-once guard');
+});
+
+test('flowsSweep: a tracked CA with NO cache entry is setupSweep\'s job — 0 calls', async () => {
+  const ca = 'CA-FLOWS-NOCACHE';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now)); // row exists, but no cache entry → not flowsSweep's to fetch
+
+  await flowsSweep();
+
+  assert.equal(seriesCalls, 0, 'an uncached CA is left to setupSweep — flowsSweep must not fetch');
+  assert.equal(exchangeCalls, 0, 'and must not fetch its LF either');
+});
+
+/** A marker-carrying, payload-less entry — numeric fields absent, arrays empty. */
+function markerOnlyEntry(ca: string, over: Partial<SetupCacheEntry>): SetupCacheEntry {
+  return {
+    ca,
+    chain: CHAIN,
+    taken_at: Date.now(),
+    window: '',
+    series_from: undefined,
+    series: [],
+    exchange: [],
+    t100_pct: undefined,
+    t100_multiple: undefined,
+    anchor_at: undefined,
+    genesis_bal: undefined,
+    ...over,
+  };
+}
+
+// Decouple marker from payload (2026-09-29): 343 CAs held current numeric data
+// but no cache entry — isStorable demanded non-empty series AND exchange, so the
+// marker that parks the CA on its TTL was coupled to the chart payload.
+test('marker-only entry: replay applies NOTHING — token_state bal/t100 untouched', async () => {
+  const ca = 'CA-MARKER-REPLAY';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  updateTokenAnalytics(ca, CHAIN, { t100Pct: 42, genesisBal: 7, anchorAt: now - 1_000, bal: { d1: { peak: 100, trough: 50 } } });
+
+  putSetupCacheEntry(markerOnlyEntry(ca, { info_at: now, series_at: now }));
+  assert.notEqual(getSetupCacheEntry(ca, CHAIN), undefined, 'a marker-only entry must be cached and replayable');
+
+  await refreshSeries(ca, CHAIN);
+
+  const st = getTokenState(ca, CHAIN);
+  assert.ok(st);
+  assert.equal(st.bal_peak_24h, 100, 'a payload-less replay must not wipe bal_peak_24h');
+  assert.equal(st.bal_trough_24h, 50, 'a payload-less replay must not wipe bal_trough_24h');
+  assert.equal(st.t100_pct, 42, 'a payload-less replay must not wipe t100_pct');
+  assert.equal(seriesCalls, 0, 'a fresh marker applies from cache — no fetch');
+});
+
+test('empty series pass keeps prev series_at — no fresh stamp, marker-carrying entry persisted', async () => {
+  const ca = 'CA-EMPTY-CARRY';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows([], [])); // empty series
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 });
+  const staleAt = now - config.pollFlowsMs - HOUR;
+  const staleTakenAt = staleAt - 5 * HOUR;
+  putSetupCacheEntry(entryFor(ca, { taken_at: staleTakenAt, series_at: staleAt, info_at: staleAt }));
+
+  await refreshSeries(ca, CHAIN);
+
+  const e = getSetupCacheEntry(ca, CHAIN);
+  assert.ok(e);
+  assert.equal(e.series_at, staleAt, 'an empty pass must NOT stamp a fresh series_at — prev marker carried');
+  assert.ok(e.taken_at > staleTakenAt, 'the empty pass still persisted a marker-carrying entry');
+  assert.ok(Date.now() - (e.series_at ?? 0) >= config.pollFlowsMs, 'the carried marker is still the stale one');
+});
+
+test('haveLf relaxation: genesis_bal known + cached exchange [] ⇒ 0 exchange calls on a stale pass', async () => {
+  const ca = 'CA-HAVE-LF-RELAX';
+  open(':memory:');
+  loadSetupCache(tempCache());
+  const now = Date.now();
+  await installFakeDoor();
+  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+  upsertTokenInfo(info(ca, now));
+  updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 });
+  const staleAt = now - config.pollFlowsMs - HOUR;
+  putSetupCacheEntry(markerOnlyEntry(ca, { taken_at: staleAt, info_at: staleAt, series_at: staleAt }));
+
+  await refreshSeries(ca, CHAIN);
+
+  assert.equal(seriesCalls, 1, 'a stale series still fetches the T100');
+  assert.equal(exchangeCalls, 0, 'genesis_bal known ⇒ the 1-credit LF is never re-bought, even with [] cached points');
 });
