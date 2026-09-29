@@ -134,6 +134,7 @@ const TIER_STYLES: Record<string, string> = {
   A: 'border-warn/40 bg-watch-ink text-warn',
   'B+': 'border-neut/40 bg-surface2 text-neut',
   B: 'border-neut/40 bg-surface2 text-neut',
+  P: 'border-line bg-surface text-muted',
 };
 
 /** Tag → extra class applied to a wallet's display name (styles in index.css). */

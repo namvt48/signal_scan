@@ -126,7 +126,7 @@ test('PUT /api/tier: null, absent or empty tier clears — the row is DELETED, s
 test('PUT /api/tier: 400 on invalid tier, invalid chain or missing ca — nothing written', async () => {
   const badTier = await put({ ca: CA, chain: 'sol', tier: 'C' });
   assert.equal(badTier.status, 400);
-  assert.equal(badTier.json.error, 'tier must be one of S+, S, A+, A, B+, B or null');
+  assert.equal(badTier.json.error, 'tier must be one of S+, S, A+, A, B+, B, P or null');
 
   assert.equal((await put({ ca: CA, chain: 'doge', tier: 'S' })).status, 400);
   assert.equal((await put({ chain: 'sol', tier: 'S' })).status, 400);
@@ -146,6 +146,15 @@ test('PUT /api/tier: 404 for a CA that is not tracked', async () => {
   // Tracked on ANOTHER chain only — the (ca, chain) key must not cross.
   const wrongChain = await put({ ca: CA, chain: 'bsc', tier: 'S' });
   assert.equal(wrongChain.status, 404);
+});
+
+test('PUT /api/tier: P (the dashboard-only tier) is accepted and stored', async () => {
+  insertTrackedCa({ address: 'caTier-P-004', chain: 'sol', note: '' });
+  const res = await put({ ca: 'caTier-P-004', chain: 'sol', tier: 'P' });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json, { ca: 'caTier-P-004', chain: 'sol', tier: 'P' });
+  assert.equal(tierOf('caTier-P-004'), 'P');
+  assert.equal(signalTier('caTier-P-004'), 'P');
 });
 
 test('tier map is permanent: pruning keeps the row, re-adding the CA restores the tier', () => {
