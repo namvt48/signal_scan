@@ -933,7 +933,10 @@ export async function balanceSeries(
   // internal snapshots or kicking a door refetch.
   if (cached.length <= 1) {
     const e = getSetupCacheEntry(ca, chain);
-    if (e && isSetupCacheFresh(e, Date.now())) {
+    // Payload guard (2026-09-29): an always-written entry can be `taken_at`-fresh with
+    // an EMPTY series (an empty fetch pass writes one so its markers have a home) —
+    // replaying it would log a false "replayed chart windows" and buy nothing.
+    if (e && e.series.length > 0 && isSetupCacheFresh(e, Date.now())) {
       cacheSeriesWindows(ca, chain, e.series, e.taken_at);
       log.info(`[setup-cache] replayed ${ca.slice(0, 8)} (${chain}) chart windows from the file cache`);
       cachedAt = nansenSeriesCachedAt(ca, chain, window);

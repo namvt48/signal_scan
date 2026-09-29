@@ -76,12 +76,13 @@ test('C2: prune against an EMPTY tracked set is a no-op — a DB reset cannot wi
   assert.equal(readFileSync(file, 'utf8'), before);
 });
 
-test('C3: entries parseEntry would drop are never stored — non-finite fields, no marker, or empty ca', () => {
+test('C3: entries parseEntry would drop are never stored — non-finite fields or empty ca', () => {
   // Given a loaded cache with one good entry
   const file = join(dir, 'refuse.json');
   loadSetupCache(file);
   const now = Date.now();
-  // A marker is what makes an entry storable now; empty payloads are allowed WITH one.
+  // A marker is NOT required: the entry is where the markers live, and a CA whose
+  // first fetch came back empty must still be cacheable (else it can never park).
   const marked = (ca: string, over: Partial<SetupCacheEntry> = {}): SetupCacheEntry => ({
     ...sampleEntry(ca, now, over),
     info_at: now,
@@ -97,15 +98,18 @@ test('C3: entries parseEntry would drop are never stored — non-finite fields, 
   putSetupCacheEntry(marked('nanTaken', { taken_at: Number.NaN }));
   putSetupCacheEntry(marked('nanFrom', { series_from: Number.NaN }));
   putSetupCacheEntry(marked('', { ca: '' }));
-  putSetupCacheEntry(sampleEntry('noMarker', now, { series: [], exchange: [] })); // nothing obtained → refused
+  // ...while a markerless, payload-less entry IS storable (2026-09-29 root fix: every
+  // tracked CA must be able to persist its clock).
+  putSetupCacheEntry(sampleEntry('noMarker', now, { series: [], exchange: [] }));
 
-  // Then the in-memory map holds ONLY the good entry...
+  // Then the in-memory map holds the good entry and the markerless one...
   assert.equal(getSetupCacheEntry('good', 'sol')?.taken_at, now);
-  for (const ca of ['nanPct', 'infMult', 'nanAnchor', 'nanGenesis', 'nanTaken', 'nanFrom', 'noMarker', '']) {
+  for (const ca of ['nanPct', 'infMult', 'nanAnchor', 'nanGenesis', 'nanTaken', 'nanFrom', '']) {
     assert.equal(getSetupCacheEntry(ca, 'sol'), undefined, `${ca || '<empty>'} must be refused`);
   }
   // ...and the file agrees after a reload — nothing storable was lost, nothing droppable was kept
   const map = loadSetupCache(file);
-  assert.equal(map.size, 1);
+  assert.equal(map.size, 2);
   assert.equal(map.get('sol:good')?.t100_multiple, 1.42);
+  assert.notEqual(map.get('sol:noMarker'), undefined, 'the markerless entry survives the reload');
 });

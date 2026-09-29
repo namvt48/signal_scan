@@ -205,7 +205,7 @@ export function setupCacheSize(): number {
 export function putSetupCacheEntry(entry: SetupCacheEntry): void {
   if (!isStorable(entry)) {
     log.warn(
-      `[setup-cache] skipped cache write for ${entry.chain}:${entry.ca.slice(0, 8) || '<empty>'} — incomplete pass (need a finite marker + no non-finite field)`,
+      `[setup-cache] skipped cache write for ${entry.chain}:${entry.ca.slice(0, 8) || '<empty>'} — unusable entry (need a non-empty ca, a known chain, a finite taken_at and no non-finite field)`,
     );
     return;
   }
@@ -272,12 +272,13 @@ function ensureLoaded(): void {
 }
 
 /** C3 guard: an entry parseEntry would silently DROP on the next load must never
- * reach the file. A marker-carrying entry is storable even with an empty payload —
- * the payload only feeds the chart windows, while the marker (info_at/series_at)
- * is what parks the CA on its TTL. Any PRESENT numeric field must be finite (a
- * NaN/±Infinity vanishes at reload), and at least one marker must be set. */
+ * reach the file. Identity + a finite `taken_at` are all it takes: the ENTRY is
+ * where the per-field markers (info_at/series_at) live, so requiring a marker to
+ * create it was circular — stampSetupCacheField is a no-op with no entry, so a CA
+ * whose credit series came back empty could never be cached at all and was
+ * re-asked on every pass forever (user 2026-09-29: "từ giờ không CA nào lỗi").
+ * A PRESENT numeric field must still be finite (a NaN/±Infinity vanishes at reload). */
 function isStorable(e: SetupCacheEntry): boolean {
-  const marked = isNum(e.info_at) || isNum(e.series_at);
   const numericsOk =
     (e.series_from === undefined || isNum(e.series_from)) &&
     (e.t100_pct === undefined || isNum(e.t100_pct)) &&
@@ -286,7 +287,7 @@ function isStorable(e: SetupCacheEntry): boolean {
     (e.genesis_bal === undefined || isNum(e.genesis_bal)) &&
     (e.info_at === undefined || isNum(e.info_at)) &&
     (e.series_at === undefined || isNum(e.series_at));
-  return e.ca !== '' && isChain(e.chain) && isNum(e.taken_at) && marked && numericsOk;
+  return e.ca !== '' && isChain(e.chain) && isNum(e.taken_at) && numericsOk;
 }
 
 function persist(): void {

@@ -354,7 +354,7 @@ test('T100: a flat series (≥2 buckets, no drawdown) writes multiple 1 over the
   assert.equal(getSetupCacheEntry(CA, CHAIN)?.t100_multiple, 1, 'the completed pass still stored a cache entry');
 });
 
-test('keep previous: a flows throw leaves genesis_bal / t100_multiple untouched and writes no cache entry', async () => {
+test('keep previous: a flows throw leaves genesis_bal / t100_multiple untouched and stamps no marker', async () => {
   open(':memory:');
   loadSetupCache(tempCacheFile());
   const now = Date.now();
@@ -374,7 +374,13 @@ test('keep previous: a flows throw leaves genesis_bal / t100_multiple untouched 
   assert.equal(st.t100_multiple, 1.5, 'a failed T100 fetch must keep the previous multiple');
   assert.equal(st.genesis_bal, 120, 'a failed LF fetch must keep the previous genesis balance');
   assert.equal(st.anchor_at, deployedAt);
-  assert.equal(getSetupCacheEntry(CA, CHAIN), undefined, 'an empty pass must never reach the file cache');
+  // 2026-09-29: an entry is written even by a failed pass so the per-field markers have
+  // somewhere to live — but it stamps NONE, so the CA still owes its data and keeps being
+  // retried (every gate is marker-based; taken_at parks nothing).
+  const failed = getSetupCacheEntry(CA, CHAIN);
+  assert.notEqual(failed, undefined, 'a failed pass still records its clock container');
+  assert.equal(failed?.series_at, undefined, 'a failed pass must not stamp series_at');
+  assert.equal(failed?.info_at, undefined, 'a failed pass must not stamp info_at');
 });
 
 test('tokenFlows: ONE request, per_page 1000, no order_by/filters', async () => {

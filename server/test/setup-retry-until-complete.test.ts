@@ -195,7 +195,12 @@ test('setup spam guard: a CA whose setup keeps coming back EMPTY backs off after
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(EMPTY), 1, 'first attempt happens');
-  assert.equal(getSetupCacheEntry(EMPTY, CHAIN), undefined, 'empty pass is not cached (storable guard)');
+  // 2026-09-29: the empty pass DOES write an entry (the markers need a container) but
+  // stamps no marker, so the CA still owes its data — the backoff below must hold.
+  const emptyEntry = getSetupCacheEntry(EMPTY, CHAIN);
+  assert.notEqual(emptyEntry, undefined, 'the empty pass records an entry');
+  assert.equal(emptyEntry?.series_at, undefined, 'nothing was obtained, so no series marker');
+  assert.equal(emptyEntry?.info_at, undefined, 'and no gini marker');
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(EMPTY), 1, 'empty CA must NOT be hammered on the next pass (backoff)');

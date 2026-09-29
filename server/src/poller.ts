@@ -625,9 +625,11 @@ export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
  * credit API — so it is paced against POLL_FLOWS_MS, not the door budget. Gini
  * (fresh%) stays on setupSweep's 1h cadence: the two refresh at different rates.
  *
- * Only CAs that ALREADY have a setup-cache entry are swept: a CA with no entry is
- * setupSweep's job — it owns the setup pass cap (config.setupPassCap) and the miss
- * ladder (setupMisses). Flows must not touch them. This is also the credit guard:
+ * Only CAs that have OBTAINED a series (series_at marker) are swept: a markerless or
+ * absent entry is setupSweep's job — it owns the setup pass cap (config.setupPassCap)
+ * and the miss ladder (setupMisses). Flows must not touch them. (Since 2026-09-29 the
+ * entry is written even by an empty pass, so keying this filter on entry PRESENCE would
+ * sweep every tracked CA and let the spend escape the cap.) This is also the credit guard:
  * refreshSeries honors the per-field series_at marker, so a fresh entry costs 0
  * (and its LF write-once guard skips the exchange call). An always-fetch pass here
  * ignores that marker and re-buys every CA's T100+LF forever (measured leak:
@@ -643,7 +645,7 @@ export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
  */
 export async function flowsSweep(): Promise<void> {
   if (!flowsClient()) return;
-  const cas = newCasFirst(listTrackedCas()).filter((c) => getSetupCacheEntry(c.address, c.chain) !== undefined);
+  const cas = newCasFirst(listTrackedCas()).filter((c) => getSetupCacheEntry(c.address, c.chain)?.series_at !== undefined);
   const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollFlowsMs, async (c) => {
     try {
