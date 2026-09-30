@@ -43,7 +43,6 @@ import {
 // Token detail page DISABLED — its 2 endpoints below are commented out too.
 // import { buildTokenDetail } from './detail.js';
 // import { balanceSeries } from './crawl.js';
-import { poolStatsOrNull } from './crawl.js';
 import { log } from './log.js';
 import { assembleSignals } from './signals.js';
 import {
@@ -444,6 +443,63 @@ function parseFomoImportRows(body: unknown): FomoUserInput[] | null {
   });
 }
 
+/** Door-table row re-served on the PUBLIC /api/health — the gateway's raw
+ *  `egressIp` and masked proxy string are deliberately absent. */
+interface PublicDoorStat {
+  id: number;
+  state: string;
+  requests: number;
+  lastStatus: number | null;
+  budgetUsed: number;
+  retiredReason: string | null;
+}
+
+/** Fail-open budget for the gateway /health read: a slow/dead gateway must never
+ *  stall the PUBLIC api health probe. */
+const GATEWAY_HEALTH_TIMEOUT_MS = 1_500;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/** Keep ONLY non-sensitive door fields; drop `egressIp` + `proxy` so the PUBLIC
+ *  /api/health cannot leak an egress IP or proxy string (auth.ts marks it public). */
+function publicDoorStat(raw: unknown): PublicDoorStat | null {
+  if (!isRecord(raw)) return null;
+  const { id, state, lastStatus, retiredReason } = raw;
+  if (typeof id !== 'number' || typeof state !== 'string') return null;
+  return {
+    id,
+    state,
+    requests: typeof raw.requests === 'number' ? raw.requests : 0,
+    lastStatus: typeof lastStatus === 'number' || lastStatus === null ? lastStatus : null,
+    budgetUsed: typeof raw.budgetUsed === 'number' ? raw.budgetUsed : 0,
+    retiredReason: typeof retiredReason === 'string' ? retiredReason : null,
+  };
+}
+
+/** Read the gateway /health door table FAIL-OPEN (plan todo 10). The api container
+ *  no longer builds a pool, so the local singleton is always null; the gateway is
+ *  the single authority. Unset GATEWAY_URL → null; any error/timeout → null. Never
+ *  throws, so the PUBLIC /api/health can never 500 or block on it. Todo 14 will
+ *  source the base URL from `config.gatewayUrl` instead of process.env. */
+async function fetchGatewayDoors(): Promise<PublicDoorStat[] | null> {
+  const base = process.env.GATEWAY_URL;
+  if (!base) return null;
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, '')}/health`, {
+      signal: AbortSignal.timeout(GATEWAY_HEALTH_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const body: unknown = await res.json();
+    if (!isRecord(body) || !Array.isArray(body.doors)) return null;
+    return body.doors.map(publicDoorStat).filter((d): d is PublicDoorStat => d !== null);
+  } catch (err) {
+    log.warn('[api] gateway /health unreachable — doors degraded', { err });
+    return null;
+  }
+}
+
 export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   const app = express();
   app.use(express.json());
@@ -462,15 +518,16 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   // behind the Bearer gate; the policy table is deny-by-default.
   app.use(createAuthMiddleware(authDeps));
 
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', async (_req, res) => {
     res.json({
       mode: config.mode,
       provider: providerName,
       lastTokenFetchAt: maxTokenFetchedAt(),
       healthy: true,
-      // Door table (null until the crawl pool is built): state=retired on every door is
-      // the 2026-09-23 blackout signature — no T100/LF factors are landing.
-      doors: poolStatsOrNull(),
+      // Door table from the gateway (single authority); null when GATEWAY_URL is
+      // unset, the gateway is unreachable, or its pool is not built yet. /api/health
+      // is PUBLIC, so `egressIp`/proxy strings are stripped (see fetchGatewayDoors).
+      doors: await fetchGatewayDoors(),
       ratelimit: limiters.snapshot(),
     });
   });

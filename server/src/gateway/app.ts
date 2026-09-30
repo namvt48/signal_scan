@@ -8,6 +8,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { limiters } from '../ratelimit/index.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type CallerTokens } from './auth.js';
+import { poolStatsOrNull } from './door.js';
 import {
   denial,
   parseGatewayRequest,
@@ -18,18 +19,17 @@ import {
 } from './contract.js';
 
 /**
- * DoorPool stats are unavailable in THIS process until todo 10 relocates the
- * DoorPool to `gateway/door.ts`: today `poolStatsOrNull()` lives in crawl.ts,
- * which pulls in the whole browser/DB graph — importing it here would build a
- * SECOND pool inside the gateway container, the exact bug todo 10 avoids.
- * HOOK (todo 10): replace the `doors: null` below with the relocated pool's
- * `stats()`. Those stats include `egressIp`, which the GMGN-allowlist check
- * (todo 22) needs.
+ * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
+ * `poolStatsOrNull()` is side-effect-free: it returns null until a door has
+ * actually been used, so `/health` never spawns a chrome pool. The stats include
+ * `egressIp`, which the GMGN-allowlist check (todo 22) needs.
  *
- * WHY THE (FUTURE) `egressIp` MAY BE DISCLOSED UNAUTHENTICATED: `/health` binds
- * loopback + the private `signal-scan-gateway` net only, so the egress IP is not
- * public. `/health` is NOT token-authenticated — do not describe it as such; the
- * disclosure is intentional and safe given those bindings (plan todo 2).
+ * WHY THE `egressIp` MAY BE DISCLOSED UNAUTHENTICATED: `/health` binds loopback +
+ * the private `signal-scan-gateway` net only, so the egress IP is not public.
+ * `/health` is NOT token-authenticated — do not describe it as such; the
+ * disclosure is intentional and safe given those bindings (plan todo 2). The
+ * PUBLIC api-side `/api/health` (instance a/b) STRIPS `egressIp` + proxy strings
+ * before re-serving the table (api.ts).
  */
 export interface GatewayAppDeps {
   /** Token surface; defaults to the gateway's own env (config.ts, todo 6). */
@@ -97,12 +97,13 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   });
 
   // PUBLIC health probe (acceptance: `{ok:true}`). No auth by design — see the
-  // egressIp note above. `doors` is null until todo 10 (HOOK above).
+  // egressIp note above. `doors` is the relocated DoorPool's live stats (todo 10),
+  // or null until a door call has built the pool.
   app.get('/health', (_req, res) => {
     res.json({
       ok: true,
       ratelimit: limiters.snapshot(),
-      doors: null,
+      doors: poolStatsOrNull(),
     });
   });
 
