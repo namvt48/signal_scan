@@ -204,7 +204,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
   QA scenarios: happy - configured URL + token used; failure - an unreachable URL surfaces as a handled error (todo 15), not a crash. Evidence `.omo/evidence/request-plane-gateway/task-14-request-plane-gateway.md`
   Commit: Y | `feat(server): configure providers with the gateway URL and caller token`
 
-- [ ] 15. TS fail-open / degrade on gateway failure
+- [x] 15. TS fail-open / degrade on gateway failure
   What to do / Must NOT do: **Reconcile with the pinned wire shape (todo 3): an upstream non-2xx arrives as HTTP 200 + `envelope.status` non-2xx.** FAIL-OPEN only on a gateway TRANSPORT failure (connection error / timeout) - log a warning and SKIP that sweep so `poller.ts` continues; the instance keeps serving from its OWN DB (the gateway is read-only, so nothing is lost). Do NOT claim a cross-process stale cache (the cache lives in the gateway). Do NOT swallow an upstream non-2xx (`envelope.status` 4xx/5xx) - that is a real upstream error and MUST surface via the existing typed-error path. A gateway-GENERATED 429 (`{error:"budget_exceeded"}`) ALSO surfaces as a typed error, and is NEVER retried and NEVER fail-open.
   Parallelization: Wave 3 | Blocked by: 14 | Blocks: 22
   References: `server/src/poller.ts` (sweep error handling), `server/src/log.ts` (warn + dedupe), `.omo/drafts/request-plane-gateway.md` (fail-mode assumption; C3 fix).

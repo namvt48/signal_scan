@@ -45,6 +45,8 @@ import { nansenScore } from './signals.js';
 import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
 import { fetchIcons } from './providers/dexscreener.js';
+import { GatewayDenialError, GatewayTransportError } from './gateway-client.js';
+import { HttpError } from './ratelimit/types.js';
 import { log } from './log.js';
 
 interface PollTask {
@@ -79,6 +81,41 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Todo 15 (request-plane-gateway): the sweep-level gateway fail-open policy.
+ *
+ * A gateway TRANSPORT failure (connection refused / timeout / DNS) is the ONE
+ * fail-open category — warn and SKIP this sweep, so the poller keeps running and
+ * the instance serves from its OWN DB (the gateway is read-only: nothing is lost).
+ * This is NOT a cross-process stale cache — the cache lives in the gateway.
+ *
+ * Every other failure is a real error and is NEVER swallowed here: an upstream
+ * non-2xx rides in as HTTP 200 + `envelope.status` (the provider raises it as an
+ * HttpError), and a gateway-generated 429 `{error:"budget_exceeded"}` is a
+ * GatewayDenialError. Both rethrow, so `run()`'s existing typed-error path surfaces them.
+ */
+export async function runGatewaySweep(where: string, body: () => Promise<void>): Promise<void> {
+  try {
+    await body();
+  } catch (e) {
+    if (e instanceof GatewayTransportError) {
+      log.warn(`[poller] ${where}: gateway unreachable — sweep skipped`, e);
+      return;
+    }
+    throw e;
+  }
+}
+
+/**
+ * Per-CA error inside a gateway-backed sweep. A gateway-owned or typed HTTP failure
+ * must reach `runGatewaySweep` (fail-open on transport, surface otherwise), so it is
+ * rethrown; anything else keeps the pre-existing resilience — logged, next CA tried.
+ */
+function logProviderError(e: unknown, where: string, ...fields: unknown[]): void {
+  if (e instanceof GatewayTransportError || e instanceof HttpError) throw e;
+  log.error(`[poller] ${where}`, ...fields, e);
+}
+
+/**
  * A CA added inside newCaPriorityMs jumps the queue on every free sweep, so a
  * fresh add is not stuck behind a long paced list (user 2026-09-22). Stable:
  * both partitions keep their input order.
@@ -110,25 +147,30 @@ function newCaPairsFirst<T extends { ca: string }>(
  * ONE free app-question per (CA, kind); each kind owns its cadence and columns.
  * Covers the whole tracked queue; `only` pins an explicit list instead — the
  * essential gap re-ask uses it.
+ *
+ * EXPORTED for the todo-15 fail-open test only (same test-seam precedent as
+ * setupSweep / flowsSweep / pacedFor); the scheduler stays the production caller.
  */
-async function metricSweep(
+export async function metricSweep(
   provider: MarketDataProvider,
   kind: MetricKind,
   intervalMs: number,
   only?: readonly CaTarget[],
 ): Promise<void> {
   const cas = only ?? newCasFirst(listTrackedCas());
-  await pacedFor(cas, intervalMs, async (c) => {
-    try {
-      const patch = kind === 'essential'
-        ? await withRetry(() => provider.metric(c.address, c.chain, kind), config.essentialRetries)
-        : await provider.metric(c.address, c.chain, kind);
-      if (kind === 'volume') applyVolumeDelta(c.address, c.chain, patch);
-      updateTokenMetrics(c.address, c.chain, patch);
-    } catch (e) {
-      log.error(`[poller] ${kind}Sweep`, c.address, e);
-    }
-  });
+  await runGatewaySweep(`${kind}Sweep`, () =>
+    pacedFor(cas, intervalMs, async (c) => {
+      try {
+        const patch = kind === 'essential'
+          ? await withRetry(() => provider.metric(c.address, c.chain, kind), config.essentialRetries)
+          : await provider.metric(c.address, c.chain, kind);
+        if (kind === 'volume') applyVolumeDelta(c.address, c.chain, patch);
+        updateTokenMetrics(c.address, c.chain, patch);
+      } catch (e) {
+        logProviderError(e, `${kind}Sweep`, c.address);
+      }
+    }),
+  );
 }
 
 /**
@@ -166,14 +208,16 @@ export function applyVolumeDelta(ca: string, chain: Chain, patch: MetricPatch): 
 async function symbolBackfillSweep(provider: MarketDataProvider): Promise<void> {
   const cas = listCaTargetsMissingSymbol(config.symbolBackfillWindowMs);
   if (cas.length === 0) return;
-  await pacedFor(cas, config.pollSymbolBackfillMs, async (c) => {
-    try {
-      const info = await provider.assetInfo?.(c.address, c.chain);
-      if (info?.symbol !== undefined) updateTokenMetrics(c.address, c.chain, { symbol: info.symbol });
-    } catch (e) {
-      log.error('[poller] symbolBackfill', c.address, e);
-    }
-  });
+  await runGatewaySweep('symbolBackfill', () =>
+    pacedFor(cas, config.pollSymbolBackfillMs, async (c) => {
+      try {
+        const info = await provider.assetInfo?.(c.address, c.chain);
+        if (info?.symbol !== undefined) updateTokenMetrics(c.address, c.chain, { symbol: info.symbol });
+      } catch (e) {
+        logProviderError(e, 'symbolBackfill', c.address);
+      }
+    }),
+  );
 }
 
 /**
@@ -213,7 +257,11 @@ async function withRetry<T>(fn: () => Promise<T>, attempts: number): Promise<T> 
       return await fn();
     } catch (e) {
       lastError = e;
-      if (i < tries - 1) await sleep(3_000);
+      // A gateway-owned failure is never re-issued in-pass: a transport failure
+      // fails the sweep open, and a gateway denial (429 budget / 503 gated / 401)
+      // is the gateway's own policy — retrying would double the shared credit budget.
+      if (e instanceof GatewayTransportError || e instanceof GatewayDenialError || i === tries - 1) break;
+      await sleep(3_000);
     }
   }
   throw lastError;
@@ -398,39 +446,41 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   if (all.length > cas.length) {
     log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
   }
-  await pacedFor(cas, config.pollSetupRetryMs, async (c) => {
-    const key = cacheKey(c.address, c.chain);
-    try {
-      const patch = await provider.metric(c.address, c.chain, 'gini');
-      updateTokenMetrics(c.address, c.chain, patch);
-      // Owner rule: the marker means "we OBTAINED the field", not "we called". A
-      // DAS-floor / not-indexed gini pass resolves with NO nansenFreshPct — stamping
-      // it would park the CA on the 6h clock with an empty field. Empty data must NOT
-      // stamp, so the CA keeps its retry ladder.
-      if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
-        stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
+  await runGatewaySweep('setupSweep', () =>
+    pacedFor(cas, config.pollSetupRetryMs, async (c) => {
+      const key = cacheKey(c.address, c.chain);
+      try {
+        const patch = await provider.metric(c.address, c.chain, 'gini');
+        updateTokenMetrics(c.address, c.chain, patch);
+        // Owner rule: the marker means "we OBTAINED the field", not "we called". A
+        // DAS-floor / not-indexed gini pass resolves with NO nansenFreshPct — stamping
+        // it would park the CA on the 6h clock with an empty field. Empty data must NOT
+        // stamp, so the CA keeps its retry ladder.
+        if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
+          stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
+        }
+      } catch (e) {
+        logProviderError(e, 'setupSweep gini', c.address);
       }
-    } catch (e) {
-      log.error('[poller] setupSweep gini', c.address, e);
-    }
-    try {
-      await refreshSeries(c.address, c.chain);
-    } catch (e) {
-      log.error('[poller] setupSweep series', c.address, e);
-    }
-    // A storable gini pass stamps info_at — that is the CA's ticket to the 6h
-    // cadence. Anything else counts as a miss and doubles its next wait.
-    const entry = getSetupCacheEntry(c.address, c.chain);
-    if (entry && isInfoFresh(entry, now)) setupMisses.delete(key);
-    else {
-      const misses = (setupMisses.get(key)?.misses ?? 0) + 1;
-      // Too-new token: flat hourly spacing — Nansen has not indexed the mint yet,
-      // so the doubling ladder's fast early retries are pure credit spam. The
-      // first attempt on add (kickSetupEarly) is untouched; only RETRIES throttle.
-      const delayMs = isTooNewToken(c.address, c.chain, Date.now()) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
-      setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
-    }
-  });
+      try {
+        await refreshSeries(c.address, c.chain);
+      } catch (e) {
+        logProviderError(e, 'setupSweep series', c.address);
+      }
+      // A storable gini pass stamps info_at — that is the CA's ticket to the 6h
+      // cadence. Anything else counts as a miss and doubles its next wait.
+      const entry = getSetupCacheEntry(c.address, c.chain);
+      if (entry && isInfoFresh(entry, now)) setupMisses.delete(key);
+      else {
+        const misses = (setupMisses.get(key)?.misses ?? 0) + 1;
+        // Too-new token: flat hourly spacing — Nansen has not indexed the mint yet,
+        // so the doubling ladder's fast early retries are pure credit spam. The
+        // first attempt on add (kickSetupEarly) is untouched; only RETRIES throttle.
+        const delayMs = isTooNewToken(c.address, c.chain, Date.now()) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
+        setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
+      }
+    }),
+  );
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
   // File-cache prune (plan setup-fill-on-add §4): drop entries whose CA left the
   // queue or aged past 7 cadences; the empty-set guard inside pruneSetupCache
@@ -646,13 +696,15 @@ export async function flowsSweep(): Promise<void> {
     const e = getSetupCacheEntry(c.address, c.chain);
     return e !== undefined && !isSeriesFresh(e, now);
   });
-  await pacedFor(cas, config.pollFlowsMs, async (c) => {
-    try {
-      await refreshSeries(c.address, c.chain);
-    } catch (e) {
-      log.error('[poller] flowsSweep', c.address, e);
-    }
-  });
+  await runGatewaySweep('flowsSweep', () =>
+    pacedFor(cas, config.pollFlowsMs, async (c) => {
+      try {
+        await refreshSeries(c.address, c.chain);
+      } catch (e) {
+        logProviderError(e, 'flowsSweep', c.address);
+      }
+    }),
+  );
 }
 
 /** One flows pass: fetch the series → T100 multiple / LF / bal_* windows → DB.
