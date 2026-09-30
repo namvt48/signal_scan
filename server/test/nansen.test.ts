@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { extremesFromStats, fiboDelayMs, holdersGiniBody, hourlyStatsBody, NansenWebCrawler, parseGiniStats, type HourlyStatsRow, type PostJson } from '../src/providers/nansen.js';
-import { creditsSpent, resetCreditsSpent } from '../src/providers/nansen.js';
+import { GatewayClient } from '../src/gateway-client.js';
 
 test('fiboDelayMs: 1,1,2,3,5,8,13 × base (the credit-door retry spacing)', () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((n) => fiboDelayMs(n, 1_000)), [1_000, 1_000, 2_000, 3_000, 5_000, 8_000, 13_000]);
@@ -380,48 +380,33 @@ test('metric(essential): both doors empty still throws, so the sweep logs the CA
   }
 });
 
-test('creditsSpent: x-nansen-credits-cost bumps the counter; a header-less response leaves it unchanged', async () => {
+test('NansenApiClient.currentBalance: gateway URL + envelope unwrap + data[0] parse', async () => {
   const origFetch = globalThis.fetch;
+  const urls: string[] = [];
+  const sent: { endpoint: string; body: { chain: string; filters: unknown; pagination: unknown }; priority: number }[] = [];
+  const gw = new GatewayClient({ baseUrl: 'http://gateway:8130', callerToken: 'tok' });
   try {
-    resetCreditsSpent();
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify({ data: [{ token_amount: 1, price_usd: 1, value_usd: 1 }] }), {
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      urls.push(String(url));
+      sent.push(JSON.parse(String(init?.body)));
+      const upstream = { data: [{ token_amount: 123, price_usd: 0.5, value_usd: 61.5, token_symbol: 'TOK' }] };
+      return new Response(JSON.stringify({ status: 200, body: JSON.stringify(upstream), headers: { 'x-nansen-credits-cost': '1' } }), {
         status: 200,
-        headers: { 'x-nansen-credits-cost': '1', 'x-nansen-credits-remaining': '999' },
-      })) as typeof fetch;
-    await new NansenApiClient('key').currentBalance('W', 'sol', 'caX');
-    assert.equal(creditsSpent(), 1, 'a cost header of 1 must bump the spend counter by 1');
-
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify({ data: [{ token_amount: 1, price_usd: 1, value_usd: 1 }] }), { status: 200 })) as typeof fetch;
-    await new NansenApiClient('key').currentBalance('W', 'sol', 'caX');
-    assert.equal(creditsSpent(), 1, 'no cost header → the spend counter is unchanged');
-  } finally {
-    globalThis.fetch = origFetch;
-    resetCreditsSpent();
-  }
-});
-
-test('NansenApiClient.currentBalance: request shape + data[0] parse (credits header logged)', async () => {
-  const origFetch = globalThis.fetch;
-  try {
-    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
-      const body = JSON.parse(String(init?.body));
-      assert.equal(String(_url), 'https://api.nansen.ai/api/v1/profiler/address/current-balance');
-      assert.equal(body.chain, 'solana'); // API door maps sol → solana
-      assert.deepEqual(body.filters, { token_address: 'caX' });
-      assert.deepEqual(body.pagination, { page: 1, per_page: 5 });
-      return new Response(JSON.stringify({ data: [{ token_amount: 123, price_usd: 0.5, value_usd: 61.5, token_symbol: 'TOK' }] }), {
-        status: 200,
-        headers: { 'x-nansen-credits-remaining': '9877' },
       });
     }) as typeof fetch;
-    const b = await new NansenApiClient('key').currentBalance('W', 'sol', 'caX');
+    const b = await new NansenApiClient('key', gw).currentBalance('W', 'sol', 'caX');
     assert.deepEqual(b, { tokenAmount: 123, priceUsd: 0.5, valueUsd: 61.5, tokenSymbol: 'TOK' });
+    assert.equal(urls[0], 'http://gateway:8130/v1/nansen/credit');
+    assert.equal(sent[0].endpoint, '/api/v1/profiler/address/current-balance');
+    assert.equal(sent[0].body.chain, 'solana'); // API door maps sol → solana
+    assert.deepEqual(sent[0].body.filters, { token_address: 'caX' });
+    assert.deepEqual(sent[0].body.pagination, { page: 1, per_page: 5 });
+    assert.equal(sent[0].priority, 1);
 
     // empty data → undefined (no position)
-    globalThis.fetch = (async () => new Response(JSON.stringify({ data: [] }), { status: 200 })) as typeof fetch;
-    assert.equal(await new NansenApiClient('key').currentBalance('W', 'sol', 'caX'), undefined);
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: 200, body: JSON.stringify({ data: [] }), headers: {} }), { status: 200 })) as typeof fetch;
+    assert.equal(await new NansenApiClient('key', gw).currentBalance('W', 'sol', 'caX'), undefined);
   } finally {
     globalThis.fetch = origFetch;
   }

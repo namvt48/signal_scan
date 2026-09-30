@@ -30,6 +30,7 @@ const { updateTokenMetrics, updateTokenAnalytics } = await import('../src/ingest
 const { loadSetupCache, getSetupCacheEntry } = await import('../src/setup-cache.js');
 const { refreshSeries, setPollerDeps } = await import('../src/poller.js');
 const { NansenApiClient } = await import('../src/providers/nansen.js');
+const { GatewayClient } = await import('../src/gateway-client.js');
 
 const CA = 'CA-TGM-FLOWS';
 const CHAIN: Chain = 'sol';
@@ -383,29 +384,65 @@ test('keep previous: a flows throw leaves genesis_bal / t100_multiple untouched 
   assert.equal(failed?.info_at, undefined, 'a failed pass must not stamp info_at');
 });
 
-test('tokenFlows: ONE request, per_page 1000, no order_by/filters', async () => {
+test('tokenFlows: ONE gateway request, per_page 1000, no order_by/filters', async () => {
   const realFetch = globalThis.fetch;
-  const client = new NansenApiClient('test-key');
+  const gw = new GatewayClient({ baseUrl: 'http://gateway:8130', callerToken: 'tok' });
+  const client = new NansenApiClient('test-key', gw);
   const req: TgmFlowsRequest = {
     chain: CHAIN,
     token_address: CA,
     date: { from: new Date(0).toISOString(), to: new Date(DAY).toISOString() },
     label: 'top_100_holders',
   };
-  const bodies: Record<string, unknown>[] = [];
+  const urls: string[] = [];
+  const sent: { endpoint: string; body: Record<string, unknown> }[] = [];
   try {
-    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
-      bodies.push(JSON.parse(init?.body ?? '{}') as Record<string, unknown>);
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      urls.push(String(url));
+      sent.push(JSON.parse(init?.body ?? '{}') as { endpoint: string; body: Record<string, unknown> });
       const data = Array.from({ length: 1000 }, (_, i) => ({ date: new Date(0).toISOString(), token_amount: i }));
-      return new Response(JSON.stringify({ data }), { status: 200 });
+      return new Response(JSON.stringify({ status: 200, body: JSON.stringify({ data }), headers: {} }), { status: 200 });
     }) as typeof fetch;
     const rows = await client.tokenFlows(req);
     assert.equal(rows.length, 1000);
-    assert.equal(bodies.length, 1, 'a full page must NOT trigger page 2 — the endpoint has no real pagination');
-    assert.deepEqual(bodies[0].pagination, { page: 1, per_page: 1000 });
-    assert.equal('order_by' in bodies[0], false);
-    assert.equal('filters' in bodies[0], false);
+    assert.equal(sent.length, 1, 'a full page must NOT trigger page 2 — the endpoint has no real pagination');
+    assert.equal(urls[0], 'http://gateway:8130/v1/nansen/credit');
+    assert.equal(sent[0].endpoint, '/api/v1/tgm/flows');
+    assert.deepEqual(sent[0].body.pagination, { page: 1, per_page: 1000 });
+    assert.equal('order_by' in sent[0].body, false);
+    assert.equal('filters' in sent[0].body, false);
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('live chart path: refreshSeries → seriesAtRung fetches through the gateway', async () => {
+  const realFetch = globalThis.fetch;
+  open(':memory:');
+  loadSetupCache(tempCacheFile());
+  const deployedAt = Date.now() - 3 * DAY;
+  updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
+  const urls: string[] = [];
+  try {
+    globalThis.fetch = (async (url: unknown, init?: { body?: string }) => {
+      urls.push(String(url));
+      const sent = JSON.parse(String(init?.body)) as { body: { date?: { from?: string; to?: string } } };
+      const from = Date.parse(sent.body.date?.from ?? '');
+      const to = Date.parse(sent.body.date?.to ?? '');
+      const rows: TgmFlowsRow[] = [];
+      for (let t = from; t <= to; t += DAY) rows.push({ date: new Date(t).toISOString(), token_amount: 100, holders_count: 1 });
+      return new Response(JSON.stringify({ status: 200, body: JSON.stringify({ data: rows }), headers: {} }), { status: 200 });
+    }) as typeof fetch;
+    const gw = new GatewayClient({ baseUrl: 'http://gateway:8130', callerToken: 'tok' });
+    setPollerDeps(stubProvider, new NansenApiClient('test-key', gw));
+    await refreshSeries(CA, CHAIN);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.ok(urls.length >= 1, 'the live chart path must fetch the series through the gateway');
+  assert.deepEqual(
+    [...new Set(urls)],
+    ['http://gateway:8130/v1/nansen/credit'],
+    `every series call must go to the gateway, got ${urls.join(', ')}`,
+  );
 });

@@ -7,8 +7,8 @@ import { listTrackedCas, open, seedIfEmpty } from './db.js';
 import { MockProvider } from './providers/mock.js';
 import { GmgnMarketProvider } from './providers/gmgn.js';
 import { CompositeProvider } from './providers/composite.js';
-import { NansenApiClient, NansenMarketProvider } from './providers/nansen.js';
-import { browserPostJson } from './crawl.js';
+import { NansenApiClient, NansenMarketProvider, doorEndpointFor } from './providers/nansen.js';
+import { gatewayClientFromEnv, GW_NANSEN_DOOR_PATH } from './gateway-client.js';
 import type { MarketDataProvider } from './providers/provider.js';
 import { startPoller } from './poller.js';
 import { cacheKey, loadSetupCache, pruneSetupCache } from './setup-cache.js';
@@ -27,17 +27,23 @@ log.info(`[setup-cache] loaded ${setupCache.size} entries from ${config.setupCac
 // Credit API client: first-add token-information (1cr) + non-sol wallet balances.
 // Absent key -> the free app-question metrics still run; the credit paths are skipped.
 const nansenApi = config.nansenApiKey ? new NansenApiClient(config.nansenApiKey) : null;
-const gmgnApi = config.gmgnApiKey ? new GmgnMarketProvider(config.gmgnApiKey) : null;
+// The gateway injects GMGN's key (todo 13), so the provider is built unconditionally.
+const gmgnApi = new GmgnMarketProvider(config.gmgnApiKey);
+
+// The free app-questions door rides the gateway too: the api process never builds
+// a DoorPool, it POSTs the question to the gateway's door route.
+const gateway = gatewayClientFromEnv();
+async function doorPostJson(url: string, body: unknown): Promise<{ status: number; json: unknown }> {
+  const endpoint = doorEndpointFor(url);
+  if (endpoint === null) throw new Error(`[index] unknown nansen door url ${url}`);
+  const env = await gateway.call(GW_NANSEN_DOOR_PATH, { endpoint, body });
+  return { status: env.status, json: env.body === null ? null : (JSON.parse(env.body) as unknown) };
+}
 
 function buildProvider(): MarketDataProvider {
   if (config.mode === 'mock') return new MockProvider();
-  // app-questions door rides the browser transport (CF blocks non-browser TLS).
-  const nansen = new NansenMarketProvider((url, body) => browserPostJson(url, body), nansenApi, listTrackedCas);
+  const nansen = new NansenMarketProvider(doorPostJson, nansenApi, listTrackedCas);
   if (config.mode !== 'gmgn') return nansen;
-  if (!gmgnApi) {
-    log.warn('[index] MODE=gmgn but GMGN_API_KEY unset → nansen only');
-    return nansen;
-  }
   return new CompositeProvider(gmgnApi, nansen);
 }
 
@@ -48,7 +54,7 @@ startPoller(provider, nansenApi);
 createApp(provider.name).listen(config.port, () => {
   log.info(
     `[index] listening on :${config.port} mode=${config.mode} provider=${provider.name}` +
-      ` nansenApi=${nansenApi ? 'on' : 'off'} gmgnApi=${gmgnApi ? 'on' : 'off'}` +
+      ` nansenApi=${nansenApi ? 'on' : 'off'} gmgnApi=on` +
       ` chartSweep=${config.crawlEnabled ? 'on' : 'off'} db=${config.dbPath}`,
   );
 });

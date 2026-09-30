@@ -39,7 +39,7 @@ import {
   stampSetupCacheField,
   type SetupCacheEntry,
 } from './setup-cache.js';
-import { creditsSpent, type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
+import { type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
 import { exchangeAnchorLf, RUNG_SPAN_DAYS, seriesReachesStart, t100Mdd } from './snapshot.js';
 import { nansenScore } from './signals.js';
 import { getThresholds } from './settings.js';
@@ -398,7 +398,6 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   if (all.length > cas.length) {
     log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
   }
-  const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollSetupRetryMs, async (c) => {
     const key = cacheKey(c.address, c.chain);
     try {
@@ -432,7 +431,6 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
       setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
     }
   });
-  log.info('[poller] setupSweep credit spend', creditsSpent() - spendBefore);
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
   // File-cache prune (plan setup-fill-on-add §4): drop entries whose CA left the
   // queue or aged past 7 cadences; the empty-set guard inside pruneSetupCache
@@ -648,7 +646,6 @@ export async function flowsSweep(): Promise<void> {
     const e = getSetupCacheEntry(c.address, c.chain);
     return e !== undefined && !isSeriesFresh(e, now);
   });
-  const spendBefore = creditsSpent();
   await pacedFor(cas, config.pollFlowsMs, async (c) => {
     try {
       await refreshSeries(c.address, c.chain);
@@ -656,7 +653,6 @@ export async function flowsSweep(): Promise<void> {
       log.error('[poller] flowsSweep', c.address, e);
     }
   });
-  log.info('[poller] flowsSweep credit spend', creditsSpent() - spendBefore);
 }
 
 /** One flows pass: fetch the series → T100 multiple / LF / bal_* windows → DB.

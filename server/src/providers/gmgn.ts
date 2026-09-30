@@ -5,6 +5,9 @@
 //       ?chain=sol&address=<ca>&timestamp=<unix-sec>&client_id=<uuid>
 //   header: X-APIKEY: <key>
 //
+// The provider no longer calls this URL itself: it POSTs `{ca, chain, priority}`
+// to the gateway (`/v1/gmgn/token-info`), which builds the request above and
+// injects the api key. The `key` ctor arg is kept for arity only.
 // ONE call returns every field the six columns need — live-verified 2026-09-24 on
 // MINI (Ax5dAamJPeuaLpFUzs9FdcpoUhHDcxyjPzxCJQidjups): price 0.0026489706,
 // holder_count 2923, volume_1h 4915.02, volume_24h 425137.45, circulating_supply
@@ -18,16 +21,14 @@
 //
 // Rate limiting is WEIGHT-based, not request-based: calls/sec = plan weight /
 // endpoint weight (gmgn.ai/ai table, 2026-09-24) — Free 5, Plus 20, Pro 50, and
-// `/v1/token/info` costs 1, so Free allows 5 calls/sec. The ratelimit layer
-// (src/ratelimit/) owns the weight bucket and the 429 ban gate; this provider
-// only throws HttpError so the layer can gate. No retry/backoff here: a 429
-// thrown is caught by the sweep, and the next hourly pass is the durable retry.
+// `/v1/token/info` costs 1, so Free allows 5 calls/sec. The gateway now owns the
+// weight bucket and the 429 ban gate; this provider only throws HttpError so the
+// caller keeps one typed-error path. No retry/backoff here: a 429 thrown is
+// caught by the sweep, and the next hourly pass is the durable retry.
 
-import { randomUUID } from 'node:crypto';
 import { timed } from '../log.js';
-import { limiters } from '../ratelimit/index.js';
 import { HttpError, type Priority } from '../ratelimit/types.js';
-import { chainSlugs } from '../shared/chain-slugs.js';
+import { gatewayClientFromEnv, GatewayClient, GW_GMGN_TOKEN_INFO_PATH } from '../gateway-client.js';
 import type { Chain } from '../shared/chain.js';
 import type { AssetInfo } from './solana.js';
 import type { MetricKind, MetricPatch } from './provider.js';
@@ -36,12 +37,6 @@ export const GMGN_TOKEN_INFO_URL = 'https://openapi.gmgn.ai/v1/token/info';
 
 /** Weight `/v1/token/info` costs against the plan budget (calls/sec = plan / this). */
 export const GMGN_TOKEN_INFO_WEIGHT = 1;
-
-/** GMGN slugs the chain `sol` — `solana` 404s TOKEN_NOT_FOUND (probed 2026-09-24). */
-function gmgnChain(chain: string): string {
-  const slugs = chainSlugs(chain);
-  return slugs.gmgn;
-}
 
 /** GMGN sends every numeric field as a STRING ("425137.45927614") — coerce, 0 on junk. */
 function num(v: unknown): number {
@@ -126,7 +121,12 @@ export interface GmgnProvider {
 export class GmgnMarketProvider implements GmgnProvider {
   readonly name = 'gmgn';
 
-  constructor(private readonly apiKey: string) {}
+  constructor(
+    private readonly apiKey: string,
+    private readonly gateway: GatewayClient = gatewayClientFromEnv(),
+  ) {
+    void this.apiKey;
+  }
 
   /**
    * ONE token/info call per kind, split into the two DISJOINT field sets the
@@ -168,27 +168,12 @@ export class GmgnMarketProvider implements GmgnProvider {
   }
 
   private async fetchTokenInfo(ca: string, chain: Chain, priority: Priority): Promise<MetricPatch> {
-    return limiters.run('gmgn', { weight: GMGN_TOKEN_INFO_WEIGHT, priority }, () =>
-      timed('gmgn token/info', { ca, chain }, async () => {
-        const qs = new URLSearchParams({
-          chain: gmgnChain(chain),
-          address: ca,
-          timestamp: String(Math.floor(Date.now() / 1000)),
-          client_id: randomUUID(),
-        });
-        const res = await fetch(`${GMGN_TOKEN_INFO_URL}?${qs.toString()}`, {
-          headers: { 'X-APIKEY': this.apiKey },
-        });
-        const json = (await res.json().catch(() => null)) as GmgnTokenInfoResponse | null;
-        if (!res.ok || !json) {
-          throw new HttpError(
-            res.status,
-            res.headers.get('x-ratelimit-reset'),
-            `gmgn token/info ${res.status}: ${json?.error ?? ''} ${json?.message ?? ''}`.slice(0, 200),
-          );
-        }
-        return parseTokenInfo(json);
-      }),
-    );
+    return timed('gmgn token/info', { ca, chain }, async () => {
+      const env = await this.gateway.call(GW_GMGN_TOKEN_INFO_PATH, { ca, chain, priority });
+      if (env.status < 200 || env.status >= 300 || env.body === null) {
+        throw new HttpError(env.status, env.headers['x-ratelimit-reset'] ?? null, `gmgn token/info ${env.status}`.slice(0, 200));
+      }
+      return parseTokenInfo(JSON.parse(env.body) as GmgnTokenInfoResponse);
+    });
   }
 }

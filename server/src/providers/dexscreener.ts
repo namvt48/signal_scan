@@ -15,7 +15,7 @@
 // directly and writes through the generic updateTokenMetrics patch seam.
 
 import { log } from '../log.js';
-import { limiters } from '../ratelimit/index.js';
+import { gatewayClientFromEnv, GatewayClient, GW_DEXSCREENER_PATH } from '../gateway-client.js';
 
 export const DEXSCREENER_TOKENS_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 
@@ -111,22 +111,23 @@ export function chunkAddresses(cas: readonly string[], size: number = DEXSCREENE
  * slots exist to protect per-CA rate-limited doors, and a keyless batch call
  * covering 30 CAs has no such door to protect.
  */
-export async function fetchIcons(cas: readonly string[], timeoutMs = 30_000): Promise<Map<string, string>> {
+export async function fetchIcons(
+  cas: readonly string[],
+  gateway: GatewayClient = gatewayClientFromEnv(),
+): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   for (const chunk of chunkAddresses(cas)) {
     try {
-      const res = await limiters.run('dexscreener', { priority: 2 }, () =>
-        fetch(`${DEXSCREENER_TOKENS_URL}/${chunk.join(',')}`, {
-          headers: { 'User-Agent': 'signal-scan/0.1 (token icon metadata; self-hosted dashboard)' },
-          signal: AbortSignal.timeout(timeoutMs),
-        }),
-      );
-      const json = (await res.json().catch(() => null)) as DexTokensResponse | null;
-      if (!res.ok || json === null) {
-        log.warn(`[dexscreener] tokens http ${res.status} — chunk skipped`, { n: chunk.length });
+      const env = await gateway.call(GW_DEXSCREENER_PATH, {
+        endpoint: 'tokens',
+        params: { addresses: chunk.join(',') },
+        priority: 2,
+      });
+      if (env.status < 200 || env.status >= 300 || env.body === null) {
+        log.warn(`[dexscreener] tokens http ${env.status} — chunk skipped`, { n: chunk.length });
         continue;
       }
-      for (const [mint, url] of parseIcons(json)) out.set(mint, url);
+      for (const [mint, url] of parseIcons(JSON.parse(env.body) as DexTokensResponse)) out.set(mint, url);
     } catch (e) {
       // Timeout / DNS / connection reset — same skip-and-continue as a non-200.
       log.warn('[dexscreener] tokens fetch failed — chunk skipped', { n: chunk.length, err: e });

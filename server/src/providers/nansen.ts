@@ -21,8 +21,8 @@ import { EvmRpcClient } from './evm.js';
 import { solanaRpcEndpoints, SolanaRpcClient, type AssetInfo } from './solana.js';
 import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo, WalletActivity, WalletTokenHolding } from './provider.js';
 import { log, timed } from '../log.js';
-import { limiters } from '../ratelimit/index.js';
 import { HttpError } from '../ratelimit/types.js';
+import { gatewayClientFromEnv, GatewayClient, GW_NANSEN_CREDIT_PATH } from '../gateway-client.js';
 
 export interface BalanceRange {
   peak: number;
@@ -54,6 +54,19 @@ export const NANSEN_TOKEN_INFORMATION_PATH = '/api/v1/tgm/token-information';
  * is ≤7 days, DAILY for longer (no parameter forces hourly on a wider range) —
  * this is why the poller's T100 fetch chunks into 7-day calls. */
 export const NANSEN_FLOWS_PATH = '/api/v1/tgm/flows';
+
+/** The three live app-question URLs → the pinned gateway door `endpoint`.
+ *  Mirrors `gateway/nansen.ts` `doorEndpointFor` (gateway/* is out of scope for
+ *  the adapter todo, so the map is pinned here too — both sides are test-covered). */
+const DOOR_ENDPOINTS: Record<string, 'tgm-essential-data' | 'tgm-volume-details' | 'tgm-holders-gini-stats'> = {
+  [NANSEN_ESSENTIAL_DATA_URL]: 'tgm-essential-data',
+  [NANSEN_VOLUME_DETAILS_URL]: 'tgm-volume-details',
+  [NANSEN_HOLDERS_GINI_URL]: 'tgm-holders-gini-stats',
+};
+
+export function doorEndpointFor(url: string): 'tgm-essential-data' | 'tgm-volume-details' | 'tgm-holders-gini-stats' | null {
+  return DOOR_ENDPOINTS[url] ?? null;
+}
 
 export type StatWindow = 'day' | 'week' | 'month';
 
@@ -336,65 +349,41 @@ export function fiboDelayMs(n: number, baseMs: number): number {
   return a * baseMs;
 }
 
-/** Cumulative Nansen credit spend this process — incremented per SUCCESSFUL credit
- * call by the `x-nansen-credits-cost` header. Lets a sweep log its own spend. */
-let creditSpend = 0;
-
-export function creditsSpent(): number {
-  return creditSpend;
-}
-
-export function resetCreditsSpent(): void {
-  creditSpend = 0;
-}
-
 export class NansenApiClient implements TokenFlowsClient {
   readonly name = 'nansen-api';
 
-  constructor(private readonly apiKey: string) {}
-
-  /** Credit door: routed through the shared `nansen-credit` limiter — fibo retry on
-   * 429/5xx; a 403 (out of credits) rejects and arms the gate's cooldown. */
-  private async post<T>(path: string, body: unknown): Promise<T> {
-    return timed('nansen post', { path }, () =>
-      limiters.run('nansen-credit', { priority: 1 }, async () => {
-        try {
-          return await this.postOnce<T>(path, body);
-        } catch (e) {
-          if (e instanceof HttpError) throw e;
-          // transport/parse failure carried no status — surface as a retryable 503 so the layer retries it
-          throw new HttpError(503, null, e instanceof Error ? e.name : 'nansen transport error');
-        }
-      }),
-    );
+  constructor(
+    private readonly apiKey: string,
+    private readonly gateway: GatewayClient = gatewayClientFromEnv(),
+  ) {
+    void this.apiKey;
   }
 
-  private async postOnce<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`https://api.nansen.ai${path}`, {
-      method: 'POST',
-      headers: { apikey: this.apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+  /** Credit door now rides the gateway (todo 13): the gateway owns the
+   * `nansen-credit` limiter, the fibo retry and the apikey injection. An upstream
+   * 4xx/5xx arrives as HTTP 200 + `envelope.status`; a gateway denial (429 budget /
+   * 503 gated) is thrown as HttpError by the transport. */
+  private async post<T>(path: string, body: unknown): Promise<T> {
+    return timed('nansen post', { path }, async () => {
+      const env = await this.gateway.call(GW_NANSEN_CREDIT_PATH, { endpoint: path, body, priority: 1 });
+      const costHeader = env.headers['x-nansen-credits-cost'];
+      const cost = costHeader === undefined ? undefined : Number(costHeader);
+      if (costHeader !== undefined) {
+        log.info('[nansen-credit]', {
+          path,
+          ...(cost !== undefined && Number.isFinite(cost) ? { cost } : {}),
+        });
+      }
+      if (env.status < 200 || env.status >= 300 || env.body === null) {
+        throw new HttpError(env.status, env.headers['x-ratelimit-reset'] ?? null, `nansen ${path} ${env.status}`.slice(0, 200));
+      }
+      const json = JSON.parse(env.body) as T | { error?: string; message?: string };
+      if (json && typeof json === 'object' && 'error' in (json as object)) {
+        const err = json as { error?: string; message?: string };
+        throw new HttpError(env.status, null, `nansen ${path} ${env.status}: ${err.error ?? ''} ${err.message ?? ''}`.slice(0, 200));
+      }
+      return json as T;
     });
-    const json = (await res.json().catch(() => null)) as T | { error?: string; message?: string } | null;
-    const costHeader = res.headers.get('x-nansen-credits-cost');
-    const remainingHeader = res.headers.get('x-nansen-credits-remaining');
-    const cost = costHeader === null ? undefined : Number(costHeader);
-    const remaining = remainingHeader === null ? undefined : Number(remainingHeader);
-    if (costHeader !== null) {
-      log.info('[nansen-credit]', {
-        path,
-        ...(cost !== undefined && Number.isFinite(cost) ? { cost } : {}),
-        ...(remaining !== undefined && Number.isFinite(remaining) ? { remaining } : {}),
-      });
-    } else if (remainingHeader !== null) {
-      log.debug('[nansen-api] credits remaining', { path, credits: remainingHeader });
-    }
-    if (!res.ok || !json || 'error' in (json as object)) {
-      const err = json as { error?: string; message?: string } | null;
-      throw new HttpError(res.status, null, `nansen ${path} ${res.status}: ${err?.error ?? ''} ${err?.message ?? ''}`.slice(0, 200));
-    }
-    if (cost !== undefined && Number.isFinite(cost)) creditSpend += cost;
-    return json as T;
   }
 
   /** tgm/flows rows for one label+range. ONE request: this endpoint has NO real
