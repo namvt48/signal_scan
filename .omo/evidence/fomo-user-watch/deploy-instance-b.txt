@@ -1,0 +1,113 @@
+# Deploy FOMO -> instance b (+ auth fix) — 2026-09-29 18:12 +07
+
+## Context
+- Local tree: HEAD `5255745` (feat/fomo-user-watch) + uncommitted `src/components/SignalTable.tsx`
+  (merged `FOMO by` into `Tracked by`, amendment 2).
+- Host `root@194.163.187.250` (vmi2958603). Instance **a** = `/root/signal_scan` (127.0.0.1:8124,
+  behind Caddy) — MUST NOT be touched. Instance **b** = `/root/signal_scan_b` (0.0.0.0:8125, public).
+
+## Commands run
+1. `make deploy INSTANCE=b` -> `== deploy OK — instance=b port=8125 dir=/root/signal_scan_b`
+2. `make up INSTANCE=b` -> b-api/b-web Recreated; `/api/health` `{"mode":"gmgn",...,"healthy":true}`
+3. auth fix: wrote `/root/signal_scan_b/.env` + 3 auth keys into `/root/signal_scan_b/server/.env`
+4. `make deploy INSTANCE=b` + `make up INSTANCE=b` (rebuild so VITE_FIREBASE_* bake into the FE)
+5. daemon staging: `mkdir /opt/fomo-watch`; `rsync watchers -> /opt/fomo-watch/`;
+   `python3 -m venv /opt/fomo-watch/venv`; `pip install websockets` (17.1)
+
+## Verified — b has the FOMO code
+- bundle: `FOMO by` = 2, `Sell PnL` = 2, `Tracked by` = 2 (pre-deploy = 0 => first FOMO rollout)
+- after auth fix: `AIza` = 1, `firebaseapp.com` = 1, `getAuth` = 1, `Sign in` = 3
+
+## REGRESSION found and fixed (record this)
+- pre-deploy: b `GET /api/signals` = **200** (b ran a pre-auth image, built 27/09),
+  `/api/fomo-users` = **404**.
+- post-deploy: both **401**.
+- Cause: `server/src/auth.ts:7` "DENY BY DEFAULT" (commit `7d1b25c feat(auth): auth/rbac, ...`)
+  + `e769edb` (gate fomo routes). `make deploy` rsyncs the whole `server/`, so shipping FOMO also
+  shipped the auth hardening. b has no `FIREBASE_PROJECT_ID` / `AUTH_USER_ROLES` / `SERVICE_TOKEN`
+  and no `/root/signal_scan_b/.env` (no `VITE_FIREBASE_*`) => every gated route 401'd and the FE
+  was a dead login wall (`Sign in` = 3, `AIza` = 0).
+- Fix (user chose: b = authenticated instance like a): copied the 3 `VITE_FIREBASE_*` from
+  `/root/signal_scan/.env` -> `/root/signal_scan_b/.env` (600); appended `FIREBASE_PROJECT_ID` +
+  `AUTH_USER_ROLES` (7 emails) from a's `server/.env` -> b's `server/.env` (600); generated a fresh
+  `SERVICE_TOKEN` for b (`openssl rand -hex 32`, independent of a's); rebuilt.
+
+## Verified — b auth after the fix
+- no token: `GET /api/signals` 401, `GET /api/fomo-users` 401, `GET /api/health` 200 (fail-closed, correct)
+- with b's `SERVICE_TOKEN`: `GET /api/fomo-users` **200**, `GET /api/signals` 200,
+  `GET /api/tracked-cas` 200, `POST /api/fomo-watch/trades` **400** (400 = body parse error =
+  PAST auth, not 401/403) => the daemon's auth path works.
+
+## Verified — instance a untouched
+- `signal_scan-web-1` `94fa0262f02aa73368e0f679d2a2c52f6475264b8fb9be6be5188d4c421e7cca`
+  started=2026-09-29T09:32:22Z (identical before/after)
+- `signal_scan-api-1` `47370031062b1deb17c006680aad3779451e5c4644147b4de65505dc40094f4c`
+  started=2026-09-29T09:49:39Z (identical)
+- a `GET /api/signals` = 401 (unchanged), a bundle `FOMO by` = 0
+- other projects (qd-crawler, qd-monitor, trading_dashboard_*, trading-monitor-*, risk-system-*)
+  all still "Up 2 hours"
+
+## Daemon staging (in place, NOT started)
+- `/opt/fomo-watch/watchers/{__init__.py,common,evm,fomo,sol}`
+- `/opt/fomo-watch/venv` — python 3.12.3, `websockets 17.1`
+- `/opt/fomo-watch/fomo.env` (600) — keys: `SIGNAL_SCAN_SERVICE_TOKEN` (b's; value NOT recorded here)
+- `/etc/systemd/system/fomo-watch.service` — WorkingDirectory=/opt/fomo-watch,
+  ExecStart=`/opt/fomo-watch/venv/bin/python -m watchers.fomo --api-url http://127.0.0.1:8125`,
+  Restart=always, logs appended to `/opt/fomo-watch/watch.log`; `is-enabled=disabled`, `is-active=inactive`
+- self-check: `python -m watchers.fomo --help` OK; without a key ->
+  `FOMO_API_KEY chưa set (hoặc --key rỗng) — không nối được socket`, **exit=1** (fail-closed proven)
+
+## Still blocking a working FOMO on b
+1. `FOMO_API_KEY` is LEAKED and must be rotated before the daemon runs. Then append it to
+   `/opt/fomo-watch/fomo.env` and `systemctl enable --now fomo-watch`.
+2. b's FOMO watch list = **0 rows** -> the daemon would match nothing. The watch list must be
+   imported (FE import / `POST /api/fomo-users/import`).
+3. F3 not run (real e2e: a watched trader's alert becomes a row and renders in the merged column;
+   negative: an untracked trader does not appear).
+4. Human check not done: Google sign-in on http://194.163.187.250:8125 with an email present in
+   `AUTH_USER_ROLES` (I cannot sign in with Google).
+
+## Watch-list import into b (2026-09-29 18:19 +07) — DONE
+- Source (user chose): `fomo/leaderboard_24h.csv` (150 handles, no userId) +
+  `fomo/itsalita_followers.csv` (14 handles, with userId) = **164 unique handles**
+  (leaderboard ∩ followers = 0, so no dedupe collisions).
+- Method: direct insert into b's DB via better-sqlite3 inside the api container
+  (host has no `sqlite3`; `docker cp` from /root failed with EACCES, so the payload was
+  staged through the existing bind mount `data-b -> /data`).
+- Semantics mirrored EXACTLY from `importFomoUsers()` (`server/src/db.ts:1131`):
+  UPSERT `ON CONFLICT(handle) DO UPDATE` with COALESCE/NULLIF preserving prior non-empty
+  values, `handle` trimmed, empty handle skipped, `source='csv'`, `created_at=now`.
+- Online backup taken BEFORE writing (sqlite backup API):
+  `/root/signal_scan_b/data-b/backup-fomo-users-2026-09-29T11-19-38-823Z.db` (135,168 bytes).
+- Result: `{"rows":164,"written":164,"skipped":0,"rowsBefore":0,"rowsAfter":164,"withUserId":14}`
+- Verified via the API with b's service token: `GET /api/fomo-users` = **164** rows,
+  14 with `userId`, 28 with `clan`. Spot check: `PoorGoat_` (leaderboard, userId null) and
+  `WeAreAllJewish` (followers, userId `86e40c7b-...`) both present with correct fields.
+- Match semantics note: handles are matched case-sensitively (`findFomoUserByHandle`',
+  `WHERE handle = ?`), so handles were stored verbatim (only trimmed). The 150 leaderboard
+  rows have no `userId` and will match on handle; the 14 followers rows match on `userId` first.
+- Temp artifacts cleaned: `/root/signal_scan_b/data-b/.fomo-import/` and the container's
+  `/tmp/{import-fomo-users.js,fomo-users-164.json}`. Local copies remain in `/tmp/opencode/`.
+  Staging dir `/root/.fomo-import/` was left on the host (script + rows.json, no secrets).
+
+### Still blocking a live FOMO column on b
+- `FOMO_API_KEY` not rotated yet -> `fomo-watch.service` stays `disabled`/`inactive`.
+  Once the rotated key is in `/opt/fomo-watch/fomo.env`:
+  `systemctl enable --now fomo-watch` then F3 (a watched trader's alert becomes a row and
+  renders in the merged column; an untracked trader does not appear).
+
+## entryUsd dropped for FOMO CAs (user decision 2026-09-29) — DONE + DEPLOYED
+- User chose "bỏ entryUsd cho FOMO CA (luôn hiện)": a FOMO-enqueued CA must never be hidden by
+  the signals display gate.
+- Why it is enough: `server/src/signals.ts:579` skips a CA only on a KNOWN sub-threshold entry
+  (`c.entry_usd != null && c.entry_usd < th.minUsd`); NULL fails open (same rule as the
+  market-cap band below it). So leaving `entry_usd` NULL makes the row always visible.
+- Change: `server/src/api.ts` — the FOMO BUY enqueue no longer passes
+  `entryUsd: parsed.usdValue ?? undefined` (kept the CA-enqueue-once behaviour + `kickCAs`).
+- Test updated for the intentional change: `server/test/fomo-watch-trade.test.ts` — the BUY
+  enqueue assertion is now `entry_usd === null` (was `2985`), with a one-line note that this is
+  deliberate (else it reads like a regression).
+- Verification (local): `npx tsc --noEmit` exit 0; `npm test` -> **tests 438 / pass 438 / fail 0**.
+- Verification (b): `make deploy INSTANCE=b` + `make up INSTANCE=b` -> api recreated,
+  `/api/health` `mode=gmgn` healthy, bundle `FOMO by` = 2, watch list still **164** after the
+  restart (write persisted), instance a unchanged (web started 09:32:22Z, api 09:49:39Z).

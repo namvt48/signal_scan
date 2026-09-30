@@ -101,21 +101,54 @@ Repo - existing FOMO groundwork in `fomo/` (1.4MB, already pulled):
 - New npm runtime dependency for WebSockets in the server.
 - Committing the FOMO API key anywhere (repo, docs, logs, evidence).
 - Storing alerts from users outside the watch list, and any retention/prune job (Q1 -> watched users only, C7 dropped).
-- A walker/discovery tool to grow the list toward ~2000 handles (Q3 -> user supplies the list; `fomo/*.csv` imports as-is).
+- A walker/discovery tool to grow the list toward ~2000 handles (Q3 -> user supplies the list; `fomo/*.csv` imports only after BOM-strip + header mapping - see the correction in the revision section).
 - Any scoring, tier or gate change driven by FOMO activity (Q2 -> display-only).
 
 ## Open questions
 None outstanding. All three forks answered by the owner:
 - Q1 (data shape) -> store ONLY watched users' alerts. Firehose is consumed in full but non-matching alerts are dropped before insert; no retention/prune job. Recorded as D9.
 - Q2 (product) -> display-only column mirroring Tracked by without `Bal`; no effect on X/3 score, tiers or gates. Recorded as D10.
-- Q3 (scope) -> no discovery walker; the owner supplies the list via UI/CSV, and the existing `fomo/*.csv` (which already carry `userId`) import as-is. Recorded as D11.
+- Q3 (scope) -> no discovery walker; the owner supplies the list via UI/CSV. NOTE (corrected after measurement): the CSVs do NOT import "as-is" - only `itsalita_following.csv`/`itsalita_followers.csv` carry `userId`; `leaderboard_24h.csv` and `fomo_clans_24h.csv` have no `userId` column at all, all four carry a UTF-8 BOM, and their headers are `displayName`/`clanName` (not `name`/`clan`). 310 unique handles vs 173 unique userIds. Import needs BOM-strip + header mapping. Recorded as D11 (amended).
 
-Still to verify during execution (not blocking approval): exact `TRACKED_BY_WINDOW_MS` value to reuse for the FOMO window; the precise insertion points in `SignalTable.tsx` for the header/inline/modal; whether `WalletsPage.tsx` is extended in place or a sibling FOMO page is added behind the same flag.
+Still to verify during execution (not blocking approval): the precise insertion points in `SignalTable.tsx` for the header/inline/modal and the exact count-sites that must be bumped (`colCount` :564, skeleton :436, `colSpan` :672, `min-w-[1928px]` :432/:660). The window question is SETTLED: the FOMO column reuses the existing 24h stats literal (`now - 86_400_000`), NOT `TRACKED_BY_WINDOW_MS` (7 days, a different job). The mount question is SETTLED: a sibling surface inside the same tab container `WalletsPage` uses, gated by `SHOW_FOMO` - not a forked page.
 
 ## Approval gate
 status: approved
-- 2026-09-29: user replied "oke" after the brief - approval granted. Plan written to `.omo/plans/fomo-user-watch.md` (187 lines: 11 implementation todos `- [ ] 1..11.` + 4 final-verifier rows `- [ ] F1..F4.`). Structural self-check passed: first `##` heading is `## TL;DR (For humans)`, header order matches the template, all task rows column-zero, tasks appear only under `## Todos` / `## Final verification wave`, zero unfilled placeholders.
-- Review state: metis gap analysis launched (bg_298824dd / ses_f1487602efferJVgYO2D0fnUx9) BEFORE the plan was written - findings to fold in when it lands. Momus review runs after folding. `review_required: false`, so the dual high-accuracy review is offered to the user, not assumed.
+- 2026-09-29: user replied "oke" after the brief - approval granted. Plan written to `.omo/plans/fomo-user-watch.md` (now 220 lines / 60,072 bytes after the revision below: 11 implementation todos `- [ ] 1..11.` + 4 final-verifier rows `- [ ] F1..F4.`). Structural self-check passed: first `##` heading is `## TL;DR (For humans)`, header order matches the template (`## Scope` carries the captured-schema subsection), all task rows column-zero, tasks appear only under `## Todos` / `## Final verification wave`, zero unfilled placeholders.
+- Review state: Metis gap analysis RAN and is FOLDED IN (18 findings: 3 blocker / 7 major / 8 minor - see the revision section below). A keyless live capture then replaced the reviewer's unknowns with measured facts. Momus review is running now against the revised plan. `review_required: false`, so the dual high-accuracy review is offered to the user, not assumed.
 - Approval authorizes the PLAN ONLY. No implementation, no implementer subagents. Execution starts only when the user explicitly starts a worker session (e.g. `$start-work`).
 <!-- When exploration is exhausted and unknowns are answered, set status: awaiting-approval. -->
 <!-- That durable record is the loop guard: on a later turn read it and resume at the gate instead of re-running exploration. -->
+
+## Revision after review (2026-09-29) - what changed in the plan and why
+
+Two things happened after the plan was first written: (1) the Metis gap analysis landed, and (2) a KEYLESS live capture of the real FOMO socket replaced every remaining unknown with a measured fact. Both are folded into the plan; the plan is now 220 lines / 60,072 bytes.
+
+### 1. Empirical capture (free, 0 credits, ~60s-delayed keyless tier)
+- Connected ONCE to `wss://api.fomoapi.io/ws/alerts` with no key; captured 109 messages / 102 alerts / 68,562 bytes in a 115s window.
+- Raw evidence: `.omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl`. Probe script: `.omo/scripts/fomo-probe.mjs` (planning tooling, not product code).
+- **Resolved a BLOCKER**: the alert DOES carry the handle - the field is `trader` (102/102 present). So the ~178 CSV rows with no `userId` are still matchable; the reviewer's "handle may not exist in the payload" concern is closed.
+- The buy/sell discriminator is **`alertType`**, NOT `type` (`type` is always the literal `"alert"`). Measured: buy 36 / sell 41 / perp 12 / thesis 13.
+- `usdValue` is NOT one currency: for a buy it byte-equals `positionValueUsd` (post-fill SIZE); for a sell it byte-equals `realizedPnlUsd` (signed PnL); perp has none (0/12); thesis has none (1/13). => summing buy−sell over it is a category error.
+- `tokenAddress` present 90/102 - the 12 nulls are exactly the 12 perp rows.
+- `chain` = {solana, robinhood, ethereum, hyperliquid, bsc, base}; `chainId` = {1399811149, 4663, 1, 1337, 56, 8453}. Only sol/base/bsc are in this repo's `Chain` union.
+- `eventId` unique 102/102. `txHash`/`execTs`/`execLagMs`/`tradeUsd` only on 17/102. `ts` = epoch ms. `replay:true` on 97/102 (delayed tier). Envelope `type` ∈ {welcome, alert, heartbeat} plus bare `ping`/`pong`.
+- Load ~0.9 alerts/s - one socket + local match is trivial.
+
+### 2. Metis findings folded (18 total: 3 blocker / 7 major / 8 minor)
+- BLOCKERS: (F1) the net-inflow mirror was built on a false `usdValue` premise; (F2) the `type`/perp/thesis filter was missing and the "no per-user stream" rationale was contradicted by the docs; (F3) most local handles have no `userId` and draft asserted they did.
+- MAJORS: (F4) the Tracked-by window/membership rule was ambiguous and the draft pointed at the 7-day `TRACKED_BY_WINDOW_MS`; (F5) `docker-compose.yml` was missing from the flag chain and "instance a untouched" was unsatisfiable; (F6) `watchers/` is NOT shipped by `make deploy`; (F7) a naive daemon would reuse the shared heartbeat/state path and mask the sol watcher; (F8) the `fomo/` CSVs do not match the proposed import schema (BOM, `displayName`/`clanName`, no `userId` in 2 files, and 2 claimed files don't exist); (F9) the SignalTable column count-sites were not enumerated; (F10) reconnect/backfill was unstated; (M6) the additive `TokenSignal.fomoUsers` field contradicts a "byte-identical instance a" promise.
+- MINORS: auth-routes test already covered; refresh cadence unpinned; batched-POST contradicted a single-object route; 404-vs-200 on an unknown user; chain mapping + `canonicalCa` normalisation unstated; `ts`/key-masking/15s-delay details; scope-creep guards + completeness-claim ban; plus an implicit "never write FOMO into `wallet_trades`" constraint made explicit.
+
+### 3. Plan changes applied
+- Added a `### Captured FOMO alert schema` subsection under `## Scope` (measured ground truth; the executor no longer guesses field names).
+- Todo 1: replaced nullable `side` + `amount_usd` with `type TEXT NOT NULL CHECK(type IN ('buy','sell'))` + `usd_value` (meaning documented as per-type); `ca` must be canonicalised.
+- Todo 6: parser now validates `alertType`/`trader`/`tokenAddress`, rejects perp/thesis with 400, maps/validates chain, canonicalises `ca`, treats 404 as "refresh the list", and is explicitly ONE trade per request (no batch endpoint).
+- Todo 7: `inflow` renamed to `buyUsd` and computed BUY-ONLY; membership redefined as EVER had a `type='buy'` row (mirroring Tracked by), plus a user with only sells must NOT be listed.
+- Todo 4: CSV parser must strip the BOM and map `displayName→name`, `clanName→clan`, with `userId` optional; only 4 files exist.
+- Todo 8: added an "unresolved (no userId)" marker and settled the mount (sibling surface in the same tab container).
+- Todo 9: enumerated every count-site (`colCount` :564, skeleton :436, `colSpan` :672, `min-w` :432/:660) + own `FOMO_COLS` + own popup state.
+- Todo 10: consumes the existing capture (no re-capture), pins the chain map, the FOMO-specific state/heartbeat filenames, the ~300s refresh, per-alert POST, 404→refresh, no backfill, no key/URL logging.
+- Todo 11: fixed the `fomo/` inventory, added the missing watchers deployment story (`scp`/`rsync` + `websockets` + the instance-b service token).
+- Scope guardrails: "instance a byte-identical" reworded to "behaviour unchanged; one additive always-empty `fomoUsers` field allowed"; explicit bans on `wallet_trades` reuse, on a net/PnL figure, and on completeness claims in UI copy.
+- F2/F4 verifiers + success criteria updated to the new semantics.
