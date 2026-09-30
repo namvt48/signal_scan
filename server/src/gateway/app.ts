@@ -18,8 +18,14 @@ import {
   type UpstreamFetch,
 } from './contract.js';
 import { GMGN_TOKEN_INFO_PATH, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
-import { DEXSCREENER_PATH, dexScreenerUpstream, handleDexScreener } from './dexscreener.js';
 import {
+  DEXSCREENER_LIMITER,
+  DEXSCREENER_PATH,
+  dexScreenerUpstream,
+  handleDexScreener,
+} from './dexscreener.js';
+import {
+  NANSEN_CREDIT_LIMITER,
   NANSEN_CREDIT_PATH,
   NANSEN_DOOR_PATH,
   handleNansenCredit,
@@ -27,6 +33,7 @@ import {
   nansenCreditUpstream,
   type DoorPost,
 } from './nansen.js';
+import { GatewayCache, type Preflight } from './cache.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -65,6 +72,19 @@ export interface GatewayAppDeps {
   nansenDoor?: DoorPost;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
+  /**
+   * Selective TTL cache + single-flight (todo 11). Injectable so tests can
+   * control the clock/TTL; defaults to a fresh in-memory cache. Only the
+   * deterministic-param routes (Nansen token-information/holders, DexScreener
+   * tokens/pairs/search) reach it — GMGN and the time-windowed Nansen flows do
+   * NOT.
+   */
+  cache?: GatewayCache;
+  /**
+   * Budget pre-flight seam (todo 19). Runs AFTER the cache lookup and BEFORE the
+   * limiter, so a cache/single-flight hit skips it. Defaults to a no-op.
+   */
+  preflight?: Preflight;
 }
 
 /** The raw-payload proxy route (todo 3). Provider routes (7/8/9) reuse the
@@ -102,6 +122,7 @@ async function handleProxy(
 
 export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   const tokens = deps.tokens ?? callerTokensFromConfig();
+  const cache = deps.cache ?? new GatewayCache();
   const app = express();
 
   // Request log — same shape as api.ts. NEVER logs headers, so no token leaks.
@@ -188,10 +209,18 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       send(res, denial(401, 'unauthorized'));
       return;
     }
-    void handleDexScreener(req.body, caller, {
-      fetchUpstream: dexUpstream,
-      runLimiter: deps.runLimiter,
-    }).then((result) => send(res, result), next);
+    const routeDeps = { fetchUpstream: dexUpstream, runLimiter: deps.runLimiter };
+    // Cache lookup + single-flight BEFORE `handleDexScreener`'s limiter (todo 11);
+    // profiles/boosts are classified uncacheable inside the cache.
+    void cache
+      .dispatch(
+        DEXSCREENER_LIMITER,
+        req.body,
+        caller,
+        () => handleDexScreener(req.body, caller, routeDeps),
+        deps.preflight,
+      )
+      .then((result) => send(res, result), next);
   });
 
   // Nansen credit API (todo 7 seam i): `NansenApiClient` methods (tokenFlows —
@@ -205,10 +234,18 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       send(res, denial(401, 'unauthorized'));
       return;
     }
-    void handleNansenCredit(req.body, caller, {
-      fetchUpstream: creditUpstream,
-      runLimiter: deps.runLimiter,
-    }).then((result) => send(res, result), next);
+    const routeDeps = { fetchUpstream: creditUpstream, runLimiter: deps.runLimiter };
+    // Cache lookup + single-flight BEFORE `handleNansenCredit`'s limiter (todo 11);
+    // flows are classified uncacheable inside the cache (moving from/to window).
+    void cache
+      .dispatch(
+        NANSEN_CREDIT_LIMITER,
+        req.body,
+        caller,
+        () => handleNansenCredit(req.body, caller, routeDeps),
+        deps.preflight,
+      )
+      .then((result) => send(res, result), next);
   });
 
   // Nansen free browser door (todo 7 seam ii): app-questions through the
