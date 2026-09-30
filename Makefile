@@ -81,12 +81,12 @@ COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NA
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
 
-FILES     := Dockerfile nginx.conf docker-compose.yml .dockerignore package.json package-lock.json tsconfig.json vite.config.ts index.html
+FILES     := Dockerfile nginx.conf docker-compose.yml docker-compose.gateway.yml .dockerignore package.json package-lock.json tsconfig.json vite.config.ts index.html
 SSH       := ssh -o BatchMode=yes -o ConnectTimeout=10 $(HOST)
 SCP       := scp -o BatchMode=yes -o ConnectTimeout=10
 RSYNC_SSH := ssh -o BatchMode=yes -o ConnectTimeout=10
 
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-down gateway-log
 
 deploy:
 	$(SSH) "mkdir -p $(REMOTE_DIR)"
@@ -94,7 +94,10 @@ deploy:
 	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src $(HOST):$(REMOTE_DIR)/
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose build && echo '== deploy OK — instance=$(INSTANCE) port=$(PORT) dir=$(REMOTE_DIR)'"
 
+# The gateway net is external: Compose will NOT create it, so every `up` (a, b, local)
+# must ensure it exists first or `docker compose up` refuses to start.
 up:
+	$(SSH) "docker network create signal-scan-gateway || true"
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose up -d"
 	sleep 2
 	@$(MAKE) status
@@ -105,6 +108,18 @@ down:
 restart:
 	@$(MAKE) deploy
 	@$(MAKE) up
+
+# ---------- request-plane gateway (its own compose project) ----------
+# docker-compose.gateway.yml ships via $(FILES); the external net is created here too.
+gateway-up:
+	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "cd $(REMOTE_DIR) && docker compose -f docker-compose.gateway.yml up -d"
+
+gateway-down:
+	$(SSH) "cd $(REMOTE_DIR) && docker compose -f docker-compose.gateway.yml down"
+
+gateway-log:
+	$(SSH) "cd $(REMOTE_DIR) && docker compose -f docker-compose.gateway.yml logs -f gateway"
 
 logs:
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose logs -f web"

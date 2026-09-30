@@ -57,6 +57,13 @@ services:
       - chrome
     expose:
       - "3001"
+    # TRAP: listing ANY `networks:` on a service REPLACES its implicit `default`
+    # membership — so `default` MUST be listed explicitly, or web (nginx
+    # `proxy_pass http://api:3001`) loses api AND api loses chrome
+    # (`CRAWL_WS_ENDPOINT: ws://chrome:3000`) → instance a breaks.
+    networks:
+      - default
+      - signal-scan-gateway
     logging: *default-logging
     restart: unless-stopped
   web:
@@ -81,3 +88,11 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+# Shared request-plane gateway net: an EXTERNAL bridge created once on the host
+# (`docker network create signal-scan-gateway`, guarded in `make up` / `make gateway-up`).
+# Not auto-created by Compose, so every `up`/`deploy` for a, b and local dev depends on it.
+# The api joins it to reach the gateway; web/chrome stay on each project's `default`.
+networks:
+  signal-scan-gateway:
+    external: true
