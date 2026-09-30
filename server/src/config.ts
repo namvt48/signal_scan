@@ -2,6 +2,8 @@
 
 import { dirname, join } from 'node:path';
 
+import { GatewayClient } from './gateway-client.js';
+
 function num(name: string, def: number): number {
   const v = process.env[name];
   if (v === undefined || v === '') return def;
@@ -242,6 +244,17 @@ export const config = {
   gatewayTokenA: str('GATEWAY_TOKEN_A', ''),
   gatewayTokenB: str('GATEWAY_TOKEN_B', ''),
   gatewayTokenWatcher: str('GATEWAY_TOKEN_WATCHER', ''),
+  /** API-side egress (todo 14): the gateway base URL the api process POSTs to,
+   * and THIS instance's per-caller bearer token. Both are host-supplied via
+   * `server/.env` (`env_file`, uncommitted): a's file sets
+   * `GATEWAY_CALLER_TOKEN=<a-token>`, b's `<b-token>`; in-container the api's
+   * `GATEWAY_URL` is `http://gateway:8130`. `gatewayUrl` DEFAULTS TO '' (EMPTY,
+   * never a loopback URL) so the todo-14 selection predicate `gatewayUrl !== ''`
+   * is false when unset and the legacy key-gated path applies. The
+   * `http://127.0.0.1:8130` default belongs ONLY to the host Python watchers
+   * (todo 16) — the TS side must NOT carry it. */
+  gatewayUrl: str('GATEWAY_URL', ''),
+  gatewayCallerToken: str('GATEWAY_CALLER_TOKEN', ''),
   /** Nansen credit budget, unit credits/DAY, split equally between callers a and
    * b (draft Decisions 5). Default 10 = the conservative Free-tier daily floor
    * (draft "Upstream limits"); the paid tier is not yet known, so
@@ -257,6 +270,15 @@ export const config = {
   // `/data/proxies-server.txt` becomes vestigial once the DoorPool moves — todo
   // 10). Door budgets (crawlPathBudget / crawlDoorCapPerMin) are reused as-is.
 };
+
+/** Todo-14 selection predicate: the gateway-backed egress client, built IFF
+ * `GATEWAY_URL` is set (non-empty). `null` means the gateway is not configured,
+ * so the caller takes the legacy key-gated path. NO loopback default — an unset
+ * URL stays '' and yields null. */
+export function gatewayClientFromConfig(): GatewayClient | null {
+  if (config.gatewayUrl === '') return null;
+  return new GatewayClient({ baseUrl: config.gatewayUrl, callerToken: config.gatewayCallerToken });
+}
 
 /** Nansen credit cost per proxied endpoint (draft "Upstream limits"): the gateway
  * falls back to this table when the upstream omits `x-nansen-credits-cost`
