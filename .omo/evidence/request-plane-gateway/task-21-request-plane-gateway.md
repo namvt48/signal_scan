@@ -330,4 +330,6 @@ plan checkbox 21 ticked; docker-compose.gateway.yml (/opt -> /root) + this evide
 - A stale `/opt/signal-scan-gateway/{gateway.env,proxies.txt}` copy remains (unused); the live files
   are `/root/signal-scan-gateway/*`. Safe to delete later.
 
+EVIDENCE_RECORDED: .omo/evidence/request-plane-gateway/task-21-request-plane-gateway.md
+
 
