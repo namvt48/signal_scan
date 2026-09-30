@@ -36,19 +36,17 @@ Range: `git log --oneline 639cdaa^..HEAD` → 21 commits, HEAD `d5c5beb`.
 | 18 Python fail-open | Y | unreachable/malformed body→unknown, no raise; feed loop completes; red→green proving the fixed escape | Y | Y |
 | 19 Credit accounting + equal split | Y | (a)-(f): half-cap per side, caller-scoped `budget_exceeded`, other routes live, day reset, gate NOT armed, cache hit=0 credit | Y | Y |
 | 20 Metrics endpoint | Y | `/metrics` JSON: all 6 limiter keys + `credits{a,b}` + cache counters; `?format=text`; unauth 401 | Y | Y |
-| 21 Deploy gateway + connect a+b | Y | net lists gateway+a-api+b-api; default net intact; both api `getent hosts gateway`+health 200; a `/api/health` 200; web/chrome start times unchanged; rollback cmd recorded | Y | **N — marker ABSENT** |
+| 21 Deploy gateway + connect a+b | Y | net lists gateway+a-api+b-api; default net intact; both api `getent hosts gateway`+health 200; a `/api/health` 200; web/chrome start times unchanged; rollback cmd recorded | Y | Y |
 | 22 End-to-end verification | Y | (a) dedupe/cross-caller-credit/GMGN/flows deltas; (b) split+soft-deny+gate untouched; (c) fail-open a=b=200 w/ gw down; (d1) gateway NAT `194.163.187.250`≠(d2) proxy `167.86.101.228` | Y | Y |
 
 ## Findings
 
-1. **BLOCKING — Todo 21 evidence file is missing the required `EVIDENCE_RECORDED:` terminator.**
-   `.omo/evidence/request-plane-gateway/task-21-request-plane-gateway.md` (333 lines) ends with a
-   blank line; `grep -c 'EVIDENCE_RECORDED'` = **0**. Plan requires every evidence file to end with
-   it (plan:46, plan:269, success criterion plan:299) and F1 (plan:275) lists "`EVIDENCE_RECORDED:`
-   recorded" as an audit criterion. The file's *content* is complete and every todo-21 acceptance
-   criterion is observably proven (see table row 21); only the terminator is absent.
-   **Remedy:** append `EVIDENCE_RECORDED: .omo/evidence/request-plane-gateway/task-21-request-plane-gateway.md`
-   as the final line, then re-run F1. No content rework required.
+1. **RESOLVED — Todo 21 evidence file `EVIDENCE_RECORDED:` terminator (was blocking).**
+   Originally absent (`grep -c 'EVIDENCE_RECORDED'` = **0**; file ended blank). Fixed in commit
+   `0c34369`: the file now carries
+   `EVIDENCE_RECORDED: .omo/evidence/request-plane-gateway/task-21-request-plane-gateway.md`
+   on line 333 as its final non-empty line (`grep -c` = 1). Two trailing blank lines follow; the
+   marker is the last content line. No other content changed. Re-verified 2026-09-30.
 
 2. **Accepted deviation (NOT a failure) — Todo 21 host dir `/opt` → `/root`.**
    Documented in the task-21 evidence (snap-docker cannot bind-mount `/opt`; probe reproduced), with
@@ -69,10 +67,10 @@ Range: `git log --oneline 639cdaa^..HEAD` → 21 commits, HEAD `d5c5beb`.
 
 ## Verdict
 
-All 22 todos meet their acceptance criteria and carry substantive evidence. Single blocker:
-todo 21's evidence file does not end with the mandated `EVIDENCE_RECORDED:` terminator (finding 1).
-That explicit, machine-checkable criterion (plan:275, plan:299) is unmet → F1 cannot pass as-is.
-The fix is a one-line append followed by re-verification.
+All 22 todos meet their acceptance criteria and carry substantive evidence.
+The single prior blocker is resolved: todo 21's evidence file now ends with the mandated
+`EVIDENCE_RECORDED:` terminator (finding 1, commit `0c34369`). Every evidence file ends with the
+marker. F1 passes.
 
 EVIDENCE_RECORDED: .omo/evidence/request-plane-gateway/f1-plan-compliance.md
-REJECT
+APPROVE
