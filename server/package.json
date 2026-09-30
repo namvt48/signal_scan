@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "gateway:build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx --test test/*.test.ts test/ratelimit/*.test.ts"
+    "test": "tsx --test test/*.test.ts test/ratelimit/*.test.ts test/gateway/*.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

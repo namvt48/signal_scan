@@ -88,7 +88,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
 
 ### Wave 1 - Gateway foundation
 
-- [ ] 1. Gateway entrypoint + build target
+- [x] 1. Gateway entrypoint + build target
   What to do / Must NOT do: Add `server/src/gateway/main.ts` starting an HTTP listener, importing ONLY existing modules (`config.ts`, `log.ts`, `ratelimit/`). Add `server/Dockerfile.gateway` (base `node:20-slim`, `CMD ["node","dist/gateway/main.js"]`) and an npm script that builds it with the existing tsconfig. **Extend the `npm test` script in `server/package.json` to include `test/gateway/*.test.ts`** (today it globs only `test/*.test.ts test/ratelimit/*.test.ts`, so gateway specs would be silently skipped). Do NOT create a new package/project; reuse `server/package.json`. Do NOT change `server/src/index.ts` yet.
   Parallelization: Wave 1 | Blocked by: none | Blocks: 2,4,6
   References: `server/src/index.ts:1-48` (boot order), `server/src/log.ts:90,128` (`createLogger`, `log`), `server/tsconfig.json`, `server/package.json` (test script glob), `server/Dockerfile` (existing api image pattern), `server/src/config.ts:5-23` (`str`/`num`/`posNum`).

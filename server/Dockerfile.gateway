@@ -1,0 +1,10 @@
+# Gateway image (plan request-plane-gateway, todo 1). Same build steps as the
+# api image (Dockerfile) but runs the gateway entrypoint instead of dist/index.js.
+# node:20-slim = glibc -> better-sqlite3 prebuilt binaries work out of the box.
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+CMD ["node", "dist/gateway/main.js"]
