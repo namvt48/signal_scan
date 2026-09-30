@@ -105,6 +105,40 @@ def http_json(url, payload=None, timeout=20, headers=None):
         return json.loads(r.read())
 
 
+# ---------- gateway (request-plane-gateway, T16) ----------
+# Watcher egress GMGN/DexScreener đi QUA gateway — gateway là SINGLE WRITER (giữ
+# X-APIKEY, tự thêm timestamp+client_id TƯƠI mỗi call). Cùng TÊN biến env như
+# phía api (T14): GATEWAY_URL + GATEWAY_CALLER_TOKEN. Default loopback CHỈ đúng
+# cho watcher host (api dùng http://gateway:8130). Thiếu token ⇒ không gửi
+# Authorization ⇒ gateway 401 — fail-closed, KHÔNG hardcode secret vào repo.
+_gateway_url = (os.environ.get("GATEWAY_URL") or "http://127.0.0.1:8130").rstrip("/")
+_gateway_token = os.environ.get("GATEWAY_CALLER_TOKEN", "").strip()
+
+
+def gateway_json(path, payload, timeout=20):
+    """POST JSON tới gateway, trả RAW UPSTREAM payload đã decode.
+
+    Gateway bọc MỌI câu trả lời upstream trong HTTP 200 envelope
+    `{status, body, headers}` (raw pass-through — contract.ts): `body` là chuỗi
+    payload gốc, `null` khi upstream non-2xx. Hàm bóc envelope: 2xx ⇒
+    `json.loads(body)`; non-2xx hoặc denial gateway `{error}` ⇒ raise. Lỗi
+    transport (từ chối kết nối/timeout) cũng raise thẳng — caller (price.py) tự
+    bắt và rơi về "price unknown" (fail-open, T18), không giết feed loop."""
+    hdrs = {"Authorization": f"Bearer {_gateway_token}"} if _gateway_token else None
+    env = http_json(f"{_gateway_url}{path}", payload, timeout=timeout, headers=hdrs)
+    if not isinstance(env, dict):
+        raise RuntimeError("gateway envelope không phải object")
+    status = env.get("status")
+    if status is None:  # denial {error:...} (401/400/429/503)
+        raise RuntimeError(f"gateway denied: {str(env.get('error'))[:40]}")
+    if not (200 <= int(status) < 300):
+        raise RuntimeError(f"gateway upstream status {status}")
+    body = env.get("body")
+    if body is None:
+        raise RuntimeError("gateway empty upstream body")
+    return json.loads(body)
+
+
 # ---------- config từ API (fail-soft: API chết ⇒ giữ nguồn CLI/file) ----------
 
 

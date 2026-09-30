@@ -10,7 +10,6 @@ import os
 import statistics
 import sys
 import time
-import uuid
 
 from watchers.common import config
 from watchers.common.config import WSOL, quotes_map
@@ -28,13 +27,11 @@ def sol_price() -> float:
     return _sol_px["v"]
 
 
-GMGN_TOKEN_INFO = "https://openapi.gmgn.ai/v1/token/info"
-# GMGN ban theo CỤM call trên IP, không theo giây: 5 call cách nhau <2s từ chính VPS
-# này ⇒ RATE_LIMIT_BANNED (draft gmgn-parity-fixes F17). Nên giãn ≥5s/call và lỗi
-# nào cũng nghỉ hẳn BAN_S trước khi thử lại; trong lúc nghỉ DexScreener gánh.
-_GMGN_GAP_S = 5.0
-_GMGN_BAN_S = 300.0
-_gmgn_next_ok = 0.0
+# GMGN token/info giờ đi QUA gateway (T16): gateway là single writer — nó giữ
+# X-APIKEY và tự thêm timestamp + client_id tươi mỗi call (gateway/gmgn.ts).
+# Gate giãn call phía client (từng có ở đây) đã bỏ: rate-limit là việc của
+# limiter `gmgn` trong gateway, giữ thêm gate nữa chỉ nhân đôi việc chặn.
+GMGN_TOKEN_INFO_PATH = "/v1/gmgn/token-info"
 
 
 def _use_gmgn() -> bool:
@@ -59,31 +56,18 @@ def _gmgn_of(env):
 
 
 def gmgn_info(mint, chain="sol"):
-    """Giá USD của `mint` qua GMGN OpenAPI (header X-APIKEY, timestamp + client_id).
-    None/0.0 khi thiếu key, đang nghỉ sau lỗi, hoặc đã gọi trong `_GMGN_GAP_S` vừa
-    qua — caller rơi về DexScreener (không bao giờ raise)."""
-    global _gmgn_next_ok
-    key = os.environ.get("GMGN_API_KEY") or ""
-    now = time.time()
-    if not key or now < _gmgn_next_ok:
-        return None, 0.0
-    _gmgn_next_ok = now + _GMGN_GAP_S
-    url = (
-        f"{GMGN_TOKEN_INFO}?chain={chain}&address={mint}"
-        f"&timestamp={int(now)}&client_id={uuid.uuid4()}"
-    )
+    """Giá USD của `mint` qua GATEWAY (route GMGN token/info). Gateway là single
+    writer: giữ X-APIKEY + thêm timestamp/client_id tươi mỗi call. None/0.0 khi
+    lỗi bất kỳ (transport/401/body sai/code≠0) — caller rơi về DexScreener, không
+    bao giờ raise. Rate-limit do limiter `gmgn` của gateway lo, không gate client."""
     try:
-        sym, px = _gmgn_of(config.http_json(url, timeout=10, headers={"X-APIKEY": key}))
-    except Exception as ex:  # noqa: BLE001 — mọi lỗi GMGN đều phải rơi về DexScreener
-        _gmgn_next_ok = time.time() + _GMGN_BAN_S
-        print(
-            f"  ! gmgn: {type(ex).__name__}: {str(ex)[:60]} (nghỉ {int(_GMGN_BAN_S)}s)",
-            file=sys.stderr,
+        env = config.gateway_json(
+            GMGN_TOKEN_INFO_PATH, {"ca": mint, "chain": chain}, timeout=10
         )
+    except Exception as ex:  # noqa: BLE001 — mọi lỗi GMGN đều phải rơi về DexScreener
+        print(f"  ! gmgn: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
         return None, 0.0
-    if not px:
-        _gmgn_next_ok = time.time() + _GMGN_BAN_S
-    return sym, px
+    return _gmgn_of(env)
 
 
 _INFO_RETRY_S = 60.0  # TTL retry cho lookup THẤT BẠI (plan §5.3, T2)
@@ -155,8 +139,10 @@ def token_info(mint, chain="sol"):
         sym, px = gmgn_info(mint, chain)
     if not px:
         try:
-            d = config.http_json(
-                f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=15
+            d = config.gateway_json(
+                "/v1/dexscreener",
+                {"endpoint": "tokens", "params": {"addresses": mint}},
+                timeout=15,
             )
             sym, px = _price_from_pairs(d.get("pairs") or [], mint)
         except Exception:
