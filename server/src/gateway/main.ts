@@ -6,10 +6,36 @@
 
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
+import { config, DEFAULT_GATEWAY_PORT } from '../config.js';
 import { log } from '../log.js';
 
-/** Gateway default port (plan pins 8130; env-configurable in todo 6). */
-export const DEFAULT_GATEWAY_PORT = 8130;
+export { DEFAULT_GATEWAY_PORT };
+
+/**
+ * The gateway's required config surface. `config.ts` parses these with safe
+ * defaults and never throws; THIS entrypoint decides what is mandatory. Fields
+ * are the parsed config keys so the check cannot drift from config.ts.
+ */
+export interface GatewayEnv {
+  nansenApiKey: string;
+  gmgnApiKey: string;
+  gatewayTokenA: string;
+  gatewayTokenB: string;
+  gatewayTokenWatcher: string;
+}
+
+const REQUIRED_GATEWAY_ENV: readonly (keyof GatewayEnv)[] = [
+  'nansenApiKey',
+  'gmgnApiKey',
+  'gatewayTokenA',
+  'gatewayTokenB',
+  'gatewayTokenWatcher',
+];
+
+/** Names (never values) of the required keys that are blank. Empty = ready. */
+export function missingGatewayEnv(env: GatewayEnv): string[] {
+  return REQUIRED_GATEWAY_ENV.filter((key) => env[key] === '');
+}
 
 /**
  * `GATEWAY_PORT` env → port number. Missing/blank → default. A non-integer or
@@ -26,6 +52,12 @@ export function parsePort(raw: string | undefined): number {
 }
 
 function main(): void {
+  const missing = missingGatewayEnv(config);
+  if (missing.length > 0) {
+    log.error(`[gateway] missing required env: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+
   let port: number;
   try {
     port = parsePort(process.env.GATEWAY_PORT);

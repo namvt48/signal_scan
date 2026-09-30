@@ -22,6 +22,11 @@ function posNum(name: string, def: number): number {
   return Number.isFinite(n) && n > 0 ? n : def;
 }
 
+/** Gateway HTTP port default (plan request-plane-gateway pins 8130). Single
+ * source of the literal: gateway/main.ts re-exports this so the entrypoint and
+ * config cannot drift. */
+export const DEFAULT_GATEWAY_PORT = 8130;
+
 export type ProviderMode = 'mock' | 'nansen' | 'gmgn';
 
 function resolveMode(): ProviderMode {
@@ -200,6 +205,67 @@ export const config = {
   crawlRequestTimeoutMs: posNum('CRAWL_REQUEST_TIMEOUT_MS', 45_000),
   /** Max random jitter added on top of a 429 retry-after quarantine (D3). */
   crawlQuarantineJitterMs: posNum('CRAWL_QUARANTINE_JITTER_MS', 30_000),
+
+  // --- Request-plane gateway (plan request-plane-gateway, todo 6) ---
+  // The gateway is its OWN process/deploy unit and the SINGLE WRITER for the
+  // shared request/response upstreams (Nansen credit API + free browser door,
+  // GMGN, DexScreener). It reads its OWN env; it must not silently inherit
+  // instance a's values.
+  //
+  // SAFE DEFAULTS ONLY HERE. This object PARSES env and never throws on a missing
+  // gateway value. The fail-loud check for a missing required value lives in the
+  // gateway ENTRYPOINT (gateway/main.ts `missingGatewayEnv`), NEVER at module
+  // scope here: config.ts is imported by the api process (index.ts), which
+  // legitimately does NOT have the three caller tokens — a module-scope throw
+  // would crash instances a and b at startup.
+  //
+  // CREDENTIAL CUSTODY: the gateway holds NANSEN_API_KEY and GMGN_API_KEY (the
+  // same env names read above) because it is the single writer; a and b stop
+  // supplying them for the proxied endpoints. That removal MUST NOT null out the
+  // api-side clients: index.ts:29-30 gates `new NansenApiClient(...)` /
+  // `new GmgnMarketProvider(...)` on the key being present, so with the key gone
+  // the credit path and GMGN would silently vanish. Todos 13/14 rewrite those
+  // gates to construct the gateway-backed client whenever GATEWAY_URL is set,
+  // regardless of the key (the gateway injects the real key); the watcher guard
+  // watchers/common/price.py:66-69 (`if not key ... return None`) is likewise
+  // replaced by the gateway call. Keep this statement here so the credential move
+  // and the constructor gate cannot drift apart.
+  //
+  // a and b SHARE ONE Nansen key/account — that shared account is exactly what
+  // makes the equal 50/50 credit split between caller `a` and caller `b`
+  // meaningful. Do NOT give the gateway per-instance Nansen keys.
+  /** Gateway HTTP port. */
+  gatewayPort: posNum('GATEWAY_PORT', DEFAULT_GATEWAY_PORT),
+  /** Per-caller bearer tokens — SEPARATE per caller so Nansen credit use is
+   * attributable (a single shared token cannot attribute it). Blank = that caller
+   * cannot authenticate; the gateway entrypoint fails loud on any blank. */
+  gatewayTokenA: str('GATEWAY_TOKEN_A', ''),
+  gatewayTokenB: str('GATEWAY_TOKEN_B', ''),
+  gatewayTokenWatcher: str('GATEWAY_TOKEN_WATCHER', ''),
+  /** Nansen credit budget, unit credits/DAY, split equally between callers a and
+   * b (draft Decisions 5). Default 10 = the conservative Free-tier daily floor
+   * (draft "Upstream limits"); the paid tier is not yet known, so
+   * NANSEN_DAILY_CREDIT_BUDGET is the knob once it is. */
+  nansenDailyCreditBudget: posNum('NANSEN_DAILY_CREDIT_BUDGET', 10),
+  /** Short-TTL cache (gateway-only, todo 11) per provider class, ms. GMGN is
+   * NEVER cached — it mandates a fresh client_id/timestamp per call. */
+  cacheTtlNansenMs: posNum('CACHE_TTL_NANSEN_MS', 30_000),
+  cacheTtlDexscreenerMs: posNum('CACHE_TTL_DEXSCREENER_MS', 30_000),
+  // Reused, NOT redefined: the gateway reads its own CRAWL_WS_ENDPOINT
+  // (`ws://gateway-chrome:3000`, todo 4) and its own CRAWL_PROXY_FILE pinned to
+  // `/data/proxies.txt` (a read-only mount; instance a's
+  // `/data/proxies-server.txt` becomes vestigial once the DoorPool moves — todo
+  // 10). Door budgets (crawlPathBudget / crawlDoorCapPerMin) are reused as-is.
+};
+
+/** Nansen credit cost per proxied endpoint (draft "Upstream limits"): the gateway
+ * falls back to this table when the upstream omits `x-nansen-credits-cost`
+ * (todo 19). `holders` requested with `premium_labels` costs 150. */
+export const NANSEN_CREDIT_COSTS: Readonly<Record<string, number>> = {
+  'token-information': 1,
+  flows: 1,
+  holders: 5,
+  'holders-premium': 150,
 };
 
 /** Framework01 spec column 9: 24h volume below this = entry available (🟢). */
