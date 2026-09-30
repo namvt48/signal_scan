@@ -34,6 +34,7 @@ import {
   type DoorPost,
 } from './nansen.js';
 import { GatewayCache, type Preflight } from './cache.js';
+import { CreditAccountant } from './credit.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -82,9 +83,17 @@ export interface GatewayAppDeps {
   cache?: GatewayCache;
   /**
    * Budget pre-flight seam (todo 19). Runs AFTER the cache lookup and BEFORE the
-   * limiter, so a cache/single-flight hit skips it. Defaults to a no-op.
+   * limiter, so a cache/single-flight hit skips it. Defaults to the app's
+   * per-caller `CreditAccountant` (equal a/b split, soft-deny at half). Supplied
+   * here only to override the budget in tests.
    */
   preflight?: Preflight;
+  /**
+   * Nansen credit ledger (todo 19). Injectable so tests can pin the budget/clock;
+   * defaults to a fresh accountant over `config.nansenDailyCreditBudget`. The
+   * accountant also wraps the credit upstream to charge the REAL per-call cost.
+   */
+  credits?: CreditAccountant;
 }
 
 /** The raw-payload proxy route (todo 3). Provider routes (7/8/9) reuse the
@@ -123,6 +132,7 @@ async function handleProxy(
 export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   const tokens = deps.tokens ?? callerTokensFromConfig();
   const cache = deps.cache ?? new GatewayCache();
+  const credits = deps.credits ?? new CreditAccountant();
   const app = express();
 
   // Request log — same shape as api.ts. NEVER logs headers, so no token leaks.
@@ -227,7 +237,8 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   // the LIVE chart path — tokenInformation, dexTrades, currentBalance) behind
   // `limiters.run('nansen-credit', {priority})`. The gateway holds NANSEN_API_KEY;
   // tests inject `nansenCreditUpstream`.
-  const creditUpstream = deps.nansenCreditUpstream ?? nansenCreditUpstream();
+  const creditUpstream = credits.wrap(deps.nansenCreditUpstream ?? nansenCreditUpstream());
+  const creditPreflight = deps.preflight ?? credits.preflight;
   app.post(NANSEN_CREDIT_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
     const caller = req.caller;
     if (caller === undefined) {
@@ -237,13 +248,16 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     const routeDeps = { fetchUpstream: creditUpstream, runLimiter: deps.runLimiter };
     // Cache lookup + single-flight BEFORE `handleNansenCredit`'s limiter (todo 11);
     // flows are classified uncacheable inside the cache (moving from/to window).
+    // The budget pre-flight (todo 19) runs inside `dispatch`, AFTER the cache and
+    // BEFORE the limiter, so a hit/joiner is never budget-denied and a denial never
+    // arms the shared gate.
     void cache
       .dispatch(
         NANSEN_CREDIT_LIMITER,
         req.body,
         caller,
         () => handleNansenCredit(req.body, caller, routeDeps),
-        deps.preflight,
+        creditPreflight,
       )
       .then((result) => send(res, result), next);
   });
