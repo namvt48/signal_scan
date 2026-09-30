@@ -138,7 +138,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
 
 ### Wave 2 - Providers, limiters, door, cache
 
-- [ ] 7. Nansen credit endpoint behind `nansen-credit` limiter (both seams)
+- [x] 7. Nansen credit endpoint behind `nansen-credit` limiter (both seams)
   What to do / Must NOT do: Add routes for the TWO distinct Nansen seams and route BOTH through the gateway: (i) the credit API (`NansenApiClient` methods, incl. `tokenFlows` used by the live chart path) via `limiters.run('nansen-credit', {priority})`, and (ii) the free browser door (app-questions, today injected as `browserPostJson` at `index.ts:35`) via the moved DoorPool. Return the raw body. Do NOT re-implement parsing; Do NOT add retries outside the limiter; Do NOT leave either seam calling upstream directly.
   Parallelization: Wave 2 | Blocked by: 3,6,10 | Blocks: 13,19
   References: `server/src/index.ts:35` (browser door injection), `server/src/providers/nansen.ts:360` (`limiters.run('nansen-credit')`), `server/src/providers/nansen.ts:573,580,589,616,620` (the LIVE free door - `ask()`/`metric()`; NOT `:266 balanceExtremes`, which is dead code), `server/src/providers/nansen.ts:678` (`tokenInformation`), `server/src/poller.ts:492-516,835,1000` (`seriesAtRung`/`crawlBalanceSeries`/`kickNansen` - the LIVE chart path), `server/src/ratelimit/spec.ts` (nansen-credit).

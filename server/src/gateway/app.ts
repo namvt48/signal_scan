@@ -8,7 +8,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { limiters } from '../ratelimit/index.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type CallerTokens } from './auth.js';
-import { poolStatsOrNull } from './door.js';
+import { poolStatsOrNull, browserPostJson } from './door.js';
 import {
   denial,
   parseGatewayRequest,
@@ -19,6 +19,14 @@ import {
 } from './contract.js';
 import { GMGN_TOKEN_INFO_PATH, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
 import { DEXSCREENER_PATH, dexScreenerUpstream, handleDexScreener } from './dexscreener.js';
+import {
+  NANSEN_CREDIT_PATH,
+  NANSEN_DOOR_PATH,
+  handleNansenCredit,
+  handleNansenDoor,
+  nansenCreditUpstream,
+  type DoorPost,
+} from './nansen.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -49,6 +57,12 @@ export interface GatewayAppDeps {
   /** DexScreener upstream (todo 9); defaults to the real keyless fetcher.
    *  Injectable so the per-class limiter route is testable with a stub. */
   dexUpstream?: UpstreamFetch;
+  /** Nansen credit-API upstream (todo 7); defaults to the real fetcher that
+   *  carries the gateway-held `apikey`. Injectable for tests. */
+  nansenCreditUpstream?: UpstreamFetch;
+  /** Nansen free-door transport (todo 7); defaults to the relocated DoorPool's
+   *  `browserPostJson`. Injectable so the door route is testable without chrome. */
+  nansenDoor?: DoorPost;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
 }
@@ -178,6 +192,40 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       fetchUpstream: dexUpstream,
       runLimiter: deps.runLimiter,
     }).then((result) => send(res, result), next);
+  });
+
+  // Nansen credit API (todo 7 seam i): `NansenApiClient` methods (tokenFlows —
+  // the LIVE chart path — tokenInformation, dexTrades, currentBalance) behind
+  // `limiters.run('nansen-credit', {priority})`. The gateway holds NANSEN_API_KEY;
+  // tests inject `nansenCreditUpstream`.
+  const creditUpstream = deps.nansenCreditUpstream ?? nansenCreditUpstream();
+  app.post(NANSEN_CREDIT_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
+    const caller = req.caller;
+    if (caller === undefined) {
+      send(res, denial(401, 'unauthorized'));
+      return;
+    }
+    void handleNansenCredit(req.body, caller, {
+      fetchUpstream: creditUpstream,
+      runLimiter: deps.runLimiter,
+    }).then((result) => send(res, result), next);
+  });
+
+  // Nansen free browser door (todo 7 seam ii): app-questions through the
+  // relocated DoorPool (`gateway/door.ts`), which owns its own path/door budgets
+  // — no limiter key here, so the never-wired `nansen-door` spec cannot
+  // double-govern. Tests inject `nansenDoor` (the `browserPostJson` seam).
+  const doorPost: DoorPost = deps.nansenDoor ?? browserPostJson;
+  app.post(NANSEN_DOOR_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
+    const caller = req.caller;
+    if (caller === undefined) {
+      send(res, denial(401, 'unauthorized'));
+      return;
+    }
+    void handleNansenDoor(req.body, { postJson: doorPost }).then(
+      (result) => send(res, result),
+      next,
+    );
   });
 
   app.use('/v1', (_req, res) => {
