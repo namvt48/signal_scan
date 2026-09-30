@@ -96,7 +96,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
   QA scenarios: happy - start binary, assert boot log line exists; failure - start with an invalid `GATEWAY_PORT`, assert exit code != 0 and an error log line. Evidence `.omo/evidence/request-plane-gateway/task-1-request-plane-gateway.md`
   Commit: Y | `feat(gateway): add standalone gateway entrypoint and build target`
 
-- [ ] 2. HTTP server, per-caller bearer auth, /health
+- [x] 2. HTTP server, per-caller bearer auth, /health
   What to do / Must NOT do: Build the gateway HTTP layer (reuse the `server/src/api.ts` `createApp` pattern). Require `Authorization: Bearer <token>` on every `/v1/*` route and resolve the CALLER (`a` | `b` | `watcher`) from the token - use SEPARATE tokens per caller (`GATEWAY_TOKEN_A`, `GATEWAY_TOKEN_B`, `GATEWAY_TOKEN_WATCHER`), because a single shared token cannot attribute credit use. Return 401 otherwise. Add `GET /health` (no auth) returning `{ok:true}` + the limiter snapshot + DoorPool stats (**the stats include `egressIp`, needed for the GMGN-allowlist check in todo 22; disclosing it unauthenticated is intentional and safe because `/health` binds loopback + the private `signal-scan-gateway` net only, never the public internet - state that in the code comment; do NOT call it "token-authed").** Add `GET /metrics` (token-gated). Do NOT add TLS (loopback + internal net only). Do NOT log tokens.
   Parallelization: Wave 1 | Blocked by: 1 | Blocks: 3,20
   References: `server/src/api.ts` (`createApp`, auth handling, `ratelimit: limiters.snapshot()` @474), `server/src/config.ts:179` (`serviceToken` pattern), `server/src/log.ts:140` (`timed`), `.omo/drafts/request-plane-gateway.md` (C4 per-caller split).

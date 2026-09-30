@@ -1,13 +1,15 @@
-// Gateway process entrypoint (plan request-plane-gateway, todo 1).
+// Gateway process entrypoint (plan request-plane-gateway, todos 1 + 2).
 //
-// Bootable skeleton ONLY: an HTTP listener bound to GATEWAY_PORT plus a
-// fail-loud port parse. The real routes, per-caller bearer auth, /health and the
-// limiters land in todo 2+. No business logic, no DB, no upstream calls here.
+// An HTTP listener bound to GATEWAY_PORT running the gateway app (per-caller
+// bearer auth, public /health, token-gated /metrics). Fail-loud on missing
+// required env BEFORE any listener binds. No business logic, no DB, no upstream
+// calls here.
 
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { config, DEFAULT_GATEWAY_PORT } from '../config.js';
 import { log } from '../log.js';
+import { createGatewayApp } from './app.js';
 
 export { DEFAULT_GATEWAY_PORT };
 
@@ -66,13 +68,10 @@ function main(): void {
     process.exit(1);
   }
 
-  const server = createServer((_req, res) => {
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end('{"error":"not_found"}');
-  });
+  const server = createServer(createGatewayApp());
 
   server.listen(port, () => {
-    log.info(`[gateway] listening on :${port} (request-plane skeleton)`);
+    log.info(`[gateway] listening on :${port}`);
   });
 
   const shutdown = (signal: string): void => {
