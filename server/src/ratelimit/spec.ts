@@ -14,7 +14,19 @@ export function buildSpecs(gmgnPlanWeight: number): Record<string, ApiLimitSpec>
         refillPerSec: gmgnPlanWeight,
         defaultWeight: 1,
       },
-      gate: { statuses: [429], header: 'x-ratelimit-reset' },
+      // 429 arms via `x-ratelimit-reset`. 403 arms a FIXED cooldown: the shared
+      // Gate matches numeric status only (`gate.ts:21-31`, `types.ts:12-16`) and
+      // `Limiter.handleError` passes no body (`limiter.ts:182-184`), so the plan
+      // gates ALL gmgn 403s (todo 8) on the documented assumption that GMGN
+      // returns 403 ONLY for the egress-IP allowlist (`AUTH_IP_BLOCKED`) — a
+      // blocked egress then backs off instead of hot-looping.
+      gate: {
+        statuses: [429],
+        statusesWithCooldown: [
+          { status: 403, cooldownMs: resolveNum('RL_GMGN_403COOLDOWNMS', 600_000) },
+        ],
+        header: 'x-ratelimit-reset',
+      },
       priorityAgingMs: resolveNum('RL_PRIORITY_AGING_MS', 30_000),
     },
     'solana-rpc': {

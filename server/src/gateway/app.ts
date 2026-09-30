@@ -17,6 +17,7 @@ import {
   type LimiterRun,
   type UpstreamFetch,
 } from './contract.js';
+import { GMGN_TOKEN_INFO_PATH, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -41,6 +42,9 @@ export interface GatewayAppDeps {
    * pre-todo-3 placeholder behavior.
    */
   upstream?: UpstreamFetch;
+  /** GMGN token/info upstream (todo 8); defaults to the real fetcher. Injectable
+   *  so the weighted/403 route is testable with a stub. */
+  gmgnUpstream?: UpstreamFetch;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
 }
@@ -117,25 +121,45 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   // contract (todo 3) is `POST /v1/proxy`; without a wired upstream it falls
   // through to the 404 below (the pre-todo-3 placeholder behavior).
   app.use('/v1', requireCaller(tokens));
+
+  // JSON body parser; a parse error becomes the contract's 400 denial (same as
+  // the /v1/proxy route). Shared by the provider POST routes.
+  const jsonBody = express.json({ limit: '2mb' });
+  const parseJson = (req: Request, res: Response, next: NextFunction): void => {
+    jsonBody(req, res, (err?: unknown) => {
+      if (err !== undefined) {
+        send(res, denial(400, 'bad_request'));
+        return;
+      }
+      next();
+    });
+  };
+
   if (deps.upstream !== undefined) {
     const upstream = deps.upstream;
-    const jsonBody = express.json({ limit: '2mb' });
-    app.post(
-      PROXY_PATH,
-      (req, res, next) => {
-        jsonBody(req, res, (err?: unknown) => {
-          if (err !== undefined) {
-            send(res, denial(400, 'bad_request'));
-            return;
-          }
-          next();
-        });
-      },
-      (req: Request, res: Response) => {
-        void handleProxy(req, res, upstream, deps.runLimiter);
-      },
-    );
+    app.post(PROXY_PATH, parseJson, (req: Request, res: Response) => {
+      void handleProxy(req, res, upstream, deps.runLimiter);
+    });
   }
+
+  // GMGN token/info (todo 8): a DEDICATED route (not /v1/proxy) because it must
+  // add the fresh client_id + timestamp GMGN mandates — so it is EXCLUDED from
+  // the todo-11 cache/single-flight — and must pass GMGN_TOKEN_INFO_WEIGHT to
+  // the `gmgn` limiter. The real fetcher holds the gateway-held X-APIKEY; tests
+  // inject `gmgnUpstream`.
+  const gmgnUpstream = deps.gmgnUpstream ?? gmgnTokenInfoUpstream();
+  app.post(GMGN_TOKEN_INFO_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
+    const caller = req.caller;
+    if (caller === undefined) {
+      send(res, denial(401, 'unauthorized'));
+      return;
+    }
+    void handleGmgnTokenInfo(req.body, caller, {
+      fetchUpstream: gmgnUpstream,
+      runLimiter: deps.runLimiter,
+    }).then((result) => send(res, result), next);
+  });
+
   app.use('/v1', (_req, res) => {
     res.status(404).json({ error: 'not_found' });
   });
