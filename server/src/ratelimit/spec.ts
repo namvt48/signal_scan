@@ -59,8 +59,18 @@ export function buildSpecs(gmgnPlanWeight: number): Record<string, ApiLimitSpec>
       window: { max: resolveNum('RL_NANSEN_DOOR_MAX', 40), windowMs: 60_000 },
       pathWindow: { max: resolveNum('RL_NANSEN_DOOR_PATHMAX', 30), windowMs: 60_000 },
     },
+    // DexScreener meters TWO endpoint classes at different rates, and a
+    // `Limiter` holds a single `window` (`limiter.ts:44`), so each class needs
+    // its own key (todo 9 pin):
+    //   pairs/tokens/search → `dexscreener`          300/min
+    //   profiles/boosts     → `dexscreener-profiles`  60/min
+    // The `dexscreener` key name is KEPT (its window is the standard class).
+    // Both windows stay env-tunable.
     dexscreener: {
-      window: { max: resolveNum('RL_DEXSCREENER_MAX', 60), windowMs: 60_000 },
+      window: { max: resolveNum('RL_DEXSCREENER_MAX', 300), windowMs: 60_000 },
+    },
+    'dexscreener-profiles': {
+      window: { max: resolveNum('RL_DEXSCREENER_PROFILES_MAX', 60), windowMs: 60_000 },
     },
   };
 }

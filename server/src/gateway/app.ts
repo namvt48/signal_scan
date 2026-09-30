@@ -18,6 +18,7 @@ import {
   type UpstreamFetch,
 } from './contract.js';
 import { GMGN_TOKEN_INFO_PATH, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
+import { DEXSCREENER_PATH, dexScreenerUpstream, handleDexScreener } from './dexscreener.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -45,6 +46,9 @@ export interface GatewayAppDeps {
   /** GMGN token/info upstream (todo 8); defaults to the real fetcher. Injectable
    *  so the weighted/403 route is testable with a stub. */
   gmgnUpstream?: UpstreamFetch;
+  /** DexScreener upstream (todo 9); defaults to the real keyless fetcher.
+   *  Injectable so the per-class limiter route is testable with a stub. */
+  dexUpstream?: UpstreamFetch;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
 }
@@ -156,6 +160,22 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     }
     void handleGmgnTokenInfo(req.body, caller, {
       fetchUpstream: gmgnUpstream,
+      runLimiter: deps.runLimiter,
+    }).then((result) => send(res, result), next);
+  });
+
+  // DexScreener (todo 9): a per-CLASS limiter route. The class is picked from
+  // the request `endpoint` — profiles/boosts at 60/min, pairs/tokens/search at
+  // 300/min (gateway/dexscreener.ts). Keyless upstream; tests inject `dexUpstream`.
+  const dexUpstream = deps.dexUpstream ?? dexScreenerUpstream();
+  app.post(DEXSCREENER_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
+    const caller = req.caller;
+    if (caller === undefined) {
+      send(res, denial(401, 'unauthorized'));
+      return;
+    }
+    void handleDexScreener(req.body, caller, {
+      fetchUpstream: dexUpstream,
       runLimiter: deps.runLimiter,
     }).then((result) => send(res, result), next);
   });
