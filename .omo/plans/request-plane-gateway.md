@@ -272,10 +272,10 @@ Your next move: approve, or read the detailed plan below (it is already written)
 
 ## Final verification wave
 > Runs in parallel after ALL todos. ALL must APPROVE. Surface results and wait for the user's explicit okay before declaring complete.
-- [ ] F1. Plan compliance audit - every todo's acceptance criteria met, evidence paths present, `EVIDENCE_RECORDED:` recorded; no todo silently skipped.
-- [ ] F2. Code quality review - TS + Python diff reviewed for correctness, no `as any`/suppression, no duplicated limiter, no double-governed door, no dead code wired in.
-- [ ] F3. Real manual QA - independently re-run the four live proofs from todo 22 (dedupe, credit split, fail-open, GMGN egress) and confirm the raw output.
-- [ ] F4. Scope fidelity - confirm the Must NOT have list held: no stream proxying, no RPC-over-HTTP, no queue/DB, no GMGN caching, no a-side collateral changes, no secrets in repo.
+- [x] F1. Plan compliance audit - every todo's acceptance criteria met, evidence paths present, `EVIDENCE_RECORDED:` recorded; no todo silently skipped.
+- [x] F2. Code quality review - TS + Python diff reviewed for correctness, no `as any`/suppression, no duplicated limiter, no double-governed door, no dead code wired in.
+- [x] F3. Real manual QA - independently re-run the four live proofs from todo 22 (dedupe, credit split, fail-open, GMGN egress) and confirm the raw output.
+- [x] F4. Scope fidelity - confirm the Must NOT have list held: no stream proxying, no RPC-over-HTTP, no queue/DB, no GMGN caching, no a-side collateral changes, no secrets in repo.
 
 ## Commit strategy
 - One commit per todo, conventional-commit message as specified on the todo's `Commit:` line.
