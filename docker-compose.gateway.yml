@@ -1,0 +1,75 @@
+# signal-scan-gateway — request-plane gateway (plan request-plane-gateway, todo 4).
+#
+# OWN compose project: `gateway` + its OWN browserless service `gateway-chrome`
+# (do NOT reuse instance a's `chrome` service/alias — a duplicate `chrome` alias on
+# a shared network is a resolution hazard).
+#
+# ONE-TIME host command — an external network is NOT auto-created:
+#   docker network create signal-scan-gateway
+# Every `up` needs the net to exist, or compose refuses to start.
+#
+# Host deploy dir /opt/signal-scan-gateway/ (root-owned) holds:
+#   gateway.env    mode 600  — upstream credentials + RL_* limiter knobs (todo 6)
+#   proxies.txt              — one http://user:pass@host:port per line (door pool)
+# Both are bind-mounted READ-ONLY. Neither file is committed (secrets/proxy creds).
+#
+# Loopback-only port: host systemd watchers reach the gateway; the internet must not.
+# Log cap: same json-file rotation as docker-compose.yml.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  gateway:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.gateway
+    env_file:
+      # Host-only, root-owned (mode 600). Mirrors the api `server/.env` pattern:
+      # optional in `config` so a dev box without the file still validates.
+      - path: /opt/signal-scan-gateway/gateway.env
+        required: false
+    environment:
+      GATEWAY_PORT: "8130"
+      # MUST point at THIS project's browser (todo 4): copying a's ws://chrome:3000
+      # would resolve nothing here.
+      CRAWL_WS_ENDPOINT: ws://gateway-chrome:3000
+      # The door pool reads the proxy list from the read-only mount below.
+      CRAWL_PROXY_FILE: /data/proxies.txt
+    volumes:
+      - /opt/signal-scan-gateway/proxies.txt:/data/proxies.txt:ro
+      - /opt/signal-scan-gateway/gateway.env:/run/gateway.env:ro
+    ports:
+      # Loopback ONLY — host watchers need it, the public internet must not see it.
+      - "127.0.0.1:8130:8130"
+    depends_on:
+      - gateway-chrome
+    networks:
+      - signal-scan-gateway
+    logging: *default-logging
+    restart: unless-stopped
+
+  # Own headless Chromium for the Nansen web-crawl / CF door (browserless v1).
+  # Mirrors the resource limits of docker-compose.yml:21-41 — omitting them is an
+  # OOM risk (1g OOM'd in production; 6g covers N doors, shm_size 2g for /dev/shm).
+  gateway-chrome:
+    image: browserless/chrome:1.61-chrome-stable
+    environment:
+      # Default 30s is shorter than goto+settle -> session dies with the CF cookie.
+      CONNECTION_TIMEOUT: 1800000
+    restart: unless-stopped
+    mem_limit: 6g
+    shm_size: 2g
+    networks:
+      - signal-scan-gateway
+    logging: *default-logging
+
+networks:
+  # Shared private bridge; instances a/b join it via the repo docker-compose.yml
+  # (todo 5). `external: true` = compose uses the pre-created net as-is and does
+  # NOT create/own it — dropping this flag makes compose fall back to a
+  # project-scoped default net that a/b cannot resolve (see evidence failure demo).
+  signal-scan-gateway:
+    external: true
