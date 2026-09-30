@@ -178,7 +178,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
   QA scenarios: happy - TTL hit returns the cached raw body and the upstream counter does not increment; failure - upstream error is not cached and the next call retries. Evidence `.omo/evidence/request-plane-gateway/task-11-request-plane-gateway.md`
   Commit: Y | `feat(gateway): add selective TTL cache with single-flight dedupe`
 
-- [ ] 12. Wave 2 integration tests
+- [x] 12. Wave 2 integration tests
   What to do / Must NOT do: Add an integration test that boots the gateway with stubbed upstreams and exercises every route end-to-end through the real HTTP layer (auth + contract + limiter + selective cache + door). Assert raw bodies, limiter snapshots and the GMGN-no-cache exception. Do NOT stub the limiter/cache - only the network.
   Parallelization: Wave 2 | Blocked by: 7,8,9,10,11 | Blocks: 22
   References: `server/test/ratelimit/integration.test.ts`, `server/test/ratelimit/*-via-layer.test.ts`.
