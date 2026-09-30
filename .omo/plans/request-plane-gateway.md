@@ -228,7 +228,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
   QA scenarios: happy - both units restart and stay active; failure - with the gateway var removed, the watcher logs a clear config error instead of crashing silently. Evidence `.omo/evidence/request-plane-gateway/task-17-request-plane-gateway.md`
   Commit: Y | `docs(deploy): wire gateway env into the watcher systemd units`
 
-- [ ] 18. Python fail-open for price lookups
+- [x] 18. Python fail-open for price lookups
   What to do / Must NOT do: Make the Python gateway client degrade on failure - return the existing "unknown price" result (the current `token_info` failure behaviour) and never crash the feed loop. Do NOT cache-price-and-lie; if unknown, leave it unknown.
   Parallelization: Wave 3 | Blocked by: 16 | Blocks: 17,22
   References: `watchers/common/price.py` (existing failure → unknown path), `watchers/fomo/feed.py` (feed loop resilience).

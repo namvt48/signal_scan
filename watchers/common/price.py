@@ -64,10 +64,13 @@ def gmgn_info(mint, chain="sol"):
         env = config.gateway_json(
             GMGN_TOKEN_INFO_PATH, {"ca": mint, "chain": chain}, timeout=10
         )
+        # _gmgn_of nằm TRONG try: một body 2xx méo (data/token không phải dict)
+        # trước đây ném AttributeError RA NGOÀI ⇒ token_info (và feed loop) chết.
+        # Mọi hình dạng gateway sai phải rơi về DexScreener, không bao giờ raise.
+        return _gmgn_of(env)
     except Exception as ex:  # noqa: BLE001 — mọi lỗi GMGN đều phải rơi về DexScreener
         print(f"  ! gmgn: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
         return None, 0.0
-    return _gmgn_of(env)
 
 
 _INFO_RETRY_S = 60.0  # TTL retry cho lookup THẤT BẠI (plan §5.3, T2)
