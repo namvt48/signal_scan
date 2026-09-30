@@ -1,0 +1,72 @@
+AMENDMENT 2 — FOMO merged INTO the "Tracked by" column (user-requested, 2026-09-29)
+=====================================================================================
+Requester instruction (verbatim): "gộp fomo BY vào chung với tracked by đi các trường
+dữ liệu giống nhau mà" then "tạm thời để trade đi, và Buy $ | Sell PnL chốt như này".
+
+SHAPE CHOSEN (option 1 of 3 offered): ONE column, TWO stacked lists.
+  The separate "FOMO by" column is deleted. Its sub-table now renders inside the
+  "Tracked by" cell, below the wallet sub-table, separated by a top border.
+  Both lists keep their own column sets — nothing is lost, nothing is renamed:
+    wallet list : Wallet | Clan? | Bal | TXs | Inflow | Age
+    FOMO list   : User   | Clan? | Trades | Buy $ | Sell PnL | Age
+  Column-count sites: FOMO_EXTRA 1 -> 0 (15 columns with FOMO on, was 16).
+  Width: merged cell is w-96 (384px) when SHOW_FOMO is off — INSTANCE A PARITY —
+         and w-[768px] (the old tracked 384px + old fomo 384px) when on, so the
+         outer min-width stays 2312px and no other column changes size.
+
+FILES
+  src/components/SignalTable.tsx   FOMO_EXTRA=0; merged <Th>/<Td>; FOMO label row moved
+                                   into the merged header, guarded by `SHOW_FOMO && hasFomo`
+                                   (the SHOW_FOMO guard is REQUIRED: `hasFomo` alone is a
+                                   runtime prop, so minification cannot drop the FOMO
+                                   strings from the OFF bundle — see gate below).
+  src/services/dataStore.ts        DEV-ONLY mock FOMO seed (see "not part of the feature").
+
+COMMANDS + REAL CAPTURED OUTPUT
+--------------------------------
+$ npx tsc --noEmit
+TSC_EXIT=0
+
+$ VITE_SHOW_FOMO=off npm run build
+BUILD_OFF_EXIT=0
+$ grep -ro "FOMO by"  dist/assets/*.js | wc -l   -> 0
+$ grep -ro "Sell PnL" dist/assets/*.js | wc -l   -> 0
+$ grep -ro "fomoUsers" dist/assets/*.js | wc -l  -> 1
+$ grep -ro "FOMO"     dist/assets/*.js | wc -l   -> 0
+  baseline before this amendment: 0 / 0 / 1  ->  EXACT MATCH. Instance a unchanged.
+
+$ VITE_SHOW_FOMO=on npm run build
+BUILD_ON_EXIT=0
+$ grep -ro "FOMO by"  dist/assets/*.js | wc -l   -> 2
+$ grep -ro "Sell PnL" dist/assets/*.js | wc -l   -> 2
+$ grep -ro "fomoUsers" dist/assets/*.js | wc -l  -> 8
+  baseline before this amendment: 2 / 2  ->  EXACT MATCH. The 2 hits are the merged
+  header label and the popup title; "Sell PnL" is the header label and the row <th>.
+
+BROWSER RENDER (dev server, VITE_SHOW_FOMO=on VITE_SHOW_CLAN=on, real DOM measured)
+-----------------------------------------------------------------------------------
+thead th count                        15          (was 16 with a separate FOMO column)
+merged "Tracked by" header text       "Tracked by Wallet Clan Bal TXs Inflow Age
+                                       FOMO by User Clan Trades Buy $ Sell PnL Age"
+nested tables inside the merged cell  2           (wallet list, then FOMO list)
+wallet rows / FOMO rows in that cell  3 / 3       (capped at 3, "+N more" preserved)
+sample cell text                      "CT01 — $18.5K 4/1 $52K 6d 11h ago … +1 more
+                                       degen_sol a 3 $24.5K -$6.1K 6d 11h ago
+                                       sniperbot_x — 3 $8K $12.75K 6d 12h…"
+outer table width                     2312px      (unchanged)
+console errors                        0
+
+NOT PART OF THE FEATURE (uncommitted, dev-only, must not ship)
+-------------------------------------------------------------
+  * src/services/dataStore.ts  SEED_FOMO — sample rows so the merged column can be
+    eyeballed without a live FOMO feed. Set fomoUsers: [] again to remove.
+  * src/config.ts + src/App.tsx + src/auth/auth-context.tsx — VITE_DEV_NO_AUTH
+    sign-in bypass for local UI work. Never set VITE_DEV_NO_AUTH on a deployment build:
+    it only removes the CLIENT gate, the server still authorizes every /api call.
+
+REVIEW NOTE
+-----------
+The plan (.omo/plans/fomo-user-watch.md) still says "Exactly ONE new column on the
+signals table" and F1 was verified against that wording. The plan/docs have NOT been
+amended for this shape yet — do it once the UI shape is final, so the plan does not
+keep describing a column count that no longer exists.

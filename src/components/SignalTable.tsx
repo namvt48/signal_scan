@@ -45,9 +45,9 @@ const FOMO_COLS: readonly string[] = SHOW_CLAN
   ? ['30%', '14%', '14%', '14%', '14%', '14%']
   : ['32%', '17%', '17%', '17%', '17%'];
 
-/** The FOMO column adds exactly one to every column-count site when shipped. */
-const FOMO_EXTRA = SHOW_FOMO ? 1 : 0;
-/** Base table min-width (1928px) plus the new 384px FOMO column when shipped. */
+/** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
+const FOMO_EXTRA = 0;
+/** Base table min-width (1928px) plus the extra 384px the merged activity column takes when FOMO ships. */
 const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2312px]' : 'min-w-[1928px]';
 
 /**
@@ -59,8 +59,8 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
   return (
     <table className="w-full table-fixed border-collapse">
       <colgroup>
-        {WALLET_COLS.map((w) => (
-          <col key={w} style={{ width: w }} />
+        {WALLET_COLS.map((w, i) => (
+          <col key={i} style={{ width: w }} />
         ))}
       </colgroup>
       {head && (
@@ -399,7 +399,14 @@ function SignalHead({
         }
       />
       <Th className="w-36 text-center!">CA</Th>
-      <Th className="w-96 text-center!">
+      <Th
+        className={`${SHOW_FOMO ? 'w-[768px]' : 'w-96'} text-center!`}
+        title={
+          SHOW_FOMO
+            ? 'Tracked wallets, then FOMO watch-list activity. Buy $ is the sum of large BUY sizes, not net inflow or PnL.'
+            : undefined
+        }
+      >
         Tracked by
         <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: WALLET_COLS.join(' ') }}>
           <span className="text-left">Wallet</span>
@@ -409,14 +416,9 @@ function SignalHead({
           <span className="pr-3 text-right">Inflow</span>
           <span className="pl-1 text-left">Age</span>
         </span>
-      </Th>
-      {SHOW_FOMO && (
-        <Th
-          className="w-96 text-center!"
-          title="FOMO watch-list activity — large trades only. Buy $ is the sum of large BUY sizes, not net inflow or PnL."
-        >
-          FOMO by
-          {hasFomo && (
+        {SHOW_FOMO && hasFomo && (
+          <>
+            <span className="mt-2 block font-mono text-[10px] font-bold tracking-[0.03em] text-muted uppercase">FOMO by</span>
             <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
               <span className="text-left">User</span>
               {SHOW_CLAN && <span className="text-left">Clan</span>}
@@ -429,9 +431,9 @@ function SignalHead({
               </span>
               <span className="pl-1 text-left">Age</span>
             </span>
-          )}
-        </Th>
-      )}
+          </>
+        )}
+      </Th>
       <SortTh
         label="Top100"
         col="t100"
@@ -816,7 +818,7 @@ export default function SignalTable({
                         <Td className="w-24 text-center">
                           <CaCell ca={s.ca} chain={s.chain} />
                         </Td>
-                        <Td className="w-96">
+                        <Td className={SHOW_FOMO ? 'w-[768px]' : 'w-96'}>
                           {s.trackedWallets.length === 0 ? (
                             <Pill active={false}>none</Pill>
                           ) : (
@@ -834,28 +836,28 @@ export default function SignalTable({
                               )}
                             </div>
                           )}
+                          {SHOW_FOMO && (
+                            <div className="mt-2.5 min-w-0 border-t border-line pt-2">
+                              {s.fomoUsers.length === 0 ? (
+                                <Pill active={false}>none</Pill>
+                              ) : (
+                                <>
+                                  <FomoTable users={s.fomoUsers.slice(0, 3)} />
+                                  {s.fomoUsers.length > 3 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setFomoPopup(s)}
+                                      className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
+                                      title="Xem toàn bộ FOMO user đã trade token này"
+                                    >
+                                      +{s.fomoUsers.length - 3} more
+                                    </button>
+                                  )}
+                                </>
+                              )}
+                            </div>
+                          )}
                         </Td>
-                        {SHOW_FOMO && (
-                          <Td className="w-96">
-                            {s.fomoUsers.length === 0 ? (
-                              <Pill active={false}>none</Pill>
-                            ) : (
-                              <div className="min-w-0">
-                                <FomoTable users={s.fomoUsers.slice(0, 3)} />
-                                {s.fomoUsers.length > 3 && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setFomoPopup(s)}
-                                    className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
-                                    title="Xem toàn bộ FOMO user đã trade token này"
-                                  >
-                                    +{s.fomoUsers.length - 3} more
-                                  </button>
-                                )}
-                              </div>
-                            )}
-                          </Td>
-                        )}
                         <Td className={`w-24 ${NS_CELL} ${NS_START}`}>
                           <SetupValue value={s.nansen.t100?.multiple !== undefined ? fmtNum(s.nansen.t100.multiple) : '—'} pass={s.nansen.pass.t100} />
                         </Td>
