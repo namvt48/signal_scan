@@ -8,10 +8,13 @@
 #   docker network create signal-scan-gateway
 # Every `up` needs the net to exist, or compose refuses to start.
 #
-# Host deploy dir /opt/signal-scan-gateway/ (root-owned) holds:
+# Host deploy dir /root/signal-scan-gateway/ (root-owned) holds:
 #   gateway.env    mode 600  — upstream credentials + RL_* limiter knobs (todo 6)
 #   proxies.txt              — one http://user:pass@host:port per line (door pool)
 # Both are bind-mounted READ-ONLY. Neither file is committed (secrets/proxy creds).
+# NOTE: /root, NOT /opt — the host runs the snap build of docker (Ubuntu Core 24),
+# whose confinement cannot bind-mount from /opt ("mkdir ...: read-only file system").
+# /root is snap-accessible (instance a already binds /root/signal_scan/data).
 #
 # Loopback-only port: host systemd watchers reach the gateway; the internet must not.
 # Log cap: same json-file rotation as docker-compose.yml.
@@ -29,7 +32,7 @@ services:
     env_file:
       # Host-only, root-owned (mode 600). Mirrors the api `server/.env` pattern:
       # optional in `config` so a dev box without the file still validates.
-      - path: /opt/signal-scan-gateway/gateway.env
+      - path: /root/signal-scan-gateway/gateway.env
         required: false
     environment:
       GATEWAY_PORT: "8130"
@@ -39,8 +42,8 @@ services:
       # The door pool reads the proxy list from the read-only mount below.
       CRAWL_PROXY_FILE: /data/proxies.txt
     volumes:
-      - /opt/signal-scan-gateway/proxies.txt:/data/proxies.txt:ro
-      - /opt/signal-scan-gateway/gateway.env:/run/gateway.env:ro
+      - /root/signal-scan-gateway/proxies.txt:/data/proxies.txt:ro
+      - /root/signal-scan-gateway/gateway.env:/run/gateway.env:ro
     ports:
       # Loopback ONLY — host watchers need it, the public internet must not see it.
       - "127.0.0.1:8130:8130"
