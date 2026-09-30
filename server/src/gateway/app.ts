@@ -7,7 +7,7 @@
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { limiters } from '../ratelimit/index.js';
 import { log } from '../log.js';
-import { callerTokensFromConfig, requireCaller, type CallerTokens } from './auth.js';
+import { callerTokensFromConfig, requireCaller, type Caller, type CallerTokens } from './auth.js';
 import { poolStatsOrNull, browserPostJson } from './door.js';
 import {
   denial,
@@ -33,8 +33,9 @@ import {
   nansenCreditUpstream,
   type DoorPost,
 } from './nansen.js';
-import { GatewayCache, type Preflight } from './cache.js';
-import { CreditAccountant } from './credit.js';
+import { GatewayCache, type CacheStats, type Preflight } from './cache.js';
+import { CreditAccountant, type CreditSnapshot } from './credit.js';
+import type { LimiterSnapshot } from '../ratelimit/types.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -100,6 +101,32 @@ export interface GatewayAppDeps {
  *  `proxyRequest` helper directly. */
 export const PROXY_PATH = '/v1/proxy';
 
+/** Read-only metrics body (todo 20): every limiter key + per-caller credit usage
+ *  + cache counters. `text` duplicates the same figures as a greppable summary. */
+export interface GatewayMetrics {
+  ok: true;
+  caller: Caller | null;
+  ratelimit: Record<string, LimiterSnapshot>;
+  credits: CreditSnapshot;
+  cache: CacheStats;
+  text: string;
+}
+
+/** Plain-text rendering of `GatewayMetrics` (one line per section). */
+export function formatMetricsText(m: Omit<GatewayMetrics, 'text'>): string {
+  const lines = [
+    `gateway ok=${m.ok} caller=${m.caller ?? 'none'}`,
+    `credits day=${m.credits.day} budget=${m.credits.budget} half=${m.credits.half} used_a=${m.credits.used.a} used_b=${m.credits.used.b}`,
+    `cache hits=${m.cache.hits} misses=${m.cache.misses} joined=${m.cache.joined} size=${m.cache.size} inflight=${m.cache.inflight}`,
+  ];
+  for (const [key, s] of Object.entries(m.ratelimit)) {
+    lines.push(
+      `limiter ${key} inFlight=${s.inFlight} queued=${s.queued} gateUntil=${s.gateUntil} windowUsed=${s.windowUsed}`,
+    );
+  }
+  return lines.join('\n');
+}
+
 function send(res: Response, result: DispatchResult): void {
   if (result.headers !== undefined) {
     for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
@@ -160,10 +187,25 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     });
   });
 
-  // Token-gated. Todo 20 fills the real metrics; until then it also reports the
-  // caller its token resolved to — the observable proof of credit attribution.
+  // Token-gated, READ-ONLY (todo 20): every limiter key + per-caller credit
+  // usage + cache counters. JSON by default (with a `text` summary member);
+  // `?format=text` returns just the plain-text summary. Any valid caller token
+  // (a|b|watcher) may read; absent/invalid → 401. No metrics dependency.
   app.get('/metrics', requireCaller(tokens), (req, res) => {
-    res.json({ ok: true, caller: req.caller ?? null });
+    const snapshot: Omit<GatewayMetrics, 'text'> = {
+      ok: true,
+      caller: req.caller ?? null,
+      ratelimit: limiters.snapshot(),
+      credits: credits.snapshot(),
+      cache: cache.stats(),
+    };
+    const text = formatMetricsText(snapshot);
+    if (req.query.format === 'text') {
+      res.type('text/plain').send(text);
+      return;
+    }
+    const body: GatewayMetrics = { ...snapshot, text };
+    res.json(body);
   });
 
   // Every /v1/* route sits behind a caller token. The raw-payload proxy

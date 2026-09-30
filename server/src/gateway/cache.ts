@@ -116,6 +116,20 @@ interface Entry {
   result: DispatchResult;
 }
 
+/** Cache lookup counters + live sizes (observability / todo-20 metrics / tests). */
+export interface CacheStats {
+  /** Fresh stored entry returned (short-circuits before pre-flight/limiter). */
+  hits: number;
+  /** No fresh entry for a cacheable key -> an initiator ran (absent or expired). */
+  misses: number;
+  /** Requests that joined an in-flight call (dedupe; neither hit nor miss). */
+  joined: number;
+  /** Live cached-entry count. */
+  size: number;
+  /** In-flight single-flight count. */
+  inflight: number;
+}
+
 /**
  * In-memory TTL cache + single-flight for deterministic-param endpoints. One
  * instance per gateway app; read-only with respect to everything downstream.
@@ -123,6 +137,8 @@ interface Entry {
 export class GatewayCache {
   private readonly entries = new Map<string, Entry>();
   private readonly inflight = new Map<string, Promise<DispatchResult>>();
+  private hits = 0;
+  private misses = 0;
   private joined = 0;
   private readonly now: () => number;
   private readonly ttlNansenMs: number;
@@ -152,7 +168,10 @@ export class GatewayCache {
     const key = cacheKey(provider, rawBody, policy.credit, caller);
     const cached = this.entries.get(key);
     if (cached !== undefined) {
-      if (cached.expiresAt > this.now()) return cached.result; // HIT: before pre-flight
+      if (cached.expiresAt > this.now()) {
+        this.hits += 1;
+        return cached.result; // HIT: before pre-flight
+      }
       this.entries.delete(key); // stale
     }
     const joined = this.inflight.get(key);
@@ -160,6 +179,7 @@ export class GatewayCache {
       this.joined += 1;
       return joined; // joiner: zero cost, no pre-flight
     }
+    this.misses += 1;
 
     const ttlMs = policy.ttlClass === 'nansen' ? this.ttlNansenMs : this.ttlDexscreenerMs;
     const promise = this.runInitiator(key, ttlMs, provider, rawBody, caller, run, preflight);
@@ -184,6 +204,17 @@ export class GatewayCache {
   /** Total requests that joined an in-flight call (observability / tests). */
   joinedCount(): number {
     return this.joined;
+  }
+
+  /** Hit/miss/join counters + live sizes (observability / todo-20 metrics / tests). */
+  stats(): CacheStats {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      joined: this.joined,
+      size: this.entries.size,
+      inflight: this.inflight.size,
+    };
   }
 
   private async runUncached(

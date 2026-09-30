@@ -246,7 +246,7 @@ Your next move: approve, or read the detailed plan below (it is already written)
   QA scenarios: happy - a and b each consume their half then continue on non-credit routes; failure - a exhausts its half and `b`'s next Nansen credit call still succeeds AND the limiter snapshot for `b` is unaffected. Evidence `.omo/evidence/request-plane-gateway/task-19-request-plane-gateway.md`
   Commit: Y | `feat(gateway): add Nansen credit accounting with equal a/b split and soft-deny`
 
-- [ ] 20. Metrics / observability endpoint
+- [x] 20. Metrics / observability endpoint
   What to do / Must NOT do: Expose `GET /metrics` (token-gated) combining `limiters.snapshot()` with per-caller credit usage and cache hit/miss counters. Keep it read-only. Do NOT add a metrics dependency; emit JSON + a plain-text summary.
   Parallelization: Wave 4 | Blocked by: 2,19 | Blocks: 21,22
   References: `server/src/ratelimit/registry.ts:17` (`snapshot()`), `server/src/api.ts:474` (existing snapshot exposure), `server/src/log.ts`.
