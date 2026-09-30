@@ -296,4 +296,23 @@ for h in _seen_headers:
     assert h.get("Content-type") == "application/json", h
 print("OK (h): cả 2 đường POST của emit.py đều kèm Bearer")
 
+# ---------- (i) duyệt TỪNG TX: cùng mint POST 2 lần, KHÔNG bị cache nuốt ----------
+
+# Bug 2026-09-30 (CA 4WPn…xhUU): cache mint cũ add CẢ khi server trả 200
+# `{skipped: below-min-usd}` ⇒ buy lớn sau đó không bao giờ vào queue/dashboard.
+# Sau fix: mỗi TX thỏa logic (SWAP+BUY+mint) phải POST, kể cả mint đã gặp rồi.
+
+_seen_headers.clear()
+urllib.request.urlopen = _capture
+try:
+    setattr(ww, "_track", True)
+    ww.track_event(ev)
+    ww.track_event(ev)  # cùng mint, TX khác ⇒ vẫn phải POST
+finally:
+    urllib.request.urlopen = _real_urlopen
+assert len(_seen_headers) == 2, (
+    f"duyệt từng TX: 2 TX cùng mint phải POST 2 lần, got {len(_seen_headers)}"
+)
+print("OK (i): mỗi TX POST riêng, không cache theo mint (bug 4WPn…xhUU)")
+
 print("PASS: toàn bộ test config-from-API")

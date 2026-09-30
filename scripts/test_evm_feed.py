@@ -149,6 +149,38 @@ def test_sort_logs_dedup_and_order():
     ]  # dedup (tx,logIndex) + sort
 
 
+def test_track_ca_caches_only_after_success(monkeypatch):
+    """duyệt từng TX: chỉ cache (chain,ca) SAU khi POST ok; lỗi POST KHÔNG được
+    nuốt CA (cùng lớp bug emit._posted_mints, 2026-09-30)."""
+    monkeypatch.setattr(config, "_track", True)
+    calls: list[dict] = []
+
+    def ok(url, body, timeout=None):
+        calls.append(body)
+        return None
+
+    ev = {"side": "BUY", "chain": "base", "ca": TOKEN, "wallet": WALLET, "tx": TX}
+
+    monkeypatch.setattr(config, "http_json", ok)
+    feed._track_ca(ev, 100.0)
+    assert ("base", TOKEN) in feed._tracked, "POST ok ⇒ phải cache"
+    feed._track_ca(ev, 100.0)  # đã tracked ⇒ không POST lại
+    assert len(calls) == 1, f"đã tracked ⇒ không POST lại, got {len(calls)}"
+
+    feed._tracked.clear()
+
+    def boom(url, body, timeout=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(config, "http_json", boom)
+    feed._track_ca(ev, 100.0)  # lỗi ⇒ KHÔNG cache
+    assert ("base", TOKEN) not in feed._tracked, "lỗi POST KHÔNG được cache"
+
+    monkeypatch.setattr(config, "http_json", ok)
+    feed._track_ca(ev, 100.0)  # TX sau ⇒ thử lại
+    assert len(calls) == 2, f"TX sau phải POST lại sau lỗi, got {len(calls)}"
+
+
 def test_wss_url_derived_and_env_override(monkeypatch):
     assert feed.wss_url("base") == "wss://mainnet.base.org"
     monkeypatch.setenv("BSC_WSS_URL", "wss://example.com/ws")

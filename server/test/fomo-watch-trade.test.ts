@@ -194,7 +194,8 @@ test('POST /api/fomo-watch/trades: a BUY enqueues the CA into tracked_cas exactl
   const tracked = findTrackedCa(BUY_CA, 'sol');
   assert.equal(tracked?.note, 'fomo');
   assert.equal(tracked?.status, 'queued');
-  assert.equal(tracked?.entry_usd, 2985);
+  // entry_usd deliberately NOT carried (user 2026-09-29): NULL fails open in the display gate.
+  assert.equal(tracked?.entry_usd, null);
   assert.equal(listTrackedCas().filter((r) => r.address === BUY_CA && r.chain === 'sol').length, 1);
 });
 

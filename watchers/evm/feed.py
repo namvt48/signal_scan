@@ -155,13 +155,15 @@ def _sort_logs(logs):
 
 def _track_ca(ev, usd):
     """--track: POST CA vào /api/tracked-cas (chain-aware — emit.track_post_body
-    hardcode 'sol' nên KHÔNG tái dùng). Fail-soft, dedup (chain,ca) trong run."""
+    hardcode 'sol' nên KHÔNG tái dùng). Fail-soft — duyệt TỪNG TX, chỉ cache
+    (chain,ca) SAU khi server xác nhận (không raise / 409); KHÔNG cache TRƯỚC
+    khi POST (lỗi mạng/400-500 trước đây vẫn cache ⇒ CA bị nuốt cả run — cùng
+    lớp bug emit._posted_mints, 2026-09-30)."""
     if not config._track or ev["side"] != "BUY":
         return
     key = (ev["chain"], ev["ca"])
     if key in _tracked:
         return
-    _tracked.add(key)
     body = {
         "address": ev["ca"],
         "chain": ev["chain"],
@@ -174,11 +176,14 @@ def _track_ca(ev, usd):
     except urllib.error.HTTPError as ex:
         if ex.code != 409:  # 409 = đã tracked = ok (như emit.track_event)
             print(f"  ! track {ev['ca'][:8]}…: HTTP {ex.code}", file=sys.stderr)
+            return  # KHÔNG cache ⇒ TX sau thử lại
     except Exception as ex:
         print(
             f"  ! track {ev['ca'][:8]}…: {type(ex).__name__}: {str(ex)[:60]}",
             file=sys.stderr,
         )
+        return  # KHÔNG cache
+    _tracked.add(key)
 
 
 def emit_swap(ev, ts_unix):

@@ -19,7 +19,6 @@ from typing import Any
 from watchers.common import config
 
 _jsonl = ""  # --jsonl PATH: ghi thêm mỗi sự kiện 1 dòng JSON (log machine-readable)
-_posted_mints: set[str] = set()  # CA đã POST trong run này (dedup phía client)
 
 
 def jl_write(e) -> None:
@@ -82,13 +81,17 @@ def track_post_body(e) -> dict[str, Any] | None:
 
 
 def track_event(e) -> None:
-    """--track: POST CA của sự kiện trade vào API. Fail-soft — 200/201/409 = ok
-    (409 = đã tracked), 400/lỗi mạng chỉ log stderr; không bao giờ raise để loop
-    watch không chết. Dedup theo mint trong run để đỡ tải server."""
+    """--track: POST CA của MỌI sự kiện trade — duyệt TỪNG TX, KHÔNG cache theo
+    mint. Fail-soft — 201/409 = ok (409 = đã tracked), 400/lỗi mạng chỉ log
+    stderr; không bao giờ raise để loop watch không chết. Server tự chống trùng
+    (UNIQUE address,chain) và tự gate min-usd, nên client KHÔNG được nuốt TX:
+    cache mint cũ (kể cả khi server trả 200 `skipped` below-min-usd) làm CA nhỏ
+    "đầu độc" ⇒ buy lớn sau đó không bao giờ được track (bug 2026-09-30, CA
+    4WPn…xhUU: 10 buy tx bị bỏ khỏi queue/dashboard)."""
     if not config._track:
         return
     body = track_post_body(e)
-    if not body or body["address"] in _posted_mints:
+    if not body:
         return
     try:
         req = urllib.request.Request(
@@ -108,7 +111,6 @@ def track_event(e) -> None:
             file=sys.stderr,
         )
         return
-    _posted_mints.add(body["address"])
 
 
 def watch_trade_body(e, block_time=None) -> dict[str, Any] | None:

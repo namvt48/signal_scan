@@ -774,7 +774,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     // only for a genuinely NEW trade row and only when the CA is not already
     // tracked, so a replayed alert is a strict no-op (no re-enqueue, no re-kick).
     if (created && parsed.type === 'buy' && !findTrackedCa(parsed.ca, parsed.chain)) {
-      const row = insertTrackedCa({ address: parsed.ca, chain: parsed.chain, note: 'fomo', entryUsd: parsed.usdValue ?? undefined });
+      // entry_usd stays NULL on purpose (user 2026-09-29): the signals display gate only
+      // drops a CA on a KNOWN sub-threshold entry (NULL fails open), so a FOMO CA is never
+      // hidden by thresholds — the alert itself is the evidence, not the buy size.
+      const row = insertTrackedCa({ address: parsed.ca, chain: parsed.chain, note: 'fomo' });
       kickCAs([{ address: row.address, chain: row.chain }]);
     }
     res.json({ inserted: created ? 1 : 0 });
