@@ -1,6 +1,0 @@
-# watch 1 ví | feed=ws | 5 quote-mints | min $0.1
-# feed=ws logsSubscribe 1 ví | sweep 60.0s | Ctrl-C dừng
-  ! ws đứt (FileNotFoundError: [Errno 2] No such file or directory: '/home/namvt/Desktop/dev-space/si) -> reconnect sau 2s
-# feed=ws logsSubscribe 1 ví | sweep 60.0s | Ctrl-C dừng
-  ! ws đứt (FileNotFoundError: [Errno 2] No such file or directory: '/home/namvt/Desktop/dev-space/si) -> reconnect sau 2s
-# feed=ws logsSubscribe 1 ví | sweep 60.0s | Ctrl-C dừng

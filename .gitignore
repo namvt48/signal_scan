@@ -24,3 +24,6 @@ scripts/heartbeat
 # keep the example env (negates .env.* above)
 !.env.example
 !**/.env.example
+
+# agent session churn — not source
+.omo/run-continuation/

@@ -156,6 +156,7 @@ export const config = {
   // is the primary; set → evm.ts appends the keyless endpoint as the fail-over (R2).
   baseRpcUrl: str('BASE_RPC_URL', ''),
   bscRpcUrl: str('BSC_RPC_URL', ''),
+  robinhoodRpcUrl: str('ROBINHOOD_RPC_URL', ''),
 
   // Pacing: spread each sweep's requests evenly across SWEEP_PACE_FACTOR of its
   // interval (0.8 = dùng 80% chu kỳ, nghỉ 20%). Scale = tăng interval hoặc thêm
@@ -184,6 +185,10 @@ export const config = {
   /** Static Bearer token for the wallet_watch daemon (role 'service'). A long
    * random secret; compared in constant time (auth.ts matchServiceToken). */
   serviceToken: str('SERVICE_TOKEN', ''),
+  /** DEV ONLY (temporary): `AUTH_DISABLED=1` short-circuits the auth middleware
+   * and grants every request the admin principal — no Bearer token needed. Set
+   * it inline at process start; NEVER in a deployed env. Default '' = off. */
+  authDisabled: str('AUTH_DISABLED', '') === '1',
   // Mốc backfill lịch sử trades (ISO date) — 'từ lúc token được phát hiện'.
   nansenBackfillFrom: str('NANSEN_BACKFILL_FROM', '2026-08-01'),
   crawlWsEndpoint: str('CRAWL_WS_ENDPOINT', 'ws://chrome:3000'),

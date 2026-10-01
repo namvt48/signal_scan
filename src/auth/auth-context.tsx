@@ -4,6 +4,7 @@ import { GoogleAuthProvider, getRedirectResult, onIdTokenChanged, signInWithPopu
 import type { User } from 'firebase/auth';
 import { auth } from './firebase-config';
 import { AuthContext, type Role } from './auth-context-value';
+import type { AuthContextValue } from './auth-context-value';
 import { isPopupUnavailable, isSignInCancelled, signInErrorMessage } from './auth-errors';
 import { setAuthBridge } from '../services/restDataStore';
 
@@ -14,7 +15,7 @@ function isRole(v: unknown): v is Role {
   return v === 'admin' || v === 'viewer' || v === 'service';
 }
 
-export function AuthProvider({ children }: { children: ReactNode }) {
+export function FirebaseAuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [role, setRole] = useState<Role | null>(null);
@@ -135,5 +136,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     <AuthContext.Provider value={{ user, loading, signIn, signOut, getToken, role, signInError, clearSignInError, notAuthorized }}>
       {children}
     </AuthContext.Provider>
+  );
+}
+
+// DEV ONLY (temporary): when VITE_AUTH_DISABLED=1 the app skips the Firebase
+// sign-in wall and calls the API with a static bypass token (the server must be
+// started with AUTH_DISABLED=1). Never enable in a deployed build.
+function DevAuthProvider({ children }: { children: ReactNode }) {
+  useEffect(() => {
+    setAuthBridge(
+      async () => 'dev-bypass',
+      () => {},
+    );
+  }, []);
+  const value: AuthContextValue = {
+    user: { email: 'dev@local' } as unknown as User,
+    loading: false,
+    role: 'admin',
+    signIn: async () => undefined,
+    signOut: async () => undefined,
+    getToken: async () => 'dev-bypass',
+    signInError: null,
+    clearSignInError: () => undefined,
+    notAuthorized: false,
+  };
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  return import.meta.env.VITE_AUTH_DISABLED === '1' ? (
+    <DevAuthProvider>{children}</DevAuthProvider>
+  ) : (
+    <FirebaseAuthProvider>{children}</FirebaseAuthProvider>
   );
 }

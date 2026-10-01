@@ -57,7 +57,7 @@ import {
   type NansenThresholds,
 } from './settings.js';
 import { insertTrades } from './ingest.js';
-import { kickCAs, kickWalletRow } from './poller.js';
+import { kickCAs, kickFomoHoldings, kickWalletRow } from './poller.js';
 
 interface WalletJson {
   id: string;
@@ -319,6 +319,9 @@ interface FomoWatchTrade {
   usdValue?: number;
   price?: number;
   token?: string;
+  /** On-chain tx that produced the alert (present on ~17/102 captured rows). Used
+   *  to resolve the trader's wallet — opportunistic, absent ⇒ no wallet work. */
+  txHash?: string;
 }
 
 /**
@@ -353,6 +356,8 @@ function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
   if (trader) trade.trader = trader;
   const token = strField(b, 'token');
   if (token) trade.token = token;
+  const txHash = strField(b, 'txHash');
+  if (txHash) trade.txHash = txHash;
   for (const key of ['usdValue', 'price'] as const) {
     const v: unknown = b[key];
     if (v === undefined) continue;
@@ -498,6 +503,45 @@ async function fetchGatewayDoors(): Promise<PublicDoorStat[] | null> {
     log.warn('[api] gateway /health unreachable — doors degraded', { err });
     return null;
   }
+}
+
+/** Outcome of enqueueTrackedCa — the caller shapes its own HTTP response from it. */
+type EnqueueOutcome =
+  | { kind: 'inserted'; row: TrackedCaRow }
+  | { kind: 'backfilled'; row: TrackedCaRow }
+  | { kind: 'exists' }
+  | { kind: 'skipped' };
+
+/**
+ * THE single gate a CA passes to become polled — every producer goes through
+ * here (wallet-watch POST /api/tracked-cas, FOMO buy ingest) so the rule can
+ * never drift:
+ *   - already tracked → backfill entry_usd when it was unknown and usd is now
+ *     known; else no-op (no kickCAs — it already polls on its own cadence).
+ *   - new + KNOWN entryUsd below minUsd → skipped. Absent usd fails open: the
+ *     detector must never drop a real trade it could not price.
+ *   - new → insert + kickCAs.
+ */
+function enqueueTrackedCa(input: {
+  address: string;
+  chain: Chain;
+  note: string;
+  entryUsd?: number;
+}): EnqueueOutcome {
+  const existing = findTrackedCa(input.address, input.chain);
+  if (existing) {
+    if (existing.entry_usd == null && input.entryUsd != null) {
+      const row = setTrackedCaEntryUsd(input.address, input.chain, input.entryUsd) ?? existing;
+      return { kind: 'backfilled', row };
+    }
+    return { kind: 'exists' };
+  }
+  if (input.entryUsd !== undefined && input.entryUsd < getThresholds().minUsd) {
+    return { kind: 'skipped' };
+  }
+  const row = insertTrackedCa(input);
+  kickCAs([{ address: row.address, chain: row.chain }]);
+  return { kind: 'inserted', row };
 }
 
 export function createApp(providerName: string, authDeps?: AuthDeps): Express {
@@ -702,29 +746,24 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    const existing = findTrackedCa(parsed.address, parsed.chain);
-    if (existing) {
-      // Repost carrying a price backfills an entry_usd unknown at insert time.
-      // No kickCAs — the CA is already tracked and polls on its own cadence.
-      if (existing.entry_usd == null && parsed.entryUsd != null) {
-        const updated = setTrackedCaEntryUsd(parsed.address, parsed.chain, parsed.entryUsd);
-        res.status(200).json(toTrackedCa(updated ?? existing));
-        return;
-      }
+    // Dedupe + entry-size gate live in enqueueTrackedCa. A KNOWN entryUsd below
+    // minUsd is refused — 200, not 4xx, so the daemon's 2xx-is-ok client stays
+    // quiet; absent usd fails open; a repost carrying a price backfills an
+    // unknown entry_usd. Read per request so a settings change needs no restart.
+    const r = enqueueTrackedCa(parsed);
+    if (r.kind === 'inserted') {
+      res.status(201).json(toTrackedCa(r.row));
+      return;
+    }
+    if (r.kind === 'backfilled') {
+      res.status(200).json(toTrackedCa(r.row));
+      return;
+    }
+    if (r.kind === 'exists') {
       res.status(409).json({ error: 'CA already tracked on this chain' });
       return;
     }
-    // Entry-size gate (moved from scripts/wallet_watch.py, which now posts every
-    // detected buy): a KNOWN entryUsd below minUsd is refused — 200, not 4xx, so
-    // the daemon's 2xx-is-ok client stays quiet. Absent usd fails open. Read per
-    // request so a settings change takes effect without restart.
-    if (parsed.entryUsd !== undefined && parsed.entryUsd < getThresholds().minUsd) {
-      res.status(200).json({ skipped: 'below-min-usd' });
-      return;
-    }
-    const row = insertTrackedCa(parsed);
-    kickCAs([{ address: row.address, chain: row.chain }]);
-    res.status(201).json(toTrackedCa(row));
+    res.status(200).json({ skipped: 'below-min-usd' });
   });
 
   app.delete('/api/tracked-cas/:id', (req, res) => {
@@ -827,15 +866,24 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       token: parsed.token ?? null,
       ts: parsed.ts,
     });
-    // A watched user's BUY pulls the CA into the tracked queue (user 2026-09-29):
-    // only for a genuinely NEW trade row and only when the CA is not already
-    // tracked, so a replayed alert is a strict no-op (no re-enqueue, no re-kick).
-    if (created && parsed.type === 'buy' && !findTrackedCa(parsed.ca, parsed.chain)) {
-      // entry_usd stays NULL on purpose (user 2026-09-29): the signals display gate only
-      // drops a CA on a KNOWN sub-threshold entry (NULL fails open), so a FOMO CA is never
-      // hidden by thresholds — the alert itself is the evidence, not the buy size.
-      const row = insertTrackedCa({ address: parsed.ca, chain: parsed.chain, note: 'fomo' });
-      kickCAs([{ address: row.address, chain: row.chain }]);
+    // A watched user's BUY pulls the CA into the tracked queue EXACTLY like a
+    // wallet-watch buy (user 2026-09-30): same enqueueTrackedCa gate, the buy's
+    // usdValue is the entry size, so a KNOWN sub-minUsd buy is skipped and an
+    // unpriced buy fails open. Only for a genuinely NEW trade row, so a replayed
+    // alert stays a strict no-op. Still no wallet state here.
+    if (created && parsed.type === 'buy') {
+      enqueueTrackedCa({
+        address: parsed.ca,
+        chain: parsed.chain,
+        note: 'fomo',
+        ...(parsed.usdValue !== undefined ? { entryUsd: parsed.usdValue } : {}),
+      });
+    }
+    // Resolve the alert's wallet + measure its holding off the response path
+    // (fire-and-forget; a missing/unresolvable txHash is a silent no-op). This
+    // touches only the fomo_* tables — still no wallet state here.
+    if (created && parsed.txHash !== undefined) {
+      kickFomoHoldings(user.id, parsed.chain, parsed.ca, parsed.txHash);
     }
     res.json({ inserted: created ? 1 : 0 });
   });

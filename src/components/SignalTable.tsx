@@ -37,13 +37,13 @@ const WALLET_COLS: readonly string[] = SHOW_CLAN
   : ['34%', '17%', '13%', '19%', '17%'];
 
 /*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Age.
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Hold % / Age.
  * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
  * line up row for row.
  */
 const FOMO_COLS: readonly string[] = SHOW_CLAN
-  ? ['30%', '14%', '14%', '14%', '14%', '14%']
-  : ['32%', '17%', '17%', '17%', '17%'];
+  ? ['26%', '12%', '12%', '12%', '13%', '13%', '12%']
+  : ['28%', '15%', '14%', '14%', '15%', '14%'];
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
@@ -136,6 +136,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
             <th className="pb-1 pr-3 text-right">Trades</th>
             <th className="pb-1 pr-3 text-right">Buy $</th>
             <th className="pb-1 pr-3 text-right">Sell PnL</th>
+            <th className="pb-1 pr-3 text-right">Hold %</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
@@ -168,6 +169,12 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
               title="Σ realised PnL on SELL rows — not sell volume"
             >
               {usd(u.sellPnlUsd)}
+            </td>
+            <td
+              className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2"
+              title="Share of total supply held by this user's wallets"
+            >
+              {u.holdingPct !== undefined ? pct(u.holdingPct) : '—'}
             </td>
             <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
@@ -428,6 +435,9 @@ function SignalHead({
               </span>
               <span className="pr-3 text-right" title="Σ realised PnL on SELL rows — not sell volume">
                 Sell PnL
+              </span>
+              <span className="pr-3 text-right" title="Share of total supply held by this user's wallets">
+                Hold %
               </span>
               <span className="pl-1 text-left">Age</span>
             </span>

@@ -15,6 +15,7 @@ import {
   listCaTargetsMissingEssential,
   listCaTargetsMissingIcon,
   listCaTargetsMissingSymbol,
+  listFomoAlertTargets,
   listTrackedCas,
   pruneTrackedByNone,
   pruneUntrackedCas,
@@ -42,6 +43,7 @@ import {
 import { type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
 import { exchangeAnchorLf, RUNG_SPAN_DAYS, seriesReachesStart, t100Mdd } from './snapshot.js';
 import { nansenScore } from './signals.js';
+import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx } from './fomo-holdings.js';
 import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
 import { fetchIcons } from './providers/dexscreener.js';
@@ -829,6 +831,7 @@ export async function walletSweep(provider: MarketDataProvider): Promise<void> {
       log.warn(`[poller] prune tracked-by-none CA ${r.address} ${r.chain} (added ${r.added_at}) ${r.note}`);
     }
   }
+  await fomoHoldingsSweep();
 }
 
 async function run(task: PollTask): Promise<void> {
@@ -972,6 +975,39 @@ export function kickWalletHoldingsFor(cas: readonly { address: string; chain: Ch
       }
     })();
   }
+}
+
+// --- FOMO user holdings (credit-free RPC, fomo tables only) ------------------
+
+/** Serial drain so a burst of alerts resolves one after another; tests await it. */
+let fomoKickDrain: Promise<void> = Promise.resolve();
+
+/** Resolve + measure ONE alert's wallet fire-and-forget — never blocks the API
+ *  response, never rejects (trackFomoWalletFromTx swallows every failure). */
+export function kickFomoHoldings(fomoUserId: string, chain: Chain, ca: string, txHash: string): void {
+  if (txHash === '') return;
+  fomoKickDrain = fomoKickDrain.then(() => trackFomoWalletFromTx(fomoUserId, chain, ca, txHash));
+}
+
+/** Test/observability seam: resolves when every queued FOMO kick has finished. */
+export function fomoHoldingsIdle(): Promise<void> {
+  return fomoKickDrain;
+}
+
+/** Periodic re-measure of every alerted (user, ca, chain) so holding pct stays
+ *  current. Rides the wallet cadence; one supply read per (chain, ca) per pass. */
+export async function fomoHoldingsSweep(): Promise<void> {
+  const targets = listFomoAlertTargets();
+  if (targets.length === 0) return;
+  const deps = fomoRpcDeps();
+  const supplyCache = new Map<string, number | null>();
+  await pacedFor(targets, config.pollWalletsMs, async (t) => {
+    try {
+      await refreshFomoHolding(t.fomo_user_id, t.chain, t.ca, deps, supplyCache);
+    } catch (e) {
+      log.error('[poller] fomoHoldingsSweep', t.fomo_user_id, e);
+    }
+  });
 }
 
 /** Token info + Nansen series for each CA, immediately — plus its wallet links. */

@@ -58,6 +58,9 @@ export interface AuthDeps {
   firebaseProjectId?: string;
   /** Default: SERVICE_TOKEN. Empty → service path disabled (fail closed). */
   serviceToken?: string;
+  /** DEV ONLY (temporary). Default: AUTH_DISABLED. True → every request gets
+   * the admin principal, no token verified. Never set in a deployed env. */
+  authDisabled?: boolean;
 }
 
 /** Roles assignable through AUTH_USER_ROLES — 'service' is NOT: it exists only
@@ -226,7 +229,13 @@ export function createAuthMiddleware(deps: AuthDeps = {}): RequestHandler {
   const roles = deps.roles ?? parseUserRoles(config.authUserRoles);
   const projectId = deps.firebaseProjectId ?? config.firebaseProjectId;
   const serviceToken = deps.serviceToken ?? config.serviceToken;
+  const authDisabled = deps.authDisabled ?? config.authDisabled;
   return async (req, res, next) => {
+    if (authDisabled) {
+      req.principal = { email: 'dev@local', role: 'admin' };
+      next();
+      return;
+    }
     const access = resolveRouteAccess(req.method, req.path);
     if (access === 'public') {
       next();

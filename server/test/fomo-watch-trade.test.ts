@@ -4,6 +4,8 @@ import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { getDb, deleteTrackedCa, findTrackedCa, insertFomoUser, listTrackedCas, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
+import { fomoHoldingsIdle } from '../src/poller.js';
+import { TOTAL_SUPPLY_SELECTOR } from '../src/providers/evm.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
 
 // AUTH CONTRACT v1: this is the daemon's own route — the service token (via
@@ -194,8 +196,8 @@ test('POST /api/fomo-watch/trades: a BUY enqueues the CA into tracked_cas exactl
   const tracked = findTrackedCa(BUY_CA, 'sol');
   assert.equal(tracked?.note, 'fomo');
   assert.equal(tracked?.status, 'queued');
-  // entry_usd deliberately NOT carried (user 2026-09-29): NULL fails open in the display gate.
-  assert.equal(tracked?.entry_usd, null);
+  // The buy's usdValue IS the entry size (user 2026-09-30) — same gate as a wallet-watch buy.
+  assert.equal(tracked?.entry_usd, 2985);
   assert.equal(listTrackedCas().filter((r) => r.address === BUY_CA && r.chain === 'sol').length, 1);
 });
 
@@ -213,6 +215,26 @@ test('POST /api/fomo-watch/trades: a SELL of an untracked CA adds no tracked_cas
   assert.equal(listTrackedCas().some((r) => r.address === SELL_CA && r.chain === 'sol'), false);
 });
 
+test('POST /api/fomo-watch/trades: a BUY below minUsd lands as a trade but is not tracked', async () => {
+  const below = 'FomoBuyBelowMinCa01';
+  const res = await post(trade({ eventId: 'evt-fomo-buy-small', tokenAddress: below, usdValue: 30 }));
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  assert.equal(findTrackedCa(below, 'sol'), undefined);
+});
+
+test('POST /api/fomo-watch/trades: a BUY with no usdValue still tracks the CA (fail-open)', async () => {
+  const unpriced = 'FomoBuyNoUsdCa001';
+  const body = trade({ eventId: 'evt-fomo-buy-nousd', tokenAddress: unpriced });
+  delete body.usdValue;
+  const res = await post(body);
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  const tracked = findTrackedCa(unpriced, 'sol');
+  assert.equal(tracked?.note, 'fomo');
+  assert.equal(tracked?.entry_usd, null);
+});
+
 test('POST /api/fomo-watch/trades: a replayed BUY whose CA was removed does not re-enqueue', async () => {
   const first = await post(trade({ eventId: 'evt-fomo-replay', tokenAddress: REPLAY_CA }));
   assert.equal(first.json.inserted, 1);
@@ -224,4 +246,67 @@ test('POST /api/fomo-watch/trades: a replayed BUY whose CA was removed does not 
   assert.equal(replay.status, 200);
   assert.equal(replay.json.inserted, 0);
   assert.equal(findTrackedCa(REPLAY_CA, 'sol'), undefined);
+});
+
+// --- opportunistic wallet resolution on ingest (EVM fixture) -----------------
+
+const EVM_CA = `0x${'a1'.repeat(20)}`;
+const EVM_TX = `0x${'ef'.repeat(32)}`;
+const EVM_WALLET = `0x${'d4'.repeat(20)}`;
+
+function u256(n: bigint | number): string {
+  return BigInt(n).toString(16).padStart(64, '0');
+}
+
+function wordOf(hex: string, i: number): string {
+  return hex.slice(10 + i * 64, 10 + (i + 1) * 64);
+}
+
+function aggregate3Result(rs: readonly { success: boolean; returnData: string }[]): string {
+  const tuples = rs.map((r) => {
+    const data = r.returnData.replace(/^0x/i, '');
+    return [u256(r.success ? 1 : 0), u256(0x40), u256(data.length / 2), data.padEnd(Math.ceil(data.length / 64) * 64, '0')].join('');
+  });
+  const offs: string[] = [];
+  let at = rs.length * 32;
+  for (const t of tuples) {
+    offs.push(u256(at));
+    at += t.length / 2;
+  }
+  return `0x${u256(0x20)}${u256(rs.length)}${offs.join('')}${tuples.join('')}`;
+}
+
+const ok = (returnData: string): { success: boolean; returnData: string } => ({ success: true, returnData });
+const rpcOk = (result: unknown): Response =>
+  new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }), { status: 200 });
+
+test('POST /api/fomo-watch/trades: a txHash opportunistically records the trader wallet + holding (fire-and-forget)', async () => {
+  const orig = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (String(url).startsWith(base)) return orig(url as string, init); // let the request reach the test server
+      const body = JSON.parse(String(init?.body)) as { method: string; params: [{ data: string }] };
+      if (body.method === 'eth_getTransactionByHash') return rpcOk({ from: EVM_WALLET });
+      const data = body.params[0].data;
+      const n = Number(BigInt(`0x${wordOf(data, 1)}`));
+      if (data.includes(TOTAL_SUPPLY_SELECTOR)) return rpcOk(aggregate3Result([ok(u256(1000n * 10n ** 18n)), ok(u256(18))]));
+      return rpcOk(aggregate3Result(n === 1 ? [ok(u256(250n * 10n ** 18n))] : [ok(u256(250n * 10n ** 18n)), ok(u256(18))]));
+    }) as unknown as typeof fetch;
+
+    const res = await post(trade({ eventId: 'evt-fomo-txhash', chain: 'base', tokenAddress: EVM_CA, txHash: EVM_TX }));
+    assert.equal(res.status, 200);
+    await fomoHoldingsIdle();
+
+    const wallet = getDb()
+      .prepare('SELECT address FROM fomo_user_wallets WHERE fomo_user_id = ? AND chain = ?')
+      .get(fomoUserId, 'base') as { address: string } | undefined;
+    assert.equal(wallet?.address, EVM_WALLET);
+    const h = getDb()
+      .prepare('SELECT amount, pct FROM fomo_holdings WHERE fomo_user_id = ? AND chain = ?')
+      .get(fomoUserId, 'base') as { amount: number; pct: number } | undefined;
+    assert.equal(h?.amount, 250);
+    assert.equal(h?.pct, 25);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });

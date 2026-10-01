@@ -61,9 +61,11 @@ export interface FomoUserStat {
   sells: number;
   trades: number;
   lastTs: number;
+  /** Σ token units the user's wallets hold of this CA; absent until measured. */
+  holdingAmount?: number;
+  /** holdingAmount / total supply × 100; absent when never measured or supply unknown. */
+  holdingPct?: number;
 }
-
-/** mirrors TokenSignal in src/types.ts (tier = the user-set per-CA rating, null = unrated) */
 export interface TokenSignal {
   id: string;
   ca: string;
@@ -247,7 +249,8 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
   return out;
 }
 
-/** Raw SQLite row behind fomoUserStats — name is '' and clan NULL when unset. */
+/** Raw SQLite row behind fomoUserStats — name is '' and clan NULL when unset.
+ *  holdingAmount/holdingPct are NULL until the wallet's holding is measured. */
 interface FomoUserStatRow {
   handle: string;
   name: string;
@@ -258,6 +261,8 @@ interface FomoUserStatRow {
   sells: number;
   trades: number;
   lastTs: number;
+  holdingAmount: number | null;
+  holdingPct: number | null;
 }
 
 /**
@@ -293,10 +298,14 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
-              COALESCE(MAX(t.ts), 0) AS lastTs
+              COALESCE(MAX(t.ts), 0) AS lastTs,
+              h.amount AS holdingAmount,
+              h.pct AS holdingPct
          FROM fomo_users u
          LEFT JOIN fomo_trades t
            ON t.fomo_user_id = u.id AND t.ca = @ca AND t.chain = @chain AND t.ts >= @statSince
+         LEFT JOIN fomo_holdings h
+           ON h.fomo_user_id = u.id AND h.ca = @ca AND h.chain = @chain
         WHERE EXISTS (SELECT 1 FROM fomo_trades b
                        WHERE b.fomo_user_id = u.id AND b.ca = @ca AND b.chain = @chain
                          AND b.type = 'buy')
@@ -304,7 +313,7 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
         ORDER BY lastTs DESC, u.handle`,
     )
     .all({ ca, chain, statSince: now - 86_400_000 }) as FomoUserStatRow[];
-  return rows.map(({ handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs }) => ({
+  return rows.map(({ handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct }) => ({
     handle,
     ...(name !== '' ? { name } : {}),
     ...(clan != null && clan !== '' ? { clan } : {}),
@@ -314,6 +323,8 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
     sells,
     trades,
     lastTs,
+    ...(holdingAmount != null ? { holdingAmount } : {}),
+    ...(holdingPct != null ? { holdingPct } : {}),
   }));
 }
 
@@ -346,17 +357,21 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
-              COALESCE(MAX(t.ts), 0) AS lastTs
+              COALESCE(MAX(t.ts), 0) AS lastTs,
+              h.amount AS holdingAmount,
+              h.pct AS holdingPct
          FROM members m
          JOIN fomo_users u ON u.id = m.fomo_user_id
          LEFT JOIN fomo_trades t
            ON t.fomo_user_id = m.fomo_user_id AND t.ca = m.ca AND t.chain = m.chain AND t.ts >= @statSince
+         LEFT JOIN fomo_holdings h
+           ON h.fomo_user_id = m.fomo_user_id AND h.ca = m.ca AND h.chain = m.chain
         GROUP BY m.chain, m.ca, m.fomo_user_id
         ORDER BY m.chain, m.ca, lastTs DESC, u.handle`,
     )
     .all({ statSince: now - 86_400_000 }) as (FomoUserStatRow & { ca: string; chain: string })[];
   const out = new Map<string, FomoUserStat[]>();
-  for (const { chain, ca, handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs } of rows) {
+  for (const { chain, ca, handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct } of rows) {
     // Same conditional spreads (and key order) as fomoUserStats — the JSON
     // response must stay byte-identical.
     const stat: FomoUserStat = {
@@ -369,6 +384,8 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
       sells,
       trades,
       lastTs,
+      ...(holdingAmount != null ? { holdingAmount } : {}),
+      ...(holdingPct != null ? { holdingPct } : {}),
     };
     const key = `${chain}:${ca}`;
     const list = out.get(key);

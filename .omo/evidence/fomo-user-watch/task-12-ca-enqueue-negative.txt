@@ -1,8 +1,0 @@
-$ cd server && npx tsx --test test/fomo-watch-trade.test.ts  # negative/edge cases
-
-✔ POST /api/fomo-watch/trades: a repeat BUY (same eventId) adds no second tracked_cas row (2.27941ms)
-✔ POST /api/fomo-watch/trades: a SELL of an untracked CA adds no tracked_cas row (2.315247ms)
-✔ POST /api/fomo-watch/trades: a replayed BUY whose CA was removed does not re-enqueue (5.825434ms)
-ℹ tests 14
-ℹ pass 14
-ℹ fail 0

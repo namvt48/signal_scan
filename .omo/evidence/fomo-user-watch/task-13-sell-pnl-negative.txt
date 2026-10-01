@@ -1,6 +1,0 @@
-$ cd server && npx tsx --test test/fomo-signals.test.ts  # negative-PnL case
-
-✔ fomoUserStats: a NEGATIVE sell usd_value (realised loss) lands in sellPnlUsd and never touches buyUsd (1.259017ms)
-ℹ tests 7
-ℹ pass 7
-ℹ fail 0

@@ -166,6 +166,49 @@ export function parseAssetInfo(json: unknown): AssetInfo {
   };
 }
 
+/** getTokenSupply(jsonParsed) → UI supply. Non-positive/absent → null (never a fake denominator). */
+export function parseTokenSupply(json: unknown): number | null {
+  const value = (json as { result?: { value?: { uiAmountString?: unknown; amount?: unknown; decimals?: unknown } } } | null)
+    ?.result?.value;
+  if (value === null || typeof value !== 'object') return null;
+  const decimals = Number(value.decimals);
+  const amount =
+    typeof value.uiAmountString === 'string' && value.uiAmountString !== ''
+      ? Number(value.uiAmountString)
+      : Number(value.amount) / 10 ** (Number.isFinite(decimals) ? decimals : 0);
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+/**
+ * getTransaction(jsonParsed) → the trader's wallet. Prefers the SPL-transfer
+ * instruction's `authority`/`owner` (the account that AUTHORISED the transfer);
+ * falls back to accountKeys[0] (the fee payer/signer). null when the tx is
+ * unknown, unparseable, or carries no usable account key — the caller then
+ * fabricates nothing.
+ */
+export function parseSolanaTransferOwner(json: unknown): string | null {
+  const result = (json as { result?: unknown } | null)?.result;
+  if (result === null || typeof result !== 'object') return null;
+  const message = (result as { transaction?: { message?: { accountKeys?: unknown; instructions?: unknown } } })
+    .transaction?.message;
+  if (message === null || message === undefined || typeof message !== 'object') return null;
+  const instructions = Array.isArray(message.instructions) ? message.instructions : [];
+  for (const ix of instructions) {
+    const programId = (ix as { programId?: unknown }).programId;
+    if (typeof programId !== 'string' || !(TOKEN_PROGRAM_IDS as readonly string[]).includes(programId)) continue;
+    const parsed = (ix as { parsed?: { type?: unknown; info?: Record<string, unknown> } }).parsed;
+    if (typeof parsed?.type !== 'string' || !parsed.type.startsWith('transfer')) continue;
+    const owner = parsed.info?.authority ?? parsed.info?.owner;
+    if (typeof owner === 'string' && owner !== '') return owner;
+  }
+  const keys = message.accountKeys;
+  if (!Array.isArray(keys) || keys.length === 0) return null;
+  const first = keys[0];
+  if (typeof first === 'string' && first !== '') return first;
+  const pubkey = (first as { pubkey?: unknown })?.pubkey;
+  return typeof pubkey === 'string' && pubkey !== '' ? pubkey : null;
+}
+
 export class SolanaRpcClient {
   readonly name = 'solana-rpc';
 
@@ -298,5 +341,52 @@ export class SolanaRpcClient {
       }
     }
     return {};
+  }
+
+  /** getTransaction → the trader's wallet via parseSolanaTransferOwner. Opportunistic:
+   *  null on every failure (unknown tx, parse gap, dead endpoints) — never throws. */
+  async getTransactionOwner(signature: string): Promise<string | null> {
+    for (const endpoint of this.activeEndpoints()) {
+      try {
+        const res = await this.post(endpoint, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransaction',
+          params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
+        });
+        const json = (await res.json().catch(() => null)) as unknown;
+        if (isCreditExhausted(json)) {
+          this.retire(endpoint);
+          continue;
+        }
+        const rpcError = (json as { error?: unknown } | null)?.error;
+        if (!res.ok || !json || rpcError) continue;
+        return parseSolanaTransferOwner(json);
+      } catch {
+        // next endpoint, then give up
+      }
+    }
+    return null;
+  }
+
+  /** getTokenSupply(mint) → UI total supply; null when unavailable. */
+  async getTokenSupply(mint: string): Promise<number | null> {
+    for (const endpoint of this.activeEndpoints()) {
+      try {
+        const res = await this.post(endpoint, { jsonrpc: '2.0', id: 1, method: 'getTokenSupply', params: [mint] });
+        const json = (await res.json().catch(() => null)) as unknown;
+        if (isCreditExhausted(json)) {
+          this.retire(endpoint);
+          continue;
+        }
+        const rpcError = (json as { error?: unknown } | null)?.error;
+        if (!res.ok || !json || rpcError) continue;
+        const supply = parseTokenSupply(json);
+        if (supply !== null) return supply;
+      } catch {
+        // next endpoint, then give up
+      }
+    }
+    return null;
   }
 }

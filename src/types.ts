@@ -1,4 +1,4 @@
-export const CHAINS = ['sol', 'base', 'bsc'] as const;
+export const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
 export type Chain = (typeof CHAINS)[number];
 
 export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B', 'P'] as const;
@@ -96,6 +96,10 @@ export interface FomoUserStat {
   sells: number;
   trades: number;
   lastTs: number;
+  /** Σ token units the user's wallets hold of this CA; absent until measured. */
+  holdingAmount?: number;
+  /** Share of total supply held; absent when never measured or supply unknown. */
+  holdingPct?: number;
 }
 
 export interface TokenSignal {

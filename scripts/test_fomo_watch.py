@@ -9,7 +9,7 @@ Fixtures dựng từ capture THẬT `.omo/evidence/fomo-user-watch/task-0-alert-
 (102 alert, schema đã pin trong plan). Cover đúng danh sách todo 10:
   1. welcome/heartbeat/ping → không emit, không raise.
   2. perp (tokenAddress null) + thesis → drop.
-  3. chain 'ethereum' → drop; solana/base/bsc → map sol/base/bsc.
+  3. chain 'ethereum' → drop; solana/base/bsc/robinhood → map tương ứng.
   4. trader không được watch → drop, không emit.
   5. trader khớp handle (row KHÔNG có userId) → CÓ emit (handle matching works).
   6. cùng eventId 2 lần → emit 1 lần (dedupe).
@@ -83,6 +83,7 @@ ETH = _first(_ALERTS, chain="ethereum", alertType="buy")
 SOL_BUY = _first(_ALERTS, chain="solana", alertType="buy")
 BASE_SELL = _first(_ALERTS, chain="base", alertType="sell")
 BSC_SELL = _first(_ALERTS, chain="bsc", alertType="sell")
+ROBINHOOD_BUY = _first(_ALERTS, chain="robinhood", alertType="buy")
 check(PERP.get("tokenAddress") is None, "fixture: perp có tokenAddress null")
 
 # ---------- harness: stub urlopen + path temp ----------
@@ -212,7 +213,7 @@ try:
 finally:
     restore()
 
-# ---------- (3) chain map: ethereum drop; solana/base/bsc → sol/base/bsc ----------
+# ---------- (3) chain map: ethereum drop; solana/base/bsc/robinhood → map ----------
 
 fh = reset(
     users=[
@@ -220,11 +221,17 @@ fh = reset(
         {"handle": SOL_BUY["trader"], "source": "csv"},
         {"handle": BASE_SELL["trader"], "source": "csv"},
         {"handle": BSC_SELL["trader"], "source": "csv"},
+        {"handle": ROBINHOOD_BUY["trader"], "source": "csv"},
     ]
 )
 try:
     check(feed.alert_body(ETH) is None, "(3) chain 'ethereum' ⇒ drop")
-    for al, want in ((SOL_BUY, "sol"), (BASE_SELL, "base"), (BSC_SELL, "bsc")):
+    for al, want in (
+        (SOL_BUY, "sol"),
+        (BASE_SELL, "base"),
+        (BSC_SELL, "bsc"),
+        (ROBINHOOD_BUY, "robinhood"),
+    ):
         b = feed.alert_body(al)
         check(
             b is not None and b["chain"] == want,

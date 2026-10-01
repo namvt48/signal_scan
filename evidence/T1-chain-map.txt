@@ -1,5 +1,0 @@
-=== CHAIN_SLUGS for all 3 chains (via tsx) ===
-sol {"gmgn":"sol","nansen":"solana","dexscreener":"solana","chainId":null,"nativeSymbol":"SOL","explorer":"https://solscan.io/token/0xCA"}
-base {"gmgn":"base","nansen":"base","dexscreener":"base","chainId":8453,"nativeSymbol":"ETH","explorer":"https://basescan.org/token/0xCA"}
-bsc {"gmgn":"bsc","nansen":"bnb","dexscreener":"bsc","chainId":56,"nativeSymbol":"BNB","explorer":"https://bscscan.com/token/0xCA"}
-exit: 0

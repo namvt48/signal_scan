@@ -1,10 +1,11 @@
 // EVM JSON-RPC wallet-holdings client (plan evm-base-bsc T5/D5) — the non-sol
 // sibling of solana.ts, replacing the Nansen credit door (currentBalance,
-// 1 credit per wallet×CA) for chain 'base'/'bsc'.
+// 1 credit per wallet×CA) for chain 'base'/'bsc'/'robinhood'.
 //
 // ONE Multicall3 `eth_call` per wallet covers every asked (wallet, CA) pair:
 // `balanceOf(wallet)` for all CAs plus `decimals()` for the CAs whose scale is
-// not cached yet. Multicall3 sits at the SAME address on Base and BSC (plan R6):
+// not cached yet. Multicall3 sits at the SAME address on Base, BSC and
+// Robinhood Chain (plan R6; robinhood verified live 2026-09-30):
 //   0xcA11bde05977b3631167028862bE2a173976CA11
 //   aggregate3((address target, bool allowFailure, bytes callData)[])
 //     → (bool success, bytes returnData)[]
@@ -32,6 +33,9 @@ export const AGGREGATE3_SELECTOR = '82ad56cb';
 export const BALANCE_OF_SELECTOR = '70a08231';
 export const DECIMALS_SELECTOR = '313ce567';
 export const DECIMALS_CALLDATA = `0x${DECIMALS_SELECTOR}`;
+/** totalSupply() uint256 — the LF/holding-% denominator from the token contract. */
+export const TOTAL_SUPPLY_SELECTOR = '18160ddd';
+export const TOTAL_SUPPLY_CALLDATA = `0x${TOTAL_SUPPLY_SELECTOR}`;
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
@@ -39,6 +43,7 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const KEYLESS_RPC: Partial<Record<Chain, string>> = {
   base: 'https://mainnet.base.org',
   bsc: 'https://bsc-dataseed.binance.org',
+  robinhood: 'https://rpc.mainnet.chain.robinhood.com',
 };
 
 /** Error whose message is built locally (status + capped RPC error) and is
@@ -55,7 +60,14 @@ export function evmEndpointList(envUrl: string, keyless: string | undefined): st
  *  ⇒ not an EVM chain ⇒ this client has no source for it. */
 export function evmRpcEndpoints(chain: Chain): string[] {
   if (chainSlugs(chain).chainId === null) throw new Error(`evm rpc: chain ${chain} has no EVM RPC source`);
-  const envUrl = chain === 'base' ? config.baseRpcUrl : chain === 'bsc' ? config.bscRpcUrl : '';
+  const envUrl =
+    chain === 'base'
+      ? config.baseRpcUrl
+      : chain === 'bsc'
+        ? config.bscRpcUrl
+        : chain === 'robinhood'
+          ? config.robinhoodRpcUrl
+          : '';
   return evmEndpointList(envUrl, KEYLESS_RPC[chain]);
 }
 
@@ -260,9 +272,53 @@ export class EvmRpcClient {
   /** eth_call(Multicall3, data) — endpoints in order; the last failure is
    *  rethrown with a URL-free message (may carry the Alchemy key). */
   private async ethCall(chain: Chain, data: string): Promise<string> {
+    const result = await this.rpc(chain, 'eth_call', [{ to: MULTICALL3_ADDRESS, data }, 'latest']);
+    if (typeof result !== 'string') throw new SafeEvmError('evm rpc: malformed eth_call body');
+    return result;
+  }
+
+  /** Total supply of `ca` in TOKEN UNITS via ONE Multicall3 eth_call: totalSupply()
+   *  plus decimals() only while the scale is uncached. null when the CA is not a
+   *  contract, totalSupply reverts, or decimals is unknowable — never a guessed
+   *  number (the caller leaves holding pct null on null). */
+  async tokenSupply(ca: string, chain: Chain): Promise<number | null> {
+    if (!ADDRESS_RE.test(ca)) return null;
+    const needDecimals = !this.decimalsCache.has(decimalsKey(chain, ca));
+    const calls: Multicall3Call[] = [
+      { target: ca, allowFailure: true, callData: TOTAL_SUPPLY_CALLDATA },
+      ...(needDecimals ? [{ target: ca, allowFailure: true, callData: DECIMALS_CALLDATA }] : []),
+    ];
+    const results = decodeAggregate3(await this.ethCall(chain, encodeAggregate3(calls)));
+    const sup = results[0];
+    if (sup === undefined || !sup.success) return null;
+    const raw = decodeUint256(sup.returnData);
+    if (raw === null || raw === 0n) return null;
+    let decimals = this.decimalsCache.get(decimalsKey(chain, ca));
+    if (decimals === undefined) {
+      const dec = results[1];
+      const decoded = dec !== undefined && dec.success ? decodeDecimals(dec.returnData) : null;
+      if (decoded === null) return null;
+      decimals = decoded;
+      this.decimalsCache.set(decimalsKey(chain, ca), decoded);
+    }
+    return rawToTokenUnits(raw, decimals);
+  }
+
+  /** eth_getTransactionByHash → the sender (tx.from, lowercased) or null when the
+   *  hash is unknown or carries no valid `from`. */
+  async transactionFrom(txHash: string, chain: Chain): Promise<string | null> {
+    const result = await this.rpc(chain, 'eth_getTransactionByHash', [txHash]);
+    const from = (result as { from?: unknown } | null)?.from;
+    return typeof from === 'string' && ADDRESS_RE.test(from) ? from.toLowerCase() : null;
+  }
+
+  /** One JSON-RPC POST — endpoints in order; the LAST failure is rethrown with a
+   *  URL-free message (may carry the Alchemy key). A null result (e.g. unknown tx)
+   *  is a legitimate answer and is returned as-is. */
+  private async rpc(chain: Chain, method: string, params: unknown[]): Promise<unknown> {
     const endpoints = this.endpointsFor(chain);
     if (endpoints.length === 0) {
-      throw new Error(`evm rpc: no endpoint for ${chain} (set BASE_RPC_URL/BSC_RPC_URL)`);
+      throw new Error(`evm rpc: no endpoint for ${chain} (set BASE_RPC_URL/BSC_RPC_URL/ROBINHOOD_RPC_URL)`);
     }
     let last = 'error';
     for (const endpoint of endpoints) {
@@ -270,12 +326,7 @@ export class EvmRpcClient {
         const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'eth_call',
-            params: [{ to: MULTICALL3_ADDRESS, data }, 'latest'],
-          }),
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
           signal: AbortSignal.timeout(this.timeoutMs),
         });
         const json = (await res.json().catch(() => null)) as { result?: unknown; error?: unknown } | null;
@@ -283,12 +334,12 @@ export class EvmRpcClient {
         if (!res.ok || json === null || (rpcError !== undefined && rpcError !== null)) {
           throw new SafeEvmError(`evm rpc ${res.status}${rpcError ? ` ${JSON.stringify(rpcError).slice(0, 80)}` : ''}`);
         }
-        if (typeof json.result !== 'string') throw new SafeEvmError('evm rpc: malformed eth_call body');
+        if (json.result === undefined) throw new SafeEvmError(`evm rpc: malformed ${method} body`);
         return json.result;
       } catch (e) {
         last = e instanceof SafeEvmError ? e.message : e instanceof Error ? e.name : 'error';
       }
     }
-    throw new Error(`evm rpc eth_call failed (${chain}): ${last.slice(0, 160)}`);
+    throw new Error(`evm rpc ${method} failed (${chain}): ${last.slice(0, 160)}`);
   }
 }

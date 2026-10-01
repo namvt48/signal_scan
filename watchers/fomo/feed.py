@@ -8,13 +8,16 @@ Alert field → fomo_trades contract (server `parseFomoWatchTradeBody`, đo trê
   trader (handle, 102/102) → `trader`;  userId (102/102) → `userId`
   eventId (unique 102/102) → `eventId` = khoá idempotency (dedupe + UNIQUE server)
   tokenAddress → `tokenAddress` (server canonical thành `ca`); thiếu → DROP
-  chain: solana→sol, base→base, bsc→bsc; chain khác (ethereum/robinhood/
-    hyperliquid/perp-1337) → DROP (Chain union của repo chỉ có sol|base|bsc)
+  chain: solana→sol, base→base, bsc→bsc, robinhood→robinhood; chain khác
+    (ethereum/hyperliquid/perp-1337) → DROP (Chain union của repo:
+    sol|base|bsc|robinhood)
   ts (epoch ms) → `ts`;  token (ticker) → `token`
   usdValue → `usdValue` — TYPE-DEPENDENT: buy = position size SAU fill
     (= positionValueUsd), sell = realized PnL CÓ DẤU (= realizedPnlUsd). Hai
     hướng KHÔNG cùng đơn vị tiền ⇒ không bao giờ cộng/trừ chéo (plan cấm).
   price → `price` (optional; không xuất hiện trong capture — pass-through nếu có)
+  txHash → `txHash` (optional, chỉ có ở ~17/102 alert) — server dùng để resolve ví
+    trader on-chain (opportunistic; thiếu ⇒ bỏ qua, không tạo row).
  Envelope KHÔNG phải trade: type='welcome'/'heartbeat', frame trần 'ping'/'pong'
  (non-JSON) — bỏ qua, không raise. `text` chỉ để log, KHÔNG parse.
 
@@ -37,7 +40,12 @@ from watchers.common import config
 from watchers.common.config import _CFG_REFRESH_S, HERE, api_headers
 
 WS_URL = "wss://api.fomoapi.io/ws/alerts"  # key ride query-string — KHÔNG log full URL
-_CHAIN = {"solana": "sol", "base": "base", "bsc": "bsc"}  # ngoài map ⇒ DROP
+_CHAIN = {
+    "solana": "sol",
+    "base": "base",
+    "bsc": "bsc",
+    "robinhood": "robinhood",
+}  # ngoài map ⇒ DROP
 _SEEN_MAX = 4096  # bound như evm/feed.py _SEEN_MAX
 
 STATE_PATH = os.path.join(HERE, "fomo_state.json")
@@ -145,7 +153,7 @@ def alert_body(msg) -> dict[str, Any] | None:
     """1 frame đã parse → body POST /api/fomo-watch/trades | None (drop).
     Pure (không mạng, không dedupe) — unit-test offline. Drop: không phải
     type='alert'; alertType ngoài buy/sell (perp/thesis/listing); thiếu
-    tokenAddress; chain ngoài sol/base/bsc; trader+userId không thuộc watch list;
+    tokenAddress; chain ngoài sol/base/bsc/robinhood; trader+userId không thuộc watch list;
     thiếu eventId/ts hợp lệ (body server sẽ 400 — không gửi rác)."""
     if not isinstance(msg, dict) or msg.get("type") != "alert":
         return None
@@ -180,6 +188,9 @@ def alert_body(msg) -> dict[str, Any] | None:
         body["usdValue"] = usd
     if px is not None:
         body["price"] = px
+    tx_hash = _str(msg, "txHash")
+    if tx_hash:
+        body["txHash"] = tx_hash
     return body
 
 

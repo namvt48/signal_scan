@@ -237,6 +237,39 @@ CREATE TABLE IF NOT EXISTS fomo_trades (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fomo_trades_event_id ON fomo_trades(event_id);
 CREATE INDEX IF NOT EXISTS idx_fomo_trades_ca_chain_ts ON fomo_trades(ca, chain, ts);
 CREATE INDEX IF NOT EXISTS idx_fomo_trades_user_ts ON fomo_trades(fomo_user_id, ts);
+
+-- FOMO user wallets: MANY per user (one trader acts from several wallets across
+-- chains). Resolved opportunistically from an alert's txHash (EVM
+-- eth_getTransactionByHash.from / Solana SPL-transfer owner) — a FOMO table, NOT
+-- wallet state: never joined to/inserted into the wallets table. address is canonicalized
+-- (canonicalCa) so EVM lookups fold like the rest of the store.
+CREATE TABLE IF NOT EXISTS fomo_user_wallets (
+  id TEXT PRIMARY KEY,
+  fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
+  chain TEXT NOT NULL,
+  address TEXT NOT NULL,
+  source TEXT,
+  tx_hash TEXT,
+  first_seen_ts INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fomo_user_wallets_identity ON fomo_user_wallets(fomo_user_id, chain, address);
+CREATE INDEX IF NOT EXISTS idx_fomo_user_wallets_user_chain ON fomo_user_wallets(fomo_user_id, chain);
+
+-- Per (user, CA, chain) measured holding: Σ token amount across the user's wallets
+-- on that chain (token units) and its share of total supply. pct is NULL when
+-- supply is unknown/0 (never a fabricated %). ca is canonicalized like fomo_trades.
+CREATE TABLE IF NOT EXISTS fomo_holdings (
+  fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  wallet TEXT NOT NULL,
+  amount REAL,
+  pct REAL,
+  measured_at INTEGER NOT NULL,
+  PRIMARY KEY (fomo_user_id, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_fomo_holdings_ca_chain ON fomo_holdings(ca, chain);
 `;
 
 let instance: Database.Database | null = null;
@@ -1223,6 +1256,105 @@ export function insertFomoTrade(input: FomoTradeInput): boolean {
       Date.now(),
     );
   return res.changes > 0;
+}
+
+// --- fomo wallet holdings ---------------------------------------------------
+
+export interface FomoUserWalletRow {
+  id: string;
+  fomo_user_id: string;
+  chain: Chain;
+  address: string;
+  source: string | null;
+  tx_hash: string | null;
+  first_seen_ts: number | null;
+  created_at: number;
+}
+
+export interface FomoUserWalletInput {
+  fomo_user_id: string;
+  chain: Chain;
+  address: string;
+  source?: string | null;
+  tx_hash?: string | null;
+  first_seen_ts?: number | null;
+}
+
+/** A user can act from MANY wallets. Identity is (user, chain, address): an
+ *  already-known wallet re-resolved from a later tx is a strict no-op. address is
+ *  canonicalized so an EVM lookup folds like everywhere else. */
+export function insertFomoUserWallet(input: FomoUserWalletInput): boolean {
+  const res = getDb()
+    .prepare(
+      `INSERT INTO fomo_user_wallets (id, fomo_user_id, chain, address, source, tx_hash, first_seen_ts, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(fomo_user_id, chain, address) DO NOTHING`,
+    )
+    .run(
+      randomUUID(),
+      input.fomo_user_id,
+      input.chain,
+      canonicalCa(input.address, input.chain),
+      input.source ?? null,
+      input.tx_hash ?? null,
+      input.first_seen_ts ?? null,
+      Date.now(),
+    );
+  return res.changes > 0;
+}
+
+export function findFomoUserWallet(fomoUserId: string, chain: Chain, address: string): FomoUserWalletRow | undefined {
+  return getDb()
+    .prepare('SELECT * FROM fomo_user_wallets WHERE fomo_user_id = ? AND chain = ? AND address = ?')
+    .get(fomoUserId, chain, canonicalCa(address, chain)) as FomoUserWalletRow | undefined;
+}
+
+export function listFomoWalletsForUser(fomoUserId: string, chain: Chain): FomoUserWalletRow[] {
+  return getDb()
+    .prepare('SELECT * FROM fomo_user_wallets WHERE fomo_user_id = ? AND chain = ? ORDER BY created_at')
+    .all(fomoUserId, chain) as FomoUserWalletRow[];
+}
+
+/** Distinct (user, CA, chain) the users have alerted on — the holdings refresh target set. */
+export function listFomoAlertTargets(): { fomo_user_id: string; ca: string; chain: Chain }[] {
+  return getDb().prepare('SELECT DISTINCT fomo_user_id, ca, chain FROM fomo_trades').all() as {
+    fomo_user_id: string;
+    ca: string;
+    chain: Chain;
+  }[];
+}
+
+export interface FomoHoldingInput {
+  fomo_user_id: string;
+  ca: string;
+  chain: Chain;
+  /** The wallet whose measurement produced this row (display/provenance). */
+  wallet: string;
+  /** Σ token units across the user's wallets on this chain; NULL when never measured. */
+  amount: number | null;
+  /** amount / total supply × 100; NULL when supply is unknown/0. */
+  pct: number | null;
+  measured_at: number;
+}
+
+/** ONE row per (user, ca, chain) — a re-measure overwrites. ca/wallet canonicalized. */
+export function upsertFomoHolding(input: FomoHoldingInput): void {
+  getDb()
+    .prepare(
+      `INSERT INTO fomo_holdings (fomo_user_id, ca, chain, wallet, amount, pct, measured_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+         wallet = excluded.wallet, amount = excluded.amount, pct = excluded.pct, measured_at = excluded.measured_at`,
+    )
+    .run(
+      input.fomo_user_id,
+      canonicalCa(input.ca, input.chain),
+      input.chain,
+      canonicalCa(input.wallet, input.chain),
+      input.amount,
+      input.pct,
+      input.measured_at,
+    );
 }
 
 // --- seed (mock mode only) -------------------------------------------------
