@@ -60,11 +60,9 @@ export const config = {
    * deployed_at now land write-once via the credit token-information kick. */
   pollEssentialMs: num('POLL_ESSENTIAL_MS', 3_600_000),
   /** Gap re-ask for a CA the 1h pass has not reached yet, so a fresh CA is
-   * complete in minutes instead of hours. Only `supply IS NULL`. */
+   * complete in minutes instead of hours. Every CA still missing `supply`; the
+   * caller drops too-new mints. */
   pollEssentialGapMs: num('POLL_ESSENTIAL_GAP_MS', 300_000),
-  /** How long a CA stays eligible for that re-ask — a mint Nansen never indexes
-   * must not be retried forever (the 1h pass still covers it). */
-  essentialGapWindowMs: num('ESSENTIAL_GAP_WINDOW_MS', 3_600_000),
   /** 24H Volume column + the Entry 🟢 gate. 15 min so both volume columns stay
    * fresh (user 2026-09-24); in MODE=gmgn this rides GMGN's own rate limit, not
    * the shared browser page. */
@@ -168,10 +166,31 @@ export const config = {
   nansenApiKey: str('NANSEN_API_KEY', ''),
   /** GMGN official OpenAPI key (gmgn.ai/ai). Absent -> MODE=gmgn falls back to nansen. */
   gmgnApiKey: str('GMGN_API_KEY', ''),
+  /** GMGN keys from SEPARATE accounts (csv/whitespace) — quota is per ACCOUNT, so N
+   * funded accounts = N× capacity, and each key gets its OWN limiter/gate so one
+   * account's 429 never blocks the others. Falls back to the single GMGN_API_KEY. */
+  gmgnApiKeys: (str('GMGN_API_KEYS', '') || str('GMGN_API_KEY', ''))
+    .split(/[\s,]+/)
+    .filter((k) => k !== ''),
   /** GMGN plan weight — Free 5 / Plus 20 / Pro 50 (gmgn.ai/ai). Calls/sec allowed
    * = this / the endpoint's weight, enforced by the rate-control layer
    * (ratelimit/spec.ts weightBucket for the 'gmgn' limiter). */
   gmgnPlanWeight: posNum('GMGN_PLAN_WEIGHT', 5),
+  /** Optional per-key plan weights, aligned by index with GMGN_API_KEYS; a key past
+   * the end (or with no list at all) uses gmgnPlanWeight. Set when keys differ in plan. */
+  gmgnPlanWeights: str('GMGN_PLAN_WEIGHTS', '')
+    .split(/[\s,]+/)
+    .filter((v) => v !== '')
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n > 0),
+
+  /** FOMO API (api.fomoapi.io) key — the AUTHORITATIVE per-position source:
+   * `costBasisUsd` (money actually spent, not the alert's position VALUE),
+   * `amount` and `priceUsd`. Absent -> fomoPositionsSweep no-ops, so dev and
+   * instance A are unaffected (user 2026-10-01: the dash read 70.7K for a
+   * 59.8K spend because it aggregated the alert's mark-to-market usdValue). */
+  fomoApiKey: str('FOMO_API_KEY', ''),
+  fomoApiBase: str('FOMO_API_BASE', 'https://api.fomoapi.io'),
 
   // Auth (AUTH CONTRACT v1, src/auth.ts). All three default to '' = FAIL CLOSED:
   // no project id → browser tokens rejected; no roles → nobody is admin/viewer;
@@ -263,8 +282,8 @@ export const config = {
   /** Nansen credit budget, unit credits/DAY, split equally between callers a and
    * b (draft Decisions 5). Default 10 = the conservative Free-tier daily floor
    * (draft "Upstream limits"); the paid tier is not yet known, so
-   * NANSEN_DAILY_CREDIT_BUDGET is the knob once it is. */
-  nansenDailyCreditBudget: posNum('NANSEN_DAILY_CREDIT_BUDGET', 10),
+   * NANSEN_DAILY_CREDIT_BUDGET is the knob once it is. 0 = UNLIMITED (no cap). */
+  nansenDailyCreditBudget: num('NANSEN_DAILY_CREDIT_BUDGET', 10),
   /** Short-TTL cache (gateway-only, todo 11) per provider class, ms. GMGN is
    * NEVER cached — it mandates a fresh client_id/timestamp per call. */
   cacheTtlNansenMs: posNum('CACHE_TTL_NANSEN_MS', 30_000),

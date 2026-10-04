@@ -47,13 +47,13 @@ test('updateWallet rewrites clan; a wallet created without one stores the empty 
 
 test('importWallets stores the clan column, defaulting to "" when absent', () => {
   const res = importWallets([
-    { address: 'clanImp-1', name: 'I1', tags: [], chain: 'sol', source: 'csv', clan: 'b' },
-    { address: 'clanImp-2', name: 'I2', tags: [], chain: 'sol', source: 'csv' },
+    { address: 'So11111111111111111111111111111111111111112', name: 'I1', tags: [], chain: 'sol', source: 'csv', clan: 'b' },
+    { address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', name: 'I2', tags: [], chain: 'sol', source: 'csv' },
   ]);
   assert.equal(res.added, 2);
   const byAddr = new Map(listWallets().map((w) => [w.address, w.clan]));
-  assert.equal(byAddr.get('clanImp-1'), 'b');
-  assert.equal(byAddr.get('clanImp-2'), '');
+  assert.equal(byAddr.get('So11111111111111111111111111111111111111112'), 'b');
+  assert.equal(byAddr.get('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'), '');
 });
 
 test('trackedWalletStats exposes clan beside the name (a clan-b wallet is still listed)', () => {

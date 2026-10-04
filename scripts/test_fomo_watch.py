@@ -81,6 +81,16 @@ PERP = _first(_ALERTS, alertType="perp")  # tokenAddress null, chain hyperliquid
 THESIS = _first(_ALERTS, alertType="thesis")
 ETH = _first(_ALERTS, chain="ethereum", alertType="buy")
 SOL_BUY = _first(_ALERTS, chain="solana", alertType="buy")
+# USD THẬT đã giao dịch (~17/102 alert có field này). steph_2441 là ca điển hình:
+# usdValue 61,206.56 (position SAU fill) trong khi chỉ mua 126.06 USD.
+SOL_BUY_TRADE = next(
+    dict(a)
+    for a in _ALERTS
+    if a.get("trader") == "steph_2441"
+    and a.get("chain") == "solana"
+    and a.get("alertType") == "buy"
+    and a.get("tradeUsd") is not None
+)
 BASE_SELL = _first(_ALERTS, chain="base", alertType="sell")
 BSC_SELL = _first(_ALERTS, chain="bsc", alertType="sell")
 ROBINHOOD_BUY = _first(_ALERTS, chain="robinhood", alertType="buy")
@@ -297,6 +307,29 @@ fh = reset(
 try:
     b = feed.alert_body(SOL_BUY)
     check(b is not None, "(5b) userId exact khớp ⇒ emit dù handle row khác")
+finally:
+    restore()
+
+# ---------- (5c) tradeUsd (USD THẬT) được forward; vắng mặt thì KHÔNG thêm key ----------
+
+fh = reset(users=[{"handle": SOL_BUY_TRADE["trader"], "source": "csv"}])
+try:
+    b = feed.alert_body(SOL_BUY_TRADE) or {}
+    check(bool(b), "(5c) alert có tradeUsd vẫn emit")
+    check(
+        b.get("tradeUsd") == float(SOL_BUY_TRADE["tradeUsd"]),
+        "(5c) POST kèm tradeUsd = USD thật đã giao dịch",
+    )
+    check(
+        b.get("usdValue") == float(SOL_BUY_TRADE["usdValue"]),
+        "(5c) usdValue giữ nguyên (position size, KHÔNG bị thay bằng tradeUsd)",
+    )
+    no_trade = {k: v for k, v in SOL_BUY_TRADE.items() if k != "tradeUsd"}
+    b2 = feed.alert_body(no_trade) or {}
+    check(
+        bool(b2) and "tradeUsd" not in b2,
+        "(5c) vắng tradeUsd ⇒ KHÔNG thêm key (không gửi None)",
+    )
 finally:
     restore()
 

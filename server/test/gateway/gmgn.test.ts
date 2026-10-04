@@ -34,6 +34,7 @@ import {
 } from '../../src/gateway/contract.js';
 import { LimiterRegistry } from '../../src/ratelimit/registry.js';
 import { buildSpecs } from '../../src/ratelimit/spec.js';
+import { GmgnKeyPool, type GmgnKey } from '../../src/gateway/gmgn-keys.js';
 import type { RunOpts } from '../../src/ratelimit/types.js';
 
 const TOKENS: CallerTokens = {
@@ -57,13 +58,14 @@ function recordingLimiter(): { run: LimiterRun; calls: { api: string; opts: RunO
 }
 
 async function withServer(
-  deps: { gmgnUpstream: UpstreamFetch; runLimiter?: LimiterRun },
+  deps: { gmgnUpstream?: UpstreamFetch; runLimiter?: LimiterRun; gmgnPool?: GmgnKeyPool },
   fn: (base: string) => Promise<void>,
 ): Promise<void> {
   const server = createGatewayApp({
     tokens: TOKENS,
     gmgnUpstream: deps.gmgnUpstream,
     runLimiter: deps.runLimiter,
+    gmgnPool: deps.gmgnPool,
   }).listen(0);
   await new Promise<void>((resolve) => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -258,5 +260,32 @@ test('the route is caller-gated and rejects a bad body without calling upstream'
 
     assert.equal(calls, 0, 'no denial ever reached upstream');
     assert.equal(rec.calls.length, 0, 'no denial ever reached the limiter');
+  });
+});
+
+test('(f) a multi-key pool picks the next OPEN key and routes on its own limiter', async () => {
+  const rec = recordingLimiter();
+  let served = 0;
+  const keyUpstream: UpstreamFetch = async () => {
+    served += 1;
+    return okUpstream();
+  };
+  const keys: GmgnKey[] = [
+    { apiKey: 'k0', limiterKey: 'gmgn', weight: 5 },
+    { apiKey: 'k1', limiterKey: 'gmgn:1', weight: 5 },
+  ];
+  const gmgnPool = new GmgnKeyPool({
+    keys,
+    fetcherFor: () => keyUpstream,
+    gateUntilOf: (limiterKey) => (limiterKey === 'gmgn' ? Date.now() + 60_000 : 0),
+    log: () => {},
+  });
+
+  await withServer({ runLimiter: rec.run, gmgnPool }, async (base) => {
+    const r = await post(base, { ca: 'CA', chain: 'sol' }, TOKENS.a);
+    assert.equal(r.status, 200);
+    assert.equal(served, 1, "the picked key's upstream served the call");
+    assert.equal(rec.calls.length, 1);
+    assert.equal(rec.calls[0].api, 'gmgn:1', 'gated key 0 is skipped; key 1 routes on gmgn:1');
   });
 });

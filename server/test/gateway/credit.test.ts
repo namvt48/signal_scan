@@ -15,6 +15,7 @@
 //   (e) a budget denial never reaches the limiter: the shared `nansen-credit`
 //       gate stays unarmed and nothing is queued for the other caller
 //   (f) a cache hit adds 0 to the caller's credit count
+//   (g) a non-positive budget (0) is UNLIMITED: the pre-flight NEVER denies
 //   cost rules: the real `x-nansen-credits-cost` wins; else the table
 //       (`holders`=5, `holders`+`premium_labels`=150); a headerless non-2xx is
 //       not charged.
@@ -294,5 +295,19 @@ test('cost rules: the real upstream header wins, else the table; a headerless no
     assert.equal(r2.status, 200);
     assert.equal(envelope(r2).status, 500, 'the upstream 500 rides the envelope');
     assert.equal(credits.snapshot().used.a, 7, 'a headerless non-2xx charges nothing');
+  });
+});
+
+test('(g) budget 0 = unlimited: the pre-flight never denies', async () => {
+  const up = countingUpstream();
+  const credits = new CreditAccountant({ budget: 0 });
+  const cache = new GatewayCache({ ttlNansenMs: 60_000 });
+
+  await withServer({ nansenCreditUpstream: up.fetch, cache, credits }, async (base) => {
+    for (let i = 0; i < 5; i += 1) {
+      const r = await post(base, NANSEN_CREDIT_PATH, creditBody(`U${i}`), TOKENS.a);
+      assert.equal(r.status, 200, `call ${i} is never budget-denied at budget 0`);
+    }
+    assert.equal(credits.snapshot().used.a, 5, 'usage is still accounted when uncapped');
   });
 });

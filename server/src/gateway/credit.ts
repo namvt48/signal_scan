@@ -123,6 +123,7 @@ export class CreditAccountant {
   ): DispatchResult | undefined => {
     if (provider !== NANSEN_CREDIT_LIMITER) return undefined;
     if (!this.billable(caller)) return undefined;
+    if (this.budget <= 0) return undefined; // 0 = UNLIMITED (no per-caller cap)
     this.rollover();
     if (this.used[caller] >= this.half()) {
       return denial(429, 'budget_exceeded', { [BUDGET_HEADER]: BUDGET_EXCEEDED });

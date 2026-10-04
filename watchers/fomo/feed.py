@@ -15,6 +15,10 @@ Alert field → fomo_trades contract (server `parseFomoWatchTradeBody`, đo trê
   usdValue → `usdValue` — TYPE-DEPENDENT: buy = position size SAU fill
     (= positionValueUsd), sell = realized PnL CÓ DẤU (= realizedPnlUsd). Hai
     hướng KHÔNG cùng đơn vị tiền ⇒ không bao giờ cộng/trừ chéo (plan cấm).
+    Là STOCK, không phải flow: cộng nó thành `Buy $` nhân sai số theo số lệnh
+    (user 2026-10-01 — iruletrenches bị đọc 285K trong khi GMGN ghi 59.8K).
+  tradeUsd → `tradeUsd` (optional, ~17/102 alert) — USD THẬT đã giao dịch, cả buy
+    lẫn sell. Đây mới là cơ sở của `Buy $`; vắng mặt ⇒ server fallback.
   price → `price` (optional; không xuất hiện trong capture — pass-through nếu có)
   txHash → `txHash` (optional, chỉ có ở ~17/102 alert) — server dùng để resolve ví
     trader on-chain (opportunistic; thiếu ⇒ bỏ qua, không tạo row).
@@ -188,6 +192,12 @@ def alert_body(msg) -> dict[str, Any] | None:
         body["usdValue"] = usd
     if px is not None:
         body["price"] = px
+    # The USD actually traded. Sent for BOTH directions when the feed resolved the
+    # on-chain fill (~17/102 alerts); absent otherwise. This — not usdValue — is
+    # what `Buy $` sums (user 2026-10-01).
+    trade_usd = _num(msg, "tradeUsd")
+    if trade_usd is not None:
+        body["tradeUsd"] = trade_usd
     tx_hash = _str(msg, "txHash")
     if tx_hash:
         body["txHash"] = tx_hash

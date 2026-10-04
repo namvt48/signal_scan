@@ -1,4 +1,5 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { MagnifyingGlass, XLogo } from '@phosphor-icons/react';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
@@ -6,6 +7,7 @@ import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
 import { CheckSquare, Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
+import { ChainBadge } from './ChainBadge';
 import { useAuth } from '../auth/use-auth';
 
 // Shared chrome for the three Nansen columns: subtle tint + a rule at the group's edges.
@@ -37,18 +39,31 @@ const WALLET_COLS: readonly string[] = SHOW_CLAN
   : ['34%', '17%', '13%', '19%', '17%'];
 
 /*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Hold % / Age.
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Age.
  * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
- * line up row for row.
+ * line up row for row. Shares track each column's widest content (user 2026-10-01):
+ * the old split starved the right pair (Sell PnL ↔ Age ~16px) and left Clan/Trades
+ * with >100px of dead space, so the horizontal rhythm read ragged.
  */
 const FOMO_COLS: readonly string[] = SHOW_CLAN
-  ? ['26%', '12%', '12%', '12%', '13%', '13%', '12%']
-  : ['28%', '15%', '14%', '14%', '15%', '14%'];
+  ? ['24%', '11%', '13%', '16%', '16%', '20%']
+  : ['30%', '16%', '17%', '20%', '17%'];
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
 /** Base table min-width (1928px) plus the extra 384px the merged activity column takes when FOMO ships. */
 const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2312px]' : 'min-w-[1928px]';
+
+/**
+ * Row value behind the three "Tracked" columns. The FOMO dash has no wallet watch-list,
+ * so they read the FOMO aggregate instead (user 2026-10-01, extended 2026-10-02): Inflow =
+ * Σ FOMO large-BUY $, Holding = Σ the users' hold %, "Tracked in" = the FOMO user count.
+ * Display, sort AND filter all read these, so the number shown can never disagree with
+ * the one being ordered/filtered.
+ */
+const rowInflow = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.reduce((n, u) => n + u.buyUsd, 0) : s.trackedInflow);
+const rowHolding = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.reduce((n, u) => n + (u.holdingPct ?? 0), 0) : s.trackedHolding);
+const rowTrackedIn = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.length : s.trackedWallets.length);
 
 /**
  * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
@@ -136,7 +151,6 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
             <th className="pb-1 pr-3 text-right">Trades</th>
             <th className="pb-1 pr-3 text-right">Buy $</th>
             <th className="pb-1 pr-3 text-right">Sell PnL</th>
-            <th className="pb-1 pr-3 text-right">Hold %</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
@@ -145,7 +159,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
         {rows.map((u) => (
           <tr key={u.handle}>
             <td className="py-1 pr-3 text-[11px]">
-              <span className="block truncate font-medium text-ink" title={u.name || u.handle}>
+              <span className={`block truncate font-medium text-ink ${walletNameClass(u.tags)}`} title={u.name || u.handle}>
                 {u.handle}
               </span>
             </td>
@@ -160,8 +174,12 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
                 )}
               </td>
             )}
-            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2">{u.trades}</td>
-            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-ink2" title="Σ large BUY sizes — not net inflow/PnL">
+            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
+              <span className="font-semibold text-pos">{u.buys}</span>
+              <span className="text-muted">/</span>
+              <span className="font-semibold text-neg">{u.sells}</span>
+            </td>
+            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-pos" title="Σ large BUY sizes — not net inflow/PnL">
               {usd(u.buyUsd)}
             </td>
             <td
@@ -170,13 +188,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
             >
               {usd(u.sellPnlUsd)}
             </td>
-            <td
-              className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2"
-              title="Share of total supply held by this user's wallets"
-            >
-              {u.holdingPct !== undefined ? pct(u.holdingPct) : '—'}
-            </td>
-            <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
+            <td className="whitespace-nowrap py-1 pl-3 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
         ))}
       </tbody>
@@ -184,21 +196,58 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
   );
 }
 
-/* CA cell: opens the token page on GMGN in a new tab. */
-function CaCell({ ca, chain }: { ca: string; chain: Chain }) {
+/*
+ * CA cell: GMGN address link, the token's X account, and a CA search on X. The X button
+ * links ONLY to the token's X account and renders as a disabled non-link (never a search)
+ * when `xHandle` is unknown; the magnifier always searches the CA on X.
+ */
+function CaCell({ ca, chain, xHandle }: { ca: string; chain: Chain; xHandle?: string }) {
+  const searchUrl = `https://x.com/search?q=${encodeURIComponent(ca)}`;
+  const iconCls =
+    'inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface2 hover:text-pos';
   return (
-    <a
-      href={`https://gmgn.ai/${CHAIN_LINKS[chain].gmgnSlug}/token/${ca}`}
-      target="_blank"
-      rel="noopener noreferrer"
-      title={`Open ${ca} on GMGN`}
-      aria-label={`Open contract address ${ca} on GMGN`}
-      className="flex w-full items-center justify-center"
-    >
-      <span className="min-w-0 truncate font-mono text-[11.5px] text-ink transition-colors hover:text-pos">
+    <div className="flex w-full items-center justify-center gap-1.5">
+      <a
+        href={`https://gmgn.ai/${CHAIN_LINKS[chain].gmgnSlug}/token/${ca}`}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`Open ${ca} on GMGN`}
+        aria-label={`Open contract address ${ca} on GMGN`}
+        className="min-w-0 truncate font-mono text-[11.5px] text-ink transition-colors hover:text-pos"
+      >
         {shortAddr(ca)}
-      </span>
-    </a>
+      </a>
+      {xHandle ? (
+        <a
+          href={`https://x.com/${xHandle}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={`Open @${xHandle} on X`}
+          aria-label={`Open @${xHandle} on X`}
+          className={iconCls}
+        >
+          <XLogo size={11} weight="bold" />
+        </a>
+      ) : (
+        <span
+          aria-disabled="true"
+          title="No X account on record"
+          className="inline-flex h-5 w-5 shrink-0 cursor-not-allowed items-center justify-center rounded text-muted opacity-40"
+        >
+          <XLogo size={11} weight="bold" />
+        </span>
+      )}
+      <a
+        href={searchUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Search this CA on X"
+        aria-label="Search this contract address on X"
+        className={iconCls}
+      >
+        <MagnifyingGlass size={11} weight="bold" />
+      </a>
+    </div>
   );
 }
 
@@ -314,7 +363,7 @@ const HL_HEAD = 'text-center!';
  */
 const C_HEAD = `${HL_HEAD} px-3! whitespace-normal!`;
 
-type SortKey = 'holders' | 'trackedInflow' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
+type SortKey = 'holders' | 'trackedIn' | 'trackedInflow' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
 /** null = the order the table ships with (newest tracked activity first) — no column armed. */
 type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null;
 
@@ -323,6 +372,7 @@ type NansenFactor = 't100' | 'lf' | 'fresh';
 
 const SORT_LABEL: Record<SortKey, string> = {
   holders: 'holder count',
+  trackedIn: 'Tracked in',
   trackedInflow: 'tracked inflow',
   trackedHolding: 'tracked holding',
   volume1h: '1H volume',
@@ -377,15 +427,12 @@ function SignalHead({
   sort = null,
   onSort,
   allFactors = false,
-  hasFomo = false,
 }: {
   thresholds?: NansenThresholds | null;
   sort?: SortState;
   onSort?: (key: SortKey) => void;
   /* Debug-only: the STT column renders only while the allFactors flag is on. */
   allFactors?: boolean;
-  /* FOMO column header only draws its sub-line once at least one visible row has users. */
-  hasFomo?: boolean;
 }) {
   return (
     <tr>
@@ -405,27 +452,18 @@ function SignalHead({
           ) : undefined
         }
       />
-      <Th className="w-36 text-center!">CA</Th>
+      <Th className="w-40 text-center!">CA</Th>
       <Th
         className={`${SHOW_FOMO ? 'w-[768px]' : 'w-96'} text-center!`}
         title={
           SHOW_FOMO
-            ? 'Tracked wallets, then FOMO watch-list activity. Buy $ is the sum of large BUY sizes, not net inflow or PnL.'
+            ? 'FOMO watch-list activity. Buy $ is the sum of large BUY sizes, not net inflow or PnL.'
             : undefined
         }
       >
-        Tracked by
-        <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: WALLET_COLS.join(' ') }}>
-          <span className="text-left">Wallet</span>
-          {SHOW_CLAN && <span className="text-left">Clan</span>}
-          <span className="pr-3 text-right">Bal</span>
-          <span className="pr-3 text-right">TXs</span>
-          <span className="pr-3 text-right">Inflow</span>
-          <span className="pl-1 text-left">Age</span>
-        </span>
-        {SHOW_FOMO && hasFomo && (
+        {SHOW_FOMO ? (
           <>
-            <span className="mt-2 block font-mono text-[10px] font-bold tracking-[0.03em] text-muted uppercase">FOMO by</span>
+            <span className="block font-mono text-[10px] font-bold tracking-[0.03em] text-muted uppercase">FOMO by</span>
             <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
               <span className="text-left">User</span>
               {SHOW_CLAN && <span className="text-left">Clan</span>}
@@ -436,14 +474,24 @@ function SignalHead({
               <span className="pr-3 text-right" title="Σ realised PnL on SELL rows — not sell volume">
                 Sell PnL
               </span>
-              <span className="pr-3 text-right" title="Share of total supply held by this user's wallets">
-                Hold %
-              </span>
+              <span className="pl-3 text-left">Age</span>
+            </span>
+          </>
+        ) : (
+          <>
+            Tracked by
+            <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: WALLET_COLS.join(' ') }}>
+              <span className="text-left">Wallet</span>
+              {SHOW_CLAN && <span className="text-left">Clan</span>}
+              <span className="pr-3 text-right">Bal</span>
+              <span className="pr-3 text-right">TXs</span>
+              <span className="pr-3 text-right">Inflow</span>
               <span className="pl-1 text-left">Age</span>
             </span>
           </>
         )}
       </Th>
+      <SortTh label="Tracked in" col="trackedIn" sort={sort} onSort={onSort} className="w-20 text-center!" />
       <SortTh
         label="Top100"
         col="t100"
@@ -549,7 +597,7 @@ export default function SignalTable({
           <thead>
             <SignalHead allFactors={allFactors} />
           </thead>
-          <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
+          <SkeletonRows rows={8} cols={(allFactors ? 17 : 16) + FOMO_EXTRA} />
         </table>
       </TableShell>
     );
@@ -557,13 +605,13 @@ export default function SignalTable({
 
   // score >= 1 is the "active signal" line counted in the strip below;
   // allFactors (debug) widens the TABLE to every tracked CA, not just passers.
-  const passing = signals.filter((s) => s.nansen.score >= 1);
+  const passing = signals.filter((s) => s.nansen.score >= 1 || s.tier !== null);
   const base = allFactors ? signals : passing;
 
   // Client-side filters. mcPass fails open on absent marketCap, matching the
   // server's convention — unknown is not evidence.
   const nansenPass = (s: TokenSignal) => nansenFilter.size === 0 || [...nansenFilter].every((k) => s.nansen.pass[k]);
-  const holdingPass = (s: TokenSignal) => !holdingOnly || s.trackedHolding > 0;
+  const holdingPass = (s: TokenSignal) => !holdingOnly || rowHolding(s) > 0;
   // Inputs are entered in THOUSANDS of dollars (the label says "K$") — multiply by
   // 1000 to compare against the raw-USD marketCap, same as the reference design.
   const mcPass = (s: TokenSignal) => {
@@ -601,9 +649,9 @@ export default function SignalTable({
     key === 'holders'
       ? s.holders
       : key === 'trackedInflow'
-        ? s.trackedInflow
+        ? rowInflow(s)
         : key === 'trackedHolding'
-          ? s.trackedHolding
+          ? rowHolding(s)
           : key === 'volume1h'
             ? s.volume1h
             : key === 't100'
@@ -614,9 +662,16 @@ export default function SignalTable({
                   ? s.nansen.fresh
                   : key === 'mc'
                     ? s.marketCap
-                    : s.volume24h;
+                    : key === 'trackedIn'
+                      ? rowTrackedIn(s)
+                      : s.volume24h;
 
   const sorted = [...filtered].sort((a, b) => {
+    // Pass ("P") always sinks below every non-P row, in BOTH directions and with no
+    // column armed — same "always loses" shape as an undefined metric below.
+    const ap = a.tier === 'P' ? 1 : 0;
+    const bp = b.tier === 'P' ? 1 : 0;
+    if (ap !== bp) return ap - bp;
     // No column armed: the order the table ships with (newest tracked activity first).
     if (!sort) return b.trackedActivityAt - a.trackedActivityAt;
     const av = sortVal(a, sort.key);
@@ -652,7 +707,7 @@ export default function SignalTable({
   const onTierChange = (row: TokenSignal, tier: Tier | null) => {
     setTierError(null);
     const prev = row.tier;
-    setSignals((cur) => cur?.map((r) => (r.id === row.id ? { ...r, tier } : r)) ?? cur);
+    setSignals((cur) => (tier === 'P' ? cur?.filter((r) => r.id !== row.id) ?? cur : cur?.map((r) => (r.id === row.id ? { ...r, tier } : r)) ?? cur));
     dataStore
       .setTier(row.ca, row.chain, tier)
       .then(() => notifyTierChange?.())
@@ -678,9 +733,7 @@ export default function SignalTable({
         ];
 
   const ratedEmpty = mode === 'rated' && visible.length === 0;
-  // FOMO header sub-line appears only once some visible CA actually has watched users.
-  const hasFomo = SHOW_FOMO && visible.some((s) => s.fomoUsers.length > 0);
-  const colCount = (allFactors ? 16 : 15) + FOMO_EXTRA;
+  const colCount = (allFactors ? 17 : 16) + FOMO_EXTRA;
 
   return (
     <div className="w-full">
@@ -783,7 +836,6 @@ export default function SignalTable({
                   sort={mode === 'rated' ? null : sort}
                   onSort={mode === 'rated' ? undefined : toggleSort}
                   allFactors={allFactors}
-                  hasFomo={hasFomo}
                 />
               </thead>
               <tbody className="[&>tr:last-child>td]:border-b-0">
@@ -796,13 +848,28 @@ export default function SignalTable({
                 ) : (
                   visible.map((s, i) => {
                     const green = s.volume24h < ENTRY_VOLUME_THRESHOLD;
+                    const isPass = s.tier === 'P';
                     return (
-                      <tr key={s.id} className="odd:bg-surface even:bg-surface2 transition-colors hover:bg-hover">
+                      <tr
+                        key={s.id}
+                        className={`transition-colors ${
+                          isPass
+                            ? 'bg-surface2 text-muted opacity-45 hover:bg-hover hover:opacity-90'
+                            : 'odd:bg-surface even:bg-surface2 hover:bg-hover'
+                        }`}
+                      >
                         {allFactors && (
                           <Td className="w-10 text-center font-mono text-[13px] tabular-nums text-muted">{i + 1}</Td>
                         )}
                         <Td className="w-20 px-2.5! text-center!">
-                          <TokenAvatar iconUrl={s.iconUrl} symbol={s.symbol} ca={s.ca} />
+                          <div className="relative inline-block">
+                            <TokenAvatar iconUrl={s.iconUrl} symbol={s.symbol} ca={s.ca} />
+                            {SHOW_FOMO && (
+                              <span className="absolute -bottom-1 -right-1">
+                                <ChainBadge chain={s.chain} />
+                              </span>
+                            )}
+                          </div>
                         </Td>
                         <Td className="w-24">
                           <span
@@ -825,29 +892,12 @@ export default function SignalTable({
                         <Td className="w-24 text-center font-mono text-[13px] tabular-nums text-ink2">
                           {s.marketCap !== undefined ? usd(s.marketCap) : '—'}
                         </Td>
-                        <Td className="w-24 text-center">
-                          <CaCell ca={s.ca} chain={s.chain} />
+                        <Td className="w-40 text-center">
+                          <CaCell ca={s.ca} chain={s.chain} xHandle={s.xHandle} />
                         </Td>
                         <Td className={SHOW_FOMO ? 'w-[768px]' : 'w-96'}>
-                          {s.trackedWallets.length === 0 ? (
-                            <Pill active={false}>none</Pill>
-                          ) : (
+                          {SHOW_FOMO ? (
                             <div className="min-w-0">
-                              <WalletTable wallets={s.trackedWallets.slice(0, 3)} />
-                              {s.trackedWallets.length > 3 && (
-                                <button
-                                  type="button"
-                                  onClick={() => setWalletsPopup(s)}
-                                  className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
-                                  title="Xem toàn bộ wallet đang track token này"
-                                >
-                                  +{s.trackedWallets.length - 3} more
-                                </button>
-                              )}
-                            </div>
-                          )}
-                          {SHOW_FOMO && (
-                            <div className="mt-2.5 min-w-0 border-t border-line pt-2">
                               {s.fomoUsers.length === 0 ? (
                                 <Pill active={false}>none</Pill>
                               ) : (
@@ -866,8 +916,25 @@ export default function SignalTable({
                                 </>
                               )}
                             </div>
+                          ) : s.trackedWallets.length === 0 ? (
+                            <Pill active={false}>none</Pill>
+                          ) : (
+                            <div className="min-w-0">
+                              <WalletTable wallets={s.trackedWallets.slice(0, 3)} />
+                              {s.trackedWallets.length > 3 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWalletsPopup(s)}
+                                  className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
+                                  title="Xem toàn bộ wallet đang track token này"
+                                >
+                                  +{s.trackedWallets.length - 3} more
+                                </button>
+                              )}
+                            </div>
                           )}
                         </Td>
+                        <Td className="w-20 text-center font-mono text-[13px] tabular-nums text-ink2">{rowTrackedIn(s)}</Td>
                         <Td className={`w-24 ${NS_CELL} ${NS_START}`}>
                           <SetupValue value={s.nansen.t100?.multiple !== undefined ? fmtNum(s.nansen.t100.multiple) : '—'} pass={s.nansen.pass.t100} />
                         </Td>
@@ -879,10 +946,10 @@ export default function SignalTable({
                         </Td>
                         <Td className="w-24 text-center font-mono tabular-nums text-[13px] text-ink2">{fmtInt(s.holders)}</Td>
                         <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{usd(s.trackedInflow)}</div>
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{usd(rowInflow(s))}</div>
                         </Td>
                         <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{pct(s.trackedHolding)}</div>
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{pct(rowHolding(s))}</div>
                         </Td>
                         <Td className="w-28">
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2">

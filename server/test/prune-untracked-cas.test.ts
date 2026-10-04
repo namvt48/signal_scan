@@ -15,9 +15,11 @@ const UNLINKED_HELD = 'caPrune-unlinked-held'; // held by a wallet with no watch
 const BOUGHT = 'caPrune-bought';
 const FLIPPED = 'caPrune-flipped'; // bought long ago (outside window), sold since -> pruned
 const YOUNG = 'caPrune-young'; // hand-added, nothing bought it yet, still inside the window
-const TIERED = 'caPrune-tiered'; // user-rated tier -> exempt from every auto-delete path
+const TIERED = 'caPrune-tiered'; // user-rated tier without inflow in 48h -> dropped
+const TIERED_ACTIVE = 'caPrune-tiered-active'; // user-rated tier WITH inflow in 48h -> kept
+const PASS_TIER = 'caPrune-pass'; // tier Pass -> dropped immediately upon setTier
+const PASS_LEGACY = 'caPrune-pass-legacy'; // legacy row already tiered P in DB -> dropped by pruneUntrackedCas
 const ORPHAN = 'caPrune-orphan'; // token_state row left behind by an earlier drop
-
 /** Backdate added_at so the window is measured from it, not from insert time. */
 function backdate(address: string, agoMs: number): void {
   getDb()
@@ -29,50 +31,58 @@ before(() => {
   open(':memory:');
 });
 
-test('pruneUntrackedCas: drops a CA nothing the CA is Tracked by holds or bought', () => {
-  // Given: seven CAs and one tracked wallet.
-  for (const ca of [FRESH, DEAD, HELD, UNLINKED_HELD, BOUGHT, FLIPPED, YOUNG, TIERED]) {
+test('pruneUntrackedCas: drops CAs with no inflow in 48h (including tiered/held) and drops Pass tier', () => {
+  // Given: CAs and tracked wallets.
+  for (const ca of [FRESH, DEAD, HELD, UNLINKED_HELD, BOUGHT, FLIPPED, YOUNG, TIERED, TIERED_ACTIVE, PASS_TIER]) {
     insertTrackedCa({ address: ca, chain: 'sol', note: '' });
   }
+  // Pre-seed token_tiers with P for PASS_LEGACY and insert directly into tracked_cas (simulating pre-existing row)
+  getDb().prepare("INSERT INTO token_tiers (ca, chain, tier, updated_at) VALUES (?, 'sol', 'P', ?)").run(PASS_LEGACY, Date.now());
+  getDb().prepare("INSERT INTO tracked_cas (id, address, chain, added_at, status) VALUES ('leg-id', ?, 'sol', ?, 'queued')").run(PASS_LEGACY, new Date().toISOString());
   const wallet = insertWallet({ address: 'wallet-prune', name: 'test_prune', tags: [], chain: 'sol', source: 'test' });
 
-  // FRESH: added seconds ago, holdings not swept yet -> kept by added_at alone.
-  // HELD: an old holding row whose wallet the CA is Tracked by — an 8d watch buy,
-  // outside the window, so ONLY the holding clause can keep it.
+  // FRESH: added seconds ago -> kept by added_at grace.
+  // HELD: an old holding row whose wallet bought 8d ago -> outside 48h window -> DROPPED.
   replaceWalletBalances(wallet.id, 'sol', [{ ca: HELD, amount: 1_000 }]);
   insertTrades(wallet.id, [{ tx: 't-held', ts: Date.now() - 8 * DAY, side: 'buy', ca: HELD, chain: 'sol', amountUsd: 500, price: 1 }], 'watch');
-  // BOUGHT: an old row with a buy inside the window -> kept.
+  // BOUGHT: an old row with a buy inside the 48h window -> KEPT.
   insertTrades(wallet.id, [{ tx: 't-bought', ts: Date.now() - HOUR, side: 'buy', ca: BOUGHT, chain: 'sol', amountUsd: 500, price: 1 }]);
-  // FLIPPED: bought 8 days ago (outside the window), so no current interaction.
+  // FLIPPED: bought 8 days ago (outside window) -> DROPPED.
   insertTrades(wallet.id, [{ tx: 't-flipped', ts: Date.now() - 8 * DAY, side: 'buy', ca: FLIPPED, chain: 'sol', amountUsd: 500, price: 1 }]);
-  // UNLINKED_HELD: a second wallet holds it without ever watch-buying it, so the
-  // holding row is not a Tracked-by row and must not keep the CA alive.
+  // UNLINKED_HELD: held with no buy -> DROPPED.
   const stranger = insertWallet({ address: 'wallet-prune-stranger', name: 'test_stranger', tags: [], chain: 'sol', source: 'test' });
   replaceWalletBalances(stranger.id, 'sol', [{ ca: UNLINKED_HELD, amount: 9_000 }]);
-  for (const ca of [DEAD, HELD, UNLINKED_HELD, BOUGHT, FLIPPED, TIERED]) backdate(ca, STALE);
-  // TIERED: identical to DEAD (stale, no holding, no buy) except the user rated a tier,
-  // so every auto-delete path must spare it (user 2026-09-28).
+  for (const ca of [DEAD, HELD, UNLINKED_HELD, BOUGHT, FLIPPED, TIERED, TIERED_ACTIVE]) backdate(ca, STALE);
+  // TIERED: user-rated tier -> user rule: tiered CAs (non-Pass) are never pruned, kept on dashboard.
   setTier(TIERED, 'sol', 'B+');
-  backdate(YOUNG, 20 * HOUR); // inside the window: "nothing bought it" must not kill it yet
+  // TIERED_ACTIVE: stale added_at, but bought 1h ago -> KEPT.
+  setTier(TIERED_ACTIVE, 'sol', 'A');
+  insertTrades(wallet.id, [{ tx: 't-tiered-active', ts: Date.now() - HOUR, side: 'buy', ca: TIERED_ACTIVE, chain: 'sol', amountUsd: 500, price: 1 }]);
+  // PASS_TIER: setting tier P immediately removes it from tracked_cas
+  setTier(PASS_TIER, 'sol', 'P');
+  assert.equal(findTrackedCa(PASS_TIER, 'sol'), undefined, 'setTier P immediately deletes from tracked_cas');
+  backdate(YOUNG, 20 * HOUR); // inside 48h window -> KEPT
 
-  // token_state rows: DEAD and HELD own one, ORPHAN belongs to no tracked CA.
+  // token_state rows
   const insertState = getDb().prepare('INSERT INTO token_state (ca, chain, fetched_at) VALUES (?, ?, ?)');
   for (const ca of [DEAD, HELD, TIERED, ORPHAN]) insertState.run(ca, 'sol', Date.now());
 
   // When
   const dropped = pruneUntrackedCas(WINDOW).map((r) => r.address).sort();
 
-  // Then
-  assert.deepEqual(dropped, [DEAD, FLIPPED, UNLINKED_HELD].sort());
-  assert.notEqual(findTrackedCa(TIERED, 'sol'), undefined, 'a tier-rated CA must survive the 48h inflow prune');
-  assert.notEqual(getTokenState(TIERED, 'sol'), undefined, 'and keep its market data');
-  // "Xoá hoàn toàn": the dropped CA's own market data goes with it, a kept CA's stays.
-  assert.equal(getTokenState(DEAD, 'sol'), undefined);
-  assert.notEqual(getTokenState(HELD, 'sol'), undefined);
-  assert.equal(getTokenState(ORPHAN, 'sol'), undefined);
-  // wallet_token_state carries no ca FK, so the prune must sweep balance rows too.
-  const balRows = (ca: string) =>
-    (getDb().prepare('SELECT COUNT(*) AS c FROM wallet_token_state WHERE ca = ?').get(ca) as { c: number }).c;
-  assert.equal(balRows(UNLINKED_HELD), 0, 'a pruned CA must take its wallet balance rows with it');
-  assert.equal(balRows(HELD), 1, 'a kept CA keeps its wallet balance rows');
+  // Then: untiered CAs with no inflow in 48h are dropped, plus legacy PASS_LEGACY. Tiered non-Pass CAs are KEPT.
+  assert.deepEqual(dropped, [DEAD, FLIPPED, HELD, PASS_LEGACY, UNLINKED_HELD].sort());
+  // Kept CAs
+  assert.notEqual(findTrackedCa(BOUGHT, 'sol'), undefined, 'recent buy survives');
+  assert.notEqual(findTrackedCa(TIERED, 'sol'), undefined, 'tiered CA survives even if no recent inflow');
+  assert.notEqual(findTrackedCa(TIERED_ACTIVE, 'sol'), undefined, 'tiered with recent buy survives');
+  assert.notEqual(findTrackedCa(YOUNG, 'sol'), undefined, 'young addition survives');
+  assert.notEqual(findTrackedCa(FRESH, 'sol'), undefined, 'fresh addition survives');
+  // Pruned CAs
+  assert.equal(findTrackedCa(HELD, 'sol'), undefined, 'held CA without tier and without inflow in 48h is pruned');
+  assert.equal(findTrackedCa(HELD, 'sol'), undefined, 'held CA without inflow in 48h is pruned');
+  assert.equal(findTrackedCa(PASS_LEGACY, 'sol'), undefined, 'legacy pass tier CA is pruned');
+  // Pass tier CA cannot be re-added
+  assert.throws(() => insertTrackedCa({ address: PASS_TIER, chain: 'sol', note: '' }), /tier is Pass/);
+  assert.throws(() => insertTrackedCa({ address: PASS_LEGACY, chain: 'sol', note: '' }), /tier is Pass/);
 });

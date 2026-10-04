@@ -144,17 +144,24 @@ not appear, and a trader whose newest buy is older than 24h still appears with z
 
 ## 4. Chain map and dedupe
 
-**Chain map.** The repo's `Chain` union is only `sol | base | bsc`, so the daemon maps:
+**Chain map.** The shared `Chain` union is `sol | base | bsc | robinhood`
+(`server/src/shared/chain.ts`, mirrored in `src/types.ts`), so the daemon maps:
 
 ```
-solana -> sol
-base   -> base
-bsc    -> bsc
+solana    -> sol
+base      -> base
+bsc       -> bsc
+robinhood -> robinhood
 ```
 
-Everything else is **dropped**: `ethereum`, `robinhood`, `hyperliquid`, and the perp
-chainId `1337`. They cannot be stored, so they are discarded at the daemon and never
+Everything else is **dropped**: `ethereum`, `hyperliquid`, and the perp chainId
+`1337`. They cannot be stored, so they are discarded at the daemon and never
 reach the ingest route.
+
+> **robinhood added 2026-10-01** (EVM, chainId 4663): the fomo dashboard now tracks
+> robinhood CAs end-to-end. The gateway's `CHAIN_SLUGS` must carry `robinhood` too
+> (`server/src/shared/chain-slugs.ts`), or every `gmgn/token-info` call for the chain
+> is denied `400 bad_request` and the CA never leaves the dashboard's score filter.
 
 **Dedupe by `eventId`.** `fomo_trades` has a UNIQUE index on `event_id`, and the insert
 is `INSERT INTO fomo_trades (...) ON CONFLICT(event_id) DO NOTHING`. Re-POSTing the same

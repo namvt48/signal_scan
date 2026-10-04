@@ -4,7 +4,7 @@
 // address non-empty → 400; duplicate → 409).
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { CHAINS, canonicalCa, type Chain } from './shared/chain.js';
+import { CHAINS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
 import { TIERS, isTier, type Tier } from './shared/tier.js';
 import { type AuthDeps, createAuthMiddleware } from './auth.js';
 import { config } from './config.js';
@@ -18,6 +18,7 @@ import {
   findFomoUserByUserId,
   findTrackedCa,
   findWalletByAddress,
+  getTier,
   getWallet,
   importFomoUsers,
   importWallets,
@@ -26,10 +27,12 @@ import {
   insertTrackedCa,
   insertWallet,
   isChain,
+  isPassTier,
   listFomoUsers,
   listTrackedCas,
   listWallets,
   maxTokenFetchedAt,
+  reactivateTrackedCa,
   setTier,
   setTrackedCaEntryUsd,
   updateFomoUser,
@@ -57,7 +60,7 @@ import {
   type NansenThresholds,
 } from './settings.js';
 import { insertTrades } from './ingest.js';
-import { kickCAs, kickFomoHoldings, kickWalletRow } from './poller.js';
+import { kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
 
 interface WalletJson {
   id: string;
@@ -99,6 +102,7 @@ interface FomoUserJson {
   id: string;
   handle: string;
   name: string;
+  tags: string[];
   clan?: string;
   userId?: string;
   walletSolana?: string;
@@ -111,6 +115,7 @@ function toFomoUser(row: FomoUserRow): FomoUserJson {
     id: row.id,
     handle: row.handle,
     name: row.name,
+    tags: JSON.parse(row.tags) as string[], // written by us via JSON.stringify(string[])
     ...(row.clan !== null ? { clan: row.clan } : {}),
     ...(row.user_id !== null ? { userId: row.user_id } : {}),
     ...(row.wallet_solana !== null ? { walletSolana: row.wallet_solana } : {}),
@@ -148,6 +153,7 @@ function parseWalletBody(body: unknown): ParseResult<WalletBody> {
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
   if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+  if (b.chain === 'sol' && !isSolanaAddress(address)) return { error: 'invalid sol address (base58, 32 bytes)' };
   return { address, name: strField(b, 'name'), tags: tagsField(b), chain: b.chain, source: strField(b, 'source'), clan: strField(b, 'clan') };
 }
 
@@ -188,6 +194,7 @@ function parseFomoUserBody(body: unknown): ParseResult<FomoUserInput> {
     name: strField(b, 'name'),
     user_id: opt('userId'),
     clan: opt('clan'),
+    tags: tagsField(b),
     wallet_solana: opt('walletSolana'),
     wallet_evm: opt('walletEvm'),
   };
@@ -210,6 +217,10 @@ function parseFomoUserPatch(body: unknown): ParseResult<Partial<FomoUserInput>> 
   if (b.name !== undefined) patch.name = strField(b, 'name');
   if (b.userId !== undefined) patch.user_id = strField(b, 'userId') || null;
   if (b.clan !== undefined) patch.clan = strField(b, 'clan') || null;
+  if (b.tags !== undefined) {
+    if (!Array.isArray(b.tags)) return { error: 'tags must be an array of strings' };
+    patch.tags = tagsField(b);
+  }
   if (b.walletSolana !== undefined) patch.wallet_solana = strField(b, 'walletSolana') || null;
   if (b.walletEvm !== undefined) patch.wallet_evm = strField(b, 'walletEvm') || null;
   if (b.source !== undefined) patch.source = strField(b, 'source');
@@ -242,8 +253,11 @@ function parseTierBody(body: unknown): ParseResult<{ ca: string; chain: Chain; t
   const ca = strField(b, 'ca');
   if (!ca) return { error: 'ca is required' };
   if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
-  const raw = b.tier;
+  let raw = b.tier;
   if (raw === undefined || raw === null || raw === '') return { ca, chain: b.chain, tier: null };
+  if (typeof raw === 'string' && (raw.toLowerCase() === 'pass' || raw === 'P')) {
+    raw = 'P';
+  }
   if (!isTier(raw)) return { error: `tier must be one of ${TIERS.join(', ')} or null` };
   return { ca, chain: b.chain, tier: raw };
 }
@@ -317,6 +331,8 @@ interface FomoWatchTrade {
   chain: Chain;
   ts: number;
   usdValue?: number;
+  /** USD actually traded, both directions. Present on ~17/102 captured rows. */
+  tradeUsd?: number;
   price?: number;
   token?: string;
   /** On-chain tx that produced the alert (present on ~17/102 captured rows). Used
@@ -331,7 +347,8 @@ interface FomoWatchTrade {
  * even though the daemon already drops them; a perp row's null `tokenAddress`
  * makes such a body doubly invalid. usdValue is TYPE-DEPENDENT (buy → post-fill
  * size, sell → SIGNED realised PnL) so — unlike the wallet parser — a negative
- * value is legal; both stay optional and store NULL. txHash is NEVER required
+ * value is legal; both stay optional and store NULL. tradeUsd is likewise
+ * optional and is the ONLY field Buy-$ sums. txHash is NEVER required
  * (present on only 17/102 captured rows).
  */
 function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
@@ -358,7 +375,7 @@ function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
   if (token) trade.token = token;
   const txHash = strField(b, 'txHash');
   if (txHash) trade.txHash = txHash;
-  for (const key of ['usdValue', 'price'] as const) {
+  for (const key of ['usdValue', 'price', 'tradeUsd'] as const) {
     const v: unknown = b[key];
     if (v === undefined) continue;
     if (typeof v !== 'number' || !Number.isFinite(v)) {
@@ -441,6 +458,7 @@ function parseFomoImportRows(body: unknown): FomoUserInput[] | null {
       name: strField(b, 'name'),
       user_id: strField(b, 'userId') || null,
       clan: strField(b, 'clan') || null,
+      tags: tagsField(b),
       wallet_solana: strField(b, 'walletSolana') || null,
       wallet_evm: strField(b, 'walletEvm') || null,
       source: strField(b, 'source') || 'csv',
@@ -516,8 +534,8 @@ type EnqueueOutcome =
  * THE single gate a CA passes to become polled — every producer goes through
  * here (wallet-watch POST /api/tracked-cas, FOMO buy ingest) so the rule can
  * never drift:
- *   - already tracked → backfill entry_usd when it was unknown and usd is now
- *     known; else no-op (no kickCAs — it already polls on its own cadence).
+ *   - already tracked → backfill entry_usd when unknown, or upgrade when
+ *     sub-threshold (< minUsd) and a larger trade arrives; else no-op.
  *   - new + KNOWN entryUsd below minUsd → skipped. Absent usd fails open: the
  *     detector must never drop a real trade it could not price.
  *   - new → insert + kickCAs.
@@ -528,11 +546,22 @@ function enqueueTrackedCa(input: {
   note: string;
   entryUsd?: number;
 }): EnqueueOutcome {
-  const existing = findTrackedCa(input.address, input.chain);
+  if (isPassTier(input.address, input.chain)) {
+    return { kind: 'skipped' };
+  }
+  const existing = findTrackedCa(input.address, input.chain, true);
   if (existing) {
-    if (existing.entry_usd == null && input.entryUsd != null) {
-      const row = setTrackedCaEntryUsd(input.address, input.chain, input.entryUsd) ?? existing;
-      return { kind: 'backfilled', row };
+    if (existing.status === 'inactive') {
+      const row = reactivateTrackedCa(input.address, input.chain, input.note, input.entryUsd) ?? existing;
+      kickCAs([{ address: row.address, chain: row.chain }]);
+      return { kind: 'inserted', row };
+    }
+    if (input.entryUsd != null) {
+      const minUsd = getThresholds().minUsd;
+      if (existing.entry_usd == null || (existing.entry_usd < minUsd && input.entryUsd > existing.entry_usd)) {
+        const row = setTrackedCaEntryUsd(input.address, input.chain, input.entryUsd, minUsd) ?? existing;
+        return { kind: 'backfilled', row };
+      }
     }
     return { kind: 'exists' };
   }
@@ -648,6 +677,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     }
     const current = toWallet(cur);
     const next: WalletBody = { ...current, ...parsed };
+    if (next.chain === 'sol' && !isSolanaAddress(next.address)) {
+      res.status(400).json({ error: 'invalid sol address (base58, 32 bytes)' });
+      return;
+    }
     // Identity key is (address, chain): a change to EITHER half can collide.
     if (
       (next.address !== current.address || next.chain !== current.chain) &&
@@ -763,7 +796,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(409).json({ error: 'CA already tracked on this chain' });
       return;
     }
-    res.status(200).json({ skipped: 'below-min-usd' });
+    res.status(200).json({ skipped: isPassTier(parsed.address, parsed.chain) ? 'pass-tier' : 'below-min-usd' });
   });
 
   app.delete('/api/tracked-cas/:id', (req, res) => {
@@ -778,7 +811,12 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    if (!findTrackedCa(parsed.ca, parsed.chain)) {
+    if (isPassTier(parsed.ca, parsed.chain)) {
+      if (parsed.tier !== 'P') {
+        res.status(409).json({ error: 'CA is permanently blocked as Pass and cannot be re-tiered or cleared' });
+        return;
+      }
+    } else if (!findTrackedCa(parsed.ca, parsed.chain, true) && !getTier(parsed.ca, parsed.chain)) {
       res.status(404).json({ error: 'CA not tracked' });
       return;
     }
@@ -799,6 +837,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
+    if (isPassTier(parsed.ca, parsed.chain)) {
+      res.json({ inserted: 0, skipped: 'pass-tier' });
+      return;
+    }
     const wallet = findWalletByAddress(parsed.wallet, parsed.chain);
     if (!wallet) {
       // Inserting would violate the wallets FK. The daemon only watches tracked
@@ -806,7 +848,6 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(404).json({ error: 'wallet not tracked' });
       return;
     }
-    // A `transfer` is not a trade row — it only means "this wallet's balance moved".
     const inserted =
       parsed.side === 'transfer'
         ? 0
@@ -825,6 +866,14 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
             ],
             'watch',
           );
+    if (parsed.side === 'buy') {
+      enqueueTrackedCa({
+        address: parsed.ca,
+        chain: parsed.chain,
+        note: 'wallet-trade',
+        ...(parsed.amountUsd !== undefined ? { entryUsd: parsed.amountUsd } : {}),
+      });
+    }
     // Re-read the wallet's balance now (user 2026-09-23) rather than waiting up to
     // POLL_WALLETS_MS for walletSweep, so a sell/transfer moves trackedHolding at once.
     // One query, for the pair this event landed on.
@@ -862,6 +911,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       chain: parsed.chain,
       type: parsed.type,
       usd_value: parsed.usdValue ?? null,
+      trade_usd: parsed.tradeUsd ?? null,
       price: parsed.price ?? null,
       token: parsed.token ?? null,
       ts: parsed.ts,
@@ -884,6 +934,9 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     // touches only the fomo_* tables — still no wallet state here.
     if (created && parsed.txHash !== undefined) {
       kickFomoHoldings(user.id, parsed.chain, parsed.ca, parsed.txHash);
+    }
+    if (created) {
+      kickFomoPositions(user.id, user.handle);
     }
     res.json({ inserted: created ? 1 : 0 });
   });

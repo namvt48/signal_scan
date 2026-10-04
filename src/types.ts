@@ -24,6 +24,8 @@ export interface FomoUser {
   handle: string;
   /** Display name (CSV `displayName`); may be empty. */
   name: string;
+  /** Display chips (CSV `tags`, `;`-separated like wallets); [] when untagged. */
+  tags: string[];
   /** Display-only clan label (CSV `clanName`). Absent/empty = unlabelled. */
   clan?: string;
   /** FOMO user id; absent until learned from the stream or seeded from CSV. */
@@ -88,6 +90,8 @@ export interface TrackedWalletStat {
 export interface FomoUserStat {
   handle: string;
   name?: string;
+  /** Display chips (mirrors FomoUser.tags); absent when the user has none. */
+  tags?: string[];
   clan?: string;
   buyUsd: number;
   /** Σ realised PnL on SELL rows. May be negative. NOT sell volume. */
@@ -110,6 +114,8 @@ export interface TokenSignal {
   symbol?: string;
   /** Token icon URL from the API; absent/empty/404 falls back to the letter avatar. */
   iconUrl?: string;
+  /** X (Twitter) handle for the token's account, no leading '@'; absent → the CA cell falls back to an X search link. */
+  xHandle?: string;
   /** Tracked wallets interacting with this token, sorted by name by the server. */
   trackedWallets: TrackedWalletStat[];
   /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */

@@ -96,6 +96,27 @@ test('parseIcons: junk rows are skipped without dropping the good ones', () => {
   assert.deepEqual([...icons.keys()], ['OK']);
 });
 
+test('parseIcons: checksummed EVM addresses fold to lowercase so canonicalCa lookup matches', () => {
+  const json: DexTokensResponse = {
+    pairs: [
+      {
+        baseToken: { address: '0xeDBf9122367d6bE0E5f1b4BfD5ce0F8c5a1B2c3D' },
+        info: { imageUrl: 'https://cdn.dexscreener.com/cms/images/evm' },
+        liquidity: { usd: 10 },
+      },
+      {
+        baseToken: { address: 'So1Base58CaseSensitiveMint' },
+        info: { imageUrl: 'https://cdn.dexscreener.com/cms/images/sol' },
+        liquidity: { usd: 10 },
+      },
+    ],
+  };
+  const icons = parseIcons(json);
+  assert.equal(icons.get('0xedbf9122367d6be0e5f1b4bfd5ce0f8c5a1b2c3d'), 'https://cdn.dexscreener.com/cms/images/evm');
+  assert.equal(icons.has('0xeDBf9122367d6bE0E5f1b4BfD5ce0F8c5a1B2c3D'), false, 'the checksummed key must not survive');
+  assert.equal(icons.get('So1Base58CaseSensitiveMint'), 'https://cdn.dexscreener.com/cms/images/sol', 'sol base58 keeps its case');
+});
+
 test('chunkAddresses: 65 CAs → batches of 30/30/5 (the API hard ceiling)', () => {
   const cas = Array.from({ length: 65 }, (_, i) => `ca${i}`);
   const chunks = chunkAddresses(cas);

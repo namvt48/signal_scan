@@ -16,6 +16,7 @@
 
 import { log } from '../log.js';
 import { gatewayClientFromEnv, GatewayClient, GW_DEXSCREENER_PATH } from '../gateway-client.js';
+import { EVM_ADDRESS } from '../shared/chain.js';
 
 export const DEXSCREENER_TOKENS_URL = 'https://api.dexscreener.com/latest/dex/tokens';
 
@@ -40,6 +41,7 @@ interface DexPair {
   baseToken?: DexBaseToken;
   info?: { imageUrl?: string };
   liquidity?: { usd?: number };
+  priceUsd?: string;
 }
 
 export interface DexTokensResponse {
@@ -74,26 +76,79 @@ export function validatedIconUrl(raw: unknown): string | undefined {
 }
 
 /**
- * Pure: a /latest/dex/tokens response → Map<mint, iconUrl>. PAIR-level rows are
- * grouped by baseToken.address; among the pairs whose imageUrl PASSES the
- * allowlist gate, the highest liquidity.usd wins. A junk/absent imageUrl
- * disqualifies only its own pair; a mint whose pairs all fail (or that has no
- * pair at all) is simply absent — "no icon", never a raw unvalidated string.
+ * Per-token market metadata DexScreener is authoritative for: symbol, price and
+ * icon. `marketCap` is NOT taken here — it is derived centrally as price × supply.
  */
-export function parseIcons(json: DexTokensResponse): Map<string, string> {
-  const best = new Map<string, { liq: number; url: string }>();
+export interface DexTokenMeta {
+  iconUrl?: string;
+  symbol?: string;
+  price?: number;
+}
+
+/**
+ * Pure: a /latest/dex/tokens response → Map<mint, DexTokenMeta>. PAIR-level rows are
+ * grouped by baseToken.address. Two independent "deepest pair" picks per mint:
+ *  - symbol/price come from the pair with the highest liquidity.usd (the same pair
+ *    the providers compare against);
+ *  - iconUrl comes from the deepest pair whose imageUrl PASSES the allowlist gate,
+ *    so a high-liquidity pair carrying no image never hides a lower pair's icon.
+ * A junk/absent reading is omitted (never a 0 or a raw unvalidated string); a mint
+ * with nothing usable is absent entirely.
+ */
+export function parseTokenMeta(json: DexTokensResponse): Map<string, DexTokenMeta> {
+  const field = new Map<string, { liq: number; symbol?: string; price?: number }>();
+  const icon = new Map<string, { liq: number; url: string }>();
   const rawPairs = json?.pairs;
   const pairs = Array.isArray(rawPairs) ? rawPairs : [];
   for (const pair of pairs) {
-    const mint = typeof pair?.baseToken?.address === 'string' ? pair.baseToken.address.trim() : '';
-    if (mint === '') continue;
-    const url = validatedIconUrl(pair?.info?.imageUrl);
-    if (url === undefined) continue;
+    const raw = typeof pair?.baseToken?.address === 'string' ? pair.baseToken.address.trim() : '';
+    if (raw === '') continue;
+    // DexScreener returns CHECKSUMMED EVM addresses (0xAbC…) while the poller looks
+    // up by the LOWERCASE canonical CA (canonicalCa) — key by the canonical form or
+    // every EVM mint (robinhood/base/bsc) misses. Sol base58 IS case-sensitive: keep it.
+    const mint = EVM_ADDRESS.test(raw) ? raw.toLowerCase() : raw;
     const liq = num(pair?.liquidity?.usd);
-    const prev = best.get(mint);
-    if (prev === undefined || liq > prev.liq) best.set(mint, { liq, url });
+    const symbol = typeof pair?.baseToken?.symbol === 'string' ? pair.baseToken.symbol.trim() : '';
+    const price = num(pair?.priceUsd);
+    const prev = field.get(mint);
+    if (prev === undefined || liq > prev.liq) {
+      field.set(mint, {
+        liq,
+        ...(symbol !== '' ? { symbol } : {}),
+        ...(price > 0 ? { price } : {}),
+      });
+    }
+    const url = validatedIconUrl(pair?.info?.imageUrl);
+    if (url !== undefined) {
+      const pi = icon.get(mint);
+      if (pi === undefined || liq > pi.liq) icon.set(mint, { liq, url });
+    }
   }
-  return new Map([...best].map(([mint, v]) => [mint, v.url]));
+  const out = new Map<string, DexTokenMeta>();
+  for (const [mint, f] of field) {
+    const ic = icon.get(mint);
+    const meta: DexTokenMeta = {
+      ...(f.symbol !== undefined ? { symbol: f.symbol } : {}),
+      ...(f.price !== undefined ? { price: f.price } : {}),
+      ...(ic !== undefined ? { iconUrl: ic.url } : {}),
+    };
+    if (Object.keys(meta).length > 0) out.set(mint, meta);
+  }
+  return out;
+}
+
+/**
+ * Icon-only projection of parseTokenMeta, kept for the existing icon tests and any
+ * caller that wants nothing but the logo. PAIR-level rows are grouped by
+ * baseToken.address; among the pairs whose imageUrl PASSES the allowlist gate, the
+ * highest liquidity.usd wins.
+ */
+export function parseIcons(json: DexTokensResponse): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [mint, meta] of parseTokenMeta(json)) {
+    if (meta.iconUrl !== undefined) out.set(mint, meta.iconUrl);
+  }
+  return out;
 }
 
 /** Pure chunker: the ≤30-address batches one /tokens call may carry. Exported for tests. */
@@ -104,18 +159,16 @@ export function chunkAddresses(cas: readonly string[], size: number = DEXSCREENE
 }
 
 /**
- * Batch icon fetch. NEVER throws: a non-200, a non-JSON body, or a network
- * failure logs and yields "no icons for this chunk" — the next sweep is the
- * durable retry (same contract as the metric sweeps). Chunks run sequentially:
- * each is ONE request, so the await chain is the pacing — pacedFor's per-item
- * slots exist to protect per-CA rate-limited doors, and a keyless batch call
- * covering 30 CAs has no such door to protect.
+ * Batch token-meta fetch (icon + symbol + price). NEVER throws: a non-200, a
+ * non-JSON body, or a network failure logs and yields nothing for that chunk — the
+ * next sweep is the durable retry (same contract as the metric sweeps). Chunks run
+ * sequentially: each is ONE request, so the await chain is the pacing.
  */
-export async function fetchIcons(
+export async function fetchTokenMeta(
   cas: readonly string[],
   gateway: GatewayClient = gatewayClientFromEnv(),
-): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
+): Promise<Map<string, DexTokenMeta>> {
+  const out = new Map<string, DexTokenMeta>();
   for (const chunk of chunkAddresses(cas)) {
     try {
       const env = await gateway.call(GW_DEXSCREENER_PATH, {
@@ -127,12 +180,24 @@ export async function fetchIcons(
         log.warn(`[dexscreener] tokens http ${env.status} — chunk skipped`, { n: chunk.length });
         continue;
       }
-      for (const [mint, url] of parseIcons(JSON.parse(env.body) as DexTokensResponse)) out.set(mint, url);
+      for (const [mint, meta] of parseTokenMeta(JSON.parse(env.body) as DexTokensResponse)) out.set(mint, meta);
     } catch (e) {
       // Timeout / DNS / connection reset — same skip-and-continue as a non-200.
       log.warn('[dexscreener] tokens fetch failed — chunk skipped', { n: chunk.length, err: e });
     }
   }
-  log.debug('[dexscreener] icons', { asked: cas.length, resolved: out.size });
+  log.debug('[dexscreener] token meta', { asked: cas.length, resolved: out.size });
+  return out;
+}
+
+/** Icon-only projection of fetchTokenMeta, kept for callers that want nothing but the logo. */
+export async function fetchIcons(
+  cas: readonly string[],
+  gateway: GatewayClient = gatewayClientFromEnv(),
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const [mint, meta] of await fetchTokenMeta(cas, gateway)) {
+    if (meta.iconUrl !== undefined) out.set(mint, meta.iconUrl);
+  }
   return out;
 }

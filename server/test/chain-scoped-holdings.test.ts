@@ -119,7 +119,7 @@ test('pruneUntrackedCas: a position on ANOTHER chain must not spare a CA', () =>
   insertTrackedCa({ address: PDUP, chain: 'base', note: 'chain-scope prune' });
   insertTrackedCa({ address: PDUP, chain: 'bsc', note: 'chain-scope prune' });
   replaceWalletBalances(wBsc, 'bsc', [{ ca: PDUP, amount: 500 }]);
-  insertTrades(wBsc, [{ tx: 't-pdup-bsc', ts: NOW - 8 * DAY, side: 'buy', ca: PDUP, chain: 'bsc', amountUsd: 500, price: 1 }], 'watch');
+  insertTrades(wBsc, [{ tx: 't-pdup-bsc', ts: Date.now() - HOUR, side: 'buy', ca: PDUP, chain: 'bsc', amountUsd: 500, price: 1 }], 'watch');
   backdate(PDUP, 'base', STALE);
   backdate(PDUP, 'bsc', STALE);
 

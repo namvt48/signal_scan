@@ -28,7 +28,9 @@ const TOUCHED = [
   'GATEWAY_TOKEN_WATCHER',
   'NANSEN_API_KEY',
   'GMGN_API_KEY',
+  'GMGN_API_KEYS',
   'GMGN_PLAN_WEIGHT',
+  'GMGN_PLAN_WEIGHTS',
   'NANSEN_DAILY_CREDIT_BUDGET',
   'CACHE_TTL_NANSEN_MS',
   'CACHE_TTL_DEXSCREENER_MS',
@@ -111,7 +113,9 @@ test('gateway config: defaults when env is unset', async () => {
     assert.equal(c.gatewayTokenWatcher, '');
     assert.equal(c.nansenApiKey, '');
     assert.equal(c.gmgnApiKey, '');
+    assert.deepEqual(c.gmgnApiKeys, []);
     assert.equal(c.gmgnPlanWeight, 5);
+    assert.deepEqual(c.gmgnPlanWeights, []);
     assert.equal(c.nansenDailyCreditBudget, 10);
     assert.equal(c.cacheTtlNansenMs, 30_000);
     assert.equal(c.cacheTtlDexscreenerMs, 30_000);
@@ -130,7 +134,9 @@ test('gateway config: env overrides win', async () => {
       GATEWAY_TOKEN_WATCHER: 'token-w',
       NANSEN_API_KEY: 'nansen-key',
       GMGN_API_KEY: 'gmgn-key',
+      GMGN_API_KEYS: 'k1,k2',
       GMGN_PLAN_WEIGHT: '20',
+      GMGN_PLAN_WEIGHTS: '5,20',
       NANSEN_DAILY_CREDIT_BUDGET: '1234',
       CACHE_TTL_NANSEN_MS: '1500',
       CACHE_TTL_DEXSCREENER_MS: '2500',
@@ -144,7 +150,9 @@ test('gateway config: env overrides win', async () => {
       assert.equal(c.gatewayTokenWatcher, 'token-w');
       assert.equal(c.nansenApiKey, 'nansen-key');
       assert.equal(c.gmgnApiKey, 'gmgn-key');
+      assert.deepEqual(c.gmgnApiKeys, ['k1', 'k2']);
       assert.equal(c.gmgnPlanWeight, 20);
+      assert.deepEqual(c.gmgnPlanWeights, [5, 20]);
       assert.equal(c.nansenDailyCreditBudget, 1234);
       assert.equal(c.cacheTtlNansenMs, 1500);
       assert.equal(c.cacheTtlDexscreenerMs, 2500);
@@ -167,6 +175,7 @@ test('missingGatewayEnv lists blank required keys, never values', () => {
     missingGatewayEnv({
       nansenApiKey: '',
       gmgnApiKey: '',
+      gmgnApiKeys: [],
       gatewayTokenA: '',
       gatewayTokenB: '',
       gatewayTokenWatcher: '',
@@ -177,6 +186,7 @@ test('missingGatewayEnv lists blank required keys, never values', () => {
     missingGatewayEnv({
       nansenApiKey: 'n',
       gmgnApiKey: 'g',
+      gmgnApiKeys: ['g'],
       gatewayTokenA: 'a',
       gatewayTokenB: 'b',
       gatewayTokenWatcher: 'w',
@@ -186,12 +196,24 @@ test('missingGatewayEnv lists blank required keys, never values', () => {
   assert.deepEqual(
     missingGatewayEnv({
       nansenApiKey: 'n',
-      gmgnApiKey: 'g',
+      gmgnApiKey: '',
+      gmgnApiKeys: ['g'],
       gatewayTokenA: '',
       gatewayTokenB: 'b',
       gatewayTokenWatcher: 'w',
     }),
     ['gatewayTokenA'],
+  );
+  assert.deepEqual(
+    missingGatewayEnv({
+      nansenApiKey: 'n',
+      gmgnApiKey: '',
+      gmgnApiKeys: [],
+      gatewayTokenA: '',
+      gatewayTokenB: 'b',
+      gatewayTokenWatcher: 'w',
+    }),
+    ['gmgnApiKey', 'gatewayTokenA'],
   );
 });
 

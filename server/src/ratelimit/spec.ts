@@ -6,12 +6,30 @@ export function resolveNum(env: string, def: number): number {
   return v !== undefined && v !== '' && Number.isFinite(n) && n > 0 ? n : def;
 }
 
-export function buildSpecs(gmgnPlanWeight: number): Record<string, ApiLimitSpec> {
-  return {
-    gmgn: {
+/** Limiter key for GMGN key `index` — index 0 keeps the bare `gmgn` name so the
+ *  metrics/test surface for a single-key deploy is unchanged. */
+export function gmgnLimiterKey(index: number): string {
+  return index === 0 ? 'gmgn' : `gmgn:${index}`;
+}
+
+/**
+ * One GMGN limiter PER KEY: GMGN meters by plan weight per ACCOUNT, so each key needs
+ * its own weight bucket AND its own 429/403 gate — a shared limiter would let one
+ * account's 429 gate the others (defeating the whole point of a key pool). Key 0 is
+ * named `gmgn`; keys 1..N-1 are `gmgn:1`..`gmgn:N-1`.
+ */
+export function buildSpecs(
+  gmgnPlanWeight: number,
+  gmgnKeyCount = 1,
+  gmgnPlanWeights: readonly number[] = [],
+): Record<string, ApiLimitSpec> {
+  const specs: Record<string, ApiLimitSpec> = {};
+  for (let i = 0; i < Math.max(1, gmgnKeyCount); i++) {
+    const weight = gmgnPlanWeights[i] ?? gmgnPlanWeight;
+    specs[gmgnLimiterKey(i)] = {
       weightBucket: {
-        capacity: gmgnPlanWeight,
-        refillPerSec: gmgnPlanWeight,
+        capacity: weight,
+        refillPerSec: weight,
         defaultWeight: 1,
       },
       // 429 arms via `x-ratelimit-reset`. 403 arms a FIXED cooldown: the shared
@@ -28,7 +46,10 @@ export function buildSpecs(gmgnPlanWeight: number): Record<string, ApiLimitSpec>
         header: 'x-ratelimit-reset',
       },
       priorityAgingMs: resolveNum('RL_PRIORITY_AGING_MS', 30_000),
-    },
+    };
+  }
+  return {
+    ...specs,
     'solana-rpc': {
       minIntervalMs: resolveNum('RL_SOLANA_RPC_MININTERVALMS', 600),
       gate: { statuses: [429] },

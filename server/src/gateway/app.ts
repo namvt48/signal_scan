@@ -5,6 +5,7 @@
 // internet.
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
+import { config } from '../config.js';
 import { limiters } from '../ratelimit/index.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type Caller, type CallerTokens } from './auth.js';
@@ -17,7 +18,8 @@ import {
   type LimiterRun,
   type UpstreamFetch,
 } from './contract.js';
-import { GMGN_TOKEN_INFO_PATH, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
+import { GMGN_TOKEN_INFO_PATH, createGmgnKeyPool, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
+import type { GmgnKeyPool } from './gmgn-keys.js';
 import {
   DEXSCREENER_LIMITER,
   DEXSCREENER_PATH,
@@ -63,6 +65,9 @@ export interface GatewayAppDeps {
   /** GMGN token/info upstream (todo 8); defaults to the real fetcher. Injectable
    *  so the weighted/403 route is testable with a stub. */
   gmgnUpstream?: UpstreamFetch;
+  /** GMGN multi-key pool (multi-account). Injectable for tests; when absent the app
+   *  builds one from `config.gmgnApiKeys` iff no `gmgnUpstream` stub was injected. */
+  gmgnPool?: GmgnKeyPool;
   /** DexScreener upstream (todo 9); defaults to the real keyless fetcher.
    *  Injectable so the per-class limiter route is testable with a stub. */
   dexUpstream?: UpstreamFetch;
@@ -238,6 +243,11 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   // the todo-11 cache/single-flight — and must pass GMGN_TOKEN_INFO_WEIGHT to
   // the `gmgn` limiter. The real fetcher holds the gateway-held X-APIKEY; tests
   // inject `gmgnUpstream`.
+  const gmgnPool =
+    deps.gmgnPool ??
+    (deps.gmgnUpstream === undefined && config.gmgnApiKeys.length > 0
+      ? createGmgnKeyPool()
+      : undefined);
   const gmgnUpstream = deps.gmgnUpstream ?? gmgnTokenInfoUpstream();
   app.post(GMGN_TOKEN_INFO_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
     const caller = req.caller;
@@ -248,6 +258,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     void handleGmgnTokenInfo(req.body, caller, {
       fetchUpstream: gmgnUpstream,
       runLimiter: deps.runLimiter,
+      pool: gmgnPool,
     }).then((result) => send(res, result), next);
   });
 

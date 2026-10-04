@@ -624,16 +624,20 @@ export class NansenMarketProvider implements MarketDataProvider {
 
   /** First-add kick (new/changed CA): credit token-information for the FULL row,
    * falling back to the free essential door when the key is absent, plus the free
-   * gini card (fresh% — token-information carries none). */
+   * gini card (fresh% — token-information carries none). The essential/base door is
+   * load-bearing — it throws when empty, so a CA with no market core stays owed; a
+   * failed volume/gini door only omits its own columns instead of discarding the row. */
   async tokenInfo(ca: string, chain: Chain): Promise<TokenInfo> {
-    const [vol, gini, full] = await Promise.all([
+    const [volR, giniR, fullR] = await Promise.allSettled([
       this.metric(ca, chain, 'volume'),
       this.metric(ca, chain, 'gini'),
       this.creditTokenInformation(ca, chain),
     ]);
-    const fresh = gini.nansenFreshPct;
-    if (fresh === undefined) throw new Error('nansen gini-stats: no fresh share');
+    const full = fullR.status === 'fulfilled' ? fullR.value : null;
     const base: TokenInformationPatch = full ?? (await this.metric(ca, chain, 'essential'));
+    const vol: MetricPatch = volR.status === 'fulfilled' ? volR.value : {};
+    const gini: MetricPatch = giniR.status === 'fulfilled' ? giniR.value : {};
+    const fresh = gini.nansenFreshPct;
     const nansenHolders = gini.nansenHolders ?? 0;
     const holders = full?.holders ?? 0;
     return {
@@ -650,12 +654,16 @@ export class NansenMarketProvider implements MarketDataProvider {
       supply: base.supply ?? 0,
       ...(base.deployedAt !== undefined ? { deployedAt: base.deployedAt } : {}),
       ...(base.symbol !== undefined ? { symbol: base.symbol } : {}),
-      nansenStats: {
-        holders: nansenHolders > 0 ? nansenHolders : holders,
-        freshSupplyPct: fresh,
-        ...(gini.nansenT100Pct !== undefined ? { t100SupplyPct: gini.nansenT100Pct } : {}),
-        ...(gini.nansenMedianUsd !== undefined ? { medianBalanceUsd: gini.nansenMedianUsd } : {}),
-      },
+      ...(fresh !== undefined
+        ? {
+            nansenStats: {
+              holders: nansenHolders > 0 ? nansenHolders : holders,
+              freshSupplyPct: fresh,
+              ...(gini.nansenT100Pct !== undefined ? { t100SupplyPct: gini.nansenT100Pct } : {}),
+              ...(gini.nansenMedianUsd !== undefined ? { medianBalanceUsd: gini.nansenMedianUsd } : {}),
+            },
+          }
+        : {}),
     };
   }
 

@@ -21,6 +21,7 @@ export { DEFAULT_GATEWAY_PORT };
 export interface GatewayEnv {
   nansenApiKey: string;
   gmgnApiKey: string;
+  gmgnApiKeys: readonly string[];
   gatewayTokenA: string;
   gatewayTokenB: string;
   gatewayTokenWatcher: string;
@@ -34,9 +35,15 @@ const REQUIRED_GATEWAY_ENV: readonly (keyof GatewayEnv)[] = [
   'gatewayTokenWatcher',
 ];
 
-/** Names (never values) of the required keys that are blank. Empty = ready. */
+/** Names (never values) of the required keys that are blank. `gmgnApiKey` is a
+ *  GROUP: satisfied by either `gmgnApiKeys` (preferred, multi-account) or the single
+ *  `gmgnApiKey`. Empty = ready. */
 export function missingGatewayEnv(env: GatewayEnv): string[] {
-  return REQUIRED_GATEWAY_ENV.filter((key) => env[key] === '');
+  return REQUIRED_GATEWAY_ENV.filter((key) =>
+    key === 'gmgnApiKey'
+      ? env.gmgnApiKeys.length === 0 && env.gmgnApiKey === ''
+      : env[key] === '',
+  );
 }
 
 /**

@@ -7,27 +7,29 @@ import { CA_INFLOW_WINDOW_MS, SNAPSHOT_RETENTION_MS, TRACKED_BY_WINDOW_MS, confi
 import type { Chain } from './shared/chain.js';
 import {
   deleteSnapshotsBefore,
-  deleteTrackedCasByIds,
+  deactivateTrackedCasByIds,
   findTrackedCa,
   getSetting,
   getTokenState,
   listCaScoreGateCandidates,
   listCaTargetsMissingEssential,
-  listCaTargetsMissingIcon,
   listCaTargetsMissingSymbol,
   listFomoAlertTargets,
+  listFomoPositionTargets,
   listTrackedCas,
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
   watchedCasForWallet,
+  upsertFomoPosition,
   upsertNansenSeries,
   type CaScoreGateRow,
   type CaTarget,
   type TokenStateRow,
   type WalletRow,
 } from './db.js';
-import { replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo } from './ingest.js';
+import { replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, fillTokenMetrics, recomputeMarketCap } from './ingest.js';
+import { fetchFomoPositions } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
@@ -46,9 +48,8 @@ import { nansenScore } from './signals.js';
 import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx } from './fomo-holdings.js';
 import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
-import { fetchIcons } from './providers/dexscreener.js';
+import { fetchTokenMeta } from './providers/dexscreener.js';
 import { GatewayDenialError, GatewayTransportError } from './gateway-client.js';
-import { HttpError } from './ratelimit/types.js';
 import { log } from './log.js';
 
 interface PollTask {
@@ -90,30 +91,44 @@ function sleep(ms: number): Promise<void> {
  * the instance serves from its OWN DB (the gateway is read-only: nothing is lost).
  * This is NOT a cross-process stale cache — the cache lives in the gateway.
  *
- * Every other failure is a real error and is NEVER swallowed here: an upstream
- * non-2xx rides in as HTTP 200 + `envelope.status` (the provider raises it as an
- * HttpError), and a gateway-generated 429 `{error:"budget_exceeded"}` is a
- * GatewayDenialError. Both rethrow, so `run()`'s existing typed-error path surfaces them.
+ * A per-CA error — an upstream non-2xx surfaced as HttpError, or a gateway denial
+ * (429 budget / 503 gated / 401) — no longer aborts the pass (bug3): it is logged
+ * per-CA and the sweep moves on, and the pass ends with a one-line failure summary.
  */
-export async function runGatewaySweep(where: string, body: () => Promise<void>): Promise<void> {
+export async function runGatewaySweep(
+  where: string,
+  body: (summary: SweepSummary) => Promise<void>,
+): Promise<void> {
+  const summary: SweepSummary = { count: 0 };
   try {
-    await body();
+    await body(summary);
   } catch (e) {
     if (e instanceof GatewayTransportError) {
       log.warn(`[poller] ${where}: gateway unreachable — sweep skipped`, e);
       return;
     }
     throw e;
+  } finally {
+    if (summary.count > 0) {
+      log.warn(`[poller] ${where}: ${summary.count} CA error(s) this pass — logged per-CA, pass continued`);
+    }
   }
 }
 
+/** Per-pass per-CA failure tally, owned by `runGatewaySweep`, bumped by `logProviderError`. */
+export interface SweepSummary {
+  count: number;
+}
+
 /**
- * Per-CA error inside a gateway-backed sweep. A gateway-owned or typed HTTP failure
- * must reach `runGatewaySweep` (fail-open on transport, surface otherwise), so it is
- * rethrown; anything else keeps the pre-existing resilience — logged, next CA tried.
+ * Per-CA error inside a gateway-backed sweep. A TRANSPORT failure still aborts (the
+ * whole sweep is skipped, fail-open) and is NOT counted. Every other per-CA error —
+ * HttpError, GatewayDenialError — is counted, logged, and the sweep CONTINUES to the
+ * next CA, so one bad CA or upstream blip can no longer kill the rest of the pass (bug3).
  */
-function logProviderError(e: unknown, where: string, ...fields: unknown[]): void {
-  if (e instanceof GatewayTransportError || e instanceof HttpError) throw e;
+function logProviderError(summary: SweepSummary, e: unknown, where: string, ...fields: unknown[]): void {
+  if (e instanceof GatewayTransportError) throw e;
+  summary.count += 1;
   log.error(`[poller] ${where}`, ...fields, e);
 }
 
@@ -160,19 +175,43 @@ export async function metricSweep(
   only?: readonly CaTarget[],
 ): Promise<void> {
   const cas = only ?? newCasFirst(listTrackedCas());
-  await runGatewaySweep(`${kind}Sweep`, () =>
+  await runGatewaySweep(`${kind}Sweep`, (summary) =>
     pacedFor(cas, intervalMs, async (c) => {
       try {
         const patch = kind === 'essential'
           ? await withRetry(() => provider.metric(c.address, c.chain, kind), config.essentialRetries)
           : await provider.metric(c.address, c.chain, kind);
         if (kind === 'volume') applyVolumeDelta(c.address, c.chain, patch);
-        updateTokenMetrics(c.address, c.chain, patch);
+        if (kind === 'essential') writeEssential(c.address, c.chain, patch);
+        else updateTokenMetrics(c.address, c.chain, patch);
       } catch (e) {
-        logProviderError(e, `${kind}Sweep`, c.address);
+        logProviderError(summary, e, `${kind}Sweep`, c.address);
       }
     }),
   );
+}
+
+/**
+ * DexScreener OWNS price/symbol (market_cap is derived from price × supply), so the
+ * GMGN essential pass only FILLS those while still NULL — it can seed a token with no
+ * DEX pair but never clobber the owning sweep's fresher value. Its exclusive columns
+ * (liquidity, holders, supply, deployed_at) are a normal overwrite; market_cap is then
+ * recomputed from whichever price × supply now stand.
+ */
+function writeEssential(ca: string, chain: Chain, patch: MetricPatch): void {
+  fillTokenMetrics(ca, chain, {
+    ...(patch.price !== undefined ? { price: patch.price } : {}),
+    ...(patch.symbol !== undefined ? { symbol: patch.symbol } : {}),
+    ...(patch.marketCap !== undefined ? { marketCap: patch.marketCap } : {}),
+  });
+  updateTokenMetrics(ca, chain, {
+    ...(patch.liquidity !== undefined ? { liquidity: patch.liquidity } : {}),
+    ...(patch.holders !== undefined ? { holders: patch.holders } : {}),
+    ...(patch.supply !== undefined ? { supply: patch.supply } : {}),
+    ...(patch.xHandle !== undefined ? { xHandle: patch.xHandle } : {}),
+    ...(patch.deployedAt !== undefined ? { deployedAt: patch.deployedAt } : {}),
+  });
+  recomputeMarketCap(ca, chain);
 }
 
 /**
@@ -210,39 +249,47 @@ export function applyVolumeDelta(ca: string, chain: Chain, patch: MetricPatch): 
 async function symbolBackfillSweep(provider: MarketDataProvider): Promise<void> {
   const cas = listCaTargetsMissingSymbol(config.symbolBackfillWindowMs);
   if (cas.length === 0) return;
-  await runGatewaySweep('symbolBackfill', () =>
+  await runGatewaySweep('symbolBackfill', (summary) =>
     pacedFor(cas, config.pollSymbolBackfillMs, async (c) => {
       try {
         const info = await provider.assetInfo?.(c.address, c.chain);
-        if (info?.symbol !== undefined) updateTokenMetrics(c.address, c.chain, { symbol: info.symbol });
+        if (info?.symbol !== undefined || info?.price !== undefined) {
+          fillTokenMetrics(c.address, c.chain, {
+            ...(info.symbol !== undefined ? { symbol: info.symbol } : {}),
+            ...(info.price !== undefined ? { price: info.price } : {}),
+          });
+          recomputeMarketCap(c.address, c.chain);
+        }
       } catch (e) {
-        logProviderError(e, 'symbolBackfill', c.address);
+        logProviderError(summary, e, 'symbolBackfill', c.address);
       }
     }),
   );
 }
 
 /**
- * Token-icon backfill (DexScreener, keyless + free — deliberately OUTSIDE the
- * MarketDataProvider seam so icons keep landing in every MODE, including when
- * Nansen credits are exhausted). NOT pacedFor-shaped: one batch call covers
- * ≤30 CAs, so fetchIcons walks the chunks sequentially and the await chain IS
- * the pacing — per-item slots exist to protect per-CA rate-limited doors, and
- * this door has none. fetchIcons never throws (a failed chunk = no icons for
- * that chunk; the next sweep is the durable retry).
- *
- * ponytail: a mint with no DEX pair returns no icon and stays NULL, so it is
- * re-asked every sweep — cheap while one call covers 30 CAs. Ceiling: if the
- * icon-less queue ever dominates the sweep, store '' as a checked-and-empty
- * sentinel or add an icon_checked_at column to suppress the re-ask.
+ * DexScreener market sweep (keyless + free — deliberately OUTSIDE the
+ * MarketDataProvider seam so it keeps landing in every MODE, including when Nansen
+ * credits are exhausted or GMGN is throttled). It OWNS symbol/price/icon and walks
+ * the WHOLE tracked queue (not just icon-less rows) so price stays fresh every 15 min
+ * for tokens GMGN is failing on; market_cap is then recomputed from price × GMGN's
+ * supply. NOT pacedFor-shaped: one batch call covers ≤30 CAs, so the await chain IS the
+ * pacing. fetchTokenMeta never throws (a failed chunk = nothing for that chunk; the
+ * next sweep is the durable retry).
  */
-async function iconSweep(): Promise<void> {
-  const cas = listCaTargetsMissingIcon(config.iconWindowMs);
+async function dexMarketSweep(): Promise<void> {
+  const cas: CaTarget[] = listTrackedCas().map((t) => ({ address: t.address, chain: t.chain }));
   if (cas.length === 0) return;
-  const icons = await fetchIcons(cas.map((c) => c.address));
+  const meta = await fetchTokenMeta(cas.map((c) => c.address));
   for (const c of cas) {
-    const iconUrl = icons.get(c.address);
-    if (iconUrl !== undefined) updateTokenMetrics(c.address, c.chain, { iconUrl });
+    const m = meta.get(c.address);
+    if (m === undefined) continue;
+    updateTokenMetrics(c.address, c.chain, {
+      ...(m.iconUrl !== undefined ? { iconUrl: m.iconUrl } : {}),
+      ...(m.symbol !== undefined ? { symbol: m.symbol } : {}),
+      ...(m.price !== undefined ? { price: m.price } : {}),
+    });
+    recomputeMarketCap(c.address, c.chain);
   }
 }
 
@@ -448,7 +495,7 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   if (all.length > cas.length) {
     log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
   }
-  await runGatewaySweep('setupSweep', () =>
+  await runGatewaySweep('setupSweep', (summary) =>
     pacedFor(cas, config.pollSetupRetryMs, async (c) => {
       const key = cacheKey(c.address, c.chain);
       try {
@@ -462,12 +509,12 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
           stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
         }
       } catch (e) {
-        logProviderError(e, 'setupSweep gini', c.address);
+        logProviderError(summary, e, 'setupSweep gini', c.address);
       }
       try {
         await refreshSeries(c.address, c.chain);
       } catch (e) {
-        logProviderError(e, 'setupSweep series', c.address);
+        logProviderError(summary, e, 'setupSweep series', c.address);
       }
       // A storable gini pass stamps info_at — that is the CA's ticket to the 6h
       // cadence. Anything else counts as a miss and doubles its next wait.
@@ -698,12 +745,12 @@ export async function flowsSweep(): Promise<void> {
     const e = getSetupCacheEntry(c.address, c.chain);
     return e !== undefined && !isSeriesFresh(e, now);
   });
-  await runGatewaySweep('flowsSweep', () =>
+  await runGatewaySweep('flowsSweep', (summary) =>
     pacedFor(cas, config.pollFlowsMs, async (c) => {
       try {
         await refreshSeries(c.address, c.chain);
       } catch (e) {
-        logProviderError(e, 'flowsSweep', c.address);
+        logProviderError(summary, e, 'flowsSweep', c.address);
       }
     }),
   );
@@ -785,8 +832,8 @@ export function zeroScoreGate(): void {
       );
     }
     if (doomed.length > 0) {
-      const deleted = deleteTrackedCasByIds(doomed.map((r) => r.id));
-      log.warn(`[poller] zero-score gate: deleted ${deleted}/${doomed.length} CAs`);
+      const deactivated = deactivateTrackedCasByIds(doomed.map((r) => r.id));
+      log.warn(`[poller] zero-score gate: deactivated ${deactivated}/${doomed.length} CAs`);
     }
   } catch (e) {
     log.error('[poller] zeroScoreGate', e);
@@ -832,6 +879,7 @@ export async function walletSweep(provider: MarketDataProvider): Promise<void> {
     }
   }
   await fomoHoldingsSweep();
+  await fomoPositionsSweep();
 }
 
 async function run(task: PollTask): Promise<void> {
@@ -1010,6 +1058,58 @@ export async function fomoHoldingsSweep(): Promise<void> {
   });
 }
 
+/** Refresh ONE trader's displayed positions from the FOMO API. Shared by the
+ *  periodic sweep and the on-alert kick so both write identical rows. */
+async function refreshFomoPositions(fomoUserId: string, handle: string): Promise<void> {
+  const tracked = new Set(listTrackedCas().map((c) => `${c.chain}:${c.address}`));
+  const fetchedAt = Date.now();
+  for (const p of await fetchFomoPositions(handle)) {
+    if (!tracked.has(`${p.chain}:${p.ca}`)) continue;
+    upsertFomoPosition({
+      fomo_user_id: fomoUserId,
+      ca: p.ca,
+      chain: p.chain,
+      trade_id: p.tradeId,
+      status: p.status,
+      amount: p.amount,
+      cost_basis_usd: p.costBasisUsd,
+      avg_entry_price: p.avgEntryPrice,
+      price_usd: p.priceUsd,
+      realized_pnl_usd: p.realizedPnlUsd,
+      unrealized_pnl_usd: p.unrealizedPnlUsd,
+      fetched_at: fetchedAt,
+    });
+  }
+}
+
+/** On-alert refresh (user 2026-10-01): the dash must show the real cost basis the
+ *  moment the trade lands, not 3 hours later when the wallet cadence comes round.
+ *  Serialized on fomoKickDrain like kickFomoHoldings so an alert burst cannot
+ *  stampede the API. */
+export function kickFomoPositions(fomoUserId: string, handle: string): void {
+  if (handle === '' || config.fomoApiKey === '') return;
+  fomoKickDrain = fomoKickDrain.then(() => refreshFomoPositions(fomoUserId, handle));
+}
+
+/** Periodic backstop for the kick: re-syncs every displayed (user, CA, chain) on
+ *  the wallet cadence, paced over ~10 minutes so a pass stays well under the API's
+ *  burst limit — a 60s pass for the same 39 traders earned 429/503 and shares the
+ *  budget with the alert daemon (measured 2026-10-01). The on-alert kick is what
+ *  keeps the dash current; this only catches what the kick missed. No-ops without
+ *  a key; a CA no longer tracked is skipped. */
+export async function fomoPositionsSweep(): Promise<void> {
+  if (config.fomoApiKey === '') return;
+  const targets = listFomoPositionTargets();
+  if (targets.length === 0) return;
+  await pacedFor(targets, Math.min(config.pollWalletsMs, 600_000), async (t) => {
+    try {
+      await refreshFomoPositions(t.fomo_user_id, t.handle);
+    } catch (e) {
+      log.error('[poller] fomoPositionsSweep', t.handle, e);
+    }
+  });
+}
+
 /** Token info + Nansen series for each CA, immediately — plus its wallet links. */
 export function kickCAs(cas: readonly { address: string; chain: Chain }[]): void {
   if (!pollerDeps) return;
@@ -1136,14 +1236,14 @@ export function startPoller(provider: MarketDataProvider, nansenApi: NansenApiCl
           provider,
           'essential',
           config.pollEssentialGapMs,
-          listCaTargetsMissingEssential(config.essentialGapWindowMs).filter((c) => !isTooNewToken(c.address, c.chain, Date.now())),
+          listCaTargetsMissingEssential().filter((c) => !isTooNewToken(c.address, c.chain, Date.now())),
         ),
     },
     { name: 'volumeSweep', intervalMs: config.pollVolumeMs, fn: () => metricSweep(provider, 'volume', config.pollVolumeMs) },
     { name: 'flowsSweep', intervalMs: config.pollFlowsMs, fn: () => flowsSweep() },
     { name: 'walletSweep', intervalMs: config.pollWalletsMs, fn: () => walletSweep(provider) },
     { name: 'symbolBackfillSweep', intervalMs: config.pollSymbolBackfillMs, fn: () => symbolBackfillSweep(provider) },
-    { name: 'iconSweep', intervalMs: config.pollIconMs, fn: () => iconSweep() },
+    { name: 'dexMarketSweep', intervalMs: config.pollIconMs, fn: () => dexMarketSweep() },
   ];
   if (config.crawlEnabled) {
     // F1=(b) (plan setup-fill-on-add T5): the marks count from the SYSTEM deploy

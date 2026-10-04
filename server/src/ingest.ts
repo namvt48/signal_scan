@@ -11,7 +11,7 @@ import type {
   WalletActivity,
   WalletTokenHolding,
 } from './providers/provider.js';
-import { getDb, getTokenState } from './db.js';
+import { clearZeroHolding, getDb, getTokenState, recordZeroHolding } from './db.js';
 
 export interface UpsertTokenOptions {
   /** Precomputed top-100 decrease percent (undefined -> stored as NULL). */
@@ -114,6 +114,7 @@ const METRIC_WRITERS: readonly (readonly [keyof MetricPatch, string, boolean?])[
   ['deployedAt', 'deployed_at'],
   ['symbol', 'symbol'],
   ['iconUrl', 'icon_url'],
+  ['xHandle', 'x_handle'],
   ['holders', 'holders'],
   ['nansenHolders', 'nansen_holders'],
   ['nansenFreshPct', 'nansen_fresh_pct'],
@@ -148,6 +149,45 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch)
        ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
     )
     .run(ca, chain, ...vals, Date.now());
+}
+
+/**
+ * Fill-only write: a column is set ONLY while it is still NULL
+ * (`COALESCE(token_state.col, excluded.col)`). Used by the NON-owning provider of a
+ * field to seed it (e.g. GMGN supplying price/symbol for a token DexScreener has no
+ * pair for) without ever clobbering the owning sweep's fresher value.
+ */
+export function fillTokenMetrics(ca: string, chain: Chain, patch: MetricPatch): void {
+  const cols: string[] = [];
+  const vals: unknown[] = [];
+  const sets: string[] = [];
+  for (const [key, col] of METRIC_WRITERS) {
+    const v = patch[key];
+    if (v === undefined) continue;
+    cols.push(col);
+    vals.push(v);
+    sets.push(`${col} = COALESCE(token_state.${col}, excluded.${col})`);
+  }
+  if (cols.length === 0) return;
+  sets.push('fetched_at = excluded.fetched_at');
+  const placeholders = cols.map(() => '?').join(', ');
+  getDb()
+    .prepare(
+      `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
+       ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
+    )
+    .run(ca, chain, ...vals, Date.now());
+}
+
+/**
+ * market_cap = price × supply. price is owned by DexScreener, supply by GMGN — so the
+ * derived value is recomputed after either owner writes. A NULL on either side leaves
+ * the last computed market_cap untouched rather than zeroing it.
+ */
+export function recomputeMarketCap(ca: string, chain: Chain): void {
+  getDb()
+    .prepare('UPDATE token_state SET market_cap = price * supply WHERE ca = ? AND chain = ? AND price IS NOT NULL AND supply IS NOT NULL')
+    .run(ca, chain);
 }
 
 /**
@@ -244,7 +284,11 @@ export function replaceWalletBalances(walletId: string, chain: Chain, rows: Wall
     const priceCache = new Map<string, number | null>();
     for (const r of current) {
       del.run(wid, r.ca, chain);
-      if (r.amount <= 0) continue;
+      if (r.amount <= 0) {
+        recordZeroHolding('wallet', wid, r.ca, chain);
+        continue;
+      }
+      clearZeroHolding('wallet', wid, r.ca, chain);
       let price = priceCache.get(r.ca);
       if (price === undefined) {
         const p = getTokenState(r.ca, chain)?.price;

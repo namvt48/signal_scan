@@ -7,7 +7,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { deleteTrackedCa, insertTrackedCa, listTiers, open, pruneUntrackedCas, setTier } from '../src/db.js';
+import { deleteTier, deleteTrackedCa, insertTrackedCa, listTiers, open, pruneUntrackedCas, setTier } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { assembleSignals } from '../src/signals.js';
 // AUTH CONTRACT v1: PUT /api/tier is admin-only — sign a REAL admin ID token
@@ -148,13 +148,69 @@ test('PUT /api/tier: 404 for a CA that is not tracked', async () => {
   assert.equal(wrongChain.status, 404);
 });
 
-test('PUT /api/tier: P (the dashboard-only tier) is accepted and stored', async () => {
+test('PUT /api/tier: P (Pass) is saved in token_tiers, removed from dashboard, and blocked from re-adding', async () => {
   insertTrackedCa({ address: 'caTier-P-004', chain: 'sol', note: '' });
   const res = await put({ ca: 'caTier-P-004', chain: 'sol', tier: 'P' });
   assert.equal(res.status, 200);
   assert.deepEqual(res.json, { ca: 'caTier-P-004', chain: 'sol', tier: 'P' });
   assert.equal(tierOf('caTier-P-004'), 'P');
-  assert.equal(signalTier('caTier-P-004'), 'P');
+  // Dropped from dashboard:
+  assert.equal(signalTier('caTier-P-004'), undefined);
+  // Blocked from re-adding:
+  assert.throws(() => insertTrackedCa({ address: 'caTier-P-004', chain: 'sol', note: '' }), /tier is Pass/);
+});
+
+test('immutable Pass tombstone: cannot be cleared (null), re-rated (B), or re-added even with BUY trade', async () => {
+  const CA_PASS = 'caTier-P-immutable';
+  insertTrackedCa({ address: CA_PASS, chain: 'sol', note: '' });
+  await put({ ca: CA_PASS, chain: 'sol', tier: 'P' });
+  assert.equal(tierOf(CA_PASS), 'P');
+
+  // 1. Attempt to clear tier via PUT /api/tier with null -> 409 Conflict
+  const clearRes = await put({ ca: CA_PASS, chain: 'sol', tier: null });
+  assert.equal(clearRes.status, 409);
+  assert.equal(tierOf(CA_PASS), 'P');
+
+  // 2. Attempt to re-rate via PUT /api/tier with 'B' -> 409 Conflict
+  const rerateRes = await put({ ca: CA_PASS, chain: 'sol', tier: 'B' });
+  assert.equal(rerateRes.status, 409);
+  assert.equal(tierOf(CA_PASS), 'P');
+
+  // 3. Direct DB helper attempts throw
+  assert.throws(() => deleteTier(CA_PASS, 'sol'), /permanently blocked as Pass/);
+  assert.throws(() => setTier(CA_PASS, 'sol', 'B'), /permanently blocked as Pass/);
+  assert.equal(tierOf(CA_PASS), 'P');
+
+  // 4. Inflow attempt via POST /api/wallet-watch/trades is skipped
+  const tradeRes = await fetch(`${base}/api/wallet-watch/trades`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: adminAuth },
+    body: JSON.stringify({
+      wallet: 'any-wallet',
+      ca: CA_PASS,
+      chain: 'sol',
+      side: 'buy',
+      tx: 'tx-immutable-buy',
+      ts: Date.now(),
+      amountUsd: 1000,
+    }),
+  });
+  assert.equal(tradeRes.status, 200);
+  const tradeJson = await tradeRes.json();
+  assert.deepEqual(tradeJson, { inserted: 0, skipped: 'pass-tier' });
+
+  // 5. Inflow attempt via POST /api/tracked-cas is skipped
+  const addRes = await fetch(`${base}/api/tracked-cas`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: adminAuth },
+    body: JSON.stringify({ address: CA_PASS, chain: 'sol', note: 'attempt re-add' }),
+  });
+  assert.equal(addRes.status, 200);
+  const addJson = await addRes.json();
+  assert.deepEqual(addJson, { skipped: 'pass-tier' });
+
+  // 6. Direct insert throws
+  assert.throws(() => insertTrackedCa({ address: CA_PASS, chain: 'sol', note: '' }), /tier is Pass/);
 });
 
 test('tier map is permanent: pruning keeps the row, re-adding the CA restores the tier', () => {

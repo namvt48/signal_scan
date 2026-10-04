@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes } from 'react';
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type SelectHTMLAttributes } from 'react';
 import { Check, Copy, Warning, X } from '@phosphor-icons/react';
 import { TIERS, type Tier } from '../types';
 
@@ -158,28 +158,143 @@ export function TierBadge({ tier }: { tier: string | null }) {
   }
   return (
     <span className={`inline-flex h-5 min-w-6 items-center justify-center rounded border px-1.5 font-mono text-xs ${TIER_STYLES[tier] ?? TIER_STYLES.B}`}>
-      {tier}
+      {tier === 'P' ? 'Pass' : tier}
     </span>
   );
 }
 
-/** Native tier picker used in the table's Tier column. '' = unrated (−). */
+/**
+ * Tier picker used in the table's Tier column. A native <select> cannot open on hover, so
+ * this is a custom listbox: the trigger keeps `.tier-select` + `data-tier` (index.css owns
+ * the chip colours) and the menu is `fixed` so the table's `overflow-x-auto` ancestor cannot
+ * clip it — the same reason TokenAvatar's preview is fixed.
+ */
+const TIER_OPTIONS: { value: Tier | null; label: string }[] = [
+  { value: null, label: '−' },
+  ...TIERS.map((t) => ({ value: t, label: t === 'P' ? 'Pass' : t })),
+];
+
 export function TierSelect({ tier, onChange, className = '' }: { tier: Tier | null; onChange: (tier: Tier | null) => void; className?: string }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; top: number; minWidth: number } | null>(null);
+  const [highlight, setHighlight] = useState(0);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const hoverClose = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (hoverClose.current) clearTimeout(hoverClose.current);
+  }, []);
+
+  const cancelClose = () => {
+    if (hoverClose.current) {
+      clearTimeout(hoverClose.current);
+      hoverClose.current = null;
+    }
+  };
+
+  const openMenu = () => {
+    cancelClose();
+    const r = trigger.current?.getBoundingClientRect();
+    if (r) setPos({ left: r.left, top: r.bottom + 2, minWidth: r.width });
+    setHighlight(Math.max(0, TIER_OPTIONS.findIndex((o) => o.value === tier)));
+    setOpen(true);
+  };
+
+  const closeMenu = () => {
+    cancelClose();
+    setOpen(false);
+  };
+
+  // Delay so the pointer can travel from the trigger across the gap into the menu.
+  const scheduleClose = () => {
+    cancelClose();
+    hoverClose.current = setTimeout(() => setOpen(false), 120);
+  };
+
+  const select = (value: Tier | null) => {
+    onChange(value);
+    closeMenu();
+  };
+
+  // `fixed` means a stale menu would float in place while the page scrolls, so close on scroll.
+  useEffect(() => {
+    if (!open) return;
+    const onScroll = () => setOpen(false);
+    window.addEventListener('scroll', onScroll, true);
+    return () => window.removeEventListener('scroll', onScroll, true);
+  }, [open]);
+
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Escape') {
+      closeMenu();
+      return;
+    }
+    if (!open) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openMenu();
+      }
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHighlight((h) => Math.min(h + 1, TIER_OPTIONS.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlight((h) => Math.max(h - 1, 0));
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      select(TIER_OPTIONS[highlight]?.value ?? null);
+    }
+  };
+
   return (
-    <select
-      value={tier ?? ''}
-      onChange={(e) => onChange(e.target.value === '' ? null : (e.target.value as Tier))}
-      aria-label="Tier"
-      data-tier={tier ?? ''}
-      className={`tier-select ${className}`}
+    <span
+      className="relative inline-block"
+      onMouseLeave={scheduleClose}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) closeMenu();
+      }}
     >
-      <option value="">−</option>
-      {TIERS.map((t) => (
-        <option key={t} value={t}>
-          {t}
-        </option>
-      ))}
-    </select>
+      <button
+        ref={trigger}
+        type="button"
+        aria-label="Tier"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        data-tier={tier ?? ''}
+        onMouseEnter={openMenu}
+        onClick={() => (open ? closeMenu() : openMenu())}
+        onKeyDown={onKeyDown}
+        className={`tier-select ${className}`}
+      >
+        {tier === 'P' ? 'Pass' : tier ?? '−'}
+      </button>
+      {open && pos && (
+        <div
+          role="listbox"
+          aria-label="Tier"
+          className="fixed z-50 overflow-hidden rounded-lg border border-line bg-surface py-1 shadow-md"
+          style={{ left: pos.left, top: pos.top, minWidth: pos.minWidth }}
+        >
+          {TIER_OPTIONS.map((o, i) => (
+            <div
+              key={o.label}
+              role="option"
+              aria-selected={o.value === tier}
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setHighlight(i)}
+              onClick={() => select(o.value)}
+              className={`cursor-pointer px-2.5 py-1 text-center font-mono text-[11.5px] font-semibold transition-colors ${
+                i === highlight ? 'bg-surface2 text-ink' : 'text-ink2 hover:bg-surface2 hover:text-ink'
+              }`}
+            >
+              {o.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </span>
   );
 }
 
@@ -260,7 +375,7 @@ export function Th({ className = '', children, title }: { className?: string; ch
   return (
     <th
       title={title}
-      className={`sticky top-0 z-10 whitespace-nowrap border-b-2 border-line bg-surface3 px-[14px] py-[14px] text-left text-[11px] font-semibold uppercase tracking-[0.03em] text-muted ${className}`}
+      className={`sticky top-0 z-10 whitespace-nowrap border-b-2 border-line bg-surface3 px-[14px] py-[14px] text-left text-[12.5px] font-extrabold uppercase tracking-[0.03em] text-muted ${className}`}
     >
       {children}
     </th>
@@ -375,7 +490,7 @@ export function ErrorState({ message, onRetry }: { message: string; onRetry?: ()
 
 // --- modal ------------------------------------------------------------------------------
 
-export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+export function Modal({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: ReactNode; className?: string }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -390,7 +505,7 @@ export function Modal({ title, onClose, children }: { title: string; onClose: ()
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-md rounded-xl border border-line bg-surface p-5 shadow-2xl">
+      <div role="dialog" aria-modal="true" aria-label={title} className={`w-full max-w-md rounded-xl border border-line bg-surface p-5 shadow-2xl ${className}`}>
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-ink">{title}</h2>
           <IconButton onClick={onClose} aria-label="Close">

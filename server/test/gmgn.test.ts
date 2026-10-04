@@ -56,6 +56,16 @@ test('parseTokenInfo: zero/absent readings are OMITTED so they cannot clobber a 
   assert.equal(p.volume1h, 0);
 });
 
+test('parseTokenInfo: X handle is normalized and charset-validated, junk is omitted', () => {
+  const withAt = parseTokenInfo({ code: 0, data: { symbol: 'X', link: { twitter_username: '@bonk_inu' } } });
+  assert.equal(withAt.xHandle, 'bonk_inu');
+  // MINI's live row has no link block → no handle (the FE falls back to a CA search)
+  assert.equal('xHandle' in parseTokenInfo(MINI), false);
+  // a value that would build a broken x.com URL is dropped, not stored
+  const junk = parseTokenInfo({ code: 0, data: { symbol: 'X', link: { twitter_username: 'a/b c' } } });
+  assert.equal('xHandle' in junk, false);
+});
+
 test('parseTokenInfo: throws on a non-zero code and on a data-less body', () => {
   assert.throws(() => parseTokenInfo({ code: 404, error: 'TOKEN_NOT_FOUND' }), /TOKEN_NOT_FOUND/);
   assert.throws(() => parseTokenInfo({ code: 0 }), /no data/);
@@ -108,6 +118,108 @@ test('CompositeProvider: routes essential+volume to GMGN, gini to Nansen', async
   assert.equal((await c.metric('ca', 'sol', 'volume')).volume24h, 1);
   assert.equal((await c.metric('ca', 'sol', 'gini')).nansenFreshPct, 5);
   assert.deepEqual(calls, ['gmgn:essential', 'gmgn:volume', 'nansen:gini']);
+});
+
+test('CompositeProvider.tokenInfo: a failing gini door keeps the GMGN market core (no full abort)', async () => {
+  const gmgn: GmgnProvider = {
+    name: 'gmgn',
+    metric: async (_ca, _chain, kind) =>
+      kind === 'volume'
+        ? { volume24h: 1, buyVol24h: 0, sellVol24h: 0 }
+        : { price: 2, symbol: 'BEM', marketCap: 9, supply: 4, holders: 8, liquidity: 1 },
+    assetInfo: async () => ({ symbol: 'BEM' }),
+  };
+  const nansen: MarketDataProvider = {
+    name: 'nansen',
+    tokenInfo: async () => {
+      throw new Error('unused');
+    },
+    metric: async () => {
+      throw new Error('nansen gini-stats 403');
+    },
+    walletTokenHoldings: async () => [],
+  };
+  const info = await new CompositeProvider(gmgn, nansen).tokenInfo('ca', 'bsc');
+  assert.equal(info.symbol, 'BEM');
+  assert.equal(info.price, 2);
+  assert.equal(info.marketCap, 9);
+  assert.equal(info.nansenStats, undefined, 'a failed gini door must omit nansenStats, not abort the write');
+});
+
+test('CompositeProvider.metric: a gated GMGN essential door falls back to Nansen', async () => {
+  const calls: string[] = [];
+  const gmgn: GmgnProvider = {
+    name: 'gmgn',
+    metric: async (_ca, _chain, kind) => {
+      calls.push(`gmgn:${kind}`);
+      if (kind === 'essential') throw new Error('gmgn essential 503 gated');
+      return { volume24h: 1 };
+    },
+    assetInfo: async () => ({}),
+  };
+  const nansen: MarketDataProvider = {
+    name: 'nansen',
+    tokenInfo: async () => {
+      throw new Error('unused');
+    },
+    metric: async (_ca, _chain, kind) => {
+      calls.push(`nansen:${kind}`);
+      return { price: 3, supply: 4, symbol: 'NAN', deployedAt: 123 };
+    },
+    walletTokenHoldings: async () => [],
+  };
+  const patch = await new CompositeProvider(gmgn, nansen).metric('ca', 'sol', 'essential');
+  assert.equal(patch.symbol, 'NAN');
+  assert.equal(patch.supply, 4);
+  assert.deepEqual(calls, ['gmgn:essential', 'nansen:essential']);
+});
+
+test('CompositeProvider.tokenInfo: a gated GMGN essential door keeps the CA writable via Nansen', async () => {
+  const gmgn: GmgnProvider = {
+    name: 'gmgn',
+    metric: async (_ca, _chain, kind) => {
+      if (kind === 'essential') throw new Error('gmgn essential 503 gated');
+      return { volume24h: 1, buyVol24h: 0, sellVol24h: 0 };
+    },
+    assetInfo: async () => ({}),
+  };
+  const nansen: MarketDataProvider = {
+    name: 'nansen',
+    tokenInfo: async () => {
+      throw new Error('unused');
+    },
+    metric: async (_ca, _chain, kind) =>
+      kind === 'essential'
+        ? { price: 3, supply: 4, symbol: 'NAN', marketCap: 12, liquidity: 5, deployedAt: 123 }
+        : { nansenFreshPct: 5, nansenHolders: 7 },
+    walletTokenHoldings: async () => [],
+  };
+  const info = await new CompositeProvider(gmgn, nansen).tokenInfo('ca', 'sol');
+  assert.equal(info.symbol, 'NAN');
+  assert.equal(info.supply, 4);
+  assert.equal(info.nansenStats?.freshSupplyPct, 5);
+});
+
+test('CompositeProvider.tokenInfo: BOTH essential doors failing still throws (nothing worth writing)', async () => {
+  const gmgn: GmgnProvider = {
+    name: 'gmgn',
+    metric: async (_ca, _chain, kind) => {
+      if (kind === 'essential') throw new Error('gmgn essential 500');
+      return { volume24h: 1 };
+    },
+    assetInfo: async () => ({}),
+  };
+  const nansen: MarketDataProvider = {
+    name: 'nansen',
+    tokenInfo: async () => {
+      throw new Error('unused');
+    },
+    metric: async () => {
+      throw new Error('nansen essential 403');
+    },
+    walletTokenHoldings: async () => [],
+  };
+  await assert.rejects(new CompositeProvider(gmgn, nansen).tokenInfo('ca', 'sol'), /nansen essential 403/);
 });
 
 test('applyVolumeDelta: keeps a provider-supplied 1h volume, derives only when absent', () => {

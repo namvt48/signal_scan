@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { insertTrackedCa, listTrackedCas, open } from '../src/db.js';
+import { findTrackedCa, insertTrackedCa, listTrackedCas, open } from '../src/db.js';
 import { getThresholds, updateThresholds } from '../src/settings.js';
 import { assembleSignals } from '../src/signals.js';
 import { createApp } from '../src/api.js';
@@ -142,4 +142,27 @@ test('POST /api/tracked-cas: absent usd fails open (201) — unknown price still
   // Then: fail-open — inserted exactly as before the gate existed.
   assert.equal(res.status, 201);
   assert.ok(trackedAddresses().includes('caGate-null-104'));
+});
+
+test('POST /api/tracked-cas: a CA tracked with sub-threshold entry_usd upgrades when a qualifying buy arrives', async () => {
+  const ca = 'caGate-upgrade-105';
+  // Step 1: initial buy unpriced -> queued with NULL entry_usd.
+  const r1 = await postTrackedCa({ address: ca, chain: 'sol', note: '' });
+  assert.equal(r1.status, 201);
+  assert.equal(findTrackedCa(ca, 'sol')?.entry_usd, null);
+
+  // Step 2: dust buy ($0.71) backfills entry_usd.
+  const r2 = await postTrackedCa({ address: ca, chain: 'sol', note: '', usd: 0.71 });
+  assert.equal(r2.status, 200);
+  assert.equal(findTrackedCa(ca, 'sol')?.entry_usd, 0.71);
+
+  // Step 3: real buy ($224.79) arrives -> upgrades entry_usd past the minUsd gate.
+  const r3 = await postTrackedCa({ address: ca, chain: 'sol', note: '', usd: 224.79 });
+  assert.equal(r3.status, 200);
+  assert.equal(findTrackedCa(ca, 'sol')?.entry_usd, 224.79);
+
+  // Step 4: further buys do not overwrite once qualifying (returns 409 already tracked).
+  const r4 = await postTrackedCa({ address: ca, chain: 'sol', note: '', usd: 500 });
+  assert.equal(r4.status, 409);
+  assert.equal(findTrackedCa(ca, 'sol')?.entry_usd, 224.79);
 });

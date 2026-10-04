@@ -6,6 +6,7 @@ Tách từ scripts/wallet_watch.py (T7) — dời nguyên văn.
 """
 
 import json
+import random
 import sys
 import time
 from typing import Any, Iterator
@@ -31,7 +32,9 @@ def _handle_tx(tx, sig, wallets, st) -> None:
     `_warm_prices` chạy TRƯỚC detect_swaps (giá quote phải có sẵn trong cache);
     `_target_event` gộp cả tx về ĐÚNG 1 token đích để `track_event` — log/
     `events.jsonl` vẫn giữ đủ MỌI step để soi route."""
-    if config._cfg_next and time.time() >= config._cfg_next:  # ~5 phút/lần, chỉ khi tới hạn
+    if (
+        config._cfg_next and time.time() >= config._cfg_next
+    ):  # ~5 phút/lần, chỉ khi tới hạn
         load_config_from_api(wallets)
     # FIX discovery: accountKeys (dù đã merge ALT qua _keys) vẫn bỏ sót ví chỉ
     # xuất hiện qua ATA của nó — 3jjAdrCK: EC2f5Dn nhận 15.000 USDC mà KHÔNG nằm
@@ -237,6 +240,26 @@ def _wss(url: str) -> str:
     return url.replace("https://", "wss://").replace("http://", "ws://")
 
 
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _valid_pubkey(addr) -> bool:
+    """base58 (bảng chữ Bitcoin) giải mã đúng 32 byte. Không checksum (sol key
+    không có) — chỉ để loại rác non-base58: Helius `mentions` từ chối CẢ shard
+    khi có 1 địa chỉ sai ⇒ 1 ví rác giết 33 ví (đo 2026-10-02: shard 5 chết vì
+    'Kaduna'/'SerBeetle')."""
+    if not 32 <= len(addr) <= 44:
+        return False
+    n = 0
+    for c in addr:
+        i = _B58.find(c)
+        if i < 0:
+            return False
+        n = n * 58 + i
+    lead = len(addr) - len(addr.lstrip("1"))
+    return lead + (n.bit_length() + 7) // 8 == 32
+
+
 # Helius free cap số subscription MỖI KEY: dồn 198 sub (1 logsSubscribe/ví) vào 1
 # connection/1 key ⇒ `1013 Rate limit reached: Too many subscriptions`, mỗi
 # reconnect lại đẩy đủ 198 sub ⇒ hố không nhận event (đo 09-24: mất 3 tx). Chia
@@ -289,19 +312,45 @@ def run_ws_feed(wallets, st) -> None:
     except ImportError:
         sys.exit("feed=ws cần:  pip install websockets   (hoặc --feed block)")
 
+    dropped = [w for w in wallets if not _valid_pubkey(w)]
+    if dropped:
+        print(
+            f"# feed=ws bỏ {len(dropped)} ví non-base58 (Helius từ chối cả shard): "
+            + ", ".join(d[:12] for d in dropped),
+            file=sys.stderr,
+            flush=True,
+        )
+        wallets = [w for w in wallets if _valid_pubkey(w)]
+
     async def _beat_loop():
         while True:  # watchdog coi heartbeat là sống; ví im lặng vẫn phải đập nhịp
             _beat()
             await asyncio.sleep(30)
 
-    async def _shard(sid, sliced, eps, nshard):
+    async def _worker(q):
+        """A: getTransaction (urllib blocking, timeout 20s + retry) chạy trong thread
+        để KHÔNG chặn event loop — loop rảnh mới trả pong kịp (hết 1011 keepalive
+        timeout). Một worker duy nhất giữ `st` đơn luồng nên không cần lock."""
+        while True:
+            sig, err = await q.get()
+            try:
+                await asyncio.to_thread(process_sig, sig, wallets, st, err)
+            except Exception as e:  # process_sig tự bắt rồi; đây chỉ là chốt chặn
+                print(
+                    f"  ! worker process_sig {sig[:12]}…: {type(e).__name__}: {str(e)[:80]}",
+                    file=sys.stderr,
+                )
+
+    async def _shard(sid, sliced, eps, nshard, q):
         k = sid  # shard khởi động ở key riêng ⇒ các connection không trùng key
+        backoff = 1.0
         while True:
             try:
                 async with websockets.connect(
                     _wss(eps[k % len(eps)]),
                     open_timeout=10,
                     ping_interval=20,
+                    ping_timeout=60,  # B: loop có thể vướng thoáng qua, đừng giết socket
                     max_size=None,
                 ) as ws:
                     for i, w in enumerate(
@@ -323,6 +372,7 @@ def run_ws_feed(wallets, st) -> None:
                         flush=True,
                     )
                     _beat()
+                    backoff = 1.0  # kết nối + subscribe OK ⇒ reset backoff
                     while True:
                         m = json.loads(await ws.recv())
                         _beat()
@@ -335,29 +385,35 @@ def run_ws_feed(wallets, st) -> None:
                             raise RuntimeError(str(p["error"])[:60])
                         v = p.get("result", {}).get("value", {})
                         if v.get("signature"):
-                            # ponytail: process_sig đồng bộ trong event loop (chặn
-                            # recv ~0.1–1s/tx) — đủ vì lượng tx/ví thấp; nghẽn thì
-                            # đẩy sang to_thread + lock quanh st.
-                            process_sig(v["signature"], wallets, st, v.get("err"))
+                            # A: đẩy tx sang worker (to_thread) — KHÔNG chặn recv,
+                            # nên loop vẫn trả keepalive pong (hết 1011 timeout).
+                            await q.put((v["signature"], v.get("err")))
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
                 k += 1
+                delay = (
+                    backoff + random.random()
+                )  # C: jitter — 6 shard đừng hồi cùng lúc
                 print(
                     f"  ! ws đứt shard {sid + 1} ({type(e).__name__}: {str(e)[:70]})"
-                    " -> key kế, reconnect sau 2s",
+                    f" -> key kế, reconnect sau {delay:.1f}s",
                     file=sys.stderr,
                 )
-                await asyncio.sleep(2)
+                await asyncio.sleep(delay)
+                backoff = min(60.0, backoff * 2)
 
     async def _run():
         # chỉ shard trên endpoint CHÍNH: default (publicnode/mainnet-beta) không
         # nhận logsSubscribe ⇒ shard thừa chỉ reconnect-loop (log cũ "ws đứt shard 7").
         eps = [u for u in config.RPCS if u not in RPC_DEFAULTS] or list(config.RPCS)
         slices = _ws_shards(wallets, len(eps))
-        tasks = [asyncio.create_task(_beat_loop())]
+        q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(
+            maxsize=2000
+        )  # A: hàng đợi tx cho worker
+        tasks = [asyncio.create_task(_beat_loop()), asyncio.create_task(_worker(q))]
         for sid, sliced in enumerate(slices):
-            tasks.append(asyncio.create_task(_shard(sid, sliced, eps, len(slices))))
+            tasks.append(asyncio.create_task(_shard(sid, sliced, eps, len(slices), q)))
         await asyncio.gather(*tasks)
 
     asyncio.run(_run())

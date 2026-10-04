@@ -75,7 +75,7 @@ test('same address on 2 chains = 2 distinct wallets, resolved by (address, chain
 });
 
 test('POST /api/wallets: same address + different chain is allowed, same (address,chain) is 409', async () => {
-  const addr2 = '0xAnotherAddressForHttpBoundaryTests0000000001';
+  const addr2 = 'So11111111111111111111111111111111111111112';
   const first = await postWallet({ address: addr2, name: 'W1', tags: [], chain: 'sol', source: 'test' });
   assert.equal(first.status, 201);
   const second = await postWallet({ address: addr2, name: 'W2', tags: [], chain: 'base', source: 'test' });
@@ -83,6 +83,12 @@ test('POST /api/wallets: same address + different chain is allowed, same (addres
   assert.notEqual(second.json.id, first.json.id);
   const dup = await postWallet({ address: addr2, name: 'W3', tags: [], chain: 'base', source: 'test' });
   assert.equal(dup.status, 409);
+});
+
+test('POST /api/wallets: a non-base58 sol address is rejected (would poison the ws shard)', async () => {
+  const bad = await postWallet({ address: 'not-a-base58-address!!', name: 'BAD', tags: [], chain: 'sol', source: 'test' });
+  assert.equal(bad.status, 400);
+  assert.match(bad.json.error, /sol address/);
 });
 
 test('PATCH /api/wallets/:id: moving a wallet onto an existing (address,chain) is 409', async () => {

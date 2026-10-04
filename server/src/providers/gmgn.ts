@@ -63,7 +63,12 @@ interface GmgnData {
   liquidity?: string;
   creation_timestamp?: number;
   price?: GmgnPriceBlock;
+  /** Social links block; only twitter_username is consumed (bare handle, e.g. "bonk_inu"). */
+  link?: { twitter_username?: string; website?: string; telegram?: string };
 }
+
+/** X handles are 1–15 of [A-Za-z0-9_]; anything else would build a broken x.com URL → drop it. */
+const X_HANDLE_RE = /^[A-Za-z0-9_]{1,15}$/;
 
 export interface GmgnTokenInfoResponse {
   code?: number;
@@ -92,6 +97,10 @@ export function parseTokenInfo(json: GmgnTokenInfoResponse): MetricPatch {
   const liquidity = num(d.liquidity);
   const created = num(d.creation_timestamp);
   const sym = typeof d.symbol === 'string' ? d.symbol.trim() : '';
+  // Strip a leading '@' (GMGN sometimes includes it) then validate the charset — a handle that
+  // fails validation is omitted rather than written, so the FE's fallback search link still works.
+  const rawHandle = typeof d.link?.twitter_username === 'string' ? d.link.twitter_username.trim().replace(/^@+/, '') : '';
+  const xHandle = X_HANDLE_RE.test(rawHandle) ? rawHandle : '';
   return {
     ...(price > 0 ? { price } : {}),
     ...(supply > 0 ? { supply } : {}),
@@ -104,6 +113,7 @@ export function parseTokenInfo(json: GmgnTokenInfoResponse): MetricPatch {
     volume1h: num(p.volume_1h),
     ...(created > 0 ? { deployedAt: created * 1000 } : {}),
     ...(sym !== '' ? { symbol: sym } : {}),
+    ...(xHandle !== '' ? { xHandle } : {}),
   };
 }
 
@@ -153,6 +163,7 @@ export class GmgnMarketProvider implements GmgnProvider {
       ...(p.liquidity !== undefined ? { liquidity: p.liquidity } : {}),
       ...(p.holders !== undefined ? { holders: p.holders } : {}),
       ...(p.symbol !== undefined ? { symbol: p.symbol } : {}),
+      ...(p.xHandle !== undefined ? { xHandle: p.xHandle } : {}),
       ...(p.deployedAt !== undefined ? { deployedAt: p.deployedAt } : {}),
     };
   }

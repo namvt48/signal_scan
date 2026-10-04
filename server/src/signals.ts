@@ -3,7 +3,7 @@
 // purpose — keep the two in sync when the contract changes).
 
 import { T100_WINDOW_MS } from './config.js';
-import { allTokenStates, earliestSnapshotAt, getDb, latestSnapshot, latestWatchTradeTsByCa, listTiers, listTrackedCas, snapshotAtOrBefore, snapshotsSince, type TokenStateRow } from './db.js';
+import { allTokenStates, earliestSnapshotAt, getDb, isPassTier, latestSnapshot, latestWatchTradeTsByCa, listTiers, listTrackedCas, snapshotAtOrBefore, snapshotsSince, type TokenStateRow } from './db.js';
 import { getDebugAllFactors, getThresholds, type NansenThresholds } from './settings.js';
 import { t100Decrease } from './snapshot.js';
 import type { HolderRow } from './providers/provider.js';
@@ -54,6 +54,8 @@ export interface TrackedWalletStat {
 export interface FomoUserStat {
   handle: string;
   name?: string;
+  /** Display chips from fomo_users.tags; absent when the user has none. */
+  tags?: string[];
   clan?: string;
   buyUsd: number;
   sellPnlUsd: number;
@@ -75,6 +77,9 @@ export interface TokenSignal {
   /** Token logo URL (DexScreener icon sweep; validated https + allowlisted host at write).
    * Absent until the sweep lands one — the FE renders its fallback instead. */
   iconUrl?: string;
+  /** X (Twitter) handle (GMGN token/info) — bare handle, no leading '@'. Absent → FE falls back
+   * to an X search for the CA. */
+  xHandle?: string;
   trackedWallets: TrackedWalletStat[];
   /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
   fomoUsers: FomoUserStat[];
@@ -171,7 +176,15 @@ export function trackedWalletStats(ca: string, chain: string, now: number): Trac
          LEFT JOIN wallet_token_state s ON s.wallet_id = w.id AND s.ca = @ca AND s.chain = @chain
          WHERE EXISTS (SELECT 1 FROM wallet_trades b
                         WHERE b.wallet_id = w.id AND b.ca = @ca AND b.chain = @chain
-                          AND b.side = 'buy' AND b.source = 'watch')
+                          AND b.side = 'buy' AND b.source = 'watch'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM zero_holdings zh
+                             WHERE zh.member_type = 'wallet'
+                               AND zh.member_id = b.wallet_id
+                               AND zh.ca = b.ca
+                               AND zh.chain = b.chain
+                               AND zh.zero_at <= @statSince
+                          ))
          GROUP BY w.id
          ORDER BY lastTs DESC, w.name`,
     )
@@ -207,7 +220,15 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
       `WITH members AS (
          SELECT DISTINCT b.chain AS chain, b.ca AS ca, b.wallet_id AS wallet_id
            FROM wallet_trades b
-          WHERE b.side = 'buy' AND b.source = 'watch')
+          WHERE b.side = 'buy' AND b.source = 'watch'
+            AND NOT EXISTS (
+              SELECT 1 FROM zero_holdings zh
+               WHERE zh.member_type = 'wallet'
+                 AND zh.member_id = b.wallet_id
+                 AND zh.ca = b.ca
+                 AND zh.chain = b.chain
+                 AND zh.zero_at <= @statSince
+            ))
        SELECT m.chain AS chain,
               m.ca AS ca,
               w.name AS name,
@@ -254,6 +275,7 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
 interface FomoUserStatRow {
   handle: string;
   name: string;
+  tags: string;
   clan: string | null;
   buyUsd: number;
   sellPnlUsd: number;
@@ -266,21 +288,38 @@ interface FomoUserStatRow {
 }
 
 /**
+ * `Buy $` for one (user, ca) — the USD actually SPENT, in precedence order:
+ *   1. `fomo_positions.cost_basis_usd` — the FOMO API's own cost basis for the
+ *      position, i.e. the authority (user 2026-10-01: iruletrenches 59,844.66,
+ *      where the alerts alone made the dash read 70,716.89).
+ *   2. `SUM(trade_usd)` — the feed's resolved real per-trade amounts.
+ *   3. `MAX(usd_value)` — the post-fill position VALUE; exact only for a first buy
+ *      and an upper bound once the user already held.
+ * Never SUM(usd_value): it is a STOCK, so summing it inflates by the buy count
+ * (the 6-buy iruletrenches read 5.6x its real spend). Shared by both aggregations
+ * below so the two can never drift apart.
+ */
+const BUY_USD_SQL = `COALESCE(p.cost_basis_usd, SUM(CASE WHEN t.type = 'buy' THEN t.trade_usd END), MAX(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd`;
+
+/**
  * Per-user FOMO stats for one CA — the fomo mirror of trackedWalletStats, with
  * the same membership-vs-stats-window split.
  *
- * MEMBERSHIP mirrors `Tracked by` (ever-bought): a user is listed ONLY on a
+ * MEMBERSHIP mirrors `Tracked by` (ever-bought): a user is listed on a
  * type='buy' fomo_trades row for this (ca, chain) — EVER, with NO time bound —
  * so a user whose newest buy is older than the stats window appears with zero
- * stats and lastTs 0, and a user with ONLY sells never appears (its sells
- * uncounted). Scoped to ONE (chain, ca) identity: the same ca string on two
- * chains must not pool the other chain's users or trades.
+ * stats and lastTs 0. A user with ONLY sells is ALSO a member when FOMO recorded
+ * a bought position (fomo_positions.cost_basis_usd > 0): the firehose does not
+ * backfill gaps, so a buy whose alert never arrived leaves only the position
+ * (user 2026-10-02 Nailoong — cryptokillua99/397397/EarlyBurry bought, only
+ * their sells were alerted). Such a member has buys 0 and buyUsd from the
+ * position cost basis. Scoped to ONE (chain, ca) identity: the same ca string on
+ * two chains must not pool the other chain's users or trades.
  *
- * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd sums BUY
- * rows only (a buy's usd_value is the post-fill position size) and sellPnlUsd
- * sums SELL rows only (a sell's usd_value is signed realised PnL). The two are
- * reported SEPARATELY and are never combined into a net/inflow figure: a buy's
- * usd_value (position size) and a sell's usd_value (PnL) are different
+ * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd is BUY rows
+ * only (see BUY_USD_SQL) and sellPnlUsd sums SELL rows only (a sell's usd_value is
+ * signed realised PnL). The two are reported SEPARATELY and are never combined into
+ * a net/inflow figure: a buy's figure is a SPEND and a sell's is a PnL — different
  * quantities that must never be summed (fomo_trades DDL).
  *
  * Rows are ordered newest-trade-first, so a member with no trade inside the
@@ -292,40 +331,66 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
     .prepare(
       `SELECT u.handle AS handle,
               u.name AS name,
+              u.tags AS tags,
               u.clan AS clan,
-              COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              ${BUY_USD_SQL},
               COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
               COALESCE(MAX(t.ts), 0) AS lastTs,
-              h.amount AS holdingAmount,
+              COALESCE(p.amount, h.amount) AS holdingAmount,
               h.pct AS holdingPct
          FROM fomo_users u
          LEFT JOIN fomo_trades t
            ON t.fomo_user_id = u.id AND t.ca = @ca AND t.chain = @chain AND t.ts >= @statSince
          LEFT JOIN fomo_holdings h
            ON h.fomo_user_id = u.id AND h.ca = @ca AND h.chain = @chain
-        WHERE EXISTS (SELECT 1 FROM fomo_trades b
-                       WHERE b.fomo_user_id = u.id AND b.ca = @ca AND b.chain = @chain
-                         AND b.type = 'buy')
+         LEFT JOIN fomo_positions p
+           ON p.fomo_user_id = u.id AND p.ca = @ca AND p.chain = @chain
+         WHERE (EXISTS (SELECT 1 FROM fomo_trades b
+                        WHERE b.fomo_user_id = u.id AND b.ca = @ca AND b.chain = @chain
+                          AND b.type = 'buy'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM zero_holdings zh
+                             WHERE zh.member_type = 'fomo'
+                               AND zh.member_id = b.fomo_user_id
+                               AND zh.ca = b.ca
+                               AND zh.chain = b.chain
+                               AND zh.zero_at <= @statSince
+                          ))
+            OR EXISTS (SELECT 1 FROM fomo_positions bp
+                        WHERE bp.fomo_user_id = u.id AND bp.ca = @ca AND bp.chain = @chain
+                          AND bp.cost_basis_usd > 0
+                          AND NOT EXISTS (
+                            SELECT 1 FROM zero_holdings zh
+                             WHERE zh.member_type = 'fomo'
+                               AND zh.member_id = bp.fomo_user_id
+                               AND zh.ca = bp.ca
+                               AND zh.chain = bp.chain
+                               AND zh.zero_at <= @statSince
+                          )))
         GROUP BY u.id
         ORDER BY lastTs DESC, u.handle`,
     )
     .all({ ca, chain, statSince: now - 86_400_000 }) as FomoUserStatRow[];
-  return rows.map(({ handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct }) => ({
-    handle,
-    ...(name !== '' ? { name } : {}),
-    ...(clan != null && clan !== '' ? { clan } : {}),
-    buyUsd,
-    sellPnlUsd,
-    buys,
-    sells,
-    trades,
-    lastTs,
-    ...(holdingAmount != null ? { holdingAmount } : {}),
-    ...(holdingPct != null ? { holdingPct } : {}),
-  }));
+  return rows.map(({ handle, name, tags, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct }) => {
+    const tagList = parseTags(tags);
+    return {
+      handle,
+      ...(name !== '' ? { name } : {}),
+      ...(tagList.length > 0 ? { tags: tagList } : {}),
+      ...(clan != null && clan !== '' ? { clan } : {}),
+      buyUsd,
+      sellPnlUsd,
+      buys,
+      sells,
+      trades,
+      lastTs,
+      ...(holdingAmount != null ? { holdingAmount } : {}),
+      ...(holdingPct != null ? { holdingPct } : {}),
+    };
+  });
 }
 
 /**
@@ -333,7 +398,9 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
  * every CA, keyed `${chain}:${ca}` — the same identity tracked_cas is unique
  * on, and the same equality the per-CA `@ca`/`@chain` binds use.
  * Membership comes from a `members` CTE — NOT from joining the windowed trades —
- * and is ever-bought (no time window), so a member with no trade inside the 24h
+ * and is ever-bought (no time window): a type='buy' fomo_trades row OR a
+ * fomo_positions row with cost_basis_usd > 0 (a buy whose firehose alert never
+ * arrived — see fomoUserStats), so a member with no trade inside the 24h
  * stat window keeps its zero-stat row, exactly like the per-CA LEFT JOIN.
  * Per-CA row order (lastTs DESC, u.handle) is preserved via ORDER BY m.chain,
  * m.ca first, then the split into per-CA arrays. A CA with no members is
@@ -346,19 +413,40 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
       `WITH members AS (
          SELECT DISTINCT b.chain AS chain, b.ca AS ca, b.fomo_user_id AS fomo_user_id
            FROM fomo_trades b
-          WHERE b.type = 'buy')
+          WHERE b.type = 'buy'
+            AND NOT EXISTS (
+              SELECT 1 FROM zero_holdings zh
+               WHERE zh.member_type = 'fomo'
+                 AND zh.member_id = b.fomo_user_id
+                 AND zh.ca = b.ca
+                 AND zh.chain = b.chain
+                 AND zh.zero_at <= @statSince
+            )
+          UNION
+         SELECT DISTINCT p.chain, p.ca, p.fomo_user_id
+           FROM fomo_positions p
+          WHERE p.cost_basis_usd > 0
+            AND NOT EXISTS (
+              SELECT 1 FROM zero_holdings zh
+               WHERE zh.member_type = 'fomo'
+                 AND zh.member_id = p.fomo_user_id
+                 AND zh.ca = p.ca
+                 AND zh.chain = p.chain
+                 AND zh.zero_at <= @statSince
+            ))
        SELECT m.chain AS chain,
               m.ca AS ca,
               u.handle AS handle,
               u.name AS name,
+              u.tags AS tags,
               u.clan AS clan,
-              COALESCE(SUM(CASE WHEN t.type = 'buy' THEN t.usd_value END), 0) AS buyUsd,
+              ${BUY_USD_SQL},
               COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
               COALESCE(MAX(t.ts), 0) AS lastTs,
-              h.amount AS holdingAmount,
+              COALESCE(p.amount, h.amount) AS holdingAmount,
               h.pct AS holdingPct
          FROM members m
          JOIN fomo_users u ON u.id = m.fomo_user_id
@@ -366,17 +454,21 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
            ON t.fomo_user_id = m.fomo_user_id AND t.ca = m.ca AND t.chain = m.chain AND t.ts >= @statSince
          LEFT JOIN fomo_holdings h
            ON h.fomo_user_id = m.fomo_user_id AND h.ca = m.ca AND h.chain = m.chain
+         LEFT JOIN fomo_positions p
+           ON p.fomo_user_id = m.fomo_user_id AND p.ca = m.ca AND p.chain = m.chain
         GROUP BY m.chain, m.ca, m.fomo_user_id
         ORDER BY m.chain, m.ca, lastTs DESC, u.handle`,
     )
     .all({ statSince: now - 86_400_000 }) as (FomoUserStatRow & { ca: string; chain: string })[];
   const out = new Map<string, FomoUserStat[]>();
-  for (const { chain, ca, handle, name, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct } of rows) {
+  for (const { chain, ca, handle, name, tags, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct } of rows) {
     // Same conditional spreads (and key order) as fomoUserStats — the JSON
     // response must stay byte-identical.
+    const tagList = parseTags(tags);
     const stat: FomoUserStat = {
       handle,
       ...(name !== '' ? { name } : {}),
+      ...(tagList.length > 0 ? { tags: tagList } : {}),
       ...(clan != null && clan !== '' ? { clan } : {}),
       buyUsd,
       sellPnlUsd,
@@ -584,12 +676,13 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
   const walletStatsByCa = trackedWalletStatsByCa(now);
   const fomoStatsByCa = fomoUserStatsByCa(now);
   for (const c of listTrackedCas()) {
+    if (isPassTier(c.address, c.chain)) continue;
     const st = tokenStates.get(`${c.chain}:${c.address}`);
     const symbol = st?.symbol != null ? sanitizeSymbol(st.symbol) : '';
-    // Debug "Show all factors" (user 2026-09-23) = the dash lists EVERY tracked CA:
-    // the display gates below are the only thing that hides a row, so skip them
-    // while the flag is on. Tracking (deletes, sweeps) is unaffected.
-    if (!allFactors) {
+    const tier = tierByCa.get(`${c.chain}:${c.address}`) ?? null;
+    // User-rated CAs (tier !== null) are explicitly tracked by the user and must never be hidden
+    // by minUsd or market-cap display gates. Unrated CAs respect the gates when allFactors is off.
+    if (!allFactors && tier === null) {
       // NULL entry_usd = entry price UNKNOWN (pre-migration row, or scanner had no
       // price at track time) — fail-open so those rows are not silently dropped;
       // exclude only a KNOWN sub-threshold entry.
@@ -631,6 +724,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       chain: c.chain,
       ...(symbol !== '' ? { symbol } : {}),
       ...(st?.icon_url != null && st.icon_url !== '' ? { iconUrl: st.icon_url } : {}),
+      ...(st?.x_handle != null && st.x_handle !== '' ? { xHandle: st.x_handle } : {}),
       trackedWallets,
       fomoUsers,
       nansen: {
@@ -655,7 +749,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       trackedHolding,
       volume24h: st?.volume24h ?? 0,
       ...(st?.vol_1h != null ? { volume1h: st.vol_1h } : {}),
-      tier: tierByCa.get(`${c.chain}:${c.address}`) ?? null,
+      tier,
       ...(st?.bal_peak_24h != null && st.bal_trough_24h != null
         ? {
             balanceRange: {

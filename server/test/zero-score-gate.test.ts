@@ -63,7 +63,7 @@ before(() => {
   }
 });
 
-test('zeroScoreGate: deletes a complete 0/3 CA and its orphan token_state', () => {
+test('zeroScoreGate: deactivates a complete 0/3 CA and preserves its token_state', () => {
   // Given
   const s = nansenScore(getTokenState(COMPLETE_DEAD, 'sol'), th);
   assert.equal(s.complete, true);
@@ -72,9 +72,9 @@ test('zeroScoreGate: deletes a complete 0/3 CA and its orphan token_state', () =
   // When
   zeroScoreGate();
 
-  // Then: tracked row and its token_state both gone.
+  // Then: tracked row is inactive (findTrackedCa returns undefined), token_state is preserved.
   assert.equal(findTrackedCa(COMPLETE_DEAD, 'sol'), undefined);
-  assert.equal(getTokenState(COMPLETE_DEAD, 'sol'), undefined);
+  assert.notEqual(getTokenState(COMPLETE_DEAD, 'sol'), undefined);
 });
 
 test('zeroScoreGate: keeps a 0/3 CA whose data is incomplete (symbol NULL)', () => {
@@ -130,7 +130,7 @@ test('zeroScoreGate: keeps a complete 0/3 CA the user rated a tier (user 2026-09
   assert.notEqual(getTokenState(TIERED_DEAD, 'sol'), undefined);
 });
 
-test('zeroScoreGate: deletes the same 0/3 CA once its wallet has dumped the position', () => {
+test('zeroScoreGate: deactivates the same 0/3 CA once its wallet has dumped the position', () => {
   // Given: the identical 0/3 data, but the holdings row is now zero.
   replaceWalletBalances(holderId, 'sol', [{ ca: DUMPED_DEAD, amount: 0 }]);
   assert.equal(nansenScore(getTokenState(DUMPED_DEAD, 'sol'), th).score, 0);
@@ -138,7 +138,7 @@ test('zeroScoreGate: deletes the same 0/3 CA once its wallet has dumped the posi
   // When
   zeroScoreGate();
 
-  // Then: nothing holds it, so it is a dead symbol again.
+  // Then: nothing holds it, so it is deactivated while preserving token_state.
   assert.equal(findTrackedCa(DUMPED_DEAD, 'sol'), undefined);
-  assert.equal(getTokenState(DUMPED_DEAD, 'sol'), undefined);
+  assert.notEqual(getTokenState(DUMPED_DEAD, 'sol'), undefined);
 });

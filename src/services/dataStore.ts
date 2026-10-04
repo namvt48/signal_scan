@@ -267,6 +267,7 @@ export function parseFomoUsersCsv(text: string): ParsedFomoImportRow[] {
   if (handleIdx === -1) throw new Error('CSV header must contain a "handle" column');
   const nameIdx = col('name', 'displayname');
   const clanIdx = col('clan', 'clanname');
+  const tagsIdx = col('tags');
   const userIdIdx = col('userid');
   const solIdx = col('walletsolana');
   const evmIdx = col('walletevm');
@@ -277,6 +278,7 @@ export function parseFomoUsersCsv(text: string): ParsedFomoImportRow[] {
     const handle = cell(cells, handleIdx);
     if (!handle) return { row: rowNo, reason: 'handle is empty' };
     const clan = cell(cells, clanIdx);
+    const tags = cell(cells, tagsIdx).split(';').map((t) => t.trim()).filter(Boolean);
     const userId = cell(cells, userIdIdx);
     const walletSolana = cell(cells, solIdx);
     const walletEvm = cell(cells, evmIdx);
@@ -285,6 +287,7 @@ export function parseFomoUsersCsv(text: string): ParsedFomoImportRow[] {
       data: {
         handle,
         name: cell(cells, nameIdx),
+        tags,
         ...(clan ? { clan } : {}),
         ...(userId ? { userId } : {}),
         ...(walletSolana ? { walletSolana } : {}),

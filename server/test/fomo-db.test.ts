@@ -184,6 +184,22 @@ test('updateFomoUser: changing handle to an existing handle throws UNIQUE', () =
   assert.equal(findFomoUserByHandle('@free')?.name, 'Free', 'the failed update changed nothing');
 });
 
+test('fomo_users.tags: insert defaults to [], update replaces, stored as a JSON string', () => {
+  const user = insertFomoUser({ handle: '@tags', name: 'Tags' });
+  assert.equal(user.tags, '[]');
+  const updated = updateFomoUser(user.id, { tags: ['Unicon'] });
+  assert.equal(updated?.tags, '["Unicon"]');
+  assert.deepEqual(JSON.parse(findFomoUserByHandle('@tags')!.tags), ['Unicon']);
+});
+
+test('importFomoUsers: tags enrich a stored handle; a tags-less re-import never blanks them', () => {
+  importFomoUsers([{ handle: '@imp-tags', name: 'T', tags: ['keep'] }]);
+  assert.deepEqual(JSON.parse(findFomoUserByHandle('@imp-tags')!.tags), ['keep']);
+  const r = importFomoUsers([{ handle: '@imp-tags', user_id: 'u-t' }]);
+  assert.equal(r.updated, 1);
+  assert.deepEqual(JSON.parse(findFomoUserByHandle('@imp-tags')!.tags), ['keep'], 'stored tags survived a tags-less row');
+});
+
 // (e) a DB created before this change still opens (fomo tables added via IF NOT EXISTS).
 test('(e) open(): a pre-change DB gains the fomo tables without throwing', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fomo-pre-'));

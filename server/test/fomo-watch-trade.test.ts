@@ -166,6 +166,24 @@ test('POST /api/fomo-watch/trades: usdValue/price optional → NULL; a negative 
   assert.equal(rowOf('evt-fomo-loss')?.usd_value, -120.5);
 });
 
+test('POST /api/fomo-watch/trades: tradeUsd is stored as the real trade while usdValue stays the position size', async () => {
+  // The reported bug's real shape: a $126.06 trade on a $61,206.56 position.
+  const res = await post(trade({ eventId: 'evt-fomo-tradeusd', usdValue: 61_206.56, tradeUsd: 126.06 }));
+  assert.equal(res.status, 200);
+  const row = rowOf('evt-fomo-tradeusd');
+  assert.equal(row?.trade_usd, 126.06);
+  assert.equal(row?.usd_value, 61_206.56);
+});
+
+test('POST /api/fomo-watch/trades: tradeUsd is optional → NULL, and a non-number is a 400', async () => {
+  assert.equal((await post(trade({ eventId: 'evt-fomo-tradeusd-absent' }))).status, 200);
+  assert.equal(rowOf('evt-fomo-tradeusd-absent')?.trade_usd, null);
+
+  const bad = await post(trade({ eventId: 'evt-fomo-tradeusd-bad', tradeUsd: 'lots' }));
+  assert.equal(bad.status, 400);
+  assert.equal(rowOf('evt-fomo-tradeusd-bad'), undefined);
+});
+
 test('POST /api/fomo-watch/trades: ca is canonicalized (EVM folded, sol verbatim)', async () => {
   const res = await post(
     trade({ eventId: 'evt-fomo-evm', chain: 'base', tokenAddress: '0xABCdef1234567890AbCdEf1234567890ABCdEF12' }),

@@ -25,5 +25,7 @@ scripts/heartbeat
 !.env.example
 !**/.env.example
 
-# agent session churn — not source
-.omo/run-continuation/
+# agent session churn & artifacts
+.omo/
+reports/
+fomo-*.png

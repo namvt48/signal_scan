@@ -18,26 +18,43 @@ export class CompositeProvider implements MarketDataProvider {
     this.name = `${gmgn.name}+${nansen.name}`;
   }
 
-  /** essential + volume → GMGN; gini (fresh/T100/median) → Nansen. */
-  metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
-    return kind === 'gini' ? this.nansen.metric(ca, chain, kind) : this.gmgn.metric(ca, chain, kind);
+  /** gini (fresh/T100/median) → Nansen; volume → GMGN. essential → GMGN, falling
+   * back to Nansen's free essential door when GMGN is gated/429: a GMGN-only
+   * essential left supply/deployed_at NULL for ~60% of the FOMO queue, which
+   * cascades to the LF denominator (2026-10-02). Any other GMGN failure still
+   * propagates — GMGN owns volume. */
+  async metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
+    if (kind === 'gini') return this.nansen.metric(ca, chain, kind);
+    try {
+      return await this.gmgn.metric(ca, chain, kind);
+    } catch (e) {
+      if (kind !== 'essential') throw e;
+      return this.nansen.metric(ca, chain, kind);
+    }
   }
 
   assetInfo(ca: string, chain: Chain) {
     return this.gmgn.assetInfo(ca, chain);
   }
 
-  /** First-add kick: GMGN fills the market core, Nansen the fresh card. The gini
-   * call is the same strict contract as NansenMarketProvider.tokenInfo — no fresh
-   * share throws, so the CA stays owed setup instead of landing half-filled. */
+  /** First-add kick: GMGN fills the market core, Nansen the fresh card. The
+   * essential door is load-bearing (symbol/price/mc/holders/supply) — it routes
+   * through `metric`, so a gated GMGN is backstopped by Nansen and only BOTH
+   * failing leaves the CA owed (2026-10-02). A failed or missing volume/gini door
+   * only omits ITS columns instead of discarding the market core (2026-10-01: a
+   * Nansen gini 403/503 used to abort the whole kick, leaving fresh CAs
+   * ticker-less). */
   async tokenInfo(ca: string, chain: Chain): Promise<TokenInfo> {
-    const [ess, vol, gini] = await Promise.all([
-      this.gmgn.metric(ca, chain, 'essential'),
+    const [essR, volR, giniR] = await Promise.allSettled([
+      this.metric(ca, chain, 'essential'),
       this.gmgn.metric(ca, chain, 'volume'),
       this.nansen.metric(ca, chain, 'gini'),
     ]);
+    if (essR.status === 'rejected') throw essR.reason;
+    const ess = essR.value;
+    const vol: MetricPatch = volR.status === 'fulfilled' ? volR.value : {};
+    const gini: MetricPatch = giniR.status === 'fulfilled' ? giniR.value : {};
     const fresh = gini.nansenFreshPct;
-    if (fresh === undefined) throw new Error('nansen gini-stats: no fresh share');
     const holders = ess.holders ?? 0;
     const nansenHolders = gini.nansenHolders ?? 0;
     return {
@@ -54,12 +71,16 @@ export class CompositeProvider implements MarketDataProvider {
       supply: ess.supply ?? 0,
       ...(ess.deployedAt !== undefined ? { deployedAt: ess.deployedAt } : {}),
       ...(ess.symbol !== undefined ? { symbol: ess.symbol } : {}),
-      nansenStats: {
-        holders: nansenHolders > 0 ? nansenHolders : holders,
-        freshSupplyPct: fresh,
-        ...(gini.nansenT100Pct !== undefined ? { t100SupplyPct: gini.nansenT100Pct } : {}),
-        ...(gini.nansenMedianUsd !== undefined ? { medianBalanceUsd: gini.nansenMedianUsd } : {}),
-      },
+      ...(fresh !== undefined
+        ? {
+            nansenStats: {
+              holders: nansenHolders > 0 ? nansenHolders : holders,
+              freshSupplyPct: fresh,
+              ...(gini.nansenT100Pct !== undefined ? { t100SupplyPct: gini.nansenT100Pct } : {}),
+              ...(gini.nansenMedianUsd !== undefined ? { medianBalanceUsd: gini.nansenMedianUsd } : {}),
+            },
+          }
+        : {}),
     };
   }
 

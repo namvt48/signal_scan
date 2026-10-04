@@ -63,6 +63,7 @@ test('POST /api/fomo-users: creates and returns the camelCase DTO row', async ()
     id: res.json.id,
     handle: '@alice',
     name: 'Alice',
+    tags: [],
     clan: 'a',
     userId: 'u-1',
     walletSolana: 'SolAddr',
@@ -74,10 +75,10 @@ test('POST /api/fomo-users: creates and returns the camelCase DTO row', async ()
   }
 });
 
-test('POST /api/fomo-users: minimal body defaults name="" / source="manual" and omits unset optionals', async () => {
+test('POST /api/fomo-users: a handle-only body uses the handle as its name (user 2026-10-01)', async () => {
   const res = await req('POST', '/api/fomo-users', { body: { handle: '@min' } });
   assert.equal(res.status, 201);
-  assert.deepEqual(res.json, { id: res.json.id, handle: '@min', name: '', source: 'manual' });
+  assert.deepEqual(res.json, { id: res.json.id, handle: '@min', name: '@min', tags: [], source: 'manual' });
 });
 
 test('POST /api/fomo-users: duplicate handle is 409', async () => {
@@ -98,15 +99,14 @@ test('POST /api/fomo-users: empty handle is 400 (not 500, not a silent insert)',
 });
 
 test('POST /api/fomo-users: unknown extra fields are ignored, never persisted', async () => {
-  const res = await req('POST', '/api/fomo-users', { body: { handle: '@extra', name: 'E', bogus: 'nope', tags: ['x'] } });
+  const res = await req('POST', '/api/fomo-users', { body: { handle: '@extra', name: 'E', bogus: 'nope' } });
   assert.equal(res.status, 201);
   assert.ok(!('bogus' in res.json));
-  assert.ok(!('tags' in res.json));
   const row = rawRow('@extra');
   assert.ok(row);
   assert.ok(!('bogus' in row));
   assert.deepEqual(Object.keys(row).sort(), [
-    'clan', 'created_at', 'handle', 'id', 'name', 'source', 'user_id', 'wallet_evm', 'wallet_solana',
+    'clan', 'created_at', 'handle', 'id', 'name', 'source', 'tags', 'user_id', 'wallet_evm', 'wallet_solana',
   ]);
 });
 
@@ -125,7 +125,7 @@ test('PATCH /api/fomo-users/:id: updates user_id/name/clan and returns the DTO',
   const id = created.json.id as string;
   const res = await req('PATCH', `/api/fomo-users/${id}`, { body: { userId: 'u-2', name: 'After', clan: 'b' } });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.json, { id, handle: '@patch', name: 'After', clan: 'b', userId: 'u-2', source: 'manual' });
+  assert.deepEqual(res.json, { id, handle: '@patch', name: 'After', tags: [], clan: 'b', userId: 'u-2', source: 'manual' });
   const row = rawRow('@patch');
   assert.equal(row?.user_id, 'u-2');
   assert.equal(row?.name, 'After');
@@ -143,6 +143,30 @@ test('PATCH /api/fomo-users/:id: missing id is 404, handle collision is 409, emp
 
   const empty = await req('PATCH', `/api/fomo-users/${created.json.id}`, { body: { handle: '  ' } });
   assert.equal(empty.status, 400);
+});
+
+test('POST/PATCH /api/fomo-users: tags round-trip, PATCH replaces, non-array is 400', async () => {
+  const created = await req('POST', '/api/fomo-users', { body: { handle: '@tagged', name: 'Tagged', tags: ['Unicon', 'whale'] } });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.json.tags, ['Unicon', 'whale']);
+  const id = created.json.id as string;
+
+  const patched = await req('PATCH', `/api/fomo-users/${id}`, { body: { tags: ['Unicon'] } });
+  assert.equal(patched.status, 200);
+  assert.deepEqual(patched.json.tags, ['Unicon']);
+
+  const bad = await req('PATCH', `/api/fomo-users/${id}`, { body: { tags: 'Unicon' } });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(bad.json, { error: 'tags must be an array of strings' });
+});
+
+test('POST /api/fomo-users/import: tags enrich an existing handle and never blank a stored one', async () => {
+  await req('POST', '/api/fomo-users', { body: { handle: '@imp-tags', name: 'T', tags: ['keep'] } });
+  const enriched = await req('POST', '/api/fomo-users/import', { body: { rows: [{ handle: '@imp-tags', tags: ['Unicon'] }] } });
+  assert.equal(enriched.status, 200);
+  assert.deepEqual(rawRow('@imp-tags')?.tags, '["Unicon"]');
+  await req('POST', '/api/fomo-users/import', { body: { rows: [{ handle: '@imp-tags', name: 'T2' }] } });
+  assert.deepEqual(rawRow('@imp-tags')?.tags, '["Unicon"]', 'a tags-less re-import kept the stored tags');
 });
 
 test('DELETE /api/fomo-users/:id: 204, GET omits it, FK cascade cleans fomo_trades', async () => {

@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
-import { CHAINS, canonicalCa, type Chain } from './shared/chain.js';
+import { CHAINS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
 import { type Tier } from './shared/tier.js';
 import { config } from './config.js';
 import { MOCK_CA_POOL } from './providers/mock.js';
@@ -81,6 +81,8 @@ export interface TokenStateRow {
   symbol: string | null;
   /** Token logo URL (DexScreener icon sweep) — validated https + allowlisted host before write. */
   icon_url: string | null;
+  /** X (Twitter) handle (GMGN token/info) — bare handle, validated charset before write. */
+  x_handle: string | null;
   fetched_at: number | null;
 }
 
@@ -138,6 +140,7 @@ CREATE TABLE IF NOT EXISTS token_state (
   bal_peak_30d REAL,
   bal_trough_30d REAL,
   icon_url TEXT,
+  x_handle TEXT,
   fetched_at INTEGER,
   PRIMARY KEY (ca, chain)
 );
@@ -196,6 +199,15 @@ CREATE TABLE IF NOT EXISTS token_tiers (
   PRIMARY KEY (ca, chain)
 );
 
+-- Permanently blocked CAs (Pass tombstone). NEVER re-added, NEVER re-rated, NEVER cleared.
+CREATE TABLE IF NOT EXISTS blocked_cas (
+  address TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  blocked_at INTEGER NOT NULL,
+  PRIMARY KEY (address, chain)
+);
+
 -- FOMO watch-list: a second, FOMO-specific set of tracked users beside wallets.
 -- Both tables are born here (CREATE TABLE IF NOT EXISTS), so a DB created before
 -- this change gains them on the next open() with no ALTER/rebuild — the guard for
@@ -206,6 +218,7 @@ CREATE TABLE IF NOT EXISTS fomo_users (
   user_id TEXT,
   name TEXT NOT NULL DEFAULT '',
   clan TEXT,
+  tags TEXT NOT NULL DEFAULT '[]',
   wallet_solana TEXT,
   wallet_evm TEXT,
   source TEXT NOT NULL DEFAULT 'manual',
@@ -218,8 +231,10 @@ CREATE INDEX IF NOT EXISTS idx_fomo_users_user_id ON fomo_users(user_id);
 -- 102-alert capture). ca is CANONICALIZED (canonicalCa) so \${chain}:\${ca} keys line up
 -- with tracked_cas/allTokenStates. usd_value is TYPE-DEPENDENT: for a buy it is
 -- the post-fill position size, for a sell it is signed realised PnL — never sum
--- or compare across types. type CHECK is a loud backstop: perp/thesis/listing are
--- dropped BEFORE insert, so only buy/sell ever reach here.
+-- or compare across types. trade_usd is the USD ACTUALLY TRADED (both directions)
+-- and is the only basis for a Buy-$ SUM: usd_value is a STOCK, so summing it
+-- multiplies the error once per buy (user 2026-10-01). type CHECK is a loud
+-- backstop: perp/thesis/listing are dropped BEFORE insert, so only buy/sell reach.
 CREATE TABLE IF NOT EXISTS fomo_trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
@@ -228,6 +243,7 @@ CREATE TABLE IF NOT EXISTS fomo_trades (
   chain TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN ('buy','sell')),
   usd_value REAL,
+  trade_usd REAL,
   price REAL,
   token TEXT,
   ts INTEGER NOT NULL,
@@ -270,6 +286,40 @@ CREATE TABLE IF NOT EXISTS fomo_holdings (
   PRIMARY KEY (fomo_user_id, ca, chain)
 );
 CREATE INDEX IF NOT EXISTS idx_fomo_holdings_ca_chain ON fomo_holdings(ca, chain);
+
+-- Per (user, CA, chain) position straight from the FOMO API — the AUTHORITATIVE
+-- spend. cost_basis_usd is the money actually paid, where fomo_trades.usd_value is
+-- the position's mark-to-market VALUE (a stock): reading the latter as money made
+-- the dash report a 59.8K spend as 70.7K (user 2026-10-01). amount/price_usd come
+-- from the same call and back the holding column. ca is canonicalized (fomo_trades).
+CREATE TABLE IF NOT EXISTS fomo_positions (
+  fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  trade_id TEXT,
+  status TEXT,
+  amount REAL,
+  cost_basis_usd REAL,
+  avg_entry_price REAL,
+  price_usd REAL,
+  realized_pnl_usd REAL,
+  unrealized_pnl_usd REAL,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY (fomo_user_id, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_fomo_positions_ca_chain ON fomo_positions(ca, chain);
+
+-- Zero-holding tracking: records when a wallet (instance A) or FOMO user (instance B)
+-- first hit 0% holding of a CA. After 24h at zero holding, the member is removed from Tracked by / FOMO by.
+CREATE TABLE IF NOT EXISTS zero_holdings (
+  member_type TEXT NOT NULL CHECK(member_type IN ('wallet', 'fomo')),
+  member_id TEXT NOT NULL,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  zero_at INTEGER NOT NULL,
+  PRIMARY KEY (member_type, member_id, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_zero_holdings_lookup ON zero_holdings(member_type, ca, chain, zero_at);
 `;
 
 let instance: Database.Database | null = null;
@@ -297,9 +347,19 @@ export function open(path: string): void {
   if (!cols.includes('symbol')) instance.exec('ALTER TABLE token_state ADD COLUMN symbol TEXT');
   // icon_url is the validated DexScreener logo URL — TEXT affinity too.
   if (!cols.includes('icon_url')) instance.exec('ALTER TABLE token_state ADD COLUMN icon_url TEXT');
+  // x_handle is the token's bare X handle (GMGN token/info) — TEXT affinity.
+  if (!cols.includes('x_handle')) instance.exec('ALTER TABLE token_state ADD COLUMN x_handle TEXT');
+  // Auto-migrate any tier 'P' into blocked_cas (idempotent)
+  instance.exec(`
+    INSERT OR IGNORE INTO blocked_cas (address, chain, reason, blocked_at)
+    SELECT ca, chain, 'pass', updated_at FROM token_tiers WHERE tier = 'P';
+  `);
   // tracked_cas.entry_usd (USD entry size — the minUsd signals gate), nullable.
   const trackedCols = (instance.pragma('table_info(tracked_cas)') as { name: string }[]).map((c) => c.name);
   if (!trackedCols.includes('entry_usd')) instance.exec('ALTER TABLE tracked_cas ADD COLUMN entry_usd REAL');
+  // A FOMO user known only by handle shows that handle as its name (user 2026-10-01):
+  // rows created before this rule carry an empty name. Idempotent (0 rows after run 1).
+  instance.exec("UPDATE fomo_users SET name = handle WHERE name = ''");
   // wallet_token_state.token_amount — the price-independent holdings source for
   // the Tracked by / Holding % columns (ALTER, never drop: prod rows survive).
   const walletTokenCols = (instance.pragma('table_info(wallet_token_state)') as { name: string }[]).map((c) => c.name);
@@ -313,6 +373,17 @@ export function open(path: string): void {
   const tradeCols = (instance.pragma('table_info(wallet_trades)') as { name: string }[]).map((c) => c.name);
   if (!tradeCols.includes('source')) {
     instance.exec("ALTER TABLE wallet_trades ADD COLUMN source TEXT NOT NULL DEFAULT 'nansen'");
+  }
+  // fomo_trades.trade_usd — the USD actually traded. Absent on ~72% of alerts (the
+  // feed resolves it on-chain), so it is nullable and Buy-$ falls back (user 2026-10-01).
+  const fomoTradeCols = (instance.pragma('table_info(fomo_trades)') as { name: string }[]).map((c) => c.name);
+  if (!fomoTradeCols.includes('trade_usd')) instance.exec('ALTER TABLE fomo_trades ADD COLUMN trade_usd REAL');
+  // fomo_users.tags — parity with wallets.tags (user 2026-10-02): a JSON array of
+  // display-only labels the FE renders as chips (and 'Unicon' → rainbow name).
+  // Never filters/routes; DEFAULT '[]' so pre-existing rows read as untagged.
+  const fomoUserCols = (instance.pragma('table_info(fomo_users)') as { name: string }[]).map((c) => c.name);
+  if (!fomoUserCols.includes('tags')) {
+    instance.exec("ALTER TABLE fomo_users ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
   }
   // wallets.clan — display-only label rendered beside the wallet name (user
   // 2026-09-24: "clan chỉ là một cái tên bên cạnh name của wallet"). NOT a
@@ -566,6 +637,12 @@ export function importWallets(
         skipped.push({ row: i, reason: `invalid chain "${r.chain}" (expected one of ${CHAINS.join(', ')})` });
         return;
       }
+      // A non-base58 sol address poisons the wallet-watch ws shard (Helius
+      // rejects the WHOLE logsSubscribe batch) — keep it out of the DB.
+      if (r.chain === 'sol' && !isSolanaAddress(address)) {
+        skipped.push({ row: i, reason: 'invalid sol address (base58, 32 bytes)' });
+        return;
+      }
       const res = ins.run(randomUUID(), address, r.name.trim(), JSON.stringify(r.tags), r.chain, r.source.trim(), (r.clan ?? '').trim());
       if (res.changes === 0) {
         skipped.push({ row: i, reason: 'duplicate address' });
@@ -587,8 +664,11 @@ export interface TrackedCaInput {
   entryUsd?: number;
 }
 
-export function listTrackedCas(): TrackedCaRow[] {
-  return getDb().prepare('SELECT * FROM tracked_cas ORDER BY added_at DESC').all() as TrackedCaRow[];
+export function listTrackedCas(includeInactive = false): TrackedCaRow[] {
+  if (includeInactive) {
+    return getDb().prepare('SELECT * FROM tracked_cas ORDER BY added_at DESC').all() as TrackedCaRow[];
+  }
+  return getDb().prepare("SELECT * FROM tracked_cas WHERE status != 'inactive' ORDER BY added_at DESC").all() as TrackedCaRow[];
 }
 
 /** A poll target — the (address, chain) pair the sweeps actually need. */
@@ -599,22 +679,21 @@ export interface CaTarget {
 
 /**
  * Tracked CAs whose essential core never landed. `supply` is the write-once LF
- * denominator, so NULL means the 24h essential pass has not reached the CA yet —
- * it paces 44min/CA, so a fresh CA would stay blank for hours. Bounded by
- * `withinMs`: a mint Nansen never indexes must not be retried forever (the 24h
- * pass still covers it).
+ * denominator, so NULL means the essential pass has not reached the CA yet — it
+ * paces the whole queue, so a fresh CA would stay blank for hours. No age window:
+ * a CA keeps being re-asked each gap tick until its core lands; too-new mints are
+ * filtered by the caller (isTooNewToken).
  */
-export function listCaTargetsMissingEssential(withinMs: number): CaTarget[] {
-  const since = new Date(Date.now() - withinMs).toISOString();
+export function listCaTargetsMissingEssential(): CaTarget[] {
   return getDb()
     .prepare(
       `SELECT t.address AS address, t.chain AS chain
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.chain = t.chain AND s.ca = t.address
-        WHERE s.supply IS NULL AND t.added_at >= ?
+        WHERE t.status != 'inactive' AND s.supply IS NULL
         ORDER BY t.added_at DESC`,
     )
-    .all(since) as CaTarget[];
+    .all() as CaTarget[];
 }
 
 /**
@@ -631,7 +710,7 @@ export function listCaTargetsMissingSymbol(withinMs: number): CaTarget[] {
       `SELECT t.address AS address, t.chain AS chain
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.chain = t.chain AND s.ca = t.address
-        WHERE (s.symbol IS NULL OR trim(s.symbol) = '') AND t.added_at >= ?
+        WHERE t.status != 'inactive' AND (s.symbol IS NULL OR trim(s.symbol) = '') AND t.added_at >= ?
         ORDER BY t.added_at DESC`,
     )
     .all(since) as CaTarget[];
@@ -650,22 +729,39 @@ export function listCaTargetsMissingIcon(withinMs: number): CaTarget[] {
       `SELECT t.address AS address, t.chain AS chain
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.chain = t.chain AND s.ca = t.address
-        WHERE s.icon_url IS NULL AND t.added_at >= ?
+        WHERE t.status != 'inactive' AND s.icon_url IS NULL AND t.added_at >= ?
         ORDER BY t.added_at DESC`,
     )
     .all(since) as CaTarget[];
 }
 
-export function findTrackedCa(address: string, chain: Chain): TrackedCaRow | undefined {
+export function findTrackedCa(address: string, chain: Chain, includeInactive = false): TrackedCaRow | undefined {
+  const canon = canonicalCa(address, chain);
+  if (includeInactive) {
+    return getDb()
+      .prepare('SELECT * FROM tracked_cas WHERE address = ? AND chain = ?')
+      .get(canon, chain) as TrackedCaRow | undefined;
+  }
   return getDb()
-    .prepare('SELECT * FROM tracked_cas WHERE address = ? AND chain = ?')
-    .get(canonicalCa(address, chain), chain) as TrackedCaRow | undefined;
+    .prepare("SELECT * FROM tracked_cas WHERE address = ? AND chain = ? AND status != 'inactive'")
+    .get(canon, chain) as TrackedCaRow | undefined;
 }
 
 export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
+  const address = canonicalCa(input.address, input.chain);
+  if (isPassTier(address, input.chain)) {
+    throw new Error(`cannot track CA ${address} on ${input.chain}: tier is Pass`);
+  }
+  const existing = findTrackedCa(address, input.chain, true);
+  if (existing) {
+    if (existing.status === 'inactive') {
+      return reactivateTrackedCa(address, input.chain, input.note, input.entryUsd) ?? existing;
+    }
+    return existing;
+  }
   const row: TrackedCaRow = {
     id: randomUUID(),
-    address: canonicalCa(input.address, input.chain),
+    address,
     chain: input.chain,
     note: input.note,
     added_at: new Date().toISOString(),
@@ -679,14 +775,46 @@ export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
 }
 
 /**
- * Fills entry_usd for a CA whose entry value was unknown at insert time. Never
- * overwrites a known value — the `entry_usd IS NULL` guard enforces that in SQL.
+ * Fills entry_usd for a CA whose entry value was unknown at insert time (NULL),
+ * or upgrades a sub-threshold entry (< minUsd) when a larger trade arrives.
+ * A qualifying entry (>= minUsd) is a historical fact and is never overwritten.
  */
-export function setTrackedCaEntryUsd(address: string, chain: Chain, usd: number): TrackedCaRow | undefined {
+export function setTrackedCaEntryUsd(
+  address: string,
+  chain: Chain,
+  usd: number,
+  minUsd: number = 0,
+): TrackedCaRow | undefined {
   getDb()
-    .prepare('UPDATE tracked_cas SET entry_usd = ? WHERE address = ? AND chain = ? AND entry_usd IS NULL')
-    .run(usd, canonicalCa(address, chain), chain);
-  return findTrackedCa(address, chain);
+    .prepare(
+      `UPDATE tracked_cas
+       SET entry_usd = ?
+       WHERE address = ? AND chain = ?
+         AND (entry_usd IS NULL OR (entry_usd < ? AND ? > entry_usd))`,
+    )
+    .run(usd, canonicalCa(address, chain), chain, minUsd, usd);
+  return findTrackedCa(address, chain, true);
+}
+
+/** Reactivate an inactive tracked CA when new buy inflow arrives. */
+export function reactivateTrackedCa(
+  address: string,
+  chain: Chain,
+  note?: string,
+  entryUsd?: number,
+): TrackedCaRow | undefined {
+  const db = getDb();
+  const canon = canonicalCa(address, chain);
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE tracked_cas
+       SET status = 'queued',
+           added_at = ?,
+           note = COALESCE(?, note),
+           entry_usd = COALESCE(?, entry_usd)
+     WHERE address = ? AND chain = ?
+  `).run(now, note ?? null, entryUsd ?? null, canon, chain);
+  return findTrackedCa(canon, chain, true);
 }
 
 export function deleteTrackedCa(id: string): void {
@@ -700,7 +828,19 @@ export function deleteTrackedCa(id: string): void {
  * Defined once so the three paths cannot drift apart. Reads tracked_cas via the
  * alias `t`, which every candidate query below uses.
  */
-const NOT_TIERED = `NOT EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain)`;
+const NOT_TIERED = `NOT EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier != 'P')`;
+/**
+ * "A FOMO user BOUGHT this CA inside the window" — a BUY, never a lone SELL. This
+ * mirrors the dash's own membership rule exactly (signals.fomoUserStatsByCa lists a
+ * user only on a type='buy' row), so a CA whose captured alerts are ALL sells has no
+ * member to display and renders `none` in the FOMO column — a row with no signal,
+ * pruned as noise (user 2026-10-01). A SELL therefore does NOT spare a CA; the
+ * earlier buy-OR-sell version kept 29 sell-only CAs that read `none` on the dash.
+ * Reads tracked_cas via the alias `t`; binds ONE window param, like the wallet clauses.
+ */
+const FOMO_ACTIVE = `EXISTS (SELECT 1 FROM fomo_trades f
+                      WHERE f.ca = t.address AND f.chain = t.chain
+                        AND f.type = 'buy' AND f.ts >= ?)`;
 
 /**
  * Deletes CA-scoped market data whose CA is no longer tracked. EVERY prune path
@@ -747,36 +887,49 @@ function sweepOrphanedCaData(): void {
  * A CA with a stored user tier is never a candidate. Every clause is scoped to the
  * row's own (chain, ca) (user 2026-09-28): tracked_cas is UNIQUE(address, chain), so
  * a position or a buy on base must never keep bsc:0x… alive.
+ * A FOMO user's BUY inside `windowMs` also keeps the CA (user 2026-10-01): the FOMO
+ * dash carries no wallet watch data, so the wallet clauses alone would drain it.
+ * A lone SELL does NOT (same date, second call): the dash lists members off BUY rows
+ * only, so a sell-only CA shows `none` and is noise.
  */
-export function pruneUntrackedCas(windowMs: number): TrackedCaRow[] {
+export function pruneUntrackedCas(windowMs: number, now: number = Date.now()): TrackedCaRow[] {
   const db = getDb();
-  const since = Date.now() - windowMs;
-  // added_at is written as toISOString() (always 'YYYY-MM-DDTHH:mm:ss.sssZ'), so a
-  // lexicographic compare against another ISO instant is a correct time compare.
+  const since = now - windowMs;
   const cutoff = new Date(since).toISOString();
-  const doomed = db
+
+  // Rule 1: Pass tier / blocked_cas (hard delete and data wipe)
+  const passDoomed = db
     .prepare(
-        `SELECT t.* FROM tracked_cas t
-        WHERE t.added_at <= ?
-          AND ${NOT_TIERED}
-          AND NOT EXISTS (SELECT 1 FROM wallet_token_state s
-                           WHERE s.ca = t.address AND s.chain = t.chain AND s.token_amount > 0
-                             AND EXISTS (SELECT 1 FROM wallet_trades wt
-                                          WHERE wt.wallet_id = s.wallet_id AND wt.ca = s.ca AND wt.chain = s.chain
-                                            AND wt.side = 'buy' AND wt.source = 'watch'))
-          AND NOT EXISTS (SELECT 1 FROM wallet_trades w
-                           WHERE w.ca = t.address AND w.chain = t.chain AND w.side = 'buy' AND w.ts >= ?)`,
+      `SELECT t.* FROM tracked_cas t
+        WHERE EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier = 'P')
+           OR EXISTS (SELECT 1 FROM blocked_cas b WHERE b.address = t.address AND b.chain = t.chain)`,
     )
-    .all(cutoff, since) as TrackedCaRow[];
-  // Safe + deliberate: every token_state / wallet_token_state reader joins
-  // tracked_cas, so a row whose CA is gone is unreachable, and the sweep is
-  // unconditional to drain the old backlog too.
+    .all() as TrackedCaRow[];
+
+  // Rule 2: Older than 48h and no new buy inflow in the last 48h (soft deactivate, NEVER wiped!)
+  const inactiveDoomed = db
+    .prepare(
+      `SELECT t.* FROM tracked_cas t
+        WHERE t.added_at <= ?
+          AND t.status != 'inactive'
+          AND ${NOT_TIERED}
+          AND NOT EXISTS (SELECT 1 FROM wallet_trades w
+                           WHERE w.ca = t.address AND w.chain = t.chain AND w.side = 'buy' AND w.ts >= ?)
+          AND NOT ${FOMO_ACTIVE}`,
+    )
+    .all(cutoff, since, since) as TrackedCaRow[];
+
   db.transaction(() => {
+    // Pass tier: hard delete and sweep
     const del = db.prepare('DELETE FROM tracked_cas WHERE id = ?');
-    for (const r of doomed) del.run(r.id);
-    sweepOrphanedCaData();
+    for (const r of passDoomed) del.run(r.id);
+    if (passDoomed.length > 0) sweepOrphanedCaData();
+
+    // 48h no inflow: soft deactivate ONLY. Keep all data intact!
+    const deact = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?");
+    for (const r of inactiveDoomed) deact.run(r.id);
   })();
-  return doomed;
+  return [...passDoomed, ...inactiveDoomed];
 }
 
 /**
@@ -786,26 +939,52 @@ export function pruneUntrackedCas(windowMs: number): TrackedCaRow[] {
  * alone lets a backfilled `auto:BUY` row outlive its own window. `graceMs` spares a
  * just-added CA, since wallet_watch.py POSTs the CA a round-trip before its BUY.
  * A CA with a stored user tier is never a candidate.
+ *
+ * A FOMO user's BUY inside `withinMs` also counts as `Tracked by` (user 2026-10-01):
+ * a FOMO alert enqueues the CA (api.ts) so it shows on the dash, but it has no wallet
+ * watch-buy by construction — without this the CA is deleted one sweep later. BUY only:
+ * a lone SELL leaves the dash's FOMO column reading `none` (membership is buy-based), so
+ * a sell must NOT spare the CA — 29 such sell-only rows were pruning as noise (2026-10-01).
  */
 export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): TrackedCaRow[] {
   const db = getDb();
   const since = Date.now() - withinMs;
   const cutoff = new Date(Date.now() - graceMs).toISOString();
-  const doomed = db
+
+  // 1. Pass tier CAs (hard delete + blocked_cas tombstone + sweep)
+  const passDoomed = db
+    .prepare(
+      `SELECT t.* FROM tracked_cas t
+        WHERE EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier = 'P')
+           OR EXISTS (SELECT 1 FROM blocked_cas b WHERE b.address = t.address AND b.chain = t.chain)`,
+    )
+    .all() as TrackedCaRow[];
+
+  // 2. Untiered active CAs with no tracker (soft deactivate, NEVER wiped!)
+  const inactiveDoomed = db
     .prepare(
       `SELECT t.* FROM tracked_cas t
         WHERE t.added_at <= ?
+          AND t.status != 'inactive'
           AND ${NOT_TIERED}
           AND NOT EXISTS (SELECT 1 FROM wallet_trades b
-                           WHERE b.ca = t.address AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= ?)`,
+                           WHERE b.ca = t.address AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= ?)
+          AND NOT ${FOMO_ACTIVE}`,
     )
-    .all(cutoff, since) as TrackedCaRow[];
+    .all(cutoff, since, since) as TrackedCaRow[];
+
   db.transaction(() => {
+    // Pass tier: hard delete and sweep
     const del = db.prepare('DELETE FROM tracked_cas WHERE id = ?');
-    for (const r of doomed) del.run(r.id);
-    sweepOrphanedCaData();
+    for (const r of passDoomed) del.run(r.id);
+    if (passDoomed.length > 0) sweepOrphanedCaData();
+
+    // Untracked: soft deactivate ONLY. Keep all data intact!
+    const deact = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?");
+    for (const r of inactiveDoomed) deact.run(r.id);
   })();
-  return doomed;
+
+  return [...passDoomed, ...inactiveDoomed];
 }
 
 /** One tracked CA joined with the token_state columns the zero-score gate judges on. */
@@ -847,6 +1026,7 @@ export function listCaScoreGateCandidates(): CaScoreGateRow[] {
                              AND EXISTS (SELECT 1 FROM wallet_trades wt
                                           WHERE wt.wallet_id = wts.wallet_id AND wt.ca = wts.ca AND wt.chain = wts.chain
                                             AND wt.side = 'buy' AND wt.source = 'watch'))
+          AND t.status != 'inactive'
           AND ${NOT_TIERED}`,
     )
     .all() as CaScoreGateRow[];
@@ -858,6 +1038,22 @@ export function listCaScoreGateCandidates(): CaScoreGateRow[] {
  * tracked_cas, so a row whose CA is gone is unreachable forever). wallet_trades
  * history is deliberately kept. Returns the number of tracked_cas rows deleted.
  */
+/**
+ * Batch deactivate tracked CAs by id in ONE transaction (status = 'inactive').
+ * Data in token_state, wallet_trades, etc. is PRESERVED completely.
+ */
+export function deactivateTrackedCasByIds(ids: readonly string[]): number {
+  if (ids.length === 0) return 0;
+  const db = getDb();
+  let deactivated = 0;
+  db.transaction(() => {
+    const upd = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?");
+    for (const id of ids) deactivated += upd.run(id).changes;
+  })();
+  return deactivated;
+}
+
+/** Hard delete tracked CAs by id (used for test teardown or explicit purging). */
 export function deleteTrackedCasByIds(ids: readonly string[]): number {
   if (ids.length === 0) return 0;
   const db = getDb();
@@ -887,19 +1083,107 @@ export function listTiers(): TierRow[] {
   return getDb().prepare('SELECT * FROM token_tiers').all() as TierRow[];
 }
 
-/** Upsert the user-set tier for a tracked CA (api.ts validates the tier value). */
-export function setTier(ca: string, chain: Chain, tier: Tier): void {
-  getDb()
-    .prepare(
-      `INSERT INTO token_tiers (ca, chain, tier, updated_at) VALUES (?, ?, ?, ?)
-       ON CONFLICT(ca, chain) DO UPDATE SET tier = excluded.tier, updated_at = excluded.updated_at`,
-    )
-    .run(canonicalCa(ca, chain), chain, tier, Date.now());
+/** Retrieve a persisted tier row by canonical (ca, chain), or undefined if unrated. */
+export function getTier(ca: string, chain: Chain): TierRow | undefined {
+  return getDb()
+    .prepare('SELECT * FROM token_tiers WHERE ca = ? AND chain = ?')
+    .get(canonicalCa(ca, chain), chain) as TierRow | undefined;
 }
 
-/** Clearing a tier DELETES the row — absent row = unrated. */
+/** Check if a CA has been marked tier 'P' (Pass) — tombstoned forever. */
+export function isPassTier(ca: string, chain: Chain): boolean {
+  const canon = canonicalCa(ca, chain);
+  const blocked = getDb()
+    .prepare('SELECT 1 FROM blocked_cas WHERE address = ? AND chain = ?')
+    .get(canon, chain);
+  if (blocked) return true;
+  const row = getDb()
+    .prepare('SELECT tier FROM token_tiers WHERE ca = ? AND chain = ?')
+    .get(canon, chain) as { tier: string } | undefined;
+  return row?.tier === 'P';
+}
+
+/** Delete a tracked CA by canonical address and chain, cascading to orphan token/holding data. */
+export function deleteTrackedCaByAddress(address: string, chain: Chain): boolean {
+  const db = getDb();
+  const canon = canonicalCa(address, chain);
+  const row = db.prepare('SELECT id FROM tracked_cas WHERE address = ? AND chain = ?').get(canon, chain) as { id: string } | undefined;
+  if (!row) return false;
+  db.transaction(() => {
+    db.prepare('DELETE FROM tracked_cas WHERE id = ?').run(row.id);
+    db.prepare('DELETE FROM zero_holdings WHERE ca = ? AND chain = ?').run(canon, chain);
+    sweepOrphanedCaData();
+  })();
+  return true;
+}
+
+/** Upsert user tier. Pass ('P') creates an immutable tombstone in blocked_cas and drops from tracking. */
+export function setTier(ca: string, chain: Chain, tier: Tier): void {
+  const canon = canonicalCa(ca, chain);
+  if (isPassTier(canon, chain) && tier !== 'P') {
+    throw new Error(`cannot re-rate CA ${canon} on ${chain}: permanently blocked as Pass`);
+  }
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO token_tiers (ca, chain, tier, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(ca, chain) DO UPDATE SET tier = excluded.tier, updated_at = excluded.updated_at`,
+    ).run(canon, chain, tier, Date.now());
+
+    if (tier === 'P') {
+      db.prepare(
+        `INSERT INTO blocked_cas (address, chain, reason, blocked_at) VALUES (?, ?, 'pass', ?)
+         ON CONFLICT(address, chain) DO NOTHING`,
+      ).run(canon, chain, Date.now());
+      deleteTrackedCaByAddress(canon, chain);
+    } else {
+      // Ensure CA is active when tiered
+      db.prepare("UPDATE tracked_cas SET status = 'queued' WHERE address = ? AND chain = ? AND status = 'inactive'").run(canon, chain);
+    }
+  })();
+}
+
+/** Record that a member's holding of a CA reached 0%. Preserves earliest zero timestamp. */
+export function recordZeroHolding(
+  memberType: 'wallet' | 'fomo',
+  memberId: string,
+  ca: string,
+  chain: Chain,
+  zeroAt: number = Date.now(),
+): void {
+  const canon = canonicalCa(ca, chain);
+  getDb()
+    .prepare(`
+      INSERT INTO zero_holdings (member_type, member_id, ca, chain, zero_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(member_type, member_id, ca, chain) DO NOTHING
+    `)
+    .run(memberType, memberId, canon, chain, zeroAt);
+}
+
+/** Clear zero holding record when a member's holding becomes > 0%. */
+export function clearZeroHolding(
+  memberType: 'wallet' | 'fomo',
+  memberId: string,
+  ca: string,
+  chain: Chain,
+): void {
+  const canon = canonicalCa(ca, chain);
+  getDb()
+    .prepare(`
+      DELETE FROM zero_holdings
+       WHERE member_type = ? AND member_id = ? AND ca = ? AND chain = ?
+    `)
+    .run(memberType, memberId, canon, chain);
+}
+
+/** Clearing a tier DELETES the row — absent row = unrated. Fails if permanently blocked. */
 export function deleteTier(ca: string, chain: Chain): void {
-  getDb().prepare('DELETE FROM token_tiers WHERE ca = ? AND chain = ?').run(canonicalCa(ca, chain), chain);
+  const canon = canonicalCa(ca, chain);
+  if (isPassTier(canon, chain)) {
+    throw new Error(`cannot clear tier for CA ${canon} on ${chain}: permanently blocked as Pass`);
+  }
+  getDb().prepare('DELETE FROM token_tiers WHERE ca = ? AND chain = ?').run(canon, chain);
 }
 
 // --- token_state ----------------------------------------------------------
@@ -1034,6 +1318,8 @@ export interface FomoUserRow {
   name: string;
   /** Display-only label beside the name (mirrors wallets.clan). Never filters/routes. */
   clan: string | null;
+  /** JSON string[] of display chips (mirrors wallets.tags); '[]' when untagged. */
+  tags: string;
   wallet_solana: string | null;
   wallet_evm: string | null;
   source: string;
@@ -1045,6 +1331,7 @@ export interface FomoUserInput {
   user_id?: string | null;
   name?: string;
   clan?: string | null;
+  tags?: string[];
   wallet_solana?: string | null;
   wallet_evm?: string | null;
   source?: string;
@@ -1061,6 +1348,8 @@ export interface FomoTradeInput {
   type: 'buy' | 'sell';
   /** TYPE-DEPENDENT: buy → post-fill position size, sell → signed realised PnL. Never sum across types. */
   usd_value?: number | null;
+  /** USD actually traded (both directions). The Buy-$ basis; NULL when the feed could not resolve the fill. */
+  trade_usd?: number | null;
   price?: number | null;
   /** Ticker symbol. */
   token?: string | null;
@@ -1086,8 +1375,9 @@ export function insertFomoUser(input: FomoUserInput): FomoUserRow {
     id: randomUUID(),
     handle: input.handle,
     user_id: input.user_id ?? null,
-    name: input.name ?? '',
+    name: nameOrHandle(input.name, input.handle),
     clan: input.clan ?? null,
+    tags: JSON.stringify(input.tags ?? []),
     wallet_solana: input.wallet_solana ?? null,
     wallet_evm: input.wallet_evm ?? null,
     source: input.source ?? 'manual',
@@ -1095,9 +1385,9 @@ export function insertFomoUser(input: FomoUserInput): FomoUserRow {
   };
   getDb()
     .prepare(
-      'INSERT INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO fomo_users (id, handle, user_id, name, clan, tags, wallet_solana, wallet_evm, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .run(row.id, row.handle, row.user_id, row.name, row.clan, row.wallet_solana, row.wallet_evm, row.source, row.created_at);
+    .run(row.id, row.handle, row.user_id, row.name, row.clan, row.tags, row.wallet_solana, row.wallet_evm, row.source, row.created_at);
   return row;
 }
 
@@ -1113,6 +1403,7 @@ export function updateFomoUser(id: string, next: Partial<FomoUserInput>): FomoUs
   if (next.user_id !== undefined) { sets.push('user_id = ?'); values.push(next.user_id); }
   if (next.name !== undefined) { sets.push('name = ?'); values.push(next.name); }
   if (next.clan !== undefined) { sets.push('clan = ?'); values.push(next.clan); }
+  if (next.tags !== undefined) { sets.push('tags = ?'); values.push(JSON.stringify(next.tags)); }
   if (next.wallet_solana !== undefined) { sets.push('wallet_solana = ?'); values.push(next.wallet_solana); }
   if (next.wallet_evm !== undefined) { sets.push('wallet_evm = ?'); values.push(next.wallet_evm); }
   if (next.source !== undefined) { sets.push('source = ?'); values.push(next.source); }
@@ -1141,6 +1432,7 @@ interface FomoUserEnrichable {
   user_id: string | null;
   name: string;
   clan: string | null;
+  tags: string | null;
   wallet_solana: string | null;
   wallet_evm: string | null;
 }
@@ -1149,6 +1441,9 @@ const nonEmpty = (v: string | null | undefined): string | null => {
   const s = (v ?? '').trim();
   return s === '' ? null : s;
 };
+
+/** A FOMO user known only by handle displays that handle as its name (user 2026-10-01). */
+const nameOrHandle = (name: string | null | undefined, handle: string): string => nonEmpty(name) ?? handle;
 
 /**
  * Server-side CSV import, staged: fomo CSVs arrive in batches and a LATER batch
@@ -1164,15 +1459,16 @@ const nonEmpty = (v: string | null | undefined): string | null => {
 export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
   const db = getDb();
   const prev = db.prepare(
-    'SELECT user_id, name, clan, wallet_solana, wallet_evm FROM fomo_users WHERE handle = ?',
+    'SELECT user_id, name, clan, tags, wallet_solana, wallet_evm FROM fomo_users WHERE handle = ?',
   );
   const upsert = db.prepare(
-    `INSERT INTO fomo_users (id, handle, user_id, name, clan, wallet_solana, wallet_evm, source, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO fomo_users (id, handle, user_id, name, clan, tags, wallet_solana, wallet_evm, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(handle) DO UPDATE SET
        user_id = COALESCE(NULLIF(excluded.user_id, ''), fomo_users.user_id),
        name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE fomo_users.name END,
        clan = COALESCE(NULLIF(excluded.clan, ''), fomo_users.clan),
+       tags = CASE WHEN excluded.tags <> '[]' THEN excluded.tags ELSE fomo_users.tags END,
        wallet_solana = COALESCE(NULLIF(excluded.wallet_solana, ''), fomo_users.wallet_solana),
        wallet_evm = COALESCE(NULLIF(excluded.wallet_evm, ''), fomo_users.wallet_evm)`,
   );
@@ -1191,6 +1487,7 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
         user_id: nonEmpty(r.user_id),
         name: (r.name ?? '').trim(),
         clan: nonEmpty(r.clan),
+        tags: r.tags && r.tags.length > 0 ? JSON.stringify(r.tags) : null,
         wallet_solana: nonEmpty(r.wallet_solana),
         wallet_evm: nonEmpty(r.wallet_evm),
       };
@@ -1201,6 +1498,7 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
         next.user_id,
         next.name,
         next.clan,
+        next.tags ?? '[]',
         next.wallet_solana,
         next.wallet_evm,
         (r.source ?? '').trim() || 'manual',
@@ -1214,6 +1512,7 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
         (next.user_id !== null && next.user_id !== before.user_id) ||
         (next.name !== '' && next.name !== before.name) ||
         (next.clan !== null && next.clan !== before.clan) ||
+        (next.tags !== null && next.tags !== before.tags) ||
         (next.wallet_solana !== null && next.wallet_solana !== before.wallet_solana) ||
         (next.wallet_evm !== null && next.wallet_evm !== before.wallet_evm);
       if (changed) {
@@ -1238,8 +1537,8 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
 export function insertFomoTrade(input: FomoTradeInput): boolean {
   const res = getDb()
     .prepare(
-      `INSERT INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, price, token, ts, source, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, trade_usd, price, token, ts, source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_id) DO NOTHING`,
     )
     .run(
@@ -1249,6 +1548,7 @@ export function insertFomoTrade(input: FomoTradeInput): boolean {
       input.chain,
       input.type,
       input.usd_value ?? null,
+      input.trade_usd ?? null,
       input.price ?? null,
       input.token ?? null,
       input.ts,
@@ -1355,6 +1655,73 @@ export function upsertFomoHolding(input: FomoHoldingInput): void {
       input.pct,
       input.measured_at,
     );
+  if (input.amount != null && input.amount > 0) {
+    clearZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain);
+  } else if (input.amount != null && input.amount <= 0) {
+    recordZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain, input.measured_at);
+  }
+}
+export interface FomoPositionInput {
+  fomo_user_id: string;
+  ca: string;
+  chain: Chain;
+  trade_id: string | null;
+  status: string | null;
+  /** Token units held (authoritative — same call as cost_basis_usd). */
+  amount: number | null;
+  /** Money actually spent. NOT the alert's usdValue (a mark-to-market stock). */
+  cost_basis_usd: number | null;
+  avg_entry_price: number | null;
+  price_usd: number | null;
+  realized_pnl_usd: number | null;
+  unrealized_pnl_usd: number | null;
+  fetched_at: number;
+}
+
+/** ONE row per (user, ca, chain) — a refresh overwrites. ca canonicalized. */
+export function upsertFomoPosition(input: FomoPositionInput): void {
+  getDb()
+    .prepare(
+      `INSERT INTO fomo_positions (fomo_user_id, ca, chain, trade_id, status, amount, cost_basis_usd,
+                                   avg_entry_price, price_usd, realized_pnl_usd, unrealized_pnl_usd, fetched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+         trade_id = excluded.trade_id, status = excluded.status, amount = excluded.amount,
+         cost_basis_usd = excluded.cost_basis_usd, avg_entry_price = excluded.avg_entry_price,
+         price_usd = excluded.price_usd, realized_pnl_usd = excluded.realized_pnl_usd,
+         unrealized_pnl_usd = excluded.unrealized_pnl_usd, fetched_at = excluded.fetched_at`,
+    )
+    .run(
+      input.fomo_user_id,
+      canonicalCa(input.ca, input.chain),
+      input.chain,
+      input.trade_id,
+      input.status,
+      input.amount,
+      input.cost_basis_usd,
+      input.avg_entry_price,
+      input.price_usd,
+      input.realized_pnl_usd,
+      input.unrealized_pnl_usd,
+      input.fetched_at,
+    );
+  if (input.amount != null && input.amount > 0) {
+    clearZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain);
+  } else if ((input.amount != null && input.amount <= 0) || input.status === 'closed') {
+    recordZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain, input.fetched_at);
+  }
+}
+/** Distinct traders to refresh positions for: anyone with a trade on a CA still tracked. */
+export function listFomoPositionTargets(): { fomo_user_id: string; handle: string }[] {
+  return getDb()
+    .prepare(
+      `SELECT DISTINCT u.id AS fomo_user_id, u.handle AS handle
+         FROM fomo_users u
+         JOIN fomo_trades t ON t.fomo_user_id = u.id
+         JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
+        WHERE u.handle <> ''`,
+    )
+    .all() as { fomo_user_id: string; handle: string }[];
 }
 
 // --- seed (mock mode only) -------------------------------------------------
