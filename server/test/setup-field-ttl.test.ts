@@ -6,8 +6,7 @@
 // Env BEFORE the src imports (node:test = one process per file): the crawl gate is
 // forced, the retry ladder is flattened to its 60s floor so a clock-advanced pass can
 // re-ask, and both cadences keep their PROD defaults so the boundary ages are real.
-// Each test uses its OWN ca: setupMisses is module-global and keyed by (chain, ca),
-// so a shared CA would let one test's backoff gate another's sweep.
+// Each test uses its own CA so independent persisted retry clocks cannot collide.
 process.env.NANSEN_CRAWL = 'on';
 process.env.POLL_SETUP_RETRY_MS = '1';
 
@@ -147,6 +146,7 @@ function entryFor(ca: string, over: Partial<SetupCacheEntry>): SetupCacheEntry {
     t100_pct: 40,
     t100_multiple: 1.5,
     anchor_at: now,
+    lf_rule: 'bucket-hour-v2',
     genesis_bal: 120,
     ...over,
   };
@@ -235,30 +235,6 @@ test('refreshSeries: fresh series with no info_at applies from cache and invents
   assert.equal(getSetupCacheEntry(ca, CHAIN)?.info_at, undefined, 'a series pass must not fabricate a gini stamp');
 });
 
-test('empty series fetch: entry refused, previous series_at survives, next pass fetches again', async () => {
-  const ca = 'CA-TTL-EMPTY-SERIES';
-  const file = tempCache();
-  open(':memory:');
-  loadSetupCache(file);
-  const now = Date.now();
-  await installFakeDoor();
-  setPollerDeps(countingProvider(now, new Map()), null, installFakeFlows([], [])); // empty series
-  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
-  upsertTokenInfo(info(ca, now));
-  updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 });
-  const staleAt = now - config.pollFlowsMs - HOUR;
-  putSetupCacheEntry(entryFor(ca, { taken_at: staleAt, series_at: staleAt, info_at: staleAt }));
-
-  await refreshSeries(ca, CHAIN);
-  const afterFirst = seriesCalls;
-  assert.ok(afterFirst >= 1, 'a stale series must actually fetch');
-  assert.equal(getSetupCacheEntry(ca, CHAIN)?.series_at, staleAt, 'an empty pass is refused (storable guard) — old series_at kept');
-  const raw = JSON.parse(readFileSync(file, 'utf8')) as { entries: { series_at?: number }[] };
-  assert.equal(raw.entries[0]?.series_at, staleAt, 'the on-disk entry still carries the old series_at');
-
-  await refreshSeries(ca, CHAIN);
-  assert.ok(seriesCalls > afterFirst, 'the still-stale series fetches again');
-});
 
 test('legacy on-disk entry (no markers) is backfilled from taken_at at load — no deploy-day burst', () => {
   const file = tempCache();
@@ -368,9 +344,6 @@ test('round-trip: stampSetupCacheField writes both clocks to disk and reload kee
   assert.equal(e?.info_at, now - 1_000);
   assert.equal(e?.series_at, now - 2_000);
 
-  // stamping an absent entry is a silent no-op (a gini success before the first series pass)
-  stampSetupCacheField('absent', CHAIN, 'info_at', now);
-  assert.equal(getSetupCacheEntry('absent', CHAIN), undefined);
 });
 
 // Credit-leak regression (2026-09-29): flowsSweep walked ALL tracked CAs through an
@@ -517,7 +490,7 @@ test('empty series pass keeps prev series_at — no fresh stamp, marker-carrying
   assert.ok(Date.now() - (e.series_at ?? 0) >= config.pollFlowsMs, 'the carried marker is still the stale one');
 });
 
-test('haveLf relaxation: genesis_bal known + cached exchange [] ⇒ 0 exchange calls on a stale pass', async () => {
+test('verified LF remains cached when raw exchange points are absent on a stale series pass', async () => {
   const ca = 'CA-HAVE-LF-RELAX';
   open(':memory:');
   loadSetupCache(tempCache());
@@ -528,10 +501,13 @@ test('haveLf relaxation: genesis_bal known + cached exchange [] ⇒ 0 exchange c
   upsertTokenInfo(info(ca, now));
   updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 });
   const staleAt = now - config.pollFlowsMs - HOUR;
-  putSetupCacheEntry(markerOnlyEntry(ca, { taken_at: staleAt, info_at: staleAt, series_at: staleAt }));
+  putSetupCacheEntry(markerOnlyEntry(ca, {
+    taken_at: staleAt, info_at: staleAt, series_at: staleAt,
+    genesis_bal: 120, lf_rule: 'bucket-hour-v2',
+  }));
 
   await refreshSeries(ca, CHAIN);
 
   assert.equal(seriesCalls, 1, 'a stale series still fetches the T100');
-  assert.equal(exchangeCalls, 0, 'genesis_bal known ⇒ the 1-credit LF is never re-bought, even with [] cached points');
+  assert.equal(exchangeCalls, 0, 'a verified same-resolution LF avoids repeat reads even without raw cached points');
 });

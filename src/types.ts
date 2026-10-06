@@ -48,6 +48,8 @@ export interface NansenSetup {
   pass: { fresh: boolean; t100: boolean; lf: boolean };
   /** Percent of holders that are fresh wallets. */
   fresh?: number;
+  /** Ungated measured Fresh %, for explicit range filters even when the setup fails. */
+  rawFresh?: number;
   /** Top100 sliding max drawdown: pct = max (peak−trough)/peak×100, multiple = peak/trough (optional until first series write). */
   t100?: { pct: number; multiple?: number };
   /**
@@ -120,7 +122,10 @@ export interface TokenSignal {
   trackedWallets: TrackedWalletStat[];
   /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
   fomoUsers: FomoUserStat[];
-  nansen: NansenSetup;
+  note?: string;
+  buyVol24h?: number;
+  sellVol24h?: number;
+  nansen: NansenSetup & { freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number };
   holders: number;
   /** Market cap USD (price × circulating supply); absent until a sweep writes one. */
   marketCap?: number;
@@ -131,6 +136,8 @@ export interface TokenSignal {
    * Orders the table (newest activity first).
    */
   trackedActivityAt: number;
+  /** Latest captured FOMO BUY for this (chain, CA); 0/absent when no BUY is known. */
+  fomoBuyAt?: number;
   /** Percent of supply held by tracked wallets. */
   trackedHolding: number;
   /** DEX 24h buy + sell volume in USD. */

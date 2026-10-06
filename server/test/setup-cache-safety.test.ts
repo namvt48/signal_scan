@@ -33,6 +33,7 @@ function sampleEntry(ca: string, takenAt: number, over: Partial<SetupCacheEntry>
     t100_pct: 12.3,
     t100_multiple: 1.42,
     anchor_at: takenAt - 7 * 86_400_000,
+    lf_rule: 'bucket-day-v2',
     genesis_bal: 128_890_000,
     ...over,
   };

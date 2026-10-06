@@ -1,12 +1,10 @@
 // F3 HTTP-level e2e (plan setup-fill-on-add, Final Verification Wave):
-//   A REAL `POST /api/tracked-cas` request must drive the paced early setup pass
+//   A REAL `POST /api/tracked-cas` request must drive the serialized early setup pass
 //   through the production chain — createApp route → kickCAs → kickToken().then(
 //   kickSetupEarly) → drainEarlySetup → refreshSeries — so token_state fills
-//   (t100_multiple / genesis_bal / anchor_at) WITHOUT waiting out the 12h
-//   setupSweep. Unlike setup-early-kick.test.ts (which calls kickCAs directly),
-//   this proves the route a real user hits reaches the trigger at all:
-//   - one add → 201 + filled row, exactly 4 official tgm/flows calls
-//     (3 early pass + 1 kickNansen); the browser door stays a TRIPWIRE at 0
+//   (t100_multiple / genesis_bal / anchor_at) without waiting for a sweep.
+//   Unlike setup-early-kick.test.ts, this exercises the real HTTP route.
+//   One add fills setup with one T100 and one LF request; no separate chart fetch.
 //   - two concurrent adds → early passes serialized, never an exchange-call burst
 //   - re-add after a DB-table reset → absorbed by the FILE cache entry the first
 //     HTTP add wrote: ZERO extra calls anywhere (the cache lifecycle end-to-end)
@@ -199,7 +197,7 @@ after(() => {
   server.close();
 });
 
-test('POST /api/tracked-cas: the real route drives ONE paced early pass → token_state filled, no 12h wait', async () => {
+test('POST /api/tracked-cas fills setup through the real route without waiting for a sweep', async () => {
   // When: a user adds a CA over HTTP with the real body shape.
   const res = await postTrackedCa({ address: CA1, chain: CHAIN });
 
@@ -219,12 +217,8 @@ test('POST /api/tracked-cas: the real route drives ONE paced early pass → toke
   // mean the pass ran AFTER the row existed — reached VIA the HTTP route.
   assertFilled(CA1);
   assert.ok(getSetupCacheEntry(CA1, CHAIN), 'the pass persisted a file-cache entry');
-  // Counts: exactly one early pass (exchange is fetched ONLY by refreshSeries)
-  // plus kickNansen's T100 fetch — 3 official flows calls for one CA, nothing more.
-  // kickNansen stays at ONE call: it runs before the row exists, so its unanchored
-  // 7d window fails the reach guard against this fake's 2-day-old series.
-  assert.equal(exchangeFetches, 1, 'exactly one early setup pass for the added CA');
-  assert.equal(flowsCalls, 3, '2 early-pass calls + 1 kickNansen T100 call');
+  assert.equal(exchangeFetches, 1, 'one LF fetch for the added CA');
+  assert.equal(flowsCalls, 2, 'one T100 and one LF, no redundant chart request');
   assert.equal(doorFetches, 0, 'the browser door is off the T100/LF path');
   assert.equal(maxActiveExchange, 1, 'no overlapping exchange fetches');
 });
@@ -246,7 +240,7 @@ test('two concurrent POSTs: both CAs filled, the early passes stay serialized (p
   assertFilled(CA2);
   assertFilled(CA3);
   assert.equal(exchangeFetches, 2, 'one early pass per added CA');
-  assert.equal(flowsCalls, 6, '3 official flows calls per CA, nothing more');
+  assert.equal(flowsCalls, 4, 'two official flows calls per CA, without duplicate chart requests');
   assert.equal(doorFetches, 0, 'the browser door is off the T100/LF path');
   assert.equal(maxActiveExchange, 1, 'the adds race, but their early passes never overlap');
 });

@@ -2,14 +2,27 @@
 //   - nextPhaseDelayMs fires land on systemDeployAt + n×POLL_SETUP_MS boundaries,
 //     never at boot + interval (the old i*20s stagger drifted on every restart)
 //   - open() writes systemDeployAt ONCE; a restart never moves the phase anchor
+process.env.POLL_SETUP_SWEEP_MS = '300000';
+process.env.POLL_SETUP_RETRY_MS = '7200000';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { config } from '../src/config.js';
-import { getSetting, open } from '../src/db.js';
-import { nextPhaseDelayMs } from '../src/poller.js';
+// Dynamic imports ensure config reads the test env values above.
+const { config } = await import('../src/config.js');
+const { getSetting, open } = await import('../src/db.js');
+const { nextPhaseDelayMs } = await import('../src/poller.js');
+
+test('setup sweep cadence is independent from failed-field retry base', () => {
+  assert.equal(config.pollSetupSweepMs, 300_000);
+  assert.equal(config.pollSetupRetryMs, 7_200_000);
+  const anchor = 1_758_000_000_000;
+  const now = anchor + 6 * 60_000;
+  assert.equal(nextPhaseDelayMs(anchor, now, config.pollSetupSweepMs), 4 * 60_000);
+});
+
 
 const POLL = config.pollSetupMs;
 

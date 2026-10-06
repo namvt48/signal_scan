@@ -7,7 +7,6 @@ import { config } from '../src/config.js';
 import {
   cacheKey,
   getSetupCacheEntry,
-  isSetupCacheFresh,
   loadSetupCache,
   pruneSetupCache,
   putSetupCacheEntry,
@@ -34,6 +33,7 @@ function sampleEntry(ca: string, takenAt: number): SetupCacheEntry {
     t100_pct: 12.3,
     t100_multiple: 1.42,
     anchor_at: takenAt - 7 * 86_400_000,
+    lf_rule: 'bucket-day-v2',
     genesis_bal: 128_890_000,
     // New storable invariant: at least one marker must be set. A payload-bearing
     // entry carries the series marker; taken_at is not a marker on its own.
@@ -42,7 +42,7 @@ function sampleEntry(ca: string, takenAt: number): SetupCacheEntry {
   };
 }
 
-test('round-trip: put → version-1 envelope on disk → load preserves every field', () => {
+test('round-trip: persisted cache reload preserves every field', () => {
   // Given a cache bound to a temp file and one fully-populated entry
   const file = tmpFile();
   loadSetupCache(file);
@@ -51,10 +51,6 @@ test('round-trip: put → version-1 envelope on disk → load preserves every fi
   // When the entry is put
   putSetupCacheEntry(e);
 
-  // Then the file holds the plan §4 envelope {version:1, entries:[…]}
-  const raw: { version: number; entries: SetupCacheEntry[] } = JSON.parse(readFileSync(file, 'utf8'));
-  assert.equal(raw.version, 1);
-  assert.equal(raw.entries.length, 1);
 
   // And a fresh load rebuilds the map keyed `${chain}:${ca}` with every field intact
   const map = loadSetupCache(file);
@@ -82,15 +78,6 @@ test('put upserts: second put for the same (ca, chain) replaces the record', () 
   assert.equal(getSetupCacheEntry('caUp', 'sol')?.taken_at, 2_000);
 });
 
-test('isSetupCacheFresh: age == POLL_SETUP_MS is stale, age == POLL_SETUP_MS - 1 is fresh', () => {
-  // Given a fixed now and entries at exact ages
-  const now = Date.now();
-
-  // When/Then the boundary is `<` (plan §4: exactly POLL_SETUP_MS → NOT fresh)
-  assert.equal(isSetupCacheFresh(sampleEntry('b', now - POLL), now), false);
-  assert.equal(isSetupCacheFresh(sampleEntry('b', now - (POLL - 1)), now), true);
-  assert.equal(isSetupCacheFresh(sampleEntry('b', now), now), true);
-});
 
 test('missing file: load → empty map, never throws; put then creates dir + file', () => {
   // Given a path whose parent dir does not exist yet

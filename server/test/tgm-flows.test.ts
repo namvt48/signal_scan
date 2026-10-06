@@ -124,7 +124,7 @@ test('pre-genesis back-fill is clamped out of both T100 and LF', async () => {
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
   setPollerDeps(stubProvider, null, {
     tokenFlows: async (req: TgmFlowsRequest) => {
-      const from = Date.parse(req.date.from);
+      const from = req.label === 'exchange' ? Math.floor(deployedAt / 3_600_000) * 3_600_000 : deployedAt;
       return [
         { date: new Date(from - 5 * DAY).toISOString(), token_amount: 999_999, holders_count: 0 },
         { date: new Date(from).toISOString(), token_amount: 500, holders_count: 1 },
@@ -351,7 +351,6 @@ test('T100: a flat series (≥2 buckets, no drawdown) writes multiple 1 over the
   assert.ok(st);
   assert.equal(st.t100_multiple, 1, 'three flat buckets prove no drawdown — the previous 1.5 is replaced');
   assert.equal(st.t100_pct, 0);
-  assert.equal(st.genesis_bal, 100, 'the pass completed: LF re-read from the exchange rows');
   assert.equal(getSetupCacheEntry(CA, CHAIN)?.t100_multiple, 1, 'the completed pass still stored a cache entry');
 });
 

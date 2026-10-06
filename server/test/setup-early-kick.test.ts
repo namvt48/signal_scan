@@ -2,17 +2,11 @@
 //   - N CAs added in one kickCAs call each get exactly ONE early refreshSeries pass,
 //     AFTER their token_state row exists (filled columns are the ordering proof:
 //     refreshSeries no-ops without the row, so nothing could fill them earlier)
-//   - the passes are paced, never a burst: serialized (max 1 exchange flows call in
-//     flight) and counted — exactly 3 official tgm/flows calls (T100 primary +
-//     the extra daily T100 series + exchange) per CA on top of the kickNansen T100
-//     call (ONE: it runs before the row exists, so its unanchored 7d window fails
-//     the reach guard against the 2-day-old fake series — no extra daily call)
+//   - one T100 + one LF request per CA; shared queue permits one active pass
 //   - a CA whose fresh file-cache entry already exists costs 0 flows calls
 // The browser door stays installed as a TRIPWIRE: the T100/LF path must never
 // touch it again (official API since 2026-09-23).
-// Env BEFORE the src imports: crawlEnabled gates the trigger, and the queue-jump
-// window is shrunk so pacedFor slots are test-sized (assertions are on COUNTS,
-// never on wall-clock sleeps). node:test = one process per file, so this is safe.
+// Env precedes dynamic imports because node:test isolates config per file.
 process.env.NANSEN_CRAWL = 'on';
 process.env.NEW_CA_PRIORITY_MS = '1000';
 
@@ -150,6 +144,7 @@ function sampleEntry(ca: string, now: number, deployedAt: number): SetupCacheEnt
     t100_pct: 33.33,
     t100_multiple: 1.5,
     anchor_at: deployedAt,
+    lf_rule: 'bucket-hour-v2',
     genesis_bal: 120,
     info_at: now - 60_000,
     series_at: now - 60_000,
@@ -173,7 +168,7 @@ function assertFilled(ca: string, deployedAt: number): void {
   assert.equal(st.anchor_at, deployedAt, `${ca} genesis anchor filled by the early pass`);
 }
 
-test('early kick: 2 CAs in one call → ONE paced setup pass each, after the row exists', async () => {
+test('early kick: two CAs fill setup after metadata with one T100 and LF request each', async () => {
   open(':memory:');
   loadSetupCache(tempCacheFile());
   const now = Date.now();
@@ -194,10 +189,8 @@ test('early kick: 2 CAs in one call → ONE paced setup pass each, after the row
   // columns mean the pass ran strictly AFTER kickToken/upsertTokenInfo.
   assertFilled(CA1, deployedAt);
   assertFilled(CA2, deployedAt);
-  // Counts, not sleeps: exactly one early pass per CA (exchange is fetched ONLY
-  // by refreshSeries), plus the pre-existing kickNansen T100 call — 3 per CA.
-  assert.equal(exchangeFetches, 2, 'exactly one early setup pass per CA');
-  assert.equal(flowsCalls, 6, '2 early-pass calls + 1 kickNansen T100 call per CA, nothing more');
+  assert.equal(exchangeFetches, 2, 'exactly one LF fetch per CA');
+  assert.equal(flowsCalls, 4, 'one T100 and one LF per CA, no separate chart fetch');
   assert.equal(doorFetches, 0, 'the browser door is off the T100/LF path');
   assert.equal(maxActiveExchange, 1, 'early passes never overlap — paced, not a burst');
 });

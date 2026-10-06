@@ -20,7 +20,7 @@ import {
 import { snapshotSeries } from './detail.js';
 import { getNansenSeries, nansenSeriesCachedAt } from './db.js';
 import { cacheSeriesWindows, kickNansen } from './poller.js';
-import { getSetupCacheEntry, isSetupCacheFresh } from './setup-cache.js';
+import { getSetupCacheEntry, isSeriesFresh } from './setup-cache.js';
 import type { Chain } from './shared/chain.js';
 import { log } from './log.js';
 // A re-export below is NOT a local binding, so the internal caller
@@ -128,11 +128,9 @@ export async function balanceSeries(
   // internal snapshots or kicking a door refetch.
   if (cached.length <= 1) {
     const e = getSetupCacheEntry(ca, chain);
-    // Payload guard (2026-09-29): an always-written entry can be `taken_at`-fresh with
-    // an EMPTY series (an empty fetch pass writes one so its markers have a home) —
-    // replaying it would log a false "replayed chart windows" and buy nothing.
-    if (e && e.series.length > 0 && isSetupCacheFresh(e, Date.now())) {
-      cacheSeriesWindows(ca, chain, e.series, e.taken_at);
+    // Fresh% stamps must never make an old chart look newly fetched.
+    if (e && e.series.length > 0 && e.series_at !== undefined && isSeriesFresh(e, Date.now())) {
+      cacheSeriesWindows(ca, chain, e.series, e.series_at);
       log.info(`[setup-cache] replayed ${ca.slice(0, 8)} (${chain}) chart windows from the file cache`);
       cachedAt = nansenSeriesCachedAt(ca, chain, window);
       cached = getNansenSeries(ca, chain, window);

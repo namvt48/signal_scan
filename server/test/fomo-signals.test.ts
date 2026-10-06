@@ -316,3 +316,16 @@ test('fomoUserStats: a stored FOMO API position cost basis OUTRANKS the alert-de
   assert.equal(after.holdingAmount, 27_003_562.7);
   assert.deepStrictEqual(fomoUserStatsByCa(NOW).get(`sol:${CA}`), [after]);
 });
+
+test('FOMO default sort timestamps use latest BUY only and stay chain-scoped', () => {
+  const rows = assembleSignals(NOW, true);
+  const find = (ca: string, chain = 'sol') => rows.find((s) => s.ca === ca && s.chain === chain)!;
+  assert.equal(find(CA_F).fomoBuyAt, NOW - 3_600_000, 'newer sells never promote a token');
+  assert.equal(find(CA_X).fomoBuyAt, NOW - 600_000);
+  assert.equal(find(CA_X, 'base').fomoBuyAt, NOW - 300_000);
+  assert.equal(find(CA_E).fomoBuyAt, 0, 'no captured BUY sinks to the end');
+  const ca = 'fomo-sort-stale-buy';
+  insertTrackedCa({ address: ca, chain: 'sol', note: '', entryUsd: 60 });
+  insertFomoTrade({ fomo_user_id: bob, event_id: 'sort-old-buy', ca, chain: 'sol', type: 'buy', ts: NOW - 2 * DAY });
+  assert.equal(assembleSignals(NOW, true).find((s) => s.ca === ca)?.fomoBuyAt, NOW - 2 * DAY, 'sorting is not capped at the stats window');
+});

@@ -10,6 +10,7 @@ import {
   deactivateTrackedCasByIds,
   findTrackedCa,
   getSetting,
+  setSetting,
   getTokenState,
   listCaScoreGateCandidates,
   listCaTargetsMissingEssential,
@@ -28,12 +29,15 @@ import {
   type TokenStateRow,
   type WalletRow,
 } from './db.js';
-import { replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, fillTokenMetrics, recomputeMarketCap } from './ingest.js';
+import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, fillTokenMetrics, recomputeMarketCap } from './ingest.js';
 import { fetchFomoPositions } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
   getSetupCacheEntry,
+  getSetupRetry,
+  recordSetupRetry,
+  clearSetupRetry,
   isInfoFresh,
   isSeriesFresh,
   pruneSetupCache,
@@ -48,6 +52,7 @@ import { nansenScore } from './signals.js';
 import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx } from './fomo-holdings.js';
 import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
+import { enqueueSetup } from './setup-queue.js';
 import { fetchTokenMeta } from './providers/dexscreener.js';
 import { GatewayDenialError, GatewayTransportError } from './gateway-client.js';
 import { log } from './log.js';
@@ -380,14 +385,12 @@ function isBackFill(rows: readonly TgmFlowsRow[]): boolean {
  * off, under the guard) and could never heal. A fetch failure keeps the previous
  * value instead of clearing the column.
  *
- * The window is walked widest → narrowest and sent as a `{from,to}` RANGE clamped
- * to `deployed_at`, not as a sugar rung: a sugar rung always starts at `now - span`,
- * so a young token gets pre-genesis filler AND coarse daily buckets — its first
- * post-deploy bucket read 45.67M for KNOTS where the user's chart reads 616.08M
- * (2026-09-21). A range from the deploy has no pre-genesis rows and hourly buckets at
- * genesis, the read behind every user-confirmed value (POT 128.89M @ 09-16T02:00).
+ * The window is walked widest → narrowest and sent as a `{from,to}` RANGE aligned
+ * to the deployment bucket: hourly through seven days, daily beyond that. The
+ * range is capped at 1000 buckets; the aligned first bucket includes listing-day
+ * balances without admitting earlier buckets into the LF anchor.
  */
-async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null): Promise<{ total: number; points: BalancePoint[] } | undefined> {
+async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null): Promise<{ total: number; points: BalancePoint[]; rule: 'bucket-hour-v2' | 'bucket-day-v2' } | undefined> {
   // Không có deployed_at ⇒ không biết genesis nằm đâu — giữ nguyên giá trị cũ (94/152
   // dòng LF hiện thuộc nhóm này — xem EVIDENCE-2026-09-21-lf-range-form-restore.md).
   if (!deployedAt) return undefined;
@@ -395,26 +398,29 @@ async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null):
   if (!client) return undefined;
   const now = Date.now();
   try {
-    // ONE official tgm/flows call, deploy → now, label=exchange. The LF_WINDOWS
-    // widest→narrowest ladder is no longer on the prod path (snapshot.ts keeps it
-    // for the debug probe + invariant tests). `to` is capped so the range always
-    // fits the API's most-recent-1000-bucket window (a deploy→now range on a
-    // >1000d token would otherwise truncate the OLD end and lose genesis).
-    // RISK: ranges >7d come back DAILY.
-    const to = Math.min(deployedAt + 999 * 86_400_000, now);
+    // API range starts are exclusive at the bucket boundary, so request one bucket
+    // before listing while anchoring/validating at the listing bucket itself.
+    const dayMs = 86_400_000;
+    const hourMs = 3_600_000;
+    const lfRule = now - deployedAt > 7 * dayMs ? 'bucket-day-v2' : 'bucket-hour-v2';
+    const bucketMs = lfRule === 'bucket-day-v2' ? dayMs : hourMs;
+    const anchorFrom = Math.floor(deployedAt / bucketMs) * bucketMs;
+    const requestFrom = anchorFrom - bucketMs;
+    // Padding must not change the selected wire granularity near day seven.
+    const to = Math.min(requestFrom + (lfRule === 'bucket-day-v2' ? 999 * dayMs : 7 * dayMs), now);
     const rows = await client.tokenFlows({
       chain,
       token_address: ca,
-      date: { from: new Date(deployedAt).toISOString(), to: new Date(to).toISOString() },
+      date: { from: new Date(requestFrom).toISOString(), to: new Date(to).toISOString() },
       label: 'exchange',
     });
     const points = flowsToPoints(rows);
-    if (!seriesReachesStart(points, deployedAt)) {
+    if (!seriesReachesStart(points, anchorFrom, lfRule === 'bucket-day-v2' ? 0 : bucketMs)) {
       log.error('[poller] genesisLF series cut ngan hon cua so xin, keep previous', ca.slice(0, 8), 'n=' + points.length);
       return undefined;
     }
-    const lf = exchangeAnchorLf(points, deployedAt);
-    if (lf) return { total: lf.total, points };
+    const lf = exchangeAnchorLf(points, anchorFrom);
+    if (lf) return { total: lf.total, points, rule: lfRule };
     log.warn('[poller] genesisLF no exchange row, keep previous', ca.slice(0, 8));
     return undefined;
   } catch (e) {
@@ -435,27 +441,46 @@ function passThroughAnalytics(st: TokenStateRow): { t100Pct?: number; t100Multip
   };
 }
 
-/** Attempts that produced no setup, per cacheKey — the empty-CA backoff ladder. */
-const setupMisses = new Map<string, { misses: number; nextAt: number }>();
-/** An empty CA is never re-asked faster than this, whatever POLL_SETUP_RETRY_MS says. */
+type SetupField = 'info' | 'series' | 'lf';
 const SETUP_RETRY_MIN_MS = 60_000;
-/** Ceiling of the miss ladder, deliberately NOT POLL_SETUP_MS: that is now 1h, so
- * capping there would make a CA whose setup keeps coming back empty retry every
- * hour forever instead of backing off. 12h keeps the ladder meaningful. */
 const SETUP_RETRY_MAX_MS = 43_200_000;
+
+function retryReady(ca: string, chain: Chain, field: SetupField, now: number): boolean {
+  const retry = getSetupRetry(ca, chain, field);
+  return retry === undefined || now >= retry.nextAt;
+}
 
 function setupRetryDelayMs(misses: number): number {
   return Math.min(SETUP_RETRY_MAX_MS, Math.max(SETUP_RETRY_MIN_MS, config.pollSetupRetryMs * 2 ** misses));
 }
 
-/** Still owed setup data: no cache entry, or one whose gini/fresh% field is past its
- * 6h TTL. Gini has its own clock (isInfoFresh); the T100 series has its own 12h clock
- * (isSeriesFresh) and refreshes independently via flowsSweep. */
+function retryLater(ca: string, chain: Chain, field: SetupField): void {
+  const now = Date.now();
+  const misses = (getSetupRetry(ca, chain, field)?.misses ?? 0) + 1;
+  const delay = isTooNewToken(ca, chain, now) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
+  recordSetupRetry(ca, chain, field, misses, now + delay);
+}
+
+function owesInfo(ca: string, chain: Chain, now: number): boolean {
+  const cached = getSetupCacheEntry(ca, chain);
+  return (!cached || !isInfoFresh(cached, now)) && retryReady(ca, chain, 'info', now);
+}
+
+function owesSeries(ca: string, chain: Chain, now: number): boolean {
+  const cached = getSetupCacheEntry(ca, chain);
+  return (!cached || !isSeriesFresh(cached, now)) && retryReady(ca, chain, 'series', now);
+}
+
+function owesLf(ca: string, chain: Chain, now: number): boolean {
+  const st = getTokenState(ca, chain);
+  const cached = getSetupCacheEntry(ca, chain);
+  if (!st?.deployed_at || !retryReady(ca, chain, 'lf', now)) return false;
+  const expectedRule = now - st.deployed_at > 7 * 86_400_000 ? 'bucket-day-v2' : 'bucket-hour-v2';
+  return cached?.genesis_bal == null || cached.lf_rule !== expectedRule;
+}
+
 function needsSetup(c: CaTarget, now: number): boolean {
-  const miss = setupMisses.get(cacheKey(c.address, c.chain));
-  if (miss && now < miss.nextAt) return false;
-  const cached = getSetupCacheEntry(c.address, c.chain);
-  return !cached || !isInfoFresh(cached, now);
+  return owesInfo(c.address, c.chain, now) || owesSeries(c.address, c.chain, now) || owesLf(c.address, c.chain, now);
 }
 
 /** Too young to retry fast: Nansen indexes a fresh mint only after some hours, so
@@ -468,77 +493,74 @@ function isTooNewToken(address: string, chain: Chain, now: number): boolean {
   return Number.isFinite(basis) && now - basis < config.newTokenMinAgeMs;
 }
 
-/**
- * The setup pass — ONE paced walk over the CAs the pass still owes setup data to
- * (fresh% / T100 / LF / series). A CA that comes back EMPTY (brand-new token, no
- * Nansen data yet) backs off on a doubling ladder so it is never hammered; a FULL
- * pass lands a fresh cache entry, which is what parks that CA on the 12h cadence.
- * Per CA it writes the free gini-stats setup card (fresh% / T100 supply / median
- * buy) and then the hourly-stats series: the T100 leftmost→trough pair, the
- * genesis timestamp, the Bal 24H/7D/30D extremes and the chart cache rows.
- * Grouping both into one pass makes the setup indicators land together (user
- * 2026-09-22).
- *
- * EXPORTED for the prune regression test only — same seam precedent as
- * refreshSeries/pacedFor; the scheduler stays the sole production caller.
- */
+/** Keep both debt classes moving without increasing the per-pass CA budget. */
+function cappedSetupTargets(all: readonly CaTarget[], now: number): CaTarget[] {
+  const cap = config.setupPassCap;
+  const fresh = all.filter((c) => owesInfo(c.address, c.chain, now));
+  const seriesOnly = all.filter((c) => !owesInfo(c.address, c.chain, now));
+  if (fresh.length === 0 || seriesOnly.length === 0) return all.slice(0, cap);
+  let seriesSlots = Math.min(seriesOnly.length, Math.max(1, Math.floor(cap / 5)));
+  if (cap === 1) {
+    seriesSlots = getSetting('setupDebtTurn') === 'series' ? 1 : 0;
+    setSetting('setupDebtTurn', seriesSlots ? 'fresh' : 'series');
+  }
+  const freshSlots = Math.min(fresh.length, cap - seriesSlots);
+  return [...fresh.slice(0, freshSlots), ...seriesOnly.slice(0, cap - freshSlots)];
+}
+
+/** Fill due factors independently, capped per pass; gateway owns upstream pacing. */
 export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   const now = Date.now();
   const tracked = listTrackedCas();
-  const all = newCasFirst(tracked).filter((c) => needsSetup(c, now));
+  const all = newCasFirst(tracked).filter((c) => needsSetup(c, now)).sort((a, b) => {
+    const aInfo = owesInfo(a.address, a.chain, now);
+    const bInfo = owesInfo(b.address, b.chain, now);
+    if (aInfo !== bInfo) return aInfo ? -1 : 1;
+    // Oldest successful Fresh read goes first; series-only debt cannot consume
+    // every capped slot while expired Fresh values wait indefinitely.
+    return aInfo
+      ? (getSetupCacheEntry(a.address, a.chain)?.info_at ?? 0) - (getSetupCacheEntry(b.address, b.chain)?.info_at ?? 0)
+      : (getSetupCacheEntry(a.address, a.chain)?.series_at ?? 0) - (getSetupCacheEntry(b.address, b.chain)?.series_at ?? 0);
+  });
   if (tracked.length > 0 && setupCacheSize() === 0) {
     log.warn('[poller] setup cache EMPTY with', tracked.length, 'tracked CA(s) — backfill capped per pass');
   }
   // A cold cache would otherwise backfill the whole queue in one pass — each CA
   // costs ≥1 credit, so trickle: the cap bounds the burst, the rest wait the next pass.
-  const cas = all.slice(0, config.setupPassCap);
+  const cas = cappedSetupTargets(all, now);
   if (all.length > cas.length) {
     log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
   }
-  await runGatewaySweep('setupSweep', (summary) =>
-    pacedFor(cas, config.pollSetupRetryMs, async (c) => {
-      const key = cacheKey(c.address, c.chain);
-      try {
-        const patch = await provider.metric(c.address, c.chain, 'gini');
-        updateTokenMetrics(c.address, c.chain, patch);
-        // Owner rule: the marker means "we OBTAINED the field", not "we called". A
-        // DAS-floor / not-indexed gini pass resolves with NO nansenFreshPct — stamping
-        // it would park the CA on the 6h clock with an empty field. Empty data must NOT
-        // stamp, so the CA keeps its retry ladder.
-        if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
-          stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
+  await runGatewaySweep('setupSweep', async (summary) => {
+    for (const c of cas) {
+      if (owesInfo(c.address, c.chain, Date.now())) {
+        try {
+          const patch = await provider.metric(c.address, c.chain, 'gini');
+          updateTokenMetrics(c.address, c.chain, patch);
+          if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
+            stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
+            clearSetupRetry(c.address, c.chain, 'info');
+          } else retryLater(c.address, c.chain, 'info');
+        } catch (e) {
+          retryLater(c.address, c.chain, 'info');
+          logProviderError(summary, e, 'setupSweep gini', c.address);
         }
-      } catch (e) {
-        logProviderError(summary, e, 'setupSweep gini', c.address);
       }
+    }
+    // Finish the selected Fresh reads before awaiting the credit-door series queue.
+    for (const c of cas) {
       try {
         await refreshSeries(c.address, c.chain);
       } catch (e) {
         logProviderError(summary, e, 'setupSweep series', c.address);
       }
-      // A storable gini pass stamps info_at — that is the CA's ticket to the 6h
-      // cadence. Anything else counts as a miss and doubles its next wait.
-      const entry = getSetupCacheEntry(c.address, c.chain);
-      if (entry && isInfoFresh(entry, now)) setupMisses.delete(key);
-      else {
-        const misses = (setupMisses.get(key)?.misses ?? 0) + 1;
-        // Too-new token: flat hourly spacing — Nansen has not indexed the mint yet,
-        // so the doubling ladder's fast early retries are pure credit spam. The
-        // first attempt on add (kickSetupEarly) is untouched; only RETRIES throttle.
-        const delayMs = isTooNewToken(c.address, c.chain, Date.now()) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
-        setupMisses.set(key, { misses, nextAt: Date.now() + delayMs });
-      }
-    }),
-  );
+    }
+  });
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
   // File-cache prune (plan setup-fill-on-add §4): drop entries whose CA left the
   // queue or aged past 7 cadences; the empty-set guard inside pruneSetupCache
   // keeps a just-reset DB from wiping the whole file.
-  // F2 fix: prune against a FRESH tracked-set read, NOT the sweep-start `cas` —
-  // this pass is paced across ~0.8 × POLL_SETUP_MS (~9.6h in prod), so a CA added
-  // mid-sweep has already had its entry written by the early kick; the stale
-  // snapshot deleted that legitimate fresh entry. Sync block: no await between
-  // listTrackedCas() and pruneSetupCache(), so no new race window opens.
+  // Re-read tracked keys after awaits so a token added mid-pass keeps its cache.
   const trackedKeysNow = new Set(listTrackedCas().map((c) => cacheKey(c.address, c.chain)));
   const dropped = pruneSetupCache(Date.now(), trackedKeysNow);
   if (dropped > 0) log.info(`[setup-cache] pruned ${dropped} entries`);
@@ -670,22 +692,24 @@ async function seriesAtRung(ca: string, chain: Chain): Promise<SeriesFetch | und
  * ranges, or undefined when nothing was applied.
  */
 function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: BalanceRange; d30?: BalanceRange } | undefined {
-  if (!getTokenState(e.ca, e.chain)) {
+  const st = getTokenState(e.ca, e.chain);
+  if (!st) {
     log.info(`[setup-cache] fresh entry ${e.ca.slice(0, 8)} (${e.chain}) waits — token_state row not created yet`);
     return undefined;
   }
+  if (st.genesis_bal == null && e.genesis_bal !== undefined) restoreTokenLf(e.ca, e.chain, e.genesis_bal);
   // Marker-only entry: no chart payload to replay. We must NOT fall through to
   // updateTokenAnalytics — it writes `?? null`, so replaying an empty payload would
   // WIPE bal_peak_*/bal_trough_* in token_state. The marker alone parks the CA.
   if (e.series.length === 0) {
-    log.info(`[setup-cache] marker-only entry ${e.ca.slice(0, 8)} (${e.chain}) applied nothing — no payload to replay`);
+    log.info(`[setup-cache] ${e.ca.slice(0, 8)} (${e.chain}) skipped chart replay — no series payload`);
     return undefined;
   }
-  const bal = cacheSeriesWindows(e.ca, e.chain, e.series, e.taken_at);
+  const bal = cacheSeriesWindows(e.ca, e.chain, e.series, e.series_at ?? e.taken_at);
   updateTokenAnalytics(e.ca, e.chain, {
     t100Pct: e.t100_pct,
     t100Multiple: e.t100_multiple,
-    genesisBal: e.genesis_bal,
+    genesisBal: st.genesis_bal ?? e.genesis_bal ?? undefined,
     anchorAt: e.anchor_at,
     bal,
   });
@@ -693,67 +717,38 @@ function applySetupCacheEntry(e: SetupCacheEntry): { d1?: BalanceRange; d7?: Bal
   return bal;
 }
 
-/**
- * T100/bal/anchors for one CA, both read off the token's OWN FE rung span — one span
- * per token, the granularity the FE would actually be showing (user 2026-09-18) —
- * fetched as a deploy-clamped range (`seriesAtRung`). T100 always overwrites from
- * the fresh series; the LF's second request is skipped once the value is known and
- * cached (write-once credit guard in applySeriesPass).
- *
- * EXPORTED for the T4 early trigger and the rehydrate tests: awaits, one CA,
- * door-guarded by the file cache — while a FRESH entry exists this NEVER fetches
- * (plan setup-fill-on-add §4), and a completed fetch pass is offered to
- * putSetupCacheEntry (whose storable guard refuses incomplete passes).
- */
-export async function refreshSeries(ca: string, chain: Chain): Promise<void> {
-  const now = Date.now();
-  const cached = getSetupCacheEntry(ca, chain);
-  if (cached && isSeriesFresh(cached, now)) {
-    applySetupCacheEntry(cached); // applies when the row exists, else waits — never fetches
-    return;
-  }
-  const entry = await applySeriesPass(ca, chain, now);
-  if (entry) putSetupCacheEntry(entry);
+/** Shared, serialized enrichment. TTLs decide eligibility; the gateway limits requests. */
+export function refreshSeries(ca: string, chain: Chain): Promise<void> {
+  const st = getTokenState(ca, chain);
+  const tracked = findTrackedCa(ca, chain);
+  const urgent = st?.t100_multiple == null || st?.genesis_bal == null ||
+    isNewCa(tracked?.added_at, Date.now() - config.newCaPriorityMs);
+  return enqueueSetup(ca, chain, urgent ? 0 : 1, async () => {
+    const now = Date.now();
+    const cached = getSetupCacheEntry(ca, chain);
+    if (cached && isSeriesFresh(cached, now)) applySetupCacheEntry(cached);
+    if (!owesSeries(ca, chain, now) && !owesLf(ca, chain, now)) return;
+    const entry = await applySeriesPass(ca, chain, now);
+    if (entry) putSetupCacheEntry(entry);
+  });
 }
 
-/**
- * Credit-only tgm/flows refresh on its own faster cadence (user 2026-09-24): T100
- * multiple, LF and the bal_* chart windows. No browser door — this is the REST
- * credit API — so it is paced against POLL_FLOWS_MS, not the door budget. Gini
- * (fresh%) stays on setupSweep's 1h cadence: the two refresh at different rates.
- *
- * Only CAs that still OWE a series are swept: an entry whose series_at marker is missing
- * or past 12h. No entry at all is setupSweep's job — it owns the setup pass cap
- * (config.setupPassCap) and the miss ladder (setupMisses). This is also the credit guard:
- * refreshSeries honors the per-field series_at marker, so a fresh entry costs 0
- * (and its LF write-once guard skips the exchange call). An always-fetch pass here
- * ignores that marker and re-buys every CA's T100+LF forever (measured leak:
- * 14 credits / 17 min ≈ 1170/day, 469 tracked CAs against only 124 cache entries).
- *
- * The old "a series write would keep gini permanently fresh" fear is gone with the
- * split per-field markers: applySeriesPass stamps only series_at and carries
- * info_at forward from prev?.info_at, so a flows write can never freeze gini's 6h
- * clock.
- *
- * EXPORTED for the credit-leak regression tests (same test-seam precedent as
- * setupSweep / refreshSeries / pacedFor).
- */
+/** Refresh due cached series and missing LF without stretching the walk across its TTL. */
 export async function flowsSweep(): Promise<void> {
   if (!flowsClient()) return;
   const now = Date.now();
-  const cas = newCasFirst(listTrackedCas()).filter((c) => {
-    const e = getSetupCacheEntry(c.address, c.chain);
-    return e !== undefined && !isSeriesFresh(e, now);
-  });
-  await runGatewaySweep('flowsSweep', (summary) =>
-    pacedFor(cas, config.pollFlowsMs, async (c) => {
+  const cas = newCasFirst(listTrackedCas()).filter((c) =>
+    getSetupCacheEntry(c.address, c.chain) !== undefined &&
+    (owesSeries(c.address, c.chain, now) || owesLf(c.address, c.chain, now)));
+  await runGatewaySweep('flowsSweep', async (summary) => {
+    for (const c of cas) {
       try {
         await refreshSeries(c.address, c.chain);
       } catch (e) {
         logProviderError(summary, e, 'flowsSweep', c.address);
       }
-    }),
-  );
+    }
+  });
 }
 
 /** One flows pass: fetch the series → T100 multiple / LF / bal_* windows → DB.
@@ -762,9 +757,16 @@ export async function flowsSweep(): Promise<void> {
 async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<SetupCacheEntry | undefined> {
   const st = getTokenState(ca, chain);
   if (!st) return undefined; // the essential sweep creates the row (supply + deployed_at)
-  const fetched = await seriesAtRung(ca, chain);
+  const prev = getSetupCacheEntry(ca, chain);
+  const fetchSeries = owesSeries(ca, chain, now);
+  const fetched = fetchSeries && flowsClient() ? await seriesAtRung(ca, chain) : undefined;
   const series = fetched?.points;
+  if (fetchSeries && flowsClient()) {
+    if (series && series.length > 0) clearSetupRetry(ca, chain, 'series');
+    else retryLater(ca, chain, 'series');
+  }
   let { t100Pct, t100Multiple, anchorAt, genesisBal } = passThroughAnalytics(st);
+  genesisBal ??= prev?.genesis_bal;
   if (series) {
     const g = fetched ? t100Mdd(fetched.t100) : undefined;
     if (g) {
@@ -774,36 +776,34 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     }
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
-  // LF write-once (credit guard): skip the 1-credit exchange fetch once genesis_bal
-  // is known. `st.genesis_bal != null` already means the LF total was obtained; the
-  // old `prev.exchange.length > 0` requirement existed ONLY because isStorable
-  // refused an empty `exchange` — that invariant is gone, so requiring cached points
-  // would merely re-buy the same 1-credit call forever.
-  const prev = getSetupCacheEntry(ca, chain);
-  const haveLf = st.genesis_bal != null && prev !== undefined;
-  const lf = haveLf ? undefined : await exchangeLf(ca, chain, st.deployed_at);
-  if (lf !== undefined) genesisBal = lf.total;
+  const fetchLf = owesLf(ca, chain, now);
+  const lf = fetchLf && flowsClient() ? await exchangeLf(ca, chain, st.deployed_at) : undefined;
+  if (lf !== undefined) {
+    genesisBal = lf.total;
+    clearSetupRetry(ca, chain, 'lf');
+  } else if (fetchLf && flowsClient()) retryLater(ca, chain, 'lf');
   updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, genesisBal, anchorAt, bal });
+  const infoAt = getSetupCacheEntry(ca, chain)?.info_at;
   return {
     ca,
     chain,
     taken_at: now,
-    window: fetched?.window ?? '',
-    series_from: fetched?.from,
-    series: series ?? [],
+    window: fetched?.window ?? prev?.window ?? '',
+    series_from: fetched?.from ?? prev?.series_from,
+    series: series ?? prev?.series ?? [],
     exchange: lf?.points ?? prev?.exchange ?? [],
     t100_pct: t100Pct,
     t100_multiple: t100Multiple,
     anchor_at: anchorAt,
     genesis_bal: genesisBal,
+    lf_rule: lf?.rule ?? prev?.lf_rule,
     // Carry the previous series marker FIRST; a fresh non-empty series then stamps
     // `now` over it. An empty pass therefore keeps prev.series_at (no fresh stamp,
     // an existing marker is never lost).
     ...(prev?.series_at !== undefined ? { series_at: prev.series_at } : {}),
     ...(series !== undefined && series.length > 0 ? { series_at: now } : {}),
-    // Carry the gini stamp forward ONLY from prev.info_at: a series-only pass must
-    // not fabricate one, so an unstamped entry stays eligible for the gini re-ask.
-    ...(prev?.info_at !== undefined ? { info_at: prev.info_at } : {}),
+    // A first-add gini result may have landed while the series request awaited.
+    ...(infoAt !== undefined ? { info_at: infoAt } : {}),
   };
 }
 
@@ -923,7 +923,7 @@ export function cacheSeriesWindows(ca: string, chain: Chain, fullRaw: BalancePoi
     const since = now - (w === 'day' ? 1 : w === 'week' ? 7 : 30) * 86_400_000;
     const pts = full.filter((p) => atMs(p) >= since);
     if (pts.length === 0) continue;
-    upsertNansenSeries(ca, chain, w, pts);
+    upsertNansenSeries(ca, chain, w, pts, now);
     const vals = pts.map((p) => p.total).filter((v) => Number.isFinite(v));
     if (vals.length) bal[w === 'day' ? 'd1' : w === 'week' ? 'd7' : 'd30'] = { peak: Math.max(...vals), trough: Math.min(...vals) };
   }
@@ -936,17 +936,10 @@ async function crawlBalanceSeries(
   chain: Chain,
 ): Promise<{ bal: { d1?: BalanceRange; d7?: BalanceRange; d30?: BalanceRange }; ok: boolean }> {
   try {
-    const now = Date.now();
-    // Door guard (plan setup-fill-on-add §4): kickNansen must not refetch while a
-    // FRESH series exists — apply it (row permitting) like refreshSeries.
+    await refreshSeries(address, chain);
     const cached = getSetupCacheEntry(address, chain);
-    if (cached && isSeriesFresh(cached, now)) {
-      const bal = applySetupCacheEntry(cached);
-      return { bal: bal ?? {}, ok: bal !== undefined };
-    }
-    const fetched = await seriesAtRung(address, chain);
-    if (!fetched) return { bal: {}, ok: false };
-    return { bal: cacheSeriesWindows(address, chain, fetched.points, now), ok: true };
+    const bal = cached && isSeriesFresh(cached, Date.now()) ? applySetupCacheEntry(cached) : undefined;
+    return { bal: bal ?? {}, ok: bal !== undefined };
   } catch (e) {
     log.error('[poller] crawlBalanceSeries', address.slice(0, 8), String(e).slice(0, 120));
     return { bal: {}, ok: false };
@@ -1120,37 +1113,30 @@ export function kickCAs(cas: readonly { address: string; chain: Chain }[]): void
     void kickToken(pollerDeps.provider, c.address, c.chain).then(() => {
       kickSetupEarly([c]);
     });
-    kickNansen(c.address, c.chain);
   }
   kickWalletHoldingsFor(cas);
 }
 
-// --- T4 early setup trigger (plan setup-fill-on-add) -------------------------
-// A newly-added CA gets ONE early refreshSeries pass instead of waiting out the
-// 12h setupSweep. Paced, never a burst: one serialized drainer (kicks arriving
-// while a pass runs batch into the next pacedFor, spaced across the queue-jump
-// window — 2 requests per CA stays far under the 30/min path + 40/min door
-// budgets), and the pool's own budgets remain the hard cap. Best-effort: every
-// error is caught inside, so an add can never fail on the early pass.
-const earlySetupPending: { address: string; chain: Chain }[] = [];
+// Newly-added tokens enter the same queue as chart and background refreshes.
+const earlySetupPending = new Map<string, { address: string; chain: Chain }>();
 let earlySetupDrain: Promise<void> = Promise.resolve();
 
 export function kickSetupEarly(cas: readonly { address: string; chain: Chain }[]): void {
   if (!config.crawlEnabled) return; // crawl off ⇒ no door, no setupSweep either — nothing to front-run
-  earlySetupPending.push(...cas);
+  for (const c of cas) earlySetupPending.set(cacheKey(c.address, c.chain), c);
   earlySetupDrain = earlySetupDrain.then(drainEarlySetup);
 }
 
 async function drainEarlySetup(): Promise<void> {
-  const batch = earlySetupPending.splice(0, earlySetupPending.length);
-  await pacedFor(batch, config.newCaPriorityMs, async (c) => {
+  const batch = [...earlySetupPending.values()];
+  earlySetupPending.clear();
+  await Promise.all(batch.map(async (c) => {
     try {
-      log.info(`[poller] early setup pass ${c.address.slice(0, 8)} (${c.chain})`);
       await refreshSeries(c.address, c.chain);
     } catch (e) {
       log.error('[poller] earlySetup', c.address, e);
     }
-  });
+  }));
 }
 
 /** Test/observability seam: resolves when every queued early setup pass has finished. */
@@ -1173,7 +1159,13 @@ export function kickToken(provider: MarketDataProvider, address: string, chain: 
     .tokenInfo(address, chain)
     .then((info) => {
       upsertTokenInfo(info);
-      if (info.nansenStats) updateNansenHolders(address, chain, info.nansenStats);
+      if (info.nansenStats) {
+        updateNansenHolders(address, chain, info.nansenStats);
+        if (Number.isFinite(info.nansenStats.freshSupplyPct)) {
+          stampSetupCacheField(address, chain, 'info_at', Date.now());
+          clearSetupRetry(address, chain, 'info');
+        }
+      }
     })
     .catch((e) => log.error('[poller] kickToken', address, e));
 }
@@ -1251,11 +1243,11 @@ export function startPoller(provider: MarketDataProvider, nansenApi: NansenApiCl
     // process boot.
     const rawAnchor = Number(getSetting('systemDeployAt'));
     const anchorAt = Number.isFinite(rawAnchor) ? rawAnchor : Date.now();
-    const delay = nextPhaseDelayMs(anchorAt, Date.now(), config.pollSetupRetryMs);
-    tasks.push({ name: 'setupSweep', intervalMs: config.pollSetupRetryMs, initialDelayMs: delay, fn: () => setupSweep(provider) });
-    log.info(`[poller] setupSweep anchored to systemDeployAt=${new Date(anchorAt).toISOString()} — next pass in ${Math.round(delay / 1000)}s`);
+    const delay = nextPhaseDelayMs(anchorAt, Date.now(), config.pollSetupSweepMs);
+    tasks.push({ name: 'setupSweep', intervalMs: config.pollSetupSweepMs, initialDelayMs: delay, fn: () => setupSweep(provider) });
+    log.info(`[poller] setupSweep anchored to systemDeployAt=${new Date(anchorAt).toISOString()} — cadence=${config.pollSetupSweepMs}ms, next pass in ${Math.round(delay / 1000)}s`);
   }
-  log.info(`[poller] setup sweep every ${config.pollSetupRetryMs}ms (retries until a CA is complete, then ${config.pollSetupMs}ms)`);
+  log.info(`[poller] setup sweep cadence=${config.pollSetupSweepMs}ms; failed-field retry base=${config.pollSetupRetryMs}ms; Fresh TTL=${config.pollSetupMs}ms`);
   tasks.forEach((task, i) => {
     setTimeout(() => {
       void run(task);

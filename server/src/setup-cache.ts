@@ -41,12 +41,20 @@ export interface SetupCacheEntry {
    * Optional: absent at runtime means "never obtained" (stale); a legacy entry
    * gets it backfilled from `taken_at` once, at load time (parseEntry). */
   info_at?: number;
-  /** Epoch ms we OBTAINED the T100 series field — its own 12h TTL (isSeriesFresh).
-   * Optional: same load-time legacy backfill as info_at. */
   series_at?: number;
+  /** LF query bucket provenance; absent on legacy entries until revalidated. */
+  lf_rule?: 'bucket-hour-v2' | 'bucket-day-v2';
 }
 
-const FILE_VERSION = 1;
+
+const FILE_VERSION = 2;
+const LEGACY_FILE_VERSION = 1;
+export interface SetupRetryState {
+  misses: number;
+  nextAt: number;
+}
+type SetupRetryField = 'info' | 'series' | 'lf';
+let retries = new Map<string, SetupRetryState>();
 /** Entries strictly older than 7 × POLL_SETUP_MS are pruned (plan §4). */
 const PRUNE_AGE_FACTOR = 7;
 
@@ -105,7 +113,7 @@ function parsePoints(v: unknown): SeriesPoint[] | undefined {
   return out;
 }
 
-function parseEntry(v: unknown): SetupCacheEntry | undefined {
+function parseEntry(v: unknown, legacy: boolean): SetupCacheEntry | undefined {
   if (!isRecord(v)) return undefined;
   const ca = v['ca'];
   const chain = v['chain'];
@@ -116,6 +124,8 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
   const window = v['window'] === undefined ? '' : v['window'];
   if (typeof window !== 'string') return undefined;
   const seriesFrom = v['series_from'];
+  const lfRule = v['lf_rule'];
+  if (lfRule !== undefined && lfRule !== 'bucket-hour-v2' && lfRule !== 'bucket-day-v2') return undefined;
   const t100Pct = v['t100_pct'];
   const t100Multiple = v['t100_multiple'];
   const anchorAt = v['anchor_at'];
@@ -143,13 +153,22 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
     t100_multiple: isNum(t100Multiple) ? t100Multiple : undefined,
     anchor_at: isNum(anchorAt) ? anchorAt : undefined,
     genesis_bal: isNum(genesisBal) ? genesisBal : undefined,
-    // Marker = "we obtained this field at T". Entries written before Fix D carry no
-    // stamp, so backfill once at LOAD from taken_at — deploying this change then does
-    // not trigger a one-time re-crawl of the whole queue. Runtime absence stays
-    // authoritative (isInfoFresh/isSeriesFresh): no read-time taken_at fallback.
-    info_at: isNum(infoAt) ? infoAt : takenAt,
-    series_at: isNum(seriesAt) ? seriesAt : takenAt,
+    info_at: isNum(infoAt) ? infoAt : legacy ? takenAt : undefined,
+    series_at: isNum(seriesAt) ? seriesAt : legacy ? takenAt : undefined,
+    ...(lfRule !== undefined ? { lf_rule: lfRule } : {}),
   };
+}
+
+function retryKey(ca: string, chain: Chain, field: SetupRetryField): string {
+  return `${cacheKey(ca, chain)}:${field}`;
+}
+
+function parseRetryState(v: unknown): SetupRetryState | undefined {
+  if (!isRecord(v)) return undefined;
+  const misses = v['misses'];
+  const nextAt = v['nextAt'];
+  if (!isNum(misses) || !Number.isSafeInteger(misses) || misses < 0 || !isNum(nextAt) || nextAt < 0) return undefined;
+  return { misses, nextAt };
 }
 
 /**
@@ -161,6 +180,7 @@ function parseEntry(v: unknown): SetupCacheEntry | undefined {
 export function loadSetupCache(file: string = config.setupCacheFile): Map<string, SetupCacheEntry> {
   activeFile = file;
   entries = new Map();
+  retries = new Map();
   loaded = true;
   let raw: unknown;
   try {
@@ -169,23 +189,54 @@ export function loadSetupCache(file: string = config.setupCacheFile): Map<string
     log.warn(`[setup-cache] no usable cache at ${file} (${msg(err)}) — starting empty`);
     return entries;
   }
-  if (!isRecord(raw) || raw['version'] !== FILE_VERSION || !Array.isArray(raw['entries'])) {
+  if (!isRecord(raw) || (raw['version'] !== FILE_VERSION && raw['version'] !== LEGACY_FILE_VERSION) || !Array.isArray(raw['entries'])) {
     log.warn(`[setup-cache] unrecognized envelope in ${file} (want {version:${FILE_VERSION}, entries:[]}) — starting empty`);
     return entries;
   }
+  const legacy = raw['version'] === LEGACY_FILE_VERSION;
   const items: unknown[] = raw['entries'];
   let skipped = 0;
   for (const item of items) {
-    const e = parseEntry(item);
+    const e = parseEntry(item, legacy);
     if (e) entries.set(cacheKey(e.ca, e.chain), e);
     else skipped += 1;
   }
-  if (skipped > 0) log.warn(`[setup-cache] skipped ${skipped} malformed entries in ${file}`);
+  if (!legacy && isRecord(raw['retries'])) {
+    for (const [key, value] of Object.entries(raw['retries'])) {
+      const state = parseRetryState(value);
+      const split = key.indexOf(':');
+      const field = key.slice(key.lastIndexOf(':') + 1);
+      if (state && isChain(key.slice(0, split)) && key.lastIndexOf(':') > split + 1 &&
+        (field === 'info' || field === 'series' || field === 'lf')) retries.set(key, state);
+      else skipped += 1;
+    }
+  }
+  if (skipped > 0) log.warn(`[setup-cache] skipped ${skipped} malformed entries/retries in ${file}`);
   return entries;
 }
+export function getSetupRetry(ca: string, chain: Chain, field: SetupRetryField): SetupRetryState | undefined {
+  ensureLoaded();
+  return retries.get(retryKey(ca, chain, field));
+}
 
-/** The loaded record for a (ca, chain), or undefined (miss / not loaded yet). */
+export function recordSetupRetry(ca: string, chain: Chain, field: SetupRetryField, misses: number, nextAt: number): void {
+  ensureLoaded();
+  if (!ca || !isChain(chain) || !Number.isSafeInteger(misses) || misses < 0 || !isNum(nextAt) || nextAt < 0) {
+    log.warn('[setup-cache] skipped invalid retry state', chain, field);
+    return;
+  }
+  retries.set(retryKey(ca, chain, field), { misses, nextAt });
+  persist();
+}
+
+export function clearSetupRetry(ca: string, chain: Chain, field: SetupRetryField): void {
+  ensureLoaded();
+  if (retries.delete(retryKey(ca, chain, field))) persist();
+}
+
+/** Read a cached record, hydrating once before any eligibility or credit decision. */
 export function getSetupCacheEntry(ca: string, chain: Chain): SetupCacheEntry | undefined {
+  ensureLoaded();
   return entries.get(cacheKey(ca, chain));
 }
 
@@ -214,10 +265,6 @@ export function putSetupCacheEntry(entry: SetupCacheEntry): void {
   persist();
 }
 
-/** Valid inside ONE setup cadence: `now - taken_at < POLL_SETUP_MS` — exactly POLL_SETUP_MS ⇒ stale (plan §4). */
-export function isSetupCacheFresh(entry: SetupCacheEntry, now: number): boolean {
-  return now - entry.taken_at < config.pollSetupMs;
-}
 
 /** gini/fresh% freshness: the marker means "we OBTAINED this field at info_at".
  * No marker ⇒ never obtained ⇒ stale — a series-only pass can never park a CA on
@@ -232,13 +279,13 @@ export function isSeriesFresh(e: SetupCacheEntry, now: number): boolean {
   return e.series_at !== undefined && now - e.series_at < config.pollFlowsMs;
 }
 
-/** Stamp one field's fetch clock on an existing entry and persist. No-op when the
- * entry is absent (a gini success before the first series pass has nowhere to write). */
+/** Record an obtained field, including first-add before any series has been fetched. */
 export function stampSetupCacheField(ca: string, chain: Chain, field: 'info_at' | 'series_at', now: number): void {
+  if (!ca || !isChain(chain) || !isNum(now)) return;
   ensureLoaded();
-  const entry = entries.get(cacheKey(ca, chain));
-  if (!entry) return;
-  entry[field] = now;
+  const key = cacheKey(ca, chain);
+  const entry = entries.get(key) ?? { ca, chain, taken_at: now, window: '', series: [], exchange: [] };
+  entries.set(key, { ...entry, taken_at: now, [field]: now });
   persist();
 }
 
@@ -261,7 +308,14 @@ export function pruneSetupCache(now: number, trackedKeys: ReadonlySet<string>): 
       dropped += 1;
     }
   }
-  if (dropped > 0) persist();
+  let retriesDropped = false;
+  for (const key of retries.keys()) {
+    if (!trackedKeys.has(key.slice(0, key.lastIndexOf(':')))) {
+      retries.delete(key);
+      retriesDropped = true;
+    }
+  }
+  if (dropped > 0 || retriesDropped) persist();
   return dropped;
 }
 
@@ -271,13 +325,7 @@ function ensureLoaded(): void {
   if (!loaded) loadSetupCache(activeFile);
 }
 
-/** C3 guard: an entry parseEntry would silently DROP on the next load must never
- * reach the file. Identity + a finite `taken_at` are all it takes: the ENTRY is
- * where the per-field markers (info_at/series_at) live, so requiring a marker to
- * create it was circular — stampSetupCacheField is a no-op with no entry, so a CA
- * whose credit series came back empty could never be cached at all and was
- * re-asked on every pass forever (user 2026-09-29: "từ giờ không CA nào lỗi").
- * A PRESENT numeric field must still be finite (a NaN/±Infinity vanishes at reload). */
+/** Reject non-finite analytics or marker timestamps before persisting an entry. */
 function isStorable(e: SetupCacheEntry): boolean {
   const numericsOk =
     (e.series_from === undefined || isNum(e.series_from)) &&
@@ -286,7 +334,8 @@ function isStorable(e: SetupCacheEntry): boolean {
     (e.anchor_at === undefined || isNum(e.anchor_at)) &&
     (e.genesis_bal === undefined || isNum(e.genesis_bal)) &&
     (e.info_at === undefined || isNum(e.info_at)) &&
-    (e.series_at === undefined || isNum(e.series_at));
+    (e.series_at === undefined || isNum(e.series_at)) &&
+    (e.lf_rule === undefined || e.lf_rule === 'bucket-hour-v2' || e.lf_rule === 'bucket-day-v2');
   return e.ca !== '' && isChain(e.chain) && isNum(e.taken_at) && numericsOk;
 }
 
@@ -294,7 +343,7 @@ function persist(): void {
   const tmp = `${activeFile}.tmp`;
   try {
     mkdirSync(dirname(activeFile), { recursive: true });
-    writeFileSync(tmp, JSON.stringify({ version: FILE_VERSION, entries: [...entries.values()] }));
+    writeFileSync(tmp, JSON.stringify({ version: FILE_VERSION, entries: [...entries.values()], retries: Object.fromEntries(retries) }));
     renameSync(tmp, activeFile);
   } catch (err) {
     try {

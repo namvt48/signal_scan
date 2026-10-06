@@ -110,4 +110,11 @@ export const restDataStore: DataStore = {
   async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {
     await request<void>('/tier', json('PUT', { ca, chain, tier }));
   },
+
+  async setNote(ca: string, chain: Chain, note: string): Promise<void> {
+    await request<{ ca: string; chain: Chain; note: string }>(
+      `/tokens/${encodeURIComponent(chain)}/${encodeURIComponent(ca)}/note`,
+      json('PUT', { note }),
+    );
+  },
 };

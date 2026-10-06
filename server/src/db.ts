@@ -29,6 +29,8 @@ export interface TrackedCaRow {
   address: string;
   chain: Chain;
   note: string;
+  /** User-authored dashboard note; tracking provenance remains in note. */
+  user_note: string;
   added_at: string;
   status: string;
   /** USD entry size — NULL until known; assembleSignals skips NULL/< minUsd rows. */
@@ -83,6 +85,10 @@ export interface TokenStateRow {
   icon_url: string | null;
   /** X (Twitter) handle (GMGN token/info) — bare handle, validated charset before write. */
   x_handle: string | null;
+  /** Epoch ms of successful Fresh ingestion, independent of general fetched_at (not upstream measurement time). */
+  fresh_updated_at: number | null;
+  /** JSON-encoded {t,value} snapshots from successful existing Fresh metric updates. */
+  fresh_history_json: string | null;
   fetched_at: number | null;
 }
 
@@ -110,6 +116,7 @@ CREATE TABLE IF NOT EXISTS tracked_cas (
   address TEXT NOT NULL,
   chain TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
+  user_note TEXT NOT NULL DEFAULT '',
   added_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
   entry_usd REAL,
@@ -142,6 +149,8 @@ CREATE TABLE IF NOT EXISTS token_state (
   icon_url TEXT,
   x_handle TEXT,
   fetched_at INTEGER,
+  fresh_updated_at INTEGER,
+  fresh_history_json TEXT,
   PRIMARY KEY (ca, chain)
 );
 CREATE TABLE IF NOT EXISTS holder_snapshots (
@@ -339,6 +348,9 @@ export function open(path: string): void {
   for (const col of ['vol_1h', 'vol_24h_prev', 'bal_peak_24h', 'bal_trough_24h', 'bal_peak_7d', 'bal_trough_7d', 'bal_peak_30d', 'bal_trough_30d', 'fresh_rate', 'nansen_holders', 'nansen_fresh_pct', 'nansen_t100_pct', 'nansen_median_usd', 't100_multiple', 'genesis_bal']) {
     if (!cols.includes(col)) instance.exec(`ALTER TABLE token_state ADD COLUMN ${col} REAL`);
   }
+  if (!cols.includes('fresh_updated_at')) instance.exec('ALTER TABLE token_state ADD COLUMN fresh_updated_at INTEGER');
+  if (!cols.includes('fresh_history_json')) instance.exec('ALTER TABLE token_state ADD COLUMN fresh_history_json TEXT');
+
   // deployed_at/anchor_at store epoch ms — INTEGER affinity (separate from the REAL list above).
   if (!cols.includes('deployed_at')) instance.exec('ALTER TABLE token_state ADD COLUMN deployed_at INTEGER');
   if (!cols.includes('anchor_at')) instance.exec('ALTER TABLE token_state ADD COLUMN anchor_at INTEGER');
@@ -357,6 +369,24 @@ export function open(path: string): void {
   // tracked_cas.entry_usd (USD entry size — the minUsd signals gate), nullable.
   const trackedCols = (instance.pragma('table_info(tracked_cas)') as { name: string }[]).map((c) => c.name);
   if (!trackedCols.includes('entry_usd')) instance.exec('ALTER TABLE tracked_cas ADD COLUMN entry_usd REAL');
+  if (!trackedCols.includes('user_note')) {
+    const migrationDb = instance;
+    migrationDb.transaction(() => {
+      migrationDb.exec("ALTER TABLE tracked_cas ADD COLUMN user_note TEXT NOT NULL DEFAULT ''");
+      // Preserve saved text and keep legacy scanner labels only as tracking provenance.
+      migrationDb.exec("UPDATE tracked_cas SET user_note = note WHERE note NOT IN ('wallet-trade', 'fomo') AND note NOT GLOB 'auto:BUY by *' AND note NOT GLOB 'auto:SELL by *'");
+    })();
+  }
+  // Repair labels copied by the first user-note migration, once only. Edited
+  // notes differ from provenance; later explicit saves must survive restarts.
+  if (getSetting('userNoteAutoLabelsRepaired') !== '1') {
+    const migrationDb = instance;
+    migrationDb.transaction(() => {
+      migrationDb.prepare(`UPDATE tracked_cas SET user_note = ''
+        WHERE user_note = note AND (note GLOB 'auto:BUY by *' OR note GLOB 'auto:SELL by *')`).run();
+      setSetting('userNoteAutoLabelsRepaired', '1');
+    })();
+  }
   // A FOMO user known only by handle shows that handle as its name (user 2026-10-01):
   // rows created before this rule carry an empty name. Idempotent (0 rows after run 1).
   instance.exec("UPDATE fomo_users SET name = handle WHERE name = ''");
@@ -747,6 +777,13 @@ export function findTrackedCa(address: string, chain: Chain, includeInactive = f
     .get(canon, chain) as TrackedCaRow | undefined;
 }
 
+/** Update a user note without overwriting the chain-scoped tracking provenance. */
+export function setTrackedCaNote(address: string, chain: Chain, note: string): TrackedCaRow | undefined {
+  const ca = canonicalCa(address, chain);
+  const result = getDb().prepare('UPDATE tracked_cas SET user_note = ? WHERE address = ? AND chain = ?').run(note, ca, chain);
+  return result.changes ? findTrackedCa(ca, chain, true) : undefined;
+}
+
 export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
   const address = canonicalCa(input.address, input.chain);
   if (isPassTier(address, input.chain)) {
@@ -764,6 +801,7 @@ export function insertTrackedCa(input: TrackedCaInput): TrackedCaRow {
     address,
     chain: input.chain,
     note: input.note,
+    user_note: '',
     added_at: new Date().toISOString(),
     status: 'queued',
     entry_usd: input.entryUsd ?? null,
@@ -1265,13 +1303,13 @@ export function nansenSeriesCachedAt(ca: string, chain: Chain, window: string): 
   return row?.taken_at;
 }
 
-export function upsertNansenSeries(ca: string, chain: Chain, window: string, points: SeriesPoint[]): void {
+export function upsertNansenSeries(ca: string, chain: Chain, window: string, points: SeriesPoint[], takenAt: number): void {
   getDb()
     .prepare(
       `INSERT INTO nansen_series (ca, chain, window, taken_at, points_json) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(ca, chain, window) DO UPDATE SET taken_at = excluded.taken_at, points_json = excluded.points_json`,
     )
-    .run(ca, chain, window, Date.now(), JSON.stringify(points));
+    .run(ca, chain, window, takenAt, JSON.stringify(points));
 }
 
 /** Epoch ms of the oldest snapshot for a CA (coverage check) — undefined when none. */
@@ -1615,13 +1653,20 @@ export function listFomoWalletsForUser(fomoUserId: string, chain: Chain): FomoUs
     .all(fomoUserId, chain) as FomoUserWalletRow[];
 }
 
-/** Distinct (user, CA, chain) the users have alerted on — the holdings refresh target set. */
+/** Distinct (user, CA, chain) the users have alerted on for actively tracked CAs. */
 export function listFomoAlertTargets(): { fomo_user_id: string; ca: string; chain: Chain }[] {
-  return getDb().prepare('SELECT DISTINCT fomo_user_id, ca, chain FROM fomo_trades').all() as {
-    fomo_user_id: string;
-    ca: string;
-    chain: Chain;
-  }[];
+  return getDb()
+    .prepare(
+      `SELECT DISTINCT t.fomo_user_id, t.ca, t.chain
+         FROM fomo_trades t
+         JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
+        WHERE c.status != 'inactive'`,
+    )
+    .all() as {
+      fomo_user_id: string;
+      ca: string;
+      chain: Chain;
+    }[];
 }
 
 export interface FomoHoldingInput {
@@ -1719,7 +1764,7 @@ export function listFomoPositionTargets(): { fomo_user_id: string; handle: strin
          FROM fomo_users u
          JOIN fomo_trades t ON t.fomo_user_id = u.id
          JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
-        WHERE u.handle <> ''`,
+        WHERE u.handle <> '' AND c.status != 'inactive'`,
     )
     .all() as { fomo_user_id: string; handle: string }[];
 }

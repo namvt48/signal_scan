@@ -35,6 +35,7 @@ import {
   reactivateTrackedCa,
   setTier,
   setTrackedCaEntryUsd,
+  setTrackedCaNote,
   updateFomoUser,
   updateWallet,
   type FomoUserInput,
@@ -804,6 +805,30 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.status(204).end();
   });
 
+  // User note updates are admin-only and chain-scoped; unknown tracked CA → 404.
+  app.put('/api/tokens/:chain/:ca/note', (req, res) => {
+    if (!isChain(req.params.chain)) {
+      res.status(400).json({ error: 'invalid chain' });
+      return;
+    }
+    const body = req.body as unknown;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      res.status(400).json({ error: 'body must be a JSON object' });
+      return;
+    }
+    const b = body as Record<string, unknown>;
+    if (Object.keys(b).some((key) => key !== 'note') || typeof b.note !== 'string' || b.note.length > 2000) {
+      res.status(400).json({ error: 'note must be a string up to 2000 characters' });
+      return;
+    }
+    const row = setTrackedCaNote(req.params.ca, req.params.chain, b.note);
+    if (!row) {
+      res.status(404).json({ error: 'tracked CA not found' });
+      return;
+    }
+    res.json({ ca: row.address, chain: row.chain, note: row.user_note });
+  });
+
   // User-set tier for a tracked CA (dashboard Tier column). Absent/null tier clears it.
   app.put('/api/tier', (req, res) => {
     const parsed = parseTierBody(req.body);
@@ -980,6 +1005,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   });
 
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof SyntaxError && 'type' in err && err.type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'body must be valid JSON' });
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     log.error('[api] unhandled', err);
     res.status(500).json({ error: message });

@@ -18,9 +18,9 @@ import type { HourlyStatsRow, TgmFlowsRow, TokenFlowsClient } from '../src/provi
 import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } from '../src/providers/provider.js';
 import type { Chain } from '../src/shared/chain.js';
 
-const { open, insertTrackedCa } = await import('../src/db.js');
-const { upsertTokenInfo } = await import('../src/ingest.js');
-const { loadSetupCache, setupCacheSize } = await import('../src/setup-cache.js');
+const { getDb, getTokenState, open, insertTrackedCa } = await import('../src/db.js');
+const { upsertTokenInfo, updateTokenMetrics } = await import('../src/ingest.js');
+const { getSetupCacheEntry, loadSetupCache, setupCacheSize, stampSetupCacheField } = await import('../src/setup-cache.js');
 const { DoorPool, setPoolForTest } = await import('../src/crawl.js');
 const { setPollerDeps, setupSweep } = await import('../src/poller.js');
 
@@ -124,4 +124,74 @@ test('setup pass cap: a cold cache with 3 CAs queries exactly 1 per sweep (cap=1
   await setupSweep(provider);
   assert.equal(total(), 2, 'the next sweep queries the next CA (the first is parked on its fresh entry)');
   assert.equal(setupCacheSize(), 2);
+});
+
+test('capped refresh picks the oldest expired Fresh result, not the newest tracked CA repeatedly', async () => {
+  open(':memory:');
+  loadSetupCache(join(mkdtempSync(join(tmpdir(), 'setup-refresh-fair-')), 'nansen-cache.json'));
+  const now = Date.now();
+  const calls = new Map<string, number>();
+  const provider = countingProvider(now, calls);
+  setPollerDeps(provider, null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
+  for (const [ca, age] of [['old-stale', 300_000], ['new-stale', 120_000], ['series-only', 60_000]] as const) {
+    insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+    getDb().prepare('UPDATE tracked_cas SET added_at = ? WHERE address = ?').run(new Date(now - age).toISOString(), ca);
+    upsertTokenInfo(info(ca, now));
+    stampSetupCacheField(ca, CHAIN, 'info_at', ca === 'series-only' ? now : now - age);
+    updateTokenMetrics(ca, CHAIN, { nansenFreshPct: 10 });
+    stampSetupCacheField(ca, CHAIN, 'series_at', now);
+  }
+  await setupSweep(provider);
+  assert.equal(getTokenState('old-stale', CHAIN)?.nansen_fresh_pct, 30, 'the older Fresh result must refresh before the newer one');
+  assert.equal(calls.get('new-stale'), undefined, 'cap still limits the pass to one CA');
+  assert.equal(calls.get('series-only'), undefined, 'Fresh-not-due series/LF debt must not take the capped Fresh slot');
+  const realNow = Date.now;
+  Date.now = () => now + 60_000; // Even the just-refreshed prefix is due again at the next cadence.
+  try {
+    await setupSweep(provider);
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(getTokenState('new-stale', CHAIN)?.nansen_fresh_pct, 30, 'the next overdue CA progresses instead of being starved');
+  assert.equal(calls.get('old-stale'), 1, 'the prior selection cannot monopolize subsequent passes');
+});
+
+test('both Fresh and series/LF debt progress when each pass crosses the Fresh TTL', async () => {
+  open(':memory:');
+  loadSetupCache(join(mkdtempSync(join(tmpdir(), 'setup-mixed-fair-')), 'cache.json'));
+  const start = Date.now();
+  const calls = new Map<string, number>();
+  const provider = countingProvider(start, calls);
+  const seriesCalls: string[] = [];
+  const flows = installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], start), flowRows([[2, 120], [1, 130]], start));
+  setPollerDeps(provider, null, { tokenFlows: async (req) => {
+    seriesCalls.push(req.token_address);
+    return flows.tokenFlows(req);
+  } });
+  for (const ca of ['fresh-debt', 'series-debt']) {
+    insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+    upsertTokenInfo(info(ca, start));
+    updateTokenMetrics(ca, CHAIN, { nansenFreshPct: 10 });
+    stampSetupCacheField(ca, CHAIN, 'info_at', start - 120_000);
+    if (ca === 'fresh-debt') stampSetupCacheField(ca, CHAIN, 'series_at', start);
+  }
+  const realNow = Date.now;
+  try {
+    for (let pass = 0; pass < 4; pass++) {
+      const now = start + pass * DAY; // Both Fresh and series TTLs expire between passes.
+      Date.now = () => now;
+      // Incoming gini reads keep this CA's Fresh current while its other fields remain due.
+      stampSetupCacheField('series-debt', CHAIN, 'info_at', now);
+      await setupSweep(provider);
+      if (pass === 1) {
+        assert.ok(seriesCalls.includes('series-debt'), 'series/LF cannot wait behind permanent Fresh debt');
+        assert.notEqual(getTokenState('series-debt', CHAIN)?.genesis_bal, null);
+      }
+    }
+    assert.equal(getTokenState('fresh-debt', CHAIN)?.nansen_fresh_pct, 30);
+    assert.ok((calls.get('fresh-debt') ?? 0) >= 2, 'Fresh continues progressing across TTL crossings');
+    assert.equal(getSetupCacheEntry('series-debt', CHAIN)?.series_at, start + 3 * DAY, 'series continues refreshing after its own TTL expires again');
+  } finally {
+    Date.now = realNow;
+  }
 });

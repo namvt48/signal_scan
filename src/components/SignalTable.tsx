@@ -6,6 +6,9 @@ import { CHAIN_LINKS } from '../chain';
 import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
+import { freshPercentageInRange, percentageInRange, volumeClass } from '../lib/signalMetrics';
+import { TokenNote } from './TokenNote';
+import { FreshWalletChart } from './FreshWalletChart';
 import { CheckSquare, Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { ChainBadge } from './ChainBadge';
 import { useAuth } from '../auth/use-auth';
@@ -51,8 +54,8 @@ const FOMO_COLS: readonly string[] = SHOW_CLAN
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
-/** Base table min-width (1928px) plus the extra 384px the merged activity column takes when FOMO ships. */
-const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2312px]' : 'min-w-[1928px]';
+/** Keep ticker text readable beside its note button in both deployment variants. */
+const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2568px]' : 'min-w-[2184px]';
 
 /**
  * Row value behind the three "Tracked" columns. The FOMO dash has no wallet watch-list,
@@ -118,7 +121,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
               <span className="font-semibold text-neg">{w.sells}</span>
             </td>
             <td className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${w.inflow >= 0 ? 'text-pos' : 'text-neg'}`}>
-              {usd(w.inflow)}
+              <span className={volumeClass(w.inflow, 'inflow')}>{usd(w.inflow)}</span>
             </td>
             <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(w.lastTs)}</td>
           </tr>
@@ -180,7 +183,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
               <span className="font-semibold text-neg">{u.sells}</span>
             </td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-pos" title="Σ large BUY sizes — not net inflow/PnL">
-              {usd(u.buyUsd)}
+              <span className={volumeClass(u.buyUsd, 'buy')}>{usd(u.buyUsd)}</span>
             </td>
             <td
               className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${u.sellPnlUsd >= 0 ? 'text-pos' : 'text-neg'}`}
@@ -264,7 +267,7 @@ function Hero({ count }: { count: number }) {
           it becomes <span className="text-neg">price</span>
         </h1>
         <p className="mt-4 max-w-[440px] text-[14.5px] leading-[1.5] text-ink2">
-          Top <b className="font-bold text-ink">{count} tokens</b> ranked by latest tracked wallet activity.
+          Top <b className="font-bold text-ink">{count} tokens</b> ranked by {SHOW_FOMO ? 'latest FOMO buy' : 'latest tracked wallet activity'}.
         </p>
       </div>
       <div className="relative flex h-[220px] items-center justify-center">
@@ -364,7 +367,7 @@ const HL_HEAD = 'text-center!';
 const C_HEAD = `${HL_HEAD} px-3! whitespace-normal!`;
 
 type SortKey = 'holders' | 'trackedIn' | 'trackedInflow' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
-/** null = the order the table ships with (newest tracked activity first) — no column armed. */
+/** null = default newest activity on A / newest FOMO BUY on B — no column armed. */
 type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null;
 
 /** Nansen-setup factors the dashboard filter bar ANDs together. */
@@ -438,7 +441,7 @@ function SignalHead({
     <tr>
       {allFactors && <Th className="w-10 text-center!">STT</Th>}
       <Th className="w-20 px-2.5! text-center!">{null}</Th>
-      <Th className="w-24">Ticker</Th>
+      <Th className="w-32">Ticker</Th>
       <Th className="w-16 text-center!">Tier</Th>
       <SortTh
         label="MC"
@@ -527,6 +530,8 @@ function SignalHead({
       <SortTh label="Tracked Holding" col="trackedHolding" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
       <SortTh label="1H Volume" col="volume1h" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
       <SortTh label="24H Volume" col="volume24h" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
+      <Th className={`w-28 ${C_HEAD}`} title="Gross DEX buy volume in the last 24 hours">Buying 24H</Th>
+      <Th className={`w-28 ${C_HEAD}`} title="Gross DEX sell volume in the last 24 hours — not realised PnL">Sell 24H</Th>
       <Th className="w-14 text-center! px-3! whitespace-normal!">Entry</Th>
     </tr>
   );
@@ -557,6 +562,10 @@ export default function SignalTable({
   const [holdingOnly, setHoldingOnly] = useState(false);
   const [mcMin, setMcMin] = useState('');
   const [mcMax, setMcMax] = useState('');
+  const [freshMin, setFreshMin] = useState('');
+  const [freshMax, setFreshMax] = useState('');
+  const [holdingMin, setHoldingMin] = useState('');
+  const [holdingMax, setHoldingMax] = useState('');
   const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(RATED_TIERS));
 
   useEffect(() => {
@@ -597,7 +606,7 @@ export default function SignalTable({
           <thead>
             <SignalHead allFactors={allFactors} />
           </thead>
-          <SkeletonRows rows={8} cols={(allFactors ? 17 : 16) + FOMO_EXTRA} />
+          <SkeletonRows rows={8} cols={(allFactors ? 19 : 18) + FOMO_EXTRA} />
         </table>
       </TableShell>
     );
@@ -622,8 +631,10 @@ export default function SignalTable({
     if (max !== null && Number.isFinite(max) && s.marketCap > max) return false;
     return true;
   };
-  const extraActive = holdingOnly || mcMin.trim() !== '' || mcMax.trim() !== '';
-  const filtered = base.filter((s) => nansenPass(s) && holdingPass(s) && mcPass(s));
+  const extraActive = holdingOnly || [mcMin, mcMax, freshMin, freshMax, holdingMin, holdingMax].some((v) => v.trim() !== '');
+  const filtered = base.filter((s) => nansenPass(s) && holdingPass(s) && mcPass(s)
+    && freshPercentageInRange(s.nansen, freshMin, freshMax)
+    && percentageInRange(rowHolding(s), holdingMin, holdingMax));
 
   // P is dashboard-only — it never enters the Rated tab (user 2026-09-29).
   const ratedAll = signals.filter((s): s is TokenSignal & { tier: Tier } => s.tier !== null && s.tier !== 'P');
@@ -672,8 +683,10 @@ export default function SignalTable({
     const ap = a.tier === 'P' ? 1 : 0;
     const bp = b.tier === 'P' ? 1 : 0;
     if (ap !== bp) return ap - bp;
-    // No column armed: the order the table ships with (newest tracked activity first).
-    if (!sort) return b.trackedActivityAt - a.trackedActivityAt;
+    // Default: newest FOMO BUY on B; newest wallet-watch activity on A.
+    if (!sort) return SHOW_FOMO
+      ? (b.fomoBuyAt ?? 0) - (a.fomoBuyAt ?? 0)
+      : b.trackedActivityAt - a.trackedActivityAt;
     const av = sortVal(a, sort.key);
     const bv = sortVal(b, sort.key);
     // A metric with no value yet (1H volume before its first sweep) sinks in BOTH directions.
@@ -733,7 +746,7 @@ export default function SignalTable({
         ];
 
   const ratedEmpty = mode === 'rated' && visible.length === 0;
-  const colCount = (allFactors ? 17 : 16) + FOMO_EXTRA;
+  const colCount = (allFactors ? 19 : 18) + FOMO_EXTRA;
 
   return (
     <div className="w-full">
@@ -748,7 +761,7 @@ export default function SignalTable({
               : `${ratedAll.length}/${signals.length} tokens tiered`
             : sort
               ? `sorted by ${SORT_LABEL[sort.key]}, ${sort.dir === 'asc' ? 'ascending' : 'descending'}`
-              : 'sorted by tracked activity'}
+              : SHOW_FOMO ? 'sorted by latest FOMO buy' : 'sorted by tracked activity'}
         </span>
       </div>
       {tierError && <p className="px-1 pb-2 text-[12px] font-semibold text-neg">Tier update failed: {tierError}</p>}
@@ -813,6 +826,19 @@ export default function SignalTable({
               value={mcMax}
               onChange={(e) => setMcMax(e.target.value)}
             />
+            <span className="filter-label" style={{ marginLeft: 8, textTransform: 'none' }}>Fresh wallets (%)</span>
+            <input type="number" min="0" max="100" step="any" inputMode="decimal" className="mc-filter-input" placeholder="Min" aria-label="Minimum fresh wallets percentage" value={freshMin} onChange={(e) => setFreshMin(e.target.value)} />
+            <span className="text-muted font-bold">–</span>
+            <input type="number" min="0" max="100" step="any" inputMode="decimal" className="mc-filter-input" placeholder="Max" aria-label="Maximum fresh wallets percentage" value={freshMax} onChange={(e) => setFreshMax(e.target.value)} />
+            <span className="filter-label" style={{ marginLeft: 8, textTransform: 'none' }}>Tracked holding (%)</span>
+            <input type="number" min="0" max="100" step="any" inputMode="decimal" className="mc-filter-input" placeholder="Min" aria-label="Minimum tracked holding percentage" value={holdingMin} onChange={(e) => setHoldingMin(e.target.value)} />
+            <span className="text-muted font-bold">–</span>
+            <input type="number" min="0" max="100" step="any" inputMode="decimal" className="mc-filter-input" placeholder="Max" aria-label="Maximum tracked holding percentage" value={holdingMax} onChange={(e) => setHoldingMax(e.target.value)} />
+            {extraActive && (
+              <button type="button" className="text-[12px] font-semibold text-pos hover:underline" onClick={() => {
+                setHoldingOnly(false); setMcMin(''); setMcMax(''); setFreshMin(''); setFreshMax(''); setHoldingMin(''); setHoldingMax('');
+              }}>Reset filters</button>
+            )}
             {extraActive && (
               <span className="filter-label" style={{ marginLeft: 4, textTransform: 'none', fontWeight: 600 }}>
                 {filtered.length}/{base.length} tokens match
@@ -871,7 +897,7 @@ export default function SignalTable({
                             )}
                           </div>
                         </Td>
-                        <Td className="w-24">
+                        <Td className="w-32">
                           <span
                             className="flex items-center gap-[2px] text-[13.5px] font-bold text-ink"
                             title={s.symbol ? `$${s.symbol.toUpperCase()}` : undefined}
@@ -880,6 +906,10 @@ export default function SignalTable({
                               $
                             </span>
                             <span className="min-w-0 truncate">{s.symbol?.toUpperCase() ?? '—'}</span>
+                            <TokenNote ca={s.ca} chain={s.chain} symbol={s.symbol} note={s.note} onSaved={(note) => {
+                              setSignals((rows) => rows?.map((row) => row.ca === s.ca && row.chain === s.chain ? { ...row, note } : row) ?? rows);
+                              notifyTierChange?.();
+                            }} />
                           </span>
                         </Td>
                         <Td className="w-16 text-center">
@@ -942,11 +972,11 @@ export default function SignalTable({
                           <SetupValue value={s.nansen.lf !== undefined ? compact(s.nansen.lf) : '—'} pass={s.nansen.pass.lf} />
                         </Td>
                         <Td className={`w-24 ${NS_CELL} ${NS_END}`}>
-                          <SetupValue value={s.nansen.fresh !== undefined ? pct(s.nansen.fresh) : '—'} pass={s.nansen.pass.fresh} />
+                          <FreshWalletChart ca={s.ca} symbol={s.symbol} fresh={s.nansen.fresh} pass={s.nansen.pass.fresh} history={s.nansen.freshHistory} updatedAt={s.nansen.freshUpdatedAt} />
                         </Td>
                         <Td className="w-24 text-center font-mono tabular-nums text-[13px] text-ink2">{fmtInt(s.holders)}</Td>
                         <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{usd(rowInflow(s))}</div>
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2"><span className={volumeClass(rowInflow(s), 'inflow')}>{usd(rowInflow(s))}</span></div>
                         </Td>
                         <Td className="w-28">
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{pct(rowHolding(s))}</div>
@@ -958,6 +988,12 @@ export default function SignalTable({
                         </Td>
                         <Td className="w-28">
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{usd(s.volume24h)}</div>
+                        </Td>
+                        <Td className="w-28 text-center font-mono text-[13px] tabular-nums text-ink2">
+                          <span className={volumeClass(s.buyVol24h, 'buy')}>{s.buyVol24h !== undefined ? usd(s.buyVol24h) : '—'}</span>
+                        </Td>
+                        <Td className="w-28 text-center font-mono text-[13px] tabular-nums">
+                          <span className={volumeClass(s.sellVol24h, 'sell')}>{s.sellVol24h !== undefined ? usd(s.sellVol24h) : '—'}</span>
                         </Td>
                         <Td className="w-14 text-center">
                           <CheckSquare ok={green} title={`24H volume ${usd(s.volume24h)} · entry threshold ${usd(ENTRY_VOLUME_THRESHOLD)}`} />

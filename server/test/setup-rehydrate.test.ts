@@ -123,6 +123,7 @@ function sampleEntry(now: number, deployedAt: number): SetupCacheEntry {
     t100_pct: 33.33,
     t100_multiple: 1.5,
     anchor_at: deployedAt,
+    lf_rule: 'bucket-hour-v2',
     genesis_bal: 120,
     info_at: now - 60_000,
     series_at: now - 60_000,
@@ -234,7 +235,7 @@ test('stale entry: age >= POLL_FLOWS_MS refetches the series and refreshes the f
 
   await refreshSeries(CA, CHAIN);
 
-  assert.equal(flowsCalls, 2, 'a stale entry must go back through the official flows API');
+  assert.equal(flowsCalls, 1, 'refresh T100 without re-buying the cached LF anchor');
   assert.equal(doorFetches, 0, 'the browser door is off the T100/LF path');
   const e = getSetupCacheEntry(CA, CHAIN);
   assert.ok(e);
@@ -262,4 +263,26 @@ test('balanceSeries: serves the FILE cache when nansen_series is empty and the e
   assert.equal(doorFetches, 0, 'the fallback replays the file cache — no door, no snapshot degradation');
   assert.equal(flowsCalls, 0, 'the fallback replays the file cache — no official API call');
   assert.ok(getNansenSeries(CA, CHAIN, 'week').length >= 3, 'the replay filled nansen_series');
+});
+
+test('chart replay uses series freshness and timestamp, not a later Fresh% stamp', async () => {
+  open(':memory:');
+  loadSetupCache(tempCacheFile());
+  const now = Date.now();
+  const seriesAt = now - (config.pollSetupMs + config.pollFlowsMs) / 2;
+  const deployedAt = seriesAt - 2 * DAY;
+  seedTokenRow(deployedAt);
+  putSetupCacheEntry({
+    ...sampleEntry(seriesAt, deployedAt),
+    taken_at: now,
+    info_at: now,
+    series_at: seriesAt,
+  });
+  installFakeFlows([], []);
+  const out = await balanceSeries(CA, CHAIN, 'week');
+  await refreshSeries(CA, CHAIN);
+  assert.equal(out.source, 'nansen');
+  assert.equal(out.cachedAt, seriesAt, 'Fresh% must not reset the chart fetch clock');
+  assert.equal(flowsCalls, 0, 'the series remains inside its own TTL');
+  assert.equal(getTokenState(CA, CHAIN)?.genesis_bal, 120);
 });

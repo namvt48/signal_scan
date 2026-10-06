@@ -97,11 +97,11 @@ export function t100Mdd(
  * exist yet), so the earliest total>0 row IS the listing float. None anywhere ->
  * undefined -> caller keeps the previous value.
  *
- * `minAt` (deployed_at epoch ms, 0/unknown = no clamp): rungs from month up
- * back-fill every pre-genesis bucket with a POSITIVE constant, so the leftmost>0
- * scan would anchor on that filler instead of the listing float (GERI month =
- * 871.973M repeated from 2025-09-19 vs real 824.2M at 2026-09-17T20:00). The
- * token's float cannot predate its deploy, so any bucket before `minAt` is filler.
+ * `minAt` là mốc bucket deploy do caller chọn (0 = không clamp). Các rung từ
+ * month có thể back-fill bucket pre-genesis bằng hằng số DƯƠNG; không clamp sẽ
+ * chọn filler thay vì listing float. Caller dùng UTC hour/day floor, không dùng
+ * timestamp intraday vì dữ liệu daily của ngày deploy nằm tại 00:00.
+ * Chỉ bỏ bucket trước mốc này; giữ bucket chứa thời điểm deploy.
  */
 export function exchangeAnchorLf(
   points: { t: number | string; total: number }[],

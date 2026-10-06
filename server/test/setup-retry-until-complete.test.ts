@@ -132,6 +132,7 @@ test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on
     t100_pct: 40,
     t100_multiple: 1.5,
     anchor_at: now,
+    lf_rule: 'bucket-hour-v2',
     genesis_bal: 120,
     info_at: now,
     series_at: now,
@@ -168,6 +169,7 @@ test('setup TTL authoritative: a FRESH cache entry with an INCOMPLETE row is NOT
     t100_pct: 40,
     t100_multiple: 1.5,
     anchor_at: now,
+    lf_rule: 'bucket-hour-v2',
     genesis_bal: 120,
     info_at: now,
     series_at: now,
@@ -195,12 +197,10 @@ test('setup spam guard: a CA whose setup keeps coming back EMPTY backs off after
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(EMPTY), 1, 'first attempt happens');
-  // 2026-09-29: the empty pass DOES write an entry (the markers need a container) but
-  // stamps no marker, so the CA still owes its data — the backoff below must hold.
+  // Fresh% succeeds independently; empty credit series must not stamp its clock.
   const emptyEntry = getSetupCacheEntry(EMPTY, CHAIN);
   assert.notEqual(emptyEntry, undefined, 'the empty pass records an entry');
   assert.equal(emptyEntry?.series_at, undefined, 'nothing was obtained, so no series marker');
-  assert.equal(emptyEntry?.info_at, undefined, 'and no gini marker');
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(EMPTY), 1, 'empty CA must NOT be hammered on the next pass (backoff)');

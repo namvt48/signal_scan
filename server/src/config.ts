@@ -67,17 +67,14 @@ export const config = {
    * fresh (user 2026-09-24); in MODE=gmgn this rides GMGN's own rate limit, not
    * the shared browser page. */
   pollVolumeMs: num('POLL_VOLUME_MS', 900_000),
-  // The 3 Nansen setup indicators — fresh% (gini) + T100 multiple and LF (the
-  // hourly-stats series) — are refreshed TOGETHER on ONE cadence (user 2026-09-22;
-  // hourly since 2026-09-24), so the shared browser page carries them hourly.
-  /** Setup-indicator cadence: gini + series + LF in one pass per CA. Also the
-   * freshness TTL of a setup cache entry (isSetupCacheFresh). 6h (was 1h): every
-   * tgm/flows call costs 1 credit, and the setup T100 series on a token older
-   * than 7 days is DAILY data — an hourly re-fetch only re-reads the same buckets. */
+  /** Fresh% TTL. T100 has its own pollFlowsMs TTL; LF is fetched until known.
+   * Setup and flows queues are serviced by the gateway limits, not spread
+   * across these freshness intervals. */
   pollSetupMs: num('POLL_SETUP_MS', 21_600_000),
-  /** Retry cadence while a CA's setup is INCOMPLETE; a COMPLETE CA with a fresh
-   * cache entry sits out until that entry goes stale (POLL_SETUP_MS). Also the
-   * setupSweep scheduler interval. */
+  /** setupSweep scheduler cadence; independent of failed-field retry backoff. */
+  pollSetupSweepMs: posNum('POLL_SETUP_SWEEP_MS', 300_000),
+
+  /** Base for exponential delay after failed setup fields; unrelated to sweep cadence. */
   pollSetupRetryMs: num('POLL_SETUP_RETRY_MS', 3_600_000),
   /** A token THIS young that has no data yet gets no faster than an hourly retry:
    * Nansen has not indexed it yet, so a faster re-ask is pure spam. */
@@ -108,14 +105,10 @@ export const config = {
   /** Wallet HOLDINGS sweep — credit-free on EVERY chain since T5: sol via Solana
    * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
-  /** Official tgm/flows (credit-only) refresh — T100 multiple, LF, the bal_* chart
-   * windows. Now ALSO the T100-series cache TTL (isSeriesFresh) AND the flowsSweep
-   * walk pace, so one knob means "series TTL = walk pace". 12h (owner 2026-09-29;
-   * was 24h / 6h / 15 min before): each call costs 1 credit, and only ~124 of 469
-   * tracked CAs hold a cache entry, so this knob sets the per-CA series spend
-   * directly (124 CAs ⇒ ~248 credits/day). A CA inside the TTL costs 0 — the setup
-   * sweep's 6h visit is what actually spends once the marker expires.
-   * Deliberately separate from the gini cadence (POLL_SETUP_MS, 6h, browser door — 0 credits). */
+  /** Official T100-series refresh interval and cache TTL (12h).
+   * LF is write-once; missing LF retries independently without re-buying T100.
+   * Gateway limits pace the queue independently of this interval.
+   * Fresh% uses pollSetupMs (6h, browser door — 0 Nansen credits). */
   pollFlowsMs: posNum('POLL_FLOWS_MS', 43_200_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */

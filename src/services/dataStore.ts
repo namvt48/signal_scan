@@ -53,6 +53,7 @@ export interface DataStore {
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
   setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void>;
+  setNote(ca: string, chain: Chain, note: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,13 @@ const FOMO_USER_KEY = 'signal_scan:fomo_users';
 const SETTINGS_KEY = 'signal_scan:settings';
 const TIER_KEY = 'signal_scan:tiers';
 
+const NOTE_KEY = 'signal_scan:notes';
+
+function readNotes(): Record<string, string> {
+  const parsed: unknown = JSON.parse(localStorage.getItem(NOTE_KEY) ?? '{}');
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('Invalid saved notes');
+  return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+}
 /** Stored tier overrides, keyed `${chain}:${ca}`. */
 function readTiers(): Record<string, Tier> {
   try {
@@ -520,7 +528,8 @@ export const localDataStore: DataStore = {
 
   async listSignals(): Promise<TokenSignal[]> {
     const tiers = readTiers();
-    return SEED_SIGNALS.map((s) => ({ ...s, tier: tiers[`${s.chain}:${s.ca}`] ?? s.tier ?? null }));
+    const notes = readNotes();
+    return SEED_SIGNALS.map((s) => ({ ...s, note: notes[`${s.chain}:${s.ca}`] ?? '', tier: tiers[`${s.chain}:${s.ca}`] ?? s.tier ?? null }));
   },
 
   async getSettings(): Promise<Settings> {
@@ -545,6 +554,12 @@ export const localDataStore: DataStore = {
     if (tier === null) delete map[key];
     else map[key] = tier;
     writeTiers(map);
+  },
+
+  async setNote(ca: string, chain: Chain, note: string): Promise<void> {
+    const key = `${chain}:${ca}`;
+    const notes = readNotes();
+    localStorage.setItem(NOTE_KEY, JSON.stringify({ ...notes, [key]: note }));
   },
 };
 

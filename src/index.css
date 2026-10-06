@@ -73,9 +73,29 @@ body {
 }
 
 /* Tag-driven wallet name styling (see walletNameClass in ui.tsx). */
-.wl-name.rainbow {
-  font-weight: 700;
+.wl-name.rainbow,
+.metric-rainbow {
+  display: inline-block;
+  max-width: 100%;
   background: linear-gradient(90deg, #FF3B6B, #FF9F1C, #F4E04D, #4ADE80, #38BDF8, #A78BFA);
+}
+
+.wl-name.rainbow {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Raw-USD volume thresholds shared by both deployment variants. */
+.metric-bold { font-weight: 700; }
+.metric-large { font-size: 1.2em; }
+.metric-sell { color: var(--c-neg); }
+.metric-yellow { color: #966600; }
+.metric-rainbow {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;

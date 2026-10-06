@@ -21,6 +21,8 @@ export interface NansenSetup {
    */
   pass: { fresh: boolean; t100: boolean; lf: boolean };
   fresh?: number;
+  /** Ungated measured Fresh %, for explicit range filters even when the setup fails. */
+  rawFresh?: number;
   /** Genesis-to-trough: pct = (A−B)/A×100, multiple = A/B (absent until a genesis write lands). */
   t100?: { pct: number; multiple?: number };
   /**
@@ -83,7 +85,11 @@ export interface TokenSignal {
   trackedWallets: TrackedWalletStat[];
   /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
   fomoUsers: FomoUserStat[];
-  nansen: NansenSetup;
+  note?: string;
+  /** Gross DEX buy/sell volume in the trailing 24h, when measured. */
+  buyVol24h?: number;
+  sellVol24h?: number;
+  nansen: NansenSetup & { freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number };
   holders: number;
   /** Market cap USD (price × circulating supply); absent until a sweep writes one. */
   marketCap?: number;
@@ -94,6 +100,8 @@ export interface TokenSignal {
    * inflow window; 0 = no tracked activity yet. Orders the table (newest activity first).
    */
   trackedActivityAt: number;
+  /** Latest captured FOMO BUY timestamp for this (chain, CA), independent of the 24h stats window. */
+  fomoBuyAt?: number;
   trackedHolding: number;
   volume24h: number;
   /** Trailing-1h DEX volume, USD. Absent until the 1h door lands a value (never a fake 0). */
@@ -675,6 +683,10 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
   const holdingByCa = sumHoldingAmountByCa();
   const walletStatsByCa = trackedWalletStatsByCa(now);
   const fomoStatsByCa = fomoUserStatsByCa(now);
+  const fomoBuys = getDb().prepare(`SELECT t.chain, t.ca, MAX(t.ts) AS ts
+    FROM fomo_trades t JOIN tracked_cas c ON c.chain = t.chain AND c.address = t.ca
+    WHERE t.type = 'buy' AND c.status != 'inactive' GROUP BY t.chain, t.ca`).all() as { chain: string; ca: string; ts: number }[];
+  const fomoBuyAt = new Map(fomoBuys.map((t) => [`${t.chain}:${t.ca}`, t.ts]));
   for (const c of listTrackedCas()) {
     if (isPassTier(c.address, c.chain)) continue;
     const st = tokenStates.get(`${c.chain}:${c.address}`);
@@ -730,24 +742,25 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       nansen: {
         score: ns.score,
         pass: { fresh: ns.freshPass, t100: ns.t100Pass, lf: ns.lfPass },
-        // Display gate (NOT the score above): show a factor if it passes, or if allFactors is on and it has a value.
         ...(ns.fresh !== undefined && (allFactors || ns.freshPass) ? { fresh: ns.fresh } : {}),
+        ...(ns.fresh !== undefined ? { rawFresh: ns.fresh } : {}),
         ...(t100Pct !== undefined && (allFactors || ns.t100Pass)
-          ? {
-              t100: {
-                pct: t100Pct,
-                ...(ns.t100Multiple !== undefined ? { multiple: ns.t100Multiple } : {}),
-              },
-            }
+          ? { t100: { pct: t100Pct, ...(ns.t100Multiple !== undefined ? { multiple: ns.t100Multiple } : {}) } }
           : {}),
         ...(ns.lf !== undefined && (allFactors || ns.lfPass) ? { lf: ns.lf } : {}),
+        ...(st?.fresh_history_json ? { freshHistory: JSON.parse(st.fresh_history_json) as { t: number; value: number }[] } : {}),
+        ...(st?.fresh_updated_at != null ? { freshUpdatedAt: st.fresh_updated_at } : {}),
       },
       holders,
       ...(st?.market_cap != null ? { marketCap: st.market_cap } : {}),
       trackedInflow,
       trackedActivityAt: lastActivityAt.get(c.address) ?? 0,
+      fomoBuyAt: fomoBuyAt.get(`${c.chain}:${c.address}`) ?? 0,
       trackedHolding,
       volume24h: st?.volume24h ?? 0,
+      ...(st?.buy_vol24h != null ? { buyVol24h: st.buy_vol24h } : {}),
+      ...(st?.sell_vol24h != null ? { sellVol24h: st.sell_vol24h } : {}),
+      ...(c.user_note !== '' ? { note: c.user_note } : {}),
       ...(st?.vol_1h != null ? { volume1h: st.vol_1h } : {}),
       tier,
       ...(st?.bal_peak_24h != null && st.bal_trough_24h != null

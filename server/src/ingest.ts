@@ -141,6 +141,33 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch)
     sets.push(coalesce ? `${col} = COALESCE(excluded.${col}, token_state.${col})` : `${col} = excluded.${col}`);
   }
   if (cols.length === 0) return;
+  const freshPresent = patch.nansenFreshPct !== undefined;
+  if (freshPresent) {
+    const db = getDb();
+    const tx = db.transaction(() => {
+      const current = db.prepare('SELECT nansen_fresh_pct, fresh_history_json FROM token_state WHERE ca = ? AND chain = ?').get(ca, chain) as
+        | { nansen_fresh_pct: number | null; fresh_history_json: string | null }
+        | undefined;
+      const next = patch.nansenFreshPct;
+      if (next === undefined || !Number.isFinite(next) || next < 0 || next > 100) {
+        throw new Error('nansenFreshPct must be a finite percentage between 0 and 100');
+      }
+      const history = current?.fresh_history_json ? JSON.parse(current.fresh_history_json) as { t: number; value: number }[] : [];
+      const sampledAt = Date.now();
+      history.push({ t: sampledAt, value: next });
+      cols.push('fresh_history_json', 'fresh_updated_at');
+      vals.push(JSON.stringify(history.slice(-256)), sampledAt);
+      sets.push('fresh_history_json = excluded.fresh_history_json', 'fresh_updated_at = excluded.fresh_updated_at');
+      sets.push('fetched_at = excluded.fetched_at');
+      const placeholders = cols.map(() => '?').join(', ');
+      db.prepare(
+        `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
+         ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
+      ).run(ca, chain, ...vals, Date.now());
+    });
+    tx();
+    return;
+  }
   sets.push('fetched_at = excluded.fetched_at');
   const placeholders = cols.map(() => '?').join(', ');
   getDb()
@@ -188,6 +215,12 @@ export function recomputeMarketCap(ca: string, chain: Chain): void {
   getDb()
     .prepare('UPDATE token_state SET market_cap = price * supply WHERE ca = ? AND chain = ? AND price IS NOT NULL AND supply IS NOT NULL')
     .run(ca, chain);
+}
+
+/** Khôi phục riêng LF từ cache; không ghi đè LF hiện có hay analytics khác. */
+export function restoreTokenLf(ca: string, chain: Chain, genesisBal: number): void {
+  getDb().prepare('UPDATE token_state SET genesis_bal = ? WHERE ca = ? AND chain = ? AND genesis_bal IS NULL')
+    .run(genesisBal, ca, chain);
 }
 
 /**
