@@ -5,6 +5,7 @@ import type { Server } from 'node:http';
 import { getSetting, open } from '../src/db.js';
 import { DEBUG_ALL_FACTORS_KEY, getDebugAllFactors, getThresholds, setDebugAllFactors } from '../src/settings.js';
 import { createApp } from '../src/api.js';
+import { config } from '../src/config.js';
 // AUTH CONTRACT v1: PUT /api/settings is admin-only — sign a REAL admin ID token
 // against the testkit's local JWKS (production middleware path, no bypass).
 import { createTestAuth } from './auth-testkit.js';
@@ -16,6 +17,18 @@ let server: Server;
 let base = '';
 
 const getSettings = (): Promise<Response> => fetch(`${base}/api/settings`, { headers: { authorization: adminAuth } });
+
+const getTelegramRules = (): Promise<Response> =>
+  fetch(`${base}/api/telegram-alert-rules`, { headers: { authorization: adminAuth } });
+
+async function putTelegramRules(body: unknown): Promise<{ status: number; json: unknown }> {
+  const res = await fetch(`${base}/api/telegram-alert-rules`, {
+    method: 'PUT',
+    headers: { ...JSON_HEADERS, authorization: adminAuth },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json() };
+}
 
 async function put(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}/api/settings`, {
@@ -38,6 +51,62 @@ before(async () => {
 
 after(() => {
   server.close();
+});
+
+test('Telegram alert rules persist, validate, and stay unavailable on instance B', async () => {
+  config.showFomo = false;
+  const initial = await getTelegramRules();
+  assert.equal(initial.status, 200);
+  assert.deepEqual(await initial.json(), {
+    fwGrowthPct: 30,
+    minFwPct: 15,
+    t100GrowthPct: 30,
+    minMcK: -1,
+    maxMcK: -1,
+    trackerBuyingK: 0,
+  });
+
+  const saved = await putTelegramRules({
+    fwGrowthPct: 40,
+    minFwPct: 20,
+    t100GrowthPct: 25,
+    minMcK: 10,
+    maxMcK: 80,
+    trackerBuyingK: 12.5,
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(await (await getTelegramRules()).json(), saved.json);
+
+  assert.equal((await putTelegramRules({ minFwPct: 101 })).status, 400);
+  assert.equal((await putTelegramRules({ minMcK: 81, maxMcK: 80 })).status, 400);
+  assert.deepEqual(await (await getTelegramRules()).json(), saved.json);
+  const lowerDisabled = await putTelegramRules({ minMcK: -1 });
+  assert.equal(lowerDisabled.status, 200);
+  const lowerDisabledRules = await (await getTelegramRules()).json() as { minMcK: number; maxMcK: number };
+  assert.deepEqual(
+    { minMcK: lowerDisabledRules.minMcK, maxMcK: lowerDisabledRules.maxMcK },
+    { minMcK: -1, maxMcK: 80 },
+  );
+  const upperDisabled = await putTelegramRules({ maxMcK: -1 });
+  assert.equal(upperDisabled.status, 200);
+  const bothDisabledRules = await (await getTelegramRules()).json() as { minMcK: number; maxMcK: number };
+  assert.deepEqual(
+    { minMcK: bothDisabledRules.minMcK, maxMcK: bothDisabledRules.maxMcK },
+    { minMcK: -1, maxMcK: -1 },
+  );
+
+  config.showFomo = true;
+  assert.equal((await getTelegramRules()).status, 404);
+  assert.equal((await putTelegramRules({ trackerBuyingK: 1 })).status, 404);
+  config.showFomo = false;
+  await putTelegramRules({
+    fwGrowthPct: 30,
+    minFwPct: 15,
+    t100GrowthPct: 30,
+    minMcK: -1,
+    maxMcK: -1,
+    trackerBuyingK: 0,
+  });
 });
 
 test('GET /api/settings exposes debug.allFactors=false by default, alongside values+defaults', async () => {

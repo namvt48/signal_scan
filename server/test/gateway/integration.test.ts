@@ -284,7 +284,7 @@ test('selective cache: 2 identical SAME-CALLER Nansen token-information requests
   });
 });
 
-test('selective cache: 2 identical CROSS-CALLER Nansen credit requests → 2 upstream calls', async () => {
+test('selective cache: identical CROSS-CALLER Nansen credit requests share public CA data', async () => {
   const raw = '{"data":[{"token_address":"CA_CROSS"}]}';
   const up = rawUpstream(raw);
 
@@ -293,7 +293,7 @@ test('selective cache: 2 identical CROSS-CALLER Nansen credit requests → 2 ups
     await post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
     await post(base, NANSEN_CREDIT_PATH, body, TOKENS.b);
 
-    assert.equal(up.calls(), 2, 'the credit cache key is caller-scoped — b cannot hit a');
+    assert.equal(up.calls(), 1, 'public CA credit data is shared across callers');
     assert.equal(registry.snapshot()[NANSEN_CREDIT_LIMITER].inFlight, 0);
   });
 });
@@ -356,10 +356,10 @@ test('/v1/nansen/door passes the app-question through the door seam and maps its
   });
 });
 
-test('429 propagation: a GMGN 429 rides the 200 envelope, arms the gate, then the next call is 503 gated', async () => {
-  // `x-ratelimit-reset` is an ABSOLUTE epoch-SECONDS value (`gate.ts:27-30`,
-  // matching the upstream header) — pin it 30s in the future so the gate arms.
-  const resetAt = Math.ceil(Date.now() / 1000) + 30;
+test('429 propagation: a GMGN token-info request retries once after reset, then arms the gate', async () => {
+  // One bounded retry waits for the 1s reset plus the 2s margin. The repeated
+  // 429 then arms the per-key fallback gate; subsequent callers fail fast.
+  const resetAt = Math.ceil(Date.now() / 1000) + 1;
   let calls = 0;
   const upstream: UpstreamFetch = async () => {
     calls += 1;
@@ -374,19 +374,17 @@ test('429 propagation: a GMGN 429 rides the 200 envelope, arms the gate, then th
     const body = { ca: 'CA_429_GMGN', chain: 'sol' };
 
     const first = await post(base, GMGN_TOKEN_INFO_PATH, body, TOKENS.a);
-    assert.equal(first.status, 200, 'an upstream 429 rides the 200 envelope (todo-3 contract)');
-    assert.equal(envelope(first).status, 429, 'the upstream status propagates — never swallowed');
-    assert.equal(envelope(first).body, null, 'the gate-arming error body is not forwarded');
-    assert.ok(
-      registry.snapshot().gmgn.gateUntil > Date.now(),
-      'the gmgn gate is armed from x-ratelimit-reset',
-    );
+    assert.equal(first.status, 200, 'the exhausted upstream 429 rides the 200 envelope');
+    assert.equal(envelope(first).status, 429);
+    assert.equal(envelope(first).body, null);
+    assert.equal(calls, 2, 'the shared egress limiter makes only one gated retry');
+    assert.ok(registry.snapshot().gmgn.gateUntil > Date.now(), 'the per-key gate is armed');
 
     const second = await post(base, GMGN_TOKEN_INFO_PATH, body, TOKENS.a);
-    assert.equal(second.status, 503, 'the armed gate makes the next call back off');
+    assert.equal(second.status, 503, 'the armed key gate rejects a fresh call');
     assert.deepEqual(second.json, { error: 'gated' });
-    assert.ok(second.headers.get(GATED_HEADER), 'the 503 carries the gate-expiry header');
-    assert.equal(calls, 1, 'the gated call never reached upstream');
+    assert.ok(second.headers.get(GATED_HEADER));
+    assert.equal(calls, 2, 'a gated request never reaches upstream');
   });
 });
 

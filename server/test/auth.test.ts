@@ -1,7 +1,7 @@
 // AUTH CONTRACT v1 (src/auth.ts) against the REAL createApp routes: real RS256
 // tokens signed by auth-testkit and verified through an injected local JWKS —
 // the production middleware path, no mocked role logic. Covers the gate matrix
-// (admin/viewer/service), the 401/403 body shapes, and every fail-closed leg:
+// (admin/viewer/service/monitor), the 401/403 body shapes, and every fail-closed leg:
 // empty AUTH_USER_ROLES, unset FIREBASE_PROJECT_ID, unset SERVICE_TOKEN.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,6 +11,7 @@ import { insertWallet, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { matchServiceToken, parseUserRoles, resolveRouteAccess, type AuthDeps } from '../src/auth.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
+const TEST_MONITOR_TOKEN = 'monitor-token-7c9bfe12e8';
 
 const WALLET = 'auth-wallet-addr-1';
 
@@ -189,6 +190,20 @@ test('service token: allowed on the read-only GETs (/api/wallets, /api/settings)
   assert.equal((await get('/api/wallets', TEST_SERVICE_TOKEN)).status, 200);
   assert.equal((await get('/api/settings', TEST_SERVICE_TOKEN)).status, 200);
 });
+test('monitor telemetry accepts only its dedicated token, not the general service token', async () => {
+  await withApp({ ...auth.deps, monitorToken: TEST_MONITOR_TOKEN }, async (url) => {
+    assert.equal((await req(url, 'GET', '/api/monitor/metrics')).status, 401);
+    assert.equal((await req(url, 'GET', '/api/monitor/metrics', { token: TEST_SERVICE_TOKEN })).status, 403);
+    const result = await req(url, 'GET', '/api/monitor/metrics', { token: TEST_MONITOR_TOKEN });
+    assert.equal(result.status, 200);
+    let rpcUsage: unknown;
+    if (typeof result.json === 'object' && result.json !== null && 'rpcUsage' in result.json) {
+      rpcUsage = result.json.rpcUsage;
+    }
+    assert.equal(Array.isArray(rpcUsage), true);
+  });
+});
+
 
 test('service token: 403 on admin-only writes — PUT /api/tier, DELETE /api/wallets/:id and friends', async () => {
   const forbidden: Array<[string, string, unknown?]> = [

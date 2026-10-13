@@ -2,8 +2,8 @@
 // deployments). Same contract as the localStorage implementation; components
 // cannot tell them apart.
 
-import type { Chain, FomoUser, Settings, SettingsPatch, Tier, TokenSignal, Wallet } from '../types';
-import { byHandle, byName, type DataStore, type FomoImportRow, type ImportResult, type ImportRow } from './dataStore';
+import type { Chain, FomoUser, Settings, SettingsPatch, TelegramAlertRules, Tier, TokenSignal, Wallet } from '../types';
+import { byHandle, byName, type DataStore, type FomoImportRow, type ImportResult, type ImportRow, type WalletWriteInput, type WalletWritePatch } from './dataStore';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
 
@@ -50,11 +50,11 @@ export const restDataStore: DataStore = {
     return wallets.slice().sort(byName);
   },
 
-  async addWallet(input: Omit<Wallet, 'id'>): Promise<Wallet> {
+  async addWallet(input: WalletWriteInput): Promise<Wallet> {
     return request<Wallet>('/wallets', json('POST', input));
   },
 
-  async updateWallet(id: string, patch: Partial<Omit<Wallet, 'id'>>): Promise<Wallet> {
+  async updateWallet(id: string, patch: WalletWritePatch): Promise<Wallet> {
     return request<Wallet>(`/wallets/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -105,6 +105,14 @@ export const restDataStore: DataStore = {
 
   async updateSettings(patch: SettingsPatch): Promise<Settings> {
     return request<Settings>('/settings', json('PUT', patch));
+  },
+
+  async getTelegramAlertRules(): Promise<TelegramAlertRules> {
+    return request<TelegramAlertRules>('/telegram-alert-rules');
+  },
+
+  async updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
+    return request<TelegramAlertRules>('/telegram-alert-rules', json('PUT', rules));
   },
 
   async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {

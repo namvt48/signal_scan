@@ -136,6 +136,32 @@ def test_router_name_case_insensitive():
     assert cl.router_name("sol", UNISWAP) is None  # sai chain
 
 
+def test_robinhood_chain_official_router_and_quotes():
+    assert cl.EVM_CHAINS == ("base", "bsc", "robinhood")
+    assert cl.DEFAULT_EVM_CHAINS == ("base", "bsc")
+    router = "0xcaf681a66d020601342297493863e78c959e5cb2"
+    universal = "0x8876789976decbfcbbbe364623c63652db8c0904"
+    weth = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+    usdg = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+    assert cl.router_name("robinhood", router.upper()) == "uniswap-v3"
+    assert cl.router_name("robinhood", universal) == "uniswap-universal"
+    assert cl.router_name("base", router) is None
+    assert cl.QUOTE_TOKENS["robinhood"] == {weth: "WETH", usdg: "USDG"}
+    buy = cl.classify_swap(
+        "robinhood", WALLET,
+        mktx(router, [xfer(WALLET, POOL, 10**18, ca=weth),
+                      xfer(POOL, WALLET, 10**6, ca=TOKEN)]),
+    )
+    assert buy["chain"] == "robinhood" and buy["side"] == "BUY"
+    assert buy["quote_sym"] == "WETH"
+    sell = cl.classify_swap(
+        "robinhood", WALLET,
+        mktx(universal, [xfer(WALLET, POOL, 2 * 10**6, ca=TOKEN),
+                         xfer(POOL, WALLET, 10**6, ca=usdg)]),
+    )
+    assert sell["side"] == "SELL" and sell["quote_sym"] == "USDG"
+
+
 # ---------- classify_swap ----------
 
 

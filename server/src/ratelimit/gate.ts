@@ -21,12 +21,19 @@ export class Gate {
   note(status: number, headerVal: string | null, now: number): void {
     const cooldown = this.spec.statusesWithCooldown?.find((s) => s.status === status);
     if (cooldown) {
-      this.untilMs = now + cooldown.cooldownMs;
+      this.untilMs = Math.max(this.untilMs, now + cooldown.cooldownMs);
       return;
     }
-    if (this.spec.statuses.includes(status) && this.spec.header && headerVal) {
-      const sec = Number(headerVal);
-      if (Number.isFinite(sec)) this.untilMs = sec * 1000 + this.marginMs;
+    if (!this.spec.statuses.includes(status)) return;
+
+    const resetSec = headerVal === null ? NaN : Number(headerVal);
+    const resetMs = resetSec * 1000 + this.marginMs;
+    if (Number.isFinite(resetSec) && resetMs > now) {
+      this.untilMs = Math.max(this.untilMs, resetMs);
+      return;
+    }
+    if (this.spec.fallbackCooldownMs !== undefined) {
+      this.untilMs = Math.max(this.untilMs, now + this.spec.fallbackCooldownMs);
     }
   }
 }

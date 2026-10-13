@@ -51,12 +51,22 @@ test('pool: all keys gated/down -> null pick + earliest availability', () => {
   assert.equal(p.nextAvailableAt(), 4000, 'min over gate/down, never in the past');
 });
 
-test('pool: stats expose per-key served/authFails/downUntil', () => {
+test('pool: stats expose attempts, failures, served, authFails, and downUntil', () => {
   const p = pool();
+  p.recordAttempt(0);
   p.record(0, 200);
+  p.recordAttempt(0);
   p.record(0, 401);
+  p.recordAttempt(1);
+  p.recordFailure(1);
   const s = p.stats();
-  assert.equal(s[0].served, 1);
+  assert.deepEqual(
+    s.map(({ index, attempts, failures, served }) => ({ index, attempts, failures, served })),
+    [
+      { index: 0, attempts: 2, failures: 1, served: 1 },
+      { index: 1, attempts: 1, failures: 1, served: 0 },
+    ],
+  );
   assert.equal(s[0].authFails, 1);
   assert.equal(s[0].downUntil, 0, 'below threshold -> not parked');
   assert.equal(s[1].served, 0);

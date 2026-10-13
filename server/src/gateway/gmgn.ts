@@ -1,30 +1,26 @@
 // GMGN token/info provider route for the gateway (plan request-plane-gateway,
 // todo 8). The gateway is the SINGLE WRITER for GMGN, so it owns the upstream
-// URL, the `X-APIKEY` header, and the MANDATORY fresh `client_id` + `timestamp`
-// per call (`providers/gmgn.ts:14-17,176-177`: GMGN rejects a replay within 7s).
+// URL, the `X-APIKEY` header, and a fresh `client_id` + `timestamp` for each
+// actual outbound request (`providers/gmgn.ts:17-19`).
 //
-// TWO CONSEQUENCES, both load-bearing:
-//   1. This route is EXCLUDED from the selective TTL cache AND single-flight
-//      (todo 11). A cached/deduped response cannot carry a fresh client_id, so
-//      caching it would replay the id and get 401 AUTH_INVALID. todo 11 must not
-//      route `gmgn/token-info` through its cache/dedupe.
-//   2. It passes the per-request endpoint WEIGHT (`GMGN_TOKEN_INFO_WEIGHT`) into
-//      `limiters.run('gmgn', {weight, priority})`; GMGN meters by weight, not by
-//      request (`providers/gmgn.ts:19-24`).
+// Concurrent identical public token reads may single-flight: only the initiator
+// contacts GMGN and creates credentials; joiners share its response. The
+// credentials are outbound query parameters, not part of the response. We do
+// NOT retain a completed result, so the next request always gets fresh data and
+// a fresh `client_id` + `timestamp`.
 //
-// 403 / GATE ASSUMPTION (plan todo 8, pinned): the shared `Gate` matches on
-// NUMERIC STATUS ONLY (`ratelimit/gate.ts:21-31`, `ratelimit/types.ts:12-16`) and
-// `Limiter.handleError` calls `gate.note(e.status, e.header, now)` WITHOUT the
-// error body (`ratelimit/limiter.ts:182-184`), so "403-with-AUTH_IP_BLOCKED"
-// cannot be targeted specifically. We therefore gate EVERY gmgn 403 on a fixed
-// cooldown (`ratelimit/spec.ts` gmgn `statusesWithCooldown`), on the documented
-// assumption that GMGN answers 403 ONLY for the egress-IP allowlist
-// (`AUTH_IP_BLOCKED`), so a blocked egress backs off instead of hot-looping. The
-// shared `Gate`/`HttpError` surface is deliberately NOT touched.
+// Every actual call acquires the selected account's weighted limiter INSIDE the
+// shared `gmgn-egress` limiter. Per-key quotas remain independent, while the
+// shared one-request/second bucket and ban gate protect the common IP.
+//
+// 429 arms both gates until the upstream reset (or the bounded fallback); 403
+// uses the configured cooldown on the key and shared egress gates. Reset and
+// Retry-After headers are normalized before they reach the gate.
 
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { log } from '../log.js';
+import { canonicalCa } from '../shared/chain.js';
 import { CHAIN_SLUGS, chainSlugs } from '../shared/chain-slugs.js';
 import type { Chain } from '../shared/chain.js';
 import { GMGN_TOKEN_INFO_URL, GMGN_TOKEN_INFO_WEIGHT } from '../providers/gmgn.js';
@@ -40,9 +36,8 @@ import {
   type LimiterRun,
   type UpstreamFetch,
 } from './contract.js';
-import { GmgnKeyPool, type GmgnKey } from './gmgn-keys.js';
+import { GmgnKeyPool, type GmgnKey, type GmgnKeyPick } from './gmgn-keys.js';
 import type { Caller } from './auth.js';
-
 /** Re-exported so callers/tests read the weight from the ONE source of truth. */
 export { GMGN_TOKEN_INFO_WEIGHT };
 
@@ -81,6 +76,52 @@ export function parseGmgnTokenInfo(raw: unknown): GmgnTokenInfoParse {
   return { ok: true, value: { ca: o.ca, chain: o.chain, priority: o.priority } };
 }
 
+export interface GmgnSingleFlightSnapshot {
+  joined: number;
+  inflight: number;
+}
+
+/**
+ * Share only currently-running public token-info calls. A settled result is
+ * never cached; the next request creates new upstream credentials and fetches
+ * fresh data. Priority and caller are omitted from the key because they do not
+ * alter the public token payload.
+ */
+export class GmgnTokenInfoSingleFlight {
+  private readonly inflight = new Map<string, Promise<DispatchResult>>();
+  private joined = 0;
+
+  async run(
+    rawBody: unknown,
+    operation: () => Promise<DispatchResult>,
+  ): Promise<DispatchResult> {
+    const parsed = parseGmgnTokenInfo(rawBody);
+    if (!parsed.ok) return operation();
+
+    const key = JSON.stringify([
+      parsed.value.chain,
+      canonicalCa(parsed.value.ca, parsed.value.chain),
+    ]);
+    const active = this.inflight.get(key);
+    if (active !== undefined) {
+      this.joined += 1;
+      return active;
+    }
+
+    const request = Promise.resolve().then(operation);
+    this.inflight.set(key, request);
+    try {
+      return await request;
+    } finally {
+      if (this.inflight.get(key) === request) this.inflight.delete(key);
+    }
+  }
+
+  snapshot(): GmgnSingleFlightSnapshot {
+    return { joined: this.joined, inflight: this.inflight.size };
+  }
+}
+
 /** Build the contract request: `params` are the upstream QUERY params (chain
  *  already mapped to its gmgn slug); the fetcher adds timestamp + client_id. */
 function toGatewayRequest(p: GmgnTokenInfoParams): GatewayRequest {
@@ -94,18 +135,19 @@ function toGatewayRequest(p: GmgnTokenInfoParams): GatewayRequest {
 
 export interface GmgnTokenInfoDeps {
   fetchUpstream: UpstreamFetch;
-  /** Limiter override (tests); defaults to the shared registry. */
+  /** Per-key limiter override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
+  /** Aggregate egress limiter override (tests); defaults to the shared registry. */
+  runEgressLimiter?: LimiterRun;
   /** Multi-key pool; absent = single-key legacy path (tests / single-key deploy). */
   pool?: GmgnKeyPool;
 }
 
 /**
- * One `gmgn/token-info` call: validate → key pick → weighted limiter → upstream →
- * envelope. With a POOL, the picked key's own limiter key is used as the request
- * `provider`, so its weight bucket and 429/403 gate are the only ones touched; when
- * every key is gated/down the call short-circuits to the 503 gated denial carrying the
- * EARLIEST availability. Without a pool it is the original single-key path.
+ * One call: validate → key pick → per-account quota → shared egress for each
+ * outbound attempt → upstream → envelope. The selected key keeps its own
+ * weighted quota and gate; aggregate traffic and ban state are shared. When
+ * every key is gated/down, return 503 gated with the EARLIEST availability.
  */
 export async function handleGmgnTokenInfo(
   rawBody: unknown,
@@ -122,20 +164,34 @@ export async function handleGmgnTokenInfo(
     return denial(503, 'gated', { [GATED_HEADER]: until });
   }
   if (pick) req.provider = pick.limiterKey;
-  const result = await proxyRequest(req, caller, {
-    fetchUpstream: pick?.upstream ?? deps.fetchUpstream,
-    runLimiter: deps.runLimiter,
+  const runKeyLimiter: LimiterRun =
+    deps.runLimiter ?? ((api, opts, job) => limiters.run(api, opts, job));
+  const runEgressLimiter: LimiterRun =
+    deps.runEgressLimiter ?? ((api, opts, job) => limiters.run(api, opts, job));
+  const runLimiter: LimiterRun = (api, opts, job) =>
+    runKeyLimiter(api, opts, () => runEgressLimiter('gmgn-egress', opts, job));
+  const fetchUpstream = pick === undefined || pick === null
+    ? deps.fetchUpstream
+    : deps.pool === undefined ? pick.upstream : trackPoolUpstream(deps.pool, pick);
+  return proxyRequest(req, caller, {
+    fetchUpstream,
+    runLimiter,
     runOpts,
   });
-  if (pick) deps.pool?.record(pick.index, envelopeStatus(result));
-  return result;
 }
 
-/** The upstream status a dispatch result carries: the envelope's `status` on a 200,
- *  else the denial status itself (e.g. 503 gated). */
-function envelopeStatus(result: DispatchResult): number {
-  const payload = result.payload as { status?: number };
-  return result.status === 200 && typeof payload.status === 'number' ? payload.status : result.status;
+function trackPoolUpstream(pool: GmgnKeyPool, pick: GmgnKeyPick): UpstreamFetch {
+  return async (request, caller) => {
+    pool.recordAttempt(pick.index);
+    try {
+      const response = await pick.upstream(request, caller);
+      pool.record(pick.index, response.status);
+      return response;
+    } catch (error) {
+      pool.recordFailure(pick.index);
+      throw error;
+    }
+  };
 }
 
 export interface GmgnUpstreamOpts {
@@ -169,7 +225,7 @@ export function gmgnTokenInfoUpstream(opts: GmgnUpstreamOpts = {}): UpstreamFetc
 }
 
 /** Build the key pool from config: one key per account, each with its own limiter key
- *  (spec key 0 = `gmgn`, i>0 = `gmgn:i`) and its own upstream fetcher. */
+ *  (spec key 0 = `gmgn`, i>0 = `gmgn:1`..`gmgn:N-1`) and its own upstream fetcher. */
 export function createGmgnKeyPool(): GmgnKeyPool {
   const keys: GmgnKey[] = config.gmgnApiKeys.map((apiKey, i) => ({
     apiKey,
@@ -183,3 +239,4 @@ export function createGmgnKeyPool(): GmgnKeyPool {
     log: (line) => log.info(line),
   });
 }
+

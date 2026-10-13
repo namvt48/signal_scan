@@ -7,6 +7,7 @@ import {
   findFomoUserWallet,
   getDb,
   insertFomoTrade,
+  insertTrackedCa,
   insertFomoUser,
   insertFomoUserWallet,
   listFomoAlertTargets,
@@ -82,6 +83,8 @@ test('upsertFomoHolding: ONE row per (user, ca, chain) — a re-measure overwrit
 
 test('listFomoAlertTargets: DISTINCT (user, ca, chain) from fomo_trades', () => {
   const user = insertFomoUser({ handle: '@targets', name: 'Targets' });
+  insertTrackedCa({ address: 'CaA', chain: 'sol', note: 'fomo' });
+  insertTrackedCa({ address: 'CaB', chain: 'sol', note: 'fomo' });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 't1', ca: 'CaA', chain: 'sol', type: 'buy', ts: 1 });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 't2', ca: 'CaA', chain: 'sol', type: 'sell', ts: 2 });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 't3', ca: 'CaB', chain: 'sol', type: 'buy', ts: 3 });

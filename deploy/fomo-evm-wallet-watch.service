@@ -1,0 +1,19 @@
+[Unit]
+Description=FOMO EVM wallet trade watcher (Base, BSC, Robinhood)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fomo-wallet-watch
+EnvironmentFile=/opt/fomo-watch/fomo.env
+EnvironmentFile=-/root/signal-scan-monitor/alchemy-rpc.env
+Environment=WATCH_HOME=/opt/fomo-wallet-watch/data
+Environment=MONITOR_HEARTBEAT_PATH=/root/signal-scan-monitor/heartbeats/fomo-evm-wallet
+ExecStart=/opt/wallet-watch/venv/bin/python -m watchers.evm --chains base,bsc,robinhood --feed poll --no-min-usd-gate --api-url http://127.0.0.1:8125 --confirmations 8 --chunk 500 --poll-sleep 3
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

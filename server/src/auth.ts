@@ -18,10 +18,10 @@ import type { RequestHandler, Response } from 'express';
 import { config } from './config.js';
 import { log } from './log.js';
 
-export type Role = 'admin' | 'viewer' | 'service';
+export type Role = 'admin' | 'viewer' | 'service' | 'monitor';
 
 export interface Principal {
-  /** null for the service token — the daemon has no email identity. */
+  /** null for service/monitor tokens — they have no email identity. */
   email: string | null;
   role: Role;
 }
@@ -58,6 +58,8 @@ export interface AuthDeps {
   firebaseProjectId?: string;
   /** Default: SERVICE_TOKEN. Empty → service path disabled (fail closed). */
   serviceToken?: string;
+  /** Dedicated monitor token — authenticates the monitor-only role. */
+  monitorToken?: string;
   /** DEV ONLY (temporary). Default: AUTH_DISABLED. True → every request gets
    * the admin principal, no token verified. Never set in a deployed env. */
   authDisabled?: boolean;
@@ -97,6 +99,7 @@ export function matchServiceToken(provided: string, expected: string): boolean {
 const ALL_ROLES: readonly Role[] = ['admin', 'viewer', 'service'];
 const ADMIN_ONLY: readonly Role[] = ['admin'];
 const ADMIN_SERVICE: readonly Role[] = ['admin', 'service'];
+const MONITOR_ONLY: readonly Role[] = ['monitor'];
 
 /** 'public' = no auth at all. Otherwise: the roles allowed on the route. */
 export type RouteAccess = 'public' | readonly Role[];
@@ -116,6 +119,8 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'GET', path: '/api/signals', access: ALL_ROLES },
   { method: 'GET', path: '/api/settings', access: ALL_ROLES }, // the daemon reads it
   { method: 'PUT', path: '/api/settings', access: ADMIN_ONLY },
+  { method: 'GET', path: '/api/telegram-alert-rules', access: ALL_ROLES },
+  { method: 'PUT', path: '/api/telegram-alert-rules', access: ADMIN_ONLY },
   { method: 'GET', path: '/api/wallets', access: ALL_ROLES }, // the daemon reads it
   { method: 'POST', path: '/api/wallets', access: ADMIN_ONLY },
   { method: 'PATCH', path: '/api/wallets/:id', access: ADMIN_ONLY },
@@ -127,6 +132,9 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'PUT', path: '/api/tokens/:chain/:ca/note', access: ADMIN_ONLY },
   { method: 'PUT', path: '/api/tier', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/wallet-watch/trades', access: ADMIN_SERVICE }, // wallet_watch daemon
+  { method: 'GET', path: '/api/monitor/metrics', access: MONITOR_ONLY },
+  { method: 'GET', path: '/api/monitor/alerts', access: MONITOR_ONLY },
+  { method: 'POST', path: '/api/monitor/alerts/ack', access: MONITOR_ONLY },
   { method: 'GET', path: '/api/fomo-users', access: ALL_ROLES }, // the daemon reads it
   { method: 'POST', path: '/api/fomo-users', access: ADMIN_ONLY },
   { method: 'PATCH', path: '/api/fomo-users/:id', access: ADMIN_ONLY },
@@ -199,9 +207,11 @@ async function authenticate(
   jwks: JwksResolver,
   projectId: string,
   serviceToken: string,
+  monitorToken: string,
   roles: ReadonlyMap<string, Role>,
 ): Promise<AuthOutcome> {
   if (matchServiceToken(token, serviceToken)) return { principal: { email: null, role: 'service' } };
+  if (matchServiceToken(token, monitorToken)) return { principal: { email: null, role: 'monitor' } };
   const email = await verifyIdTokenEmail(token, jwks, projectId);
   if (email === null) return { status: 401 };
   const role = roles.get(email.trim().toLowerCase());
@@ -230,6 +240,7 @@ export function createAuthMiddleware(deps: AuthDeps = {}): RequestHandler {
   const roles = deps.roles ?? parseUserRoles(config.authUserRoles);
   const projectId = deps.firebaseProjectId ?? config.firebaseProjectId;
   const serviceToken = deps.serviceToken ?? config.serviceToken;
+  const monitorToken = deps.monitorToken ?? config.monitorApiToken;
   const authDisabled = deps.authDisabled ?? config.authDisabled;
   return async (req, res, next) => {
     if (authDisabled) {
@@ -247,7 +258,7 @@ export function createAuthMiddleware(deps: AuthDeps = {}): RequestHandler {
       deny(res, 401);
       return;
     }
-    const outcome = await authenticate(token, jwks, projectId, serviceToken, roles);
+    const outcome = await authenticate(token, jwks, projectId, serviceToken, monitorToken, roles);
     if ('status' in outcome) {
       deny(res, outcome.status);
       return;

@@ -11,8 +11,9 @@
 //   (ii) the FREE browser door — `POST https://app.nansen.ai/api/questions/<slug>`
 //        through the relocated DoorPool (`gateway/door.ts`), today injected as
 //        `providers/nansen.ts` `PostJson` (`browserPostJson`). The DoorPool owns
-//        its own per-path + per-door budgets; the never-wired `nansen-door`
-//        limiter spec stays unwired so it cannot double-govern (plan D8).
+//        per-path/per-door budgets and its bounded, caller-fair admission queue:
+//        essential/new-CA reads precede background volume; `nansen-door` stays
+//        unwired so there is no second quota (plan D8).
 //
 // Both seams return the RAW upstream payload inside the todo-3 envelope
 // `{status, body, headers}`; the gateway does NOT parse provider payloads.
@@ -25,7 +26,7 @@
 // provider parsing — `parseEssentialData`/`parseGiniStats`/… stay in the provider.
 
 import { config } from '../config.js';
-import { browserPostJson } from './door.js';
+import { browserPostJson, type DoorRequestOptions } from './door.js';
 import type { Priority } from '../ratelimit/types.js';
 import {
   buildEnvelope,
@@ -193,8 +194,12 @@ export function nansenCreditUpstream(opts: NansenCreditUpstreamOpts = {}): Upstr
 // Free browser door seam (ii)
 // ---------------------------------------------------------------------------
 
-/** The DoorPool transport seam — the frozen `browserPostJson` signature. */
-export type DoorPost = (url: string, body: unknown) => Promise<{ status: number; json: unknown | null }>;
+/** DoorPool transport with authenticated caller and scheduling metadata. */
+export type DoorPost = (
+  url: string,
+  body: unknown,
+  options?: DoorRequestOptions,
+) => Promise<{ status: number; json: unknown | null }>;
 
 export interface NansenDoorParams {
   endpoint: NansenDoorEndpoint;
@@ -222,6 +227,8 @@ export function parseNansenDoor(raw: unknown): NansenDoorParse {
 export interface NansenDoorDeps {
   /** Door transport; defaults to the relocated DoorPool's `browserPostJson`. */
   postJson?: DoorPost;
+  /** Authenticated request owner; used for shared-quota fairness. */
+  caller?: Caller;
 }
 
 /**
@@ -236,8 +243,16 @@ export async function handleNansenDoor(
 ): Promise<DispatchResult> {
   const parsed = parseNansenDoor(rawBody);
   if (!parsed.ok) return denial(400, 'bad_request');
+  const priority: Priority =
+    parsed.value.endpoint === 'tgm-essential-data' ? 0
+      : parsed.value.endpoint === 'tgm-volume-details' ? 2
+        : 1;
   const postJson = deps.postJson ?? browserPostJson;
-  const { status, json } = await postJson(NANSEN_DOOR_URLS[parsed.value.endpoint], parsed.value.body);
+  const { status, json } = await postJson(
+    NANSEN_DOOR_URLS[parsed.value.endpoint],
+    parsed.value.body,
+    { caller: deps.caller ?? 'internal', priority },
+  );
   if (status !== 200 || json === null || json === undefined) {
     return buildEnvelope(status, null, {});
   }

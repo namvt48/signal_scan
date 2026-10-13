@@ -1,4 +1,5 @@
-import { CHAINS, type Chain, type FomoUser, type NansenThresholds, type Settings, type SettingsPatch, type Tier, type TokenSignal, type Wallet } from '../types';
+import { EVM_CHAINS, CHAINS, type Chain, type FomoUser, type NansenThresholds, type Settings, type SettingsPatch, type TelegramAlertRules, type Tier, type TokenSignal, type Wallet, type WalletScope } from '../types';
+import { SHOW_FOMO } from '../config';
 import { restDataStore } from './restDataStore';
 
 // ---------------------------------------------------------------------------
@@ -10,7 +11,7 @@ export interface ImportRow {
   address: string;
   name: string;
   tags: string[];
-  chain: Chain;
+  chain: WalletScope;
   source: string;
   /** Display-only clan label (user 2026-09-24). */
   clan?: string;
@@ -37,11 +38,14 @@ export interface ParsedFomoImportRow {
   data?: FomoImportRow;
   reason?: string;
 }
+export type WalletWriteInput = Omit<Wallet, 'id' | 'rank' | 'groups' | 'chain'> & { chain: WalletScope };
+export type WalletWritePatch = Partial<WalletWriteInput>;
+
 
 export interface DataStore {
   listWallets(): Promise<Wallet[]>;
-  addWallet(input: Omit<Wallet, 'id'>): Promise<Wallet>;
-  updateWallet(id: string, patch: Partial<Omit<Wallet, 'id'>>): Promise<Wallet>;
+  addWallet(input: WalletWriteInput): Promise<Wallet>;
+  updateWallet(id: string, patch: WalletWritePatch): Promise<Wallet>;
   deleteWallet(id: string): Promise<void>;
   importWallets(rows: ImportRow[]): Promise<ImportResult>;
   listFomoUsers(): Promise<FomoUser[]>;
@@ -52,6 +56,8 @@ export interface DataStore {
   listSignals(allFactors?: boolean): Promise<TokenSignal[]>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
+  getTelegramAlertRules(): Promise<TelegramAlertRules>;
+  updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules>;
   setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void>;
   setNote(ca: string, chain: Chain, note: string): Promise<void>;
 }
@@ -154,8 +160,14 @@ function read<T>(key: string, fallback: T[]): T[] {
 
 const uid = (): string => crypto.randomUUID();
 
-function isChain(v: unknown): v is Chain {
-  return typeof v === 'string' && (CHAINS as readonly string[]).includes(v);
+function isWalletScope(v: unknown): v is WalletScope {
+  return typeof v === 'string' && ((CHAINS as readonly string[]).includes(v) || (SHOW_FOMO && v === 'evm'));
+}
+
+function createWalletRows(input: WalletWriteInput): Wallet[] {
+  if (input.chain !== 'evm') return [{ id: uid(), ...input, chain: input.chain }];
+  const address = input.address.toLowerCase();
+  return EVM_CHAINS.map((chain) => ({ id: uid(), ...input, address, chain }));
 }
 
 export function byName(a: Wallet, b: Wallet): number {
@@ -234,8 +246,11 @@ export function parseWalletsCsv(text: string): ParsedImportRow[] {
     const address = (cells[0] ?? '').trim();
     const chainRaw = (cells[3] ?? '').trim().toLowerCase();
     if (!address) return { row: rowNo, reason: 'address is empty' };
-    if (!isChain(chainRaw)) {
-      return { row: rowNo, reason: `invalid chain "${chainRaw}" (expected one of ${CHAINS.join(', ')})` };
+    if (!isWalletScope(chainRaw)) {
+      return { row: rowNo, reason: `invalid chain "${chainRaw}" (expected one of ${CHAINS.join(', ')}${SHOW_FOMO ? ', evm' : ''})` };
+    }
+    if (chainRaw === 'evm' && !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      return { row: rowNo, reason: 'invalid EVM address (expected 0x + 40 hex characters)' };
     }
     return {
       row: rowNo,
@@ -460,35 +475,78 @@ export const localDataStore: DataStore = {
       .sort(byName);
   },
 
-  async addWallet(input: Omit<Wallet, 'id'>): Promise<Wallet> {
-    const wallet: Wallet = { id: uid(), ...input };
-    persist(WALLET_KEY, [...read<Wallet>(WALLET_KEY, SEED_WALLETS), wallet]);
+  async addWallet(input: WalletWriteInput): Promise<Wallet> {
+    const list = read<Wallet>(WALLET_KEY, SEED_WALLETS);
+    if (
+      input.chain === 'evm' &&
+      list.some((w) => w.chain !== 'sol' && w.address.toLowerCase() === input.address.toLowerCase())
+    ) {
+      throw new Error('wallet address already exists');
+    }
+    const added = createWalletRows(input);
+    persist(WALLET_KEY, [...list, ...added]);
+    const wallet = added.find((w) => w.chain === 'base') ?? added[0];
+    if (!wallet) throw new Error('no wallet rows were created');
     return wallet;
   },
 
-  async updateWallet(id: string, patch: Partial<Omit<Wallet, 'id'>>): Promise<Wallet> {
+  async updateWallet(id: string, patch: WalletWritePatch): Promise<Wallet> {
     const list = read<Wallet>(WALLET_KEY, SEED_WALLETS);
-    const idx = list.findIndex((w) => w.id === id);
-    if (idx === -1) throw new Error(`Wallet ${id} not found`);
-    const updated: Wallet = { ...list[idx], ...patch };
-    const next = list.slice();
-    next[idx] = updated;
+    const current = list.find((w) => w.id === id);
+    if (!current) throw new Error(`Wallet ${id} not found`);
+    const { chain: scope, ...fields } = patch;
+    if (current.chain !== 'sol' && SHOW_FOMO && (scope === undefined || scope === 'evm')) {
+      const oldAddress = current.address.toLowerCase();
+      const address = (fields.address ?? current.address).toLowerCase();
+      if (
+        address !== oldAddress &&
+        list.some((w) => w.chain !== 'sol' && w.address.toLowerCase() === address)
+      ) {
+        throw new Error('wallet address already exists');
+      }
+      const next = list.map((w) =>
+        w.chain !== 'sol' && w.address.toLowerCase() === oldAddress ? { ...w, ...fields, address } : w,
+      );
+      persist(WALLET_KEY, next);
+      const updated = next.find((w) => w.id === id);
+      if (!updated) throw new Error(`Wallet ${id} not found`);
+      return updated;
+    }
+    if (scope === 'evm') throw new Error('add this address as an EVM wallet instead of converting a Solana wallet');
+    const updated: Wallet = { ...current, ...fields, chain: scope ?? current.chain };
+    const next = list.map((w) => (w.id === id ? updated : w));
     persist(WALLET_KEY, next);
     return updated;
   },
 
   async deleteWallet(id: string): Promise<void> {
+    const list = read<Wallet>(WALLET_KEY, SEED_WALLETS);
+    const current = list.find((w) => w.id === id);
     persist(
       WALLET_KEY,
-      read<Wallet>(WALLET_KEY, SEED_WALLETS).filter((w) => w.id !== id),
+      current && current.chain !== 'sol' && SHOW_FOMO
+        ? list.filter((w) => w.chain === 'sol' || w.address.toLowerCase() !== current.address.toLowerCase())
+        : list.filter((w) => w.id !== id),
     );
   },
 
   async importWallets(rows: ImportRow[]): Promise<ImportResult> {
     const list = read<Wallet>(WALLET_KEY, SEED_WALLETS);
-    const added: Wallet[] = rows.map((r) => ({ id: uid(), ...r }));
+    const evmAddresses = new Set(
+      list.filter((wallet) => wallet.chain !== 'sol').map((wallet) => wallet.address.toLowerCase()),
+    );
+    const added: Wallet[] = [];
+    const skipped: ImportResult['skipped'] = [];
+    rows.forEach((row, index) => {
+      if (row.chain === 'evm' && evmAddresses.has(row.address.toLowerCase())) {
+        skipped.push({ row: index, reason: 'duplicate address' });
+        return;
+      }
+      if (row.chain === 'evm') evmAddresses.add(row.address.toLowerCase());
+      added.push(...createWalletRows(row));
+    });
     persist(WALLET_KEY, [...list, ...added]);
-    return { added: added.length, skipped: [] };
+    return { added: rows.length - skipped.length, skipped };
   },
 
   async listFomoUsers(): Promise<FomoUser[]> {
@@ -546,6 +604,27 @@ export const localDataStore: DataStore = {
       // storage blocked or full: keep working in-memory for this session
     }
     return { values, defaults: { ...DEFAULT_THRESHOLDS }, debug };
+  },
+
+  async getTelegramAlertRules(): Promise<TelegramAlertRules> {
+    const raw = localStorage.getItem('signal_scan:telegram-alert-rules');
+    const values = raw ? JSON.parse(raw) as Partial<TelegramAlertRules> : {};
+    const minMcK = num(values.minMcK, -1);
+    const maxMcK = num(values.maxMcK, -1);
+    const validRange = minMcK < 0 || maxMcK < 0 || minMcK <= maxMcK;
+    return {
+      fwGrowthPct: num(values.fwGrowthPct, 30),
+      minFwPct: num(values.minFwPct, 15),
+      t100GrowthPct: num(values.t100GrowthPct, 30),
+      minMcK: validRange && (minMcK === -1 || minMcK >= 0) ? minMcK : -1,
+      maxMcK: validRange && (maxMcK === -1 || maxMcK >= 0) ? maxMcK : -1,
+      trackerBuyingK: num(values.trackerBuyingK, 0),
+    };
+  },
+
+  async updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
+    localStorage.setItem('signal_scan:telegram-alert-rules', JSON.stringify(rules));
+    return rules;
   },
 
   async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {

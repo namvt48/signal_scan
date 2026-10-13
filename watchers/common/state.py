@@ -11,14 +11,20 @@ from watchers.common.config import HERE
 # Liveness beacon cho watchdog.sh: block feed touch mỗi block kể cả khi không có
 # trade (feed chết ⇒ mtime đứng ⇒ watchdog restart sau 300s).
 HEARTBEAT = os.path.join(HERE, "heartbeat")
+MONITOR_HEARTBEAT = os.environ.get(
+    "MONITOR_HEARTBEAT_PATH", "/root/signal-scan-monitor/heartbeats/wallet"
+)
 
 
 def _beat() -> None:
-    """Touch beacon cho watchdog.sh."""
-    try:
-        open(HEARTBEAT, "w").close()
-    except OSError:
-        pass
+    """Touch watchdog beacon and its private monitor mirror."""
+    for path in (HEARTBEAT, MONITOR_HEARTBEAT):
+        if not path:
+            continue
+        try:
+            open(path, "w").close()
+        except OSError:
+            pass
 
 
 STATE_PATH = os.path.join(HERE, "wallet_watch_state.json")

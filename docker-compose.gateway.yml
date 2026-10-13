@@ -41,6 +41,7 @@ services:
       CRAWL_WS_ENDPOINT: ws://gateway-chrome:3000
       # The door pool reads the proxy list from the read-only mount below.
       CRAWL_PROXY_FILE: /data/proxies.txt
+      MONITOR_API_TOKEN: ${MONITOR_API_TOKEN:-}
     volumes:
       - /root/signal-scan-gateway/proxies.txt:/data/proxies.txt:ro
       - /root/signal-scan-gateway/gateway.env:/run/gateway.env:ro
@@ -66,7 +67,9 @@ services:
     mem_limit: 6g
     shm_size: 2g
     networks:
-      - signal-scan-gateway
+      signal-scan-gateway:
+        aliases:
+          - signal-scan-gateway-chrome
     logging: *default-logging
 
 networks:

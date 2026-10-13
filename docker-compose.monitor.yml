@@ -1,0 +1,59 @@
+services:
+  monitor:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.gateway
+    command: ["node", "dist/monitor/main.js"]
+    environment:
+      NODE_ENV: production
+      MONITOR_PORT: "8126"
+      MONITOR_DB_PATH: /data/monitor.sqlite3
+      MONITOR_API_TOKEN: "${MONITOR_API_TOKEN:?MONITOR_API_TOKEN is required}"
+      MONITOR_API_A_URL: http://signal-scan-api-a:3001
+      MONITOR_API_B_URL: http://signal-scan-api-b:3001
+      MONITOR_GATEWAY_URL: http://gateway:8130
+      MONITOR_WEB_A_URL: http://signal-scan-web-a/
+      MONITOR_WEB_B_URL: http://signal-scan-web-b/
+      MONITOR_CHROME_A_URL: http://signal-scan-chrome-a:3000/pressure
+      MONITOR_CHROME_B_URL: http://signal-scan-chrome-b:3000/pressure
+      MONITOR_GATEWAY_CHROME_URL: http://signal-scan-gateway-chrome:3000/pressure
+      MONITOR_PUBLIC_SITE_URL: https://signal-scan.duckdns.org:8443/healthz
+      MONITOR_FOMO_USAGE_PATH: /run/host-monitor/fomo-usage.json
+      MONITOR_FOMO_HEARTBEAT_PATH: /run/watcher-heartbeats/fomo
+      MONITOR_WALLET_HEARTBEAT_PATH: /run/watcher-heartbeats/wallet
+      MONITOR_FOMO_WARN_PERCENT: "${MONITOR_FOMO_WARN_PERCENT:-10}"
+      MONITOR_NANSEN_WARN_REMAINING: "${MONITOR_NANSEN_WARN_REMAINING:-2}"
+      MONITOR_DAILY_REPORT_HOUR: "${MONITOR_DAILY_REPORT_HOUR:-8}"
+      MONITOR_TIMEZONE: "${MONITOR_TIMEZONE:-Asia/Ho_Chi_Minh}"
+      DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN:-}"
+      DISCORD_CHANNEL_ID: "${DISCORD_CHANNEL_ID:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    ports:
+      - "127.0.0.1:8126:8126"
+    volumes:
+      - /root/signal-scan-monitor/data:/data
+      - /root/signal-scan-monitor/usage:/run/host-monitor:ro
+      - /root/signal-scan-monitor/heartbeats:/run/watcher-heartbeats:ro
+    networks:
+      - signal-scan-gateway
+    restart: unless-stopped
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8126/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  signal-scan-gateway:
+    external: true

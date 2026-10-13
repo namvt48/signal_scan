@@ -1,21 +1,8 @@
-// Selective TTL cache + single-flight (plan request-plane-gateway, todo 11).
-//
-// Acceptance (a)-(k) drives the REAL gateway app over ephemeral ports with
-// stubbed upstreams and a recording limiter, so the assertions observe the
-// actual cache/limiter/upstream ordering rather than a hand-rolled mock:
-//
-//   (a) N concurrent identical SAME-CALLER Nansen token-information → 1 upstream
-//   (b) a second same-caller call within TTL → 0 upstream
-//   (c) after TTL expiry → 1 upstream
-//   (d) a 4xx/5xx is never cached
-//   (e) two identical GMGN calls → 2 upstream (never cached)
-//   (f) two time-windowed Nansen flows calls → 2 upstream (flows NOT deduped)
-//   (g) N concurrent identical DexScreener calls from DIFFERENT callers → 1 upstream
-//   (h) two concurrent identical Nansen credit calls from DIFFERENT callers → 2
-//   (i) a cross-caller Nansen credit request WITHIN TTL is NOT a hit → 2 + 2 charges
-//   (j) N concurrent identical SAME-CALLER Nansen credit → 1 upstream, ONE charge
-//   (k) an over-budget caller's cache HIT for a 0-credit endpoint returns the
-//       cached body (cache short-circuits BEFORE the budget pre-flight)
+// Public CA TTL cache + shared single-flight behavior.
+// Tests drive the gateway app over ephemeral ports with stubbed upstreams and
+// recording limiters to verify cache/preflight/limiter ordering.
+// Flows retain exact date range identity; GMGN and private endpoints remain uncached.
+// The fake clock makes expiration deterministic.
 //
 // The TTL cases use an injected `GatewayCache` over a controllable clock, so
 // expiry is observed deterministically without a real wait.
@@ -25,10 +12,16 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { createGatewayApp } from '../../src/gateway/app.js';
 import type { Caller, CallerTokens } from '../../src/gateway/auth.js';
-import { NANSEN_CREDIT_PATH } from '../../src/gateway/nansen.js';
+import {
+  NANSEN_CREDIT_LIMITER,
+  NANSEN_CREDIT_PATH,
+  NANSEN_DOOR_PATH,
+  type DoorPost,
+} from '../../src/gateway/nansen.js';
 import { DEXSCREENER_PATH } from '../../src/gateway/dexscreener.js';
 import { GMGN_TOKEN_INFO_PATH } from '../../src/gateway/gmgn.js';
 import { GatewayCache, cacheKey, type Preflight } from '../../src/gateway/cache.js';
+import { CreditAccountant } from '../../src/gateway/credit.js';
 import {
   denial,
   type GatewayEnvelope,
@@ -114,6 +107,8 @@ interface ServerDeps {
   runLimiter?: LimiterRun;
   cache?: GatewayCache;
   preflight?: Preflight;
+  nansenDoor?: DoorPost;
+  credits?: CreditAccountant;
 }
 
 async function withServer(deps: ServerDeps, fn: (base: string) => Promise<void>): Promise<void> {
@@ -261,14 +256,14 @@ test('(e) two identical GMGN calls produce TWO upstream calls (never cached)', a
   });
 });
 
-test('(f) two identical time-windowed Nansen flows calls produce TWO upstream calls (not deduped)', async () => {
+test('(f) Nansen flows cache identical windows but isolate different ranges', async () => {
   let calls = 0;
   const upstream: UpstreamFetch = async () => {
     calls += 1;
     return okUpstream('{"data":[]}');
   };
   const rec = recordingLimiter();
-  const cache = new GatewayCache({ ttlNansenMs: 60_000 });
+  const cache = new GatewayCache({ ttlFlowsMs: 60_000 });
 
   await withServer({ nansenCreditUpstream: upstream, runLimiter: rec.run, cache }, async (base) => {
     const body = {
@@ -279,10 +274,12 @@ test('(f) two identical time-windowed Nansen flows calls produce TWO upstream ca
       },
     };
     await post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
-    await post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
-    assert.equal(calls, 2, 'flows carry a moving window — never cached/deduped, even when identical');
+    await post(base, NANSEN_CREDIT_PATH, body, TOKENS.b);
+    await post(base, NANSEN_CREDIT_PATH,
+      { ...body, body: { ...body.body, date: { from: '2026-09-02', to: '2026-09-07' } } }, TOKENS.b);
+    assert.equal(calls, 2, 'equal range shares; different range is a separate upstream request');
     assert.equal(rec.calls.length, 2);
-    assert.equal(cache.size(), 0, 'no flows entry was written');
+    assert.equal(cache.size(), 2);
   });
 });
 
@@ -314,26 +311,65 @@ test('(g) N concurrent identical DexScreener calls from DIFFERENT callers collap
   });
 });
 
-test('(h) two concurrent identical Nansen credit calls from DIFFERENT callers are NOT collapsed', async () => {
-  const up = blockingUpstream('{"data":[]}');
-  const rec = recordingLimiter();
-  const cache = new GatewayCache({ ttlNansenMs: 60_000 });
+test('DexScreener latest profiles are cached and shared across callers', async () => {
+  let calls = 0;
+  const cache = new GatewayCache({ ttlDexscreenerMs: 60_000 });
+  const upstream: UpstreamFetch = async () => {
+    calls += 1;
+    return okUpstream('[{"chainId":"base","tokenAddress":"0xabc"}]');
+  };
 
-  await withServer({ nansenCreditUpstream: up.fetch, runLimiter: rec.run, cache }, async (base) => {
-    const body = creditBody('CAH');
-    const pa = post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
-    const pb = post(base, NANSEN_CREDIT_PATH, body, TOKENS.b);
-
-    await waitFor(() => up.calls() === 2);
-    assert.equal(rec.calls.length, 2, 'each caller ran its own limiter (its own charge)');
-
-    up.open();
-    await Promise.all([pa, pb]);
-    assert.equal(up.calls(), 2, 'cross-caller credit calls stay separate (caller is in the key)');
+  await withServer({ dexUpstream: upstream, cache }, async (base) => {
+    const body = { endpoint: 'profiles' };
+    const first = await post(base, DEXSCREENER_PATH, body, TOKENS.a);
+    const second = await post(base, DEXSCREENER_PATH, body, TOKENS.b);
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(calls, 1, 'public profile data shares one cached upstream result');
+    assert.equal(envelope(first).body, envelope(second).body);
   });
 });
 
-test('(i) a cross-caller Nansen credit request WITHIN TTL is NOT a cache hit (2 upstream, 2 charges)', async () => {
+test('DexScreener boosts are treated as public cacheable data', async () => {
+  let calls = 0;
+  const cache = new GatewayCache({ ttlDexscreenerMs: 60_000 });
+  const upstream: UpstreamFetch = async () => {
+    calls += 1;
+    return okUpstream('[]');
+  };
+
+  await withServer({ dexUpstream: upstream, cache }, async (base) => {
+    await post(base, DEXSCREENER_PATH, { endpoint: 'boosts' }, TOKENS.a);
+    await post(base, DEXSCREENER_PATH, { endpoint: 'boosts' }, TOKENS.a);
+    assert.equal(calls, 1);
+  });
+});
+
+test('(h) concurrent identical Nansen credit calls from different callers share one initiator', async () => {
+  const up = blockingUpstream('{"data":[]}');
+  const rec = recordingLimiter();
+  const cache = new GatewayCache({ ttlNansenMs: 60_000 });
+  const credits = new CreditAccountant({ budget: 100 });
+
+  await withServer(
+    { nansenCreditUpstream: up.fetch, runLimiter: rec.run, cache, credits },
+    async (base) => {
+      const body = creditBody('CAH');
+      const pa = post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
+      await waitFor(() => up.calls() === 1);
+      const pb = post(base, NANSEN_CREDIT_PATH, body, TOKENS.b);
+      await waitFor(() => cache.joinedCount() === 1);
+      assert.equal(up.calls(), 1);
+      up.open();
+      await Promise.all([pa, pb]);
+      assert.equal(rec.calls.length, 1, 'only the initiating caller reaches the credit upstream');
+      assert.ok(credits.snapshot().used.a > 0, 'the initiator is charged the real/fallback credit cost');
+      assert.equal(credits.snapshot().used.b, 0, 'the joiner pays no duplicate credit');
+    },
+  );
+});
+
+test('(i) a successful Nansen credit result is shared across callers within TTL', async () => {
   let calls = 0;
   const upstream: UpstreamFetch = async () => {
     calls += 1;
@@ -346,11 +382,11 @@ test('(i) a cross-caller Nansen credit request WITHIN TTL is NOT a cache hit (2 
   await withServer({ nansenCreditUpstream: upstream, runLimiter: rec.run, cache }, async (base) => {
     const body = creditBody('CAI');
     await post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
-    clock.advance(500); // well inside the TTL — yet b still must miss
+    clock.advance(500);
     await post(base, NANSEN_CREDIT_PATH, body, TOKENS.b);
-    assert.equal(calls, 2, 'the credit key is caller-scoped, so b cannot TTL-hit a');
-    assert.equal(rec.calls.length, 2, 'both callers were charged');
-    assert.equal(cache.size(), 2, 'one entry per caller');
+    assert.equal(calls, 1, 'cross-caller cache hit avoids duplicate paid fetch');
+    assert.equal(rec.calls.length, 1, 'cache hit performs no second charge');
+    assert.equal(cache.size(), 1);
   });
 });
 
@@ -413,30 +449,123 @@ test('(k) an over-budget caller still returns a cached 0-credit body (hit short-
   );
 });
 
-test('cacheKey normalization: order-independent, priority-excluded, caller-scoped for credit', () => {
-  const k1 = cacheKey(
-    'nansen-credit',
-    { endpoint: TOKEN_INFO, body: { a: 1, b: 2 }, priority: 2 },
-    true,
-    'a',
-  );
-  const k2 = cacheKey(
-    'nansen-credit',
-    { priority: 0, body: { b: 2, a: 1 }, endpoint: TOKEN_INFO },
-    true,
-    'a',
-  );
-  assert.equal(k1, k2, 'key ignores property order and priority');
+test('cacheKey preserves semantic ranges, shares public caller keys, and normalizes EVM CA only', () => {
+  const upperCa = `0x${'A'.repeat(40)}`;
+  const lowerCa = upperCa.toLowerCase();
+  const k1 = cacheKey('nansen-credit',
+    { endpoint: FLOWS, body: { parameters: { tokenAddress: upperCa, chain: 'ethereum' }, date: { from: '1', to: '2' } }, priority: 2 }, true, 'a');
+  const k2 = cacheKey('nansen-credit',
+    { endpoint: FLOWS, body: { date: { to: '2', from: '1' }, parameters: { chain: 'ethereum', tokenAddress: lowerCa } }, priority: 0 }, true, 'b');
+  assert.equal(k1, k2, 'caller, property order, priority and EVM CA case do not split key');
+  const differentRange = cacheKey('nansen-credit',
+    { endpoint: FLOWS, body: { parameters: { tokenAddress: lowerCa, chain: 'ethereum' }, date: { from: '1', to: '3' } } }, true, 'b');
+  assert.notEqual(k1, differentRange, 'different date range stays isolated');
+  const malformedUpper = cacheKey('nansen-credit',
+    { endpoint: TOKEN_INFO, body: { tokenAddress: '0xAbC', chain: 'ethereum' } }, true, 'a');
+  const malformedLower = cacheKey('nansen-credit',
+    { endpoint: TOKEN_INFO, body: { tokenAddress: '0xabc', chain: 'ethereum' } }, true, 'b');
+  assert.notEqual(malformedUpper, malformedLower, 'malformed EVM-like input is not case-folded');
+  const solanaA = cacheKey('nansen-credit', { endpoint: TOKEN_INFO, body: { tokenAddress: 'AbC', chain: 'solana' } }, true, 'a');
+  const solanaB = cacheKey('nansen-credit', { endpoint: TOKEN_INFO, body: { tokenAddress: 'abc', chain: 'solana' } }, true, 'b');
+  assert.notEqual(solanaA, solanaB, 'Solana CA remains case-sensitive');
+});
 
-  const other = cacheKey(
-    'nansen-credit',
-    { endpoint: TOKEN_INFO, body: { a: 1, b: 2 } },
-    true,
+test('Nansen door public CA data is shared across callers within the short TTL', async () => {
+  let calls = 0;
+  const door: DoorPost = async (_url, body) => {
+    calls += 1;
+    return { status: 200, json: { data: body } };
+  };
+  const cache = new GatewayCache({ ttlDoorMs: 30_000 });
+
+  await withServer({ nansenDoor: door, cache }, async (base) => {
+    const request = {
+      endpoint: 'tgm-essential-data',
+      body: { parameters: { tokenAddress: 'CA', chain: 'base' } },
+    };
+    const first = await post(base, NANSEN_DOOR_PATH, request, TOKENS.a);
+    const second = await post(base, NANSEN_DOOR_PATH, request, TOKENS.b);
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(calls, 1, 'the cross-caller cache hit avoids a second browser-door request');
+    assert.equal(envelope(second).body, envelope(first).body);
+    assert.equal(cache.stats().hits, 1);
+  });
+});
+
+test('per-wallet Nansen balance requests stay uncached and retain per-caller preflight', async () => {
+  let calls = 0;
+  const preflightCallers: Caller[] = [];
+  const upstream: UpstreamFetch = async () => {
+    calls += 1;
+    return okUpstream('{"data":[]}');
+  };
+  const preflight: Preflight = (_provider, _body, caller) => {
+    preflightCallers.push(caller);
+    return undefined;
+  };
+  const cache = new GatewayCache({ ttlNansenMs: 60_000 });
+
+  await withServer(
+    { nansenCreditUpstream: upstream, cache, preflight },
+    async (base) => {
+      const request = {
+        endpoint: '/api/v1/profiler/address/current-balance',
+        body: { address: 'wallet-specific', chain: 'solana', tokenAddress: 'CA' },
+      };
+      const first = await post(base, NANSEN_CREDIT_PATH, request, TOKENS.a);
+      const second = await post(base, NANSEN_CREDIT_PATH, request, TOKENS.b);
+      assert.equal(first.status, 200);
+      assert.equal(second.status, 200);
+      assert.equal(calls, 2, 'wallet-specific requests do not share upstream results');
+      assert.deepEqual(preflightCallers, ['a', 'b']);
+      assert.equal(cache.size(), 0);
+    },
+  );
+});
+
+test('DexScreener token-list cache keys normalize EVM addresses without changing list order', () => {
+  const upper = cacheKey(
+    'dexscreener',
+    { endpoint: 'tokens', params: { addresses: '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,SoLCase' } },
+    false,
+    'a',
+  );
+  const lower = cacheKey(
+    'dexscreener',
+    { endpoint: 'tokens', params: { addresses: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,SoLCase' } },
+    false,
     'b',
   );
-  assert.notEqual(k1, other, 'a credit key is caller-scoped');
+  const reordered = cacheKey(
+    'dexscreener',
+    { endpoint: 'tokens', params: { addresses: 'SoLCase,0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } },
+    false,
+    'b',
+  );
+  assert.equal(upper, lower, 'EVM casing is semantically irrelevant');
+  assert.notEqual(upper, reordered, 'token-list order remains significant');
+});
 
-  const shared = cacheKey('dexscreener', { endpoint: 'tokens', params: { addresses: 'A' } }, false, 'b');
-  const shared2 = cacheKey('dexscreener', { endpoint: 'tokens', params: { addresses: 'A' } }, false, 'watcher');
-  assert.equal(shared, shared2, 'a non-credit key is caller-agnostic');
+test('DexScreener pair cache key normalizes an EVM pair ID only for known EVM chains', () => {
+  const upper = cacheKey(
+    'dexscreener',
+    { endpoint: 'pairs', params: { chainId: 'base', pairId: `0x${'A'.repeat(40)}` } },
+    false,
+    'a',
+  );
+  const lower = cacheKey(
+    'dexscreener',
+    { endpoint: 'pairs', params: { chainId: 'base', pairId: `0x${'a'.repeat(40)}` } },
+    false,
+    'b',
+  );
+  const solana = cacheKey(
+    'dexscreener',
+    { endpoint: 'pairs', params: { chainId: 'solana', pairId: `0x${'A'.repeat(40)}` } },
+    false,
+    'b',
+  );
+  assert.equal(upper, lower);
+  assert.notEqual(upper, solana, 'an unknown/non-EVM chain keeps address case intact');
 });

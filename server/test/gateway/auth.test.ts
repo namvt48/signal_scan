@@ -7,9 +7,12 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
+import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { createGatewayApp } from '../../src/gateway/app.js';
 import { resolveCaller, type CallerTokens } from '../../src/gateway/auth.js';
+import { GmgnKeyPool } from '../../src/gateway/gmgn-keys.js';
+const MONITOR_TOKEN = 'monitor-token-for-test-8d71c4a9';
 
 const TOKENS: CallerTokens = {
   a: 'token-a-secret',
@@ -28,8 +31,13 @@ async function get(path: string, token?: string): Promise<{ status: number; json
 }
 
 before(async () => {
-  server = createGatewayApp({ tokens: TOKENS }).listen(0);
-  await new Promise((resolve) => server.once('listening', resolve));
+  const gmgnPool = new GmgnKeyPool({
+    keys: [{ apiKey: 'gmgn-secret-never-return-this', limiterKey: 'gmgn:0', weight: 7 }],
+    fetcherFor: () => async () => ({ status: 200, body: '{}', headers: new Headers() }),
+    gateUntilOf: () => 0,
+  });
+  server = createGatewayApp({ tokens: TOKENS, monitorToken: MONITOR_TOKEN, gmgnPool }).listen(0);
+  await once(server, 'listening');
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 
@@ -86,4 +94,18 @@ test('GET /metrics resolves distinct callers from distinct tokens', async () => 
 
   const none = await get('/metrics');
   assert.equal(none.status, 401);
+});
+
+test('monitor metrics require the isolated token and expose only key usage', async () => {
+  assert.equal((await get('/monitor/metrics')).status, 401);
+  assert.equal((await get('/monitor/metrics', TOKENS.a)).status, 401);
+  assert.equal((await get('/metrics', MONITOR_TOKEN)).status, 401);
+  const result = await get('/monitor/metrics', MONITOR_TOKEN);
+  assert.equal(result.status, 200);
+  let gmgnKeys: unknown;
+  if (typeof result.json === 'object' && result.json !== null && 'gmgnKeys' in result.json) {
+    gmgnKeys = result.json.gmgnKeys;
+  }
+  assert.equal(Array.isArray(gmgnKeys), true);
+  assert.equal(JSON.stringify(result.json)?.includes('gmgn-secret-never-return-this'), false);
 });

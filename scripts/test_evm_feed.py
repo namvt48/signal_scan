@@ -5,6 +5,7 @@ KHÔNG mạng thật: mọi JSON-RPC đi qua FakeEvm monkeypatch vào seam
 
 import json
 import os
+import threading
 from typing import Any
 
 import pytest
@@ -63,20 +64,31 @@ class FakeEvm:
         max_span=None,
         decimals=6,
         block_time=BLOCK_TIME,
+        transactions=None,
+        range_error_message="exceed maximum block range",
     ):
         self.latest = latest
         self.logs = logs or []
         self.receipts = receipts or {}
-        self.max_span = max_span  # >0 ⇒ getLogs chê range rộng hơn (như provider thật)
+        self.transactions = transactions or {}
+        self.max_span = max_span
+        self.range_error_message = range_error_message
         self.decimals = decimals
         self.block_time = block_time
         self.getlogs_calls: list[tuple[str, int, int]] = []
         self.receipt_calls: list[str] = []
         self.range_errors = 0
-
     def __call__(self, url, payload=None, timeout=20, headers=None):
         assert payload is not None
-        chain = "base" if "base.org" in url else ("bsc" if "bsc" in url else "?")
+        chain = (
+            "base"
+            if "base.org" in url
+            else "bsc"
+            if "bsc" in url
+            else "robinhood"
+            if "robinhood" in url
+            else "?"
+        )
         m, p = payload["method"], payload["params"]
         if m == "eth_blockNumber":
             r = hex(self.latest)
@@ -89,12 +101,14 @@ class FakeEvm:
                 return {
                     "jsonrpc": "2.0",
                     "id": 1,
-                    "error": {"code": -32000, "message": "exceed maximum block range"},
+                    "error": {"code": -32000, "message": self.range_error_message},
                 }
             r = [l for l in self.logs if a <= int(l["blockNumber"], 16) <= b]
         elif m == "eth_getTransactionReceipt":
             self.receipt_calls.append(p[0])
             r = self.receipts.get(p[0])
+        elif m == "eth_getTransactionByHash":
+            r = self.transactions.get(p[0])
         elif m == "eth_getBlockByNumber":
             r = {"timestamp": hex(self.block_time)}
         elif m == "eth_call":  # decimals()
@@ -190,6 +204,58 @@ def test_wss_url_derived_and_env_override(monkeypatch):
     assert feed.wss_url("base") == "wss://rpc.example.com/base"
 
 
+def test_rpc_urls_preserves_key_order_and_public_fallback(monkeypatch):
+    primary = "https://base-mainnet.g.alchemy.com/v2/first"
+    secondary = "https://base-mainnet.g.alchemy.com/v2/second"
+    monkeypatch.setenv("BASE_RPC_URL", f" {primary} , {secondary} , {primary} ")
+
+    assert feed.rpc_url("base") == primary
+    assert feed.rpc_urls("base") == [primary, secondary, feed.DEFAULT_RPC["base"]]
+
+
+def test_rpc_fails_over_to_second_configured_key_before_public(monkeypatch):
+    primary = "https://base-mainnet.g.alchemy.com/v2/first"
+    secondary = "https://base-mainnet.g.alchemy.com/v2/second"
+    monkeypatch.setenv("BASE_RPC_URL", f"{primary},{secondary}")
+    calls = []
+
+    def primary_fails(url, payload=None, timeout=20, headers=None):
+        calls.append(url)
+        if url == primary:
+            raise OSError("primary unavailable")
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x123"}
+
+    monkeypatch.setattr(config, "http_json", primary_fails)
+
+    assert feed.evm_rpc("base", "eth_blockNumber", []) == "0x123"
+    assert calls == [primary] * 3 + [secondary]
+
+
+
+
+def test_rpc_falls_back_to_public_endpoint_after_primary_failures(monkeypatch):
+    monkeypatch.setenv("BASE_RPC_URL", "https://alchemy.example/base")
+    calls = []
+
+    def primary_then_public(url, payload=None, timeout=20, headers=None):
+        calls.append(url)
+        if url == "https://alchemy.example/base":
+            raise OSError("primary unavailable")
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x123"}
+
+    monkeypatch.setattr(config, "http_json", primary_then_public)
+
+    assert feed.evm_rpc("base", "eth_blockNumber", []) == "0x123"
+    assert calls == ["https://alchemy.example/base"] * 3 + [feed.DEFAULT_RPC["base"]]
+
+
+def test_mask_redacts_path_tokens_and_query_credentials():
+    path_url = "https://base-mainnet.g.alchemy.com/v2/sensitive"
+    query_url = "https://rpc.example/rpc?api-key=sensitive"
+
+    assert config._mask(path_url) == "https://base-mainnet.g.alchemy.com/v2/***"
+    assert config._mask(query_url) == "https://rpc.example/***?***"
+
 # ---------- backfill ----------
 
 
@@ -242,6 +308,83 @@ def test_backfill_chunk_halving_on_range_error(monkeypatch, trades):
     assert ok[0][0] == 2 and ok[-1][1] == 1000  # phủ kín 2..1000…
     for (a1, b1), (a2, _) in zip(ok, ok[1:]):
         assert a2 == b1 + 1  # …không hở khúc nào (R1)
+
+def test_backfill_halves_when_provider_requires_contract_address(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=20,
+        max_span=1,
+        range_error_message="Please specify an address in your request",
+    )
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("BSC_RPC_URL", "https://bsc-rpc.publicnode.com")
+    st = {"evm": {"bsc": {"last_block": 1}}}
+    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["bsc"]["last_block"] == 20
+    assert fake.range_errors == 4  # both topics rejected across two halved ranges
+    successful = [(a, b) for chain, a, b in fake.getlogs_calls if chain == "bsc" and a == b]
+    assert successful == [(block, block) for block in range(2, 21) for _ in range(2)]
+    first_range_errors = fake.range_errors
+    fake.latest = 22
+    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["bsc"]["last_block"] == 22
+    assert fake.range_errors == first_range_errors
+
+
+def test_address_required_logs_error_skips_retries(monkeypatch):
+    fake = FakeEvm(
+        latest=20,
+        max_span=1,
+        range_error_message="Please specify an address in your request",
+    )
+    use_fake(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="Please specify an address"):
+        feed.get_logs("bsc", 2, 3, feed.cl.sub_topics([WALLET])[0])
+    assert fake.range_errors == 1
+
+
+def test_bsc_fetches_transfer_directions_concurrently(monkeypatch, trades):
+    fake = FakeEvm(latest=10)
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("BSC_RPC_URL", "https://bsc-rpc.publicnode.com")
+    barrier = threading.Barrier(2)
+    original = config.http_json
+
+    def rendezvous(url, payload=None, timeout=20, headers=None):
+        if payload and payload.get("method") == "eth_getLogs":
+            barrier.wait(timeout=2)
+        return original(url, payload=payload, timeout=timeout, headers=headers)
+
+    monkeypatch.setattr(config, "http_json", rendezvous)
+    feed.backfill("bsc", [WALLET], {}, {"conf": 1, "span": 1})
+    assert fake.getlogs_calls == [("bsc", 10, 10)] * 2
+
+
+def test_poll_feed_bounds_backfill_for_each_chain(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=100,
+        max_span=1,
+        range_error_message="Please specify an address in your request",
+    )
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("BSC_RPC_URL", "https://bsc-rpc.publicnode.com")
+    chains = ("base", "bsc", "robinhood")
+    st = {"evm": {chain: {"last_block": 1} for chain in chains}}
+    per = {chain: [WALLET] for chain in chains}
+
+    feed.run_poll_feed(
+        per,
+        st,
+        {"conf": 1, "span": 20, "max_chunks": 2, "sleep": 0, "once": True},
+    )
+
+    for chain in chains:
+        assert st["evm"][chain]["last_block"] == 3
+        successful = {
+            start
+            for name, start, end in fake.getlogs_calls
+            if name == chain and start == end
+        }
+        assert successful == {2, 3}
 
 
 def test_backfill_cold_start_at_tip(monkeypatch, trades):
@@ -376,6 +519,21 @@ def test_load_wallets_api_filters_by_chain(monkeypatch, tmp_path):
     assert per == {"base": ["0x" + "a1" * 20], "bsc": ["0x" + "b2" * 20]}
 
 
+def test_load_wallets_api_excludes_explicit_exclusion_tag(monkeypatch, tmp_path):
+    included = "0x" + "a1" * 20
+    excluded = "0x" + "e1" * 20
+    rows = [
+        {"address": included, "chain": "base", "tags": ["status:UNVERIFIED", "WHALE"]},
+        {"address": excluded, "chain": "base", "tags": ["status:EXCLUDE", "OWN_WALLET"]},
+    ]
+    monkeypatch.setattr(config, "http_json", lambda *a, **kw: rows)
+
+    per, src = emain.load_wallets(str(tmp_path / "nope.txt"))
+
+    assert src == "api"
+    assert per == {"base": [included], "bsc": []}
+
+
 def test_load_wallets_file_fallback(monkeypatch, tmp_path):
     def dead(url, payload=None, timeout=20, headers=None):
         raise OSError("api down")
@@ -390,6 +548,69 @@ def test_load_wallets_file_fallback(monkeypatch, tmp_path):
     )  # chỉ dòng 0x42hex, cả 2 chain
 
 
+
+def test_robinhood_rpc_defaults_and_explicit_wss(monkeypatch):
+    assert feed.rpc_url("robinhood") == "https://rpc.mainnet.chain.robinhood.com"
+    assert feed.wss_url("robinhood") is None
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", "https://rpc.example/rh")
+    monkeypatch.setenv("ROBINHOOD_WSS_URL", "wss://rpc.example/rh")
+    assert feed.rpc_url("robinhood") == "https://rpc.example/rh"
+    assert feed.wss_url("robinhood") == "wss://rpc.example/rh"
+
+def test_bsc_publicnode_http_default_and_override(monkeypatch):
+    assert feed.rpc_url("bsc") == "https://bsc-rpc.publicnode.com"
+    monkeypatch.setenv("BSC_RPC_URL", "https://rpc.example/bsc")
+    assert feed.rpc_url("bsc") == "https://rpc.example/bsc"
+    fake = FakeEvm()
+    use_fake(monkeypatch, fake)
+    feed.get_logs("bsc", 10, 10, [])
+    assert fake.getlogs_calls == [("bsc", 10, 10)]
+
+
+
+def test_selected_robinhood_wallet_refresh(monkeypatch):
+    rows = [{"address": "0x" + "c3" * 20, "chain": "robinhood"},
+            {"address": "0x" + "b2" * 20, "chain": "bsc"}]
+    monkeypatch.setattr(config, "http_json", lambda *a, **kw: rows)
+    per, src = emain.load_wallets("/no-file", ("robinhood",))
+    assert src == "api" and per == {"robinhood": ["0x" + "c3" * 20]}
+
+def withdrawal_log(wallet, value, ca="0x0bd7d308f8e1639fab988df18a8011f41eacad73"):
+    return {
+        "address": ca,
+        "topics": [
+            "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65",
+            "0x" + "0" * 24 + wallet.lower()[2:],
+        ],
+        "data": "0x%064x" % value,
+    }
+
+
+def test_native_input_and_output_require_router_erc20_receipt(monkeypatch, trades):
+    tx_sell = "0x" + "cd" * 32
+    incoming = raw_log(POOL, WALLET, 500 * 10**6, ca=TOKEN, idx=2)
+    outgoing = raw_log(WALLET, POOL, 200 * 10**6, ca=TOKEN, tx=tx_sell)
+    router = "0x8876789976decbfcbbbe364623c63652db8c0904"
+    fake = FakeEvm(
+        logs=[incoming, outgoing],
+        receipts={
+            TX: {"status": "0x1", "to": router, "logs": [incoming]},
+            tx_sell: {
+                "status": "0x1", "to": router,
+                "logs": [outgoing, withdrawal_log(WALLET, 2 * 10**18)],
+            },
+        },
+        transactions={
+            TX: {"from": WALLET, "value": hex(10**18)},
+            tx_sell: {"from": WALLET, "value": "0x0"},
+        },
+    )
+    use_fake(monkeypatch, fake)
+    feed.process_log("robinhood", incoming, {WALLET})
+    feed.process_log("robinhood", outgoing, {WALLET})
+    assert [trade["side"] for trade in trades] == ["buy", "sell"]
+    assert all(trade["chain"] == "robinhood" for trade in trades)
+    assert [trade["amountUsd"] for trade in trades] == pytest.approx([500, 200])
 def test_refresh_cfg_failsoft(monkeypatch):
     per = {"base": ["0xold"], "bsc": []}
 

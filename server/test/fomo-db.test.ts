@@ -14,6 +14,7 @@ import {
   insertFomoUser,
   listFomoUsers,
   open,
+  updateFomoTradeUsd,
   updateFomoUser,
 } from '../src/db.js';
 
@@ -42,6 +43,21 @@ test('(b) insertFomoTrade: event_id is idempotent (ON CONFLICT DO NOTHING)', () 
   assert.equal(insertFomoTrade(trade), true, 'first insert reports created');
   assert.equal(insertFomoTrade(trade), false, 'replay reports NOT created');
   assert.equal(countTrades('event_id = ?', 'evt-1'), 1, 'exactly one row exists');
+});
+
+test('updateFomoTradeUsd fills only an unresolved BUY belonging to the user', () => {
+  const user = insertFomoUser({ handle: '@fill-update' });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-null', ca: 'CaFill', chain: 'sol', type: 'buy', ts: 10 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-known', ca: 'CaFill', chain: 'sol', type: 'buy', trade_usd: 12, ts: 11 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-sell', ca: 'CaFill', chain: 'sol', type: 'sell', ts: 12 });
+
+  assert.equal(updateFomoTradeUsd(user.id, 'fill-null', 9950.06), true);
+  assert.equal(updateFomoTradeUsd(user.id, 'fill-null', 1), false);
+  assert.equal(updateFomoTradeUsd(user.id, 'fill-known', 1), false);
+  assert.equal(updateFomoTradeUsd(user.id, 'fill-sell', 1), false);
+  assert.equal(updateFomoTradeUsd('another-user', 'fill-null', 1), false);
+  assert.equal((getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('fill-null') as { trade_usd: number }).trade_usd, 9950.06);
+  assert.equal((getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('fill-known') as { trade_usd: number }).trade_usd, 12);
 });
 
 // insertFomoTrade canonicalizes ca (reuses canonicalCa) so ${chain}:${ca} keys line up.

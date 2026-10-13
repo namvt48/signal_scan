@@ -37,6 +37,7 @@ interface MetricsJson {
   >;
   credits: { day: string; budget: number; half: number; used: { a: number; b: number } };
   cache: { hits: number; misses: number; joined: number; size: number; inflight: number };
+  gmgnSingleFlight: { joined: number; inflight: number };
   text: string;
 }
 
@@ -114,6 +115,8 @@ test('GET /metrics returns every limiter key + credits{a,b} + cache counters', a
   for (const k of ['hits', 'misses', 'joined', 'size', 'inflight'] as const) {
     assert.equal(typeof m.cache[k], 'number', `cache.${k} is a number`);
   }
+  assert.equal(typeof m.gmgnSingleFlight.joined, 'number');
+  assert.equal(typeof m.gmgnSingleFlight.inflight, 'number');
   assert.ok(m.text.length > 0, 'text summary is present');
   assert.match(m.text, /credits day=/);
   assert.match(m.text, /cache hits=/);
@@ -140,4 +143,5 @@ test('a cacheable call increments cache.hits and ?format=text renders the figure
   assert.match(text, /caller=watcher/);
   assert.match(text, /hits=1 misses=1/);
   assert.match(text, /limiter gmgn /);
+  assert.match(text, /gmgn-singleflight joined=/);
 });

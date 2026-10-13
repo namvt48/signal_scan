@@ -106,6 +106,8 @@ test('age 24h..8d: still ONE call — the old ≥8d daily-forcing extra is gone'
   assert.ok(st);
   assert.equal(st.t100_multiple, 2.5, 'peak 1000 → trough 400 from the primary rows');
   assert.equal(st.anchor_at, deployedAt);
+  const history = JSON.parse(st.t100_history_json ?? '[]') as { peakBalance?: number; troughBalance?: number }[];
+  assert.deepEqual(history.map(({ peakBalance, troughBalance }) => [peakBalance, troughBalance]), [[1000, 400]]);
 });
 
 test('age ≥30d: the window still spans the whole life, not just the first month', async () => {

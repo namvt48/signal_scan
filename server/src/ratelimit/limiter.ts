@@ -3,7 +3,7 @@ import { Window } from './window.js';
 import { MinInterval } from './min-interval.js';
 import { Semaphore } from './semaphore.js';
 import { Gate } from './gate.js';
-import { HttpError, type ApiLimitSpec, type Constraint, type Limiter as ILimiter, type LimiterSnapshot, type Priority, type RunOpts } from './types.js';
+import { HttpError, LimiterUnavailableError, type ApiLimitSpec, type Constraint, type Limiter as ILimiter, type LimiterSnapshot, type Priority, type RetrySpec, type RunOpts, type WindowSpec } from './types.js';
 
 interface Job {
   priority: Priority;
@@ -14,6 +14,7 @@ interface Job {
   notBefore: number;
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
+  lastError?: unknown;
 }
 
 const CLOCK = {
@@ -29,8 +30,13 @@ export class Limiter implements ILimiter {
   private readonly sem: Semaphore | null;
   private readonly gate: Gate | null;
   private readonly agingMs: number;
+  private readonly queueMax: number;
+  private readonly queueMaxAgeMs: number;
+  private readonly deferGate: boolean;
+  private readonly lastCaller = new Map<Priority, string>();
   private draining = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private timerAt: number | null = null;
 
   constructor(
     private readonly api: string,
@@ -48,25 +54,48 @@ export class Limiter implements ILimiter {
     this.agingMs = spec.priorityAgingMs ?? 30_000;
     this.retry = spec.retry ?? null;
     this.pathWindow = spec.pathWindow ?? null;
+    this.queueMax = Math.min(10_000, Math.max(0, Math.floor(spec.queueMax ?? 256)));
+    this.queueMaxAgeMs = Math.min(300_000, Math.max(1, spec.queueMaxAgeMs ?? 300_000));
+    this.deferGate = spec.deferGate ?? false;
   }
 
-  private readonly retry;
-  private readonly pathWindow;
+  private readonly retry: RetrySpec | null;
+  private readonly pathWindow: WindowSpec | null;
 
   run<T>(opts: RunOpts, fn: () => Promise<T>): Promise<T> {
     const now = this.clock.now();
-    if (this.gate?.blocked(now)) {
-      return Promise.reject(new Error(`${this.api} gated until ${new Date(this.gate.until).toISOString()}`));
+    this.expireQueued(now);
+    if (opts.deadlineAt !== undefined && opts.deadlineAt <= now) {
+      return Promise.reject(new LimiterUnavailableError(this.api, 'queue-expired'));
     }
+
+    const gateUntil = this.gate?.until ?? 0;
+    const gateBlocked = this.gate?.blocked(now) ?? false;
+    if (gateBlocked && !this.deferGate) {
+      return Promise.reject(new Error(`${this.api} gated until ${new Date(gateUntil).toISOString()}`));
+    }
+    if (gateBlocked && !this.canWaitUntil(now, gateUntil, now, opts.deadlineAt)) {
+      return Promise.reject(new LimiterUnavailableError(this.api, 'gate', gateUntil));
+    }
+
+    const priority = opts.priority ?? 1;
+    const readyAt = this.readyAtFor(now, opts);
+    const mustQueue = gateBlocked || this.queueLength > 0 || (this.sem?.full ?? false) || readyAt > now;
+    if (mustQueue && this.queueLength >= this.queueMax && !this.makeRoom(priority, now)) {
+      return Promise.reject(new LimiterUnavailableError(this.api, 'queue-full'));
+    }
+    if (mustQueue && !this.canWaitUntil(now, Math.max(readyAt, gateBlocked ? gateUntil : 0), now, opts.deadlineAt)) {
+      return Promise.reject(new LimiterUnavailableError(this.api, 'queue-expired'));
+    }
+
     return new Promise<T>((resolve, reject) => {
-      const priority = opts.priority ?? 1;
       this.queues[priority].push({
         priority,
         enqueuedAt: now,
         opts,
         fn: fn as () => Promise<unknown>,
         attempt: 0,
-        notBefore: 0,
+        notBefore: gateBlocked ? gateUntil : 0,
         resolve: resolve as (v: unknown) => void,
         reject,
       });
@@ -74,6 +103,31 @@ export class Limiter implements ILimiter {
     });
   }
 
+  private get queueLength(): number {
+    return this.queues.reduce((n, q) => n + q.length, 0);
+  }
+
+  private makeRoom(priority: Priority, now: number): boolean {
+    let victim: Job | undefined;
+    let victimQueue: Job[] | undefined;
+    let victimIndex = -1;
+    for (let p = priority + 1; p <= 2; p += 1) {
+      const q = this.queues[p as Priority];
+      for (let i = 0; i < q.length; i += 1) {
+        const job = q[i];
+        if (job === undefined || this.effectivePriority(job, now) <= priority) continue;
+        if (victim === undefined || job.enqueuedAt < victim.enqueuedAt) {
+          victim = job;
+          victimQueue = q;
+          victimIndex = i;
+        }
+      }
+    }
+    if (victim === undefined || victimQueue === undefined) return false;
+    victimQueue.splice(victimIndex, 1);
+    victim.reject(new LimiterUnavailableError(this.api, 'queue-full'));
+    return true;
+  }
   snapshot(): LimiterSnapshot {
     return {
       inFlight: this.sem?.count ?? 0,
@@ -90,22 +144,78 @@ export class Limiter implements ILimiter {
   }
 
   private nextJob(now: number): Job | null {
-    let best: Job | null = null;
+    let best: Job | undefined;
     let bestEff = Number.POSITIVE_INFINITY;
+    let bestQueue: Job[] | undefined;
+    let bestIndex = -1;
     for (const q of this.queues) {
-      if (q.length === 0) continue;
-      const eff = this.effectivePriority(q[0], now);
-      if (eff < bestEff) {
-        bestEff = eff;
-        best = q[0];
+      for (let i = 0; i < q.length; i += 1) {
+        const candidate = q[i];
+        if (candidate === undefined) continue;
+        const eff = this.effectivePriority(candidate, now);
+        const last = this.lastCaller.get(eff);
+        const bestIsLast = best !== undefined && (best.opts.caller ?? '') === last;
+        const candidateIsLast = (candidate.opts.caller ?? '') === last;
+        if (eff < bestEff || (eff === bestEff && bestIsLast && !candidateIsLast)) {
+          best = candidate;
+          bestEff = eff;
+          bestQueue = q;
+          bestIndex = i;
+        }
       }
     }
-    if (best) this.queues[best.priority].shift();
+    if (best === undefined || bestQueue === undefined) return null;
+    bestQueue.splice(bestIndex, 1);
+    this.lastCaller.set(bestEff as Priority, best.opts.caller ?? '');
     return best;
   }
 
   private pushBack(job: Job): void {
-    this.queues[job.priority].unshift(job);
+    this.queues[job.priority].push(job);
+  }
+
+  private canWaitUntil(now: number, until: number, enqueuedAt: number, deadlineAt?: number): boolean {
+    if (until <= now) return true;
+    const ageDeadline = enqueuedAt + this.queueMaxAgeMs;
+    return until < ageDeadline && (deadlineAt === undefined || until < deadlineAt);
+  }
+
+  private expireQueued(now: number): void {
+    for (const q of this.queues) {
+      for (let i = q.length - 1; i >= 0; i -= 1) {
+        const job = q[i];
+        if (job === undefined) continue;
+        const deadlineReached = job.opts.deadlineAt !== undefined && now >= job.opts.deadlineAt;
+        const ageReached = now >= job.enqueuedAt + this.queueMaxAgeMs;
+        if (!deadlineReached && !ageReached) continue;
+        q.splice(i, 1);
+        job.reject(job.lastError ?? new LimiterUnavailableError(this.api, 'queue-expired'));
+      }
+    }
+  }
+
+  private queueExpiryAt(): number {
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const q of this.queues) {
+      for (const job of q) {
+        earliest = Math.min(earliest, job.enqueuedAt + this.queueMaxAgeMs);
+        if (job.opts.deadlineAt !== undefined) earliest = Math.min(earliest, job.opts.deadlineAt);
+      }
+    }
+    return earliest;
+  }
+
+  private armAtOrExpiry(readyAt: number, now: number): void {
+    const wakeAt = Math.min(readyAt, this.queueExpiryAt());
+    if (!Number.isFinite(wakeAt)) return;
+    this.arm(Math.max(1, wakeAt - now));
+  }
+
+  private clearTimer(): void {
+    if (this.timer === null) return;
+    this.clock.clearTimeout(this.timer);
+    this.timer = null;
+    this.timerAt = null;
   }
 
   private readyAtFor(now: number, opts: RunOpts): number {
@@ -138,20 +248,39 @@ export class Limiter implements ILimiter {
   }
 
   private drain(): void {
+    let deferred = 0;
     for (;;) {
       const now = this.clock.now();
+      this.expireQueued(now);
+      if (this.sem?.full) {
+        this.armAtOrExpiry(Number.POSITIVE_INFINITY, now);
+        return;
+      }
       const job = this.nextJob(now);
-      if (!job) return;
+      if (job === null) {
+        this.clearTimer();
+        return;
+      }
+      if (this.gate?.blocked(now)) {
+        const until = this.gate.until;
+        if (this.deferGate && !this.canWaitUntil(now, until, job.enqueuedAt, job.opts.deadlineAt)) {
+          job.reject(new LimiterUnavailableError(this.api, 'gate', until));
+          continue;
+        }
+        job.notBefore = Math.max(job.notBefore, until);
+        this.pushBack(job);
+        this.armAtOrExpiry(until, now);
+        return;
+      }
       const readyAt = Math.max(this.readyAtFor(now, job.opts), job.notBefore);
       if (readyAt > now) {
         this.pushBack(job);
-        this.arm(readyAt - now);
-        return;
+        deferred += 1;
+        this.armAtOrExpiry(readyAt, now);
+        if (deferred >= this.queueLength) return;
+        continue;
       }
-      if (this.sem?.full) {
-        this.pushBack(job);
-        return; // kick() is called again on release
-      }
+      deferred = 0;
       this.start(job);
     }
   }
@@ -174,29 +303,38 @@ export class Limiter implements ILimiter {
         },
         (e) => {
           this.sem?.release();
-          this.handleError(job, e, now);
+          this.handleError(job, e);
         },
       );
   }
 
-  private handleError(job: Job, e: unknown, now: number): void {
+  private handleError(job: Job, e: unknown): void {
+    const failedAt = this.clock.now();
     if (e instanceof HttpError) {
-      this.gate?.note(e.status, e.header, now);
-      if (this.gate?.blocked(now)) {
-        // the call that TRIGGERED the ban surfaces its real error; only the calls that follow
-        // get the constant `${api} gated until <ISO>` message (run()'s pre-flight) for log dedupe.
-        job.reject(e);
-        this.kick();
-        return;
-      }
-      if (this.retry && job.attempt < this.retry.retries && this.retry.retryOn(e.status)) {
-        job.attempt++;
-        const delay = this.backoffDelay(job.attempt);
-        job.notBefore = now + delay;
-        this.queues[job.priority].push(job); // rejoin at the BACK so the backoff does not block peers
-        this.arm(delay);
-        this.kick();
-        return;
+      this.gate?.note(e.status, e.header, failedAt);
+      const retryable =
+        e.status !== 400 &&
+        e.status !== 401 &&
+        e.status !== 403 &&
+        this.retry !== null &&
+        job.attempt < this.retry.retries &&
+        (this.retry.path === undefined || this.retry.path === job.opts.path) &&
+        this.retry.retryOn(e.status);
+      if (retryable) {
+        const attempt = job.attempt + 1;
+        const retryAt = Math.max(failedAt + this.backoffDelay(attempt), this.gate?.until ?? 0);
+        if (
+          this.canWaitUntil(failedAt, retryAt, job.enqueuedAt, job.opts.deadlineAt) &&
+          (this.queueLength < this.queueMax || this.makeRoom(job.priority, failedAt))
+        ) {
+          job.attempt = attempt;
+          job.lastError = e;
+          job.notBefore = retryAt;
+          this.queues[job.priority].push(job);
+          this.armAtOrExpiry(retryAt, failedAt);
+          this.kick();
+          return;
+        }
       }
     }
     job.reject(e);
@@ -204,21 +342,33 @@ export class Limiter implements ILimiter {
   }
 
   private backoffDelay(attempt: number): number {
-    const r = this.retry!;
-    if (r.backoff === 'fibo') {
+    const retry = this.retry!;
+    let delay: number;
+    if (retry.backoff === 'fibo') {
       let a = 1;
       let b = 1;
-      for (let i = 1; i < attempt; i++) [a, b] = [b, a + b];
-      return b * r.baseMs;
+      for (let i = 1; i < attempt; i += 1) [a, b] = [b, a + b];
+      delay = b * retry.baseMs;
+    } else {
+      delay = retry.baseMs * 2 ** (attempt - 1);
     }
-    return Math.min(r.capMs ?? Number.POSITIVE_INFINITY, r.baseMs * 2 ** (attempt - 1));
+    const jitterMs = retry.jitterMs ?? 0;
+    if (jitterMs > 0) {
+      const sample = (retry.random ?? Math.random)();
+      delay += Math.floor(Math.min(1, Math.max(0, sample)) * jitterMs);
+    }
+    return Math.min(retry.capMs ?? Number.POSITIVE_INFINITY, delay);
   }
 
   private arm(ms: number): void {
-    if (this.timer) this.clock.clearTimeout(this.timer);
+    const due = this.clock.now() + Math.max(1, ms);
+    if (this.timer !== null && this.timerAt !== null && this.timerAt <= due) return;
+    if (this.timer !== null) this.clock.clearTimeout(this.timer);
+    this.timerAt = due;
     this.timer = this.clock.setTimeout(() => {
       this.timer = null;
+      this.timerAt = null;
       this.kick();
-    }, Math.max(1, ms));
+    }, due - this.clock.now());
   }
 }

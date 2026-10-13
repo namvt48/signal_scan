@@ -11,7 +11,7 @@ import type {
   WalletActivity,
   WalletTokenHolding,
 } from './providers/provider.js';
-import { clearZeroHolding, getDb, getTokenState, recordZeroHolding } from './db.js';
+import { appendAlertMetricObservation, clearZeroHolding, getDb, getTokenState, recordZeroHolding } from './db.js';
 
 export interface UpsertTokenOptions {
   /** Precomputed top-100 decrease percent (undefined -> stored as NULL). */
@@ -24,7 +24,49 @@ export interface UpsertTokenOptions {
   };
 }
 
+const MARKET_CAP_HISTORY_LIMIT = 96;
+const HOLDER_HISTORY_LIMIT = 256;
+
+function recordHolderSnapshot(ca: string, chain: Chain, sampledAt: number, holderCountUpdated: boolean): void {
+  const db = getDb();
+  const state = db.prepare(
+    'SELECT holders, nansen_holders, holders_history_json FROM token_state WHERE ca = ? AND chain = ?',
+  ).get(ca, chain) as
+    | { holders: number | null; nansen_holders: number | null; holders_history_json: string | null }
+    | undefined;
+  if (!state || (!holderCountUpdated && state.holders != null && state.holders !== 0)) return;
+  const visibleCount = state.holders || state.nansen_holders || 0;
+  if (!Number.isFinite(visibleCount) || visibleCount <= 0 || !Number.isFinite(sampledAt)) return;
+  const history = state.holders_history_json
+    ? JSON.parse(state.holders_history_json) as { t: number; value: number }[]
+    : [];
+  const next = [...history, { t: sampledAt, value: Math.round(visibleCount) }].slice(-HOLDER_HISTORY_LIMIT);
+  db.prepare('UPDATE token_state SET holders_history_json = ? WHERE ca = ? AND chain = ?')
+    .run(JSON.stringify(next), ca, chain);
+}
+
+/** Record current measured market cap without issuing another provider request. */
+export function recordMarketCapSnapshot(ca: string, chain: Chain, sampledAt = Date.now()): void {
+  const db = getDb();
+  const state = db.prepare(
+    'SELECT market_cap, market_cap_history_json FROM token_state WHERE ca = ? AND chain = ?',
+  ).get(ca, chain) as
+    | { market_cap: number | null; market_cap_history_json: string | null }
+    | undefined;
+  if (state?.market_cap == null || !Number.isFinite(state.market_cap)) return;
+  const history = state.market_cap_history_json
+    ? JSON.parse(state.market_cap_history_json) as { t: number; value: number }[]
+    : [];
+  const last = history[history.length - 1];
+  const next = last && last.value === state.market_cap && sampledAt - last.t < 1_000
+    ? [...history.slice(0, -1), { t: sampledAt, value: state.market_cap }]
+    : [...history, { t: sampledAt, value: state.market_cap }].slice(-MARKET_CAP_HISTORY_LIMIT);
+  db.prepare('UPDATE token_state SET market_cap_history_json = ? WHERE ca = ? AND chain = ?')
+    .run(JSON.stringify(next), ca, chain);
+}
+
 export function upsertTokenInfo(info: TokenInfo, opts: UpsertTokenOptions = {}): void {
+  const fetchedAt = Date.now();
   getDb()
     .prepare(
       `INSERT INTO token_state
@@ -71,13 +113,13 @@ export function upsertTokenInfo(info: TokenInfo, opts: UpsertTokenOptions = {}):
     .run({
       ca: info.ca,
       chain: info.chain,
-      price: info.price,
+      price: info.price ?? null,
       holders: info.holders,
       volume24h: info.volume24h,
       buyVol24h: info.buyVol24h,
       sellVol24h: info.sellVol24h,
       volume1h: info.volume1h ?? null,
-      marketCap: info.marketCap,
+      marketCap: info.marketCap ?? null,
       liquidity: info.liquidity,
       supply: info.supply,
       // Nansen omits freshCount/top10Rate/freshRate — COALESCE keeps the last
@@ -95,8 +137,10 @@ export function upsertTokenInfo(info: TokenInfo, opts: UpsertTokenOptions = {}):
       deployedAt: info.deployedAt ?? null,
       genesisBal: info.genesisBal ?? null,
       symbol: info.symbol ?? null,
-      fetchedAt: Date.now(),
+      fetchedAt,
     });
+  recordMarketCapSnapshot(info.ca, info.chain, fetchedAt);
+  recordHolderSnapshot(info.ca, info.chain, fetchedAt, true);
 }
 
 /** Static column map — the ONLY source of SQL identifiers here (never the input). */
@@ -128,8 +172,9 @@ const METRIC_WRITERS: readonly (readonly [keyof MetricPatch, string, boolean?])[
  * touched, so the per-endpoint sweeps (each on its own cadence) never overwrite
  * each other's columns. Creates the row on first write: a CA whose essential
  * pass failed must still get its gini card instead of silently writing nowhere.
+ * `sampledAt` preserves source time when rebuilding token state from cached data.
  */
-export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch): void {
+export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch, sampledAt = Date.now()): void {
   const cols: string[] = [];
   const vals: unknown[] = [];
   const sets: string[] = [];
@@ -153,7 +198,6 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch)
         throw new Error('nansenFreshPct must be a finite percentage between 0 and 100');
       }
       const history = current?.fresh_history_json ? JSON.parse(current.fresh_history_json) as { t: number; value: number }[] : [];
-      const sampledAt = Date.now();
       history.push({ t: sampledAt, value: next });
       cols.push('fresh_history_json', 'fresh_updated_at');
       vals.push(JSON.stringify(history.slice(-256)), sampledAt);
@@ -163,9 +207,13 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch)
       db.prepare(
         `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
          ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
-      ).run(ca, chain, ...vals, Date.now());
+      ).run(ca, chain, ...vals, sampledAt);
     });
     tx();
+    if (patch.holders !== undefined || patch.nansenHolders !== undefined) {
+      recordHolderSnapshot(ca, chain, sampledAt, patch.holders !== undefined);
+    }
+    if (patch.marketCap !== undefined) recordMarketCapSnapshot(ca, chain, sampledAt);
     return;
   }
   sets.push('fetched_at = excluded.fetched_at');
@@ -175,7 +223,11 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch)
       `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
        ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
     )
-    .run(ca, chain, ...vals, Date.now());
+    .run(ca, chain, ...vals, sampledAt);
+  if (patch.holders !== undefined || patch.nansenHolders !== undefined) {
+    recordHolderSnapshot(ca, chain, sampledAt, patch.holders !== undefined);
+  }
+  if (patch.marketCap !== undefined) recordMarketCapSnapshot(ca, chain, sampledAt);
 }
 
 /**
@@ -196,24 +248,39 @@ export function fillTokenMetrics(ca: string, chain: Chain, patch: MetricPatch): 
     sets.push(`${col} = COALESCE(token_state.${col}, excluded.${col})`);
   }
   if (cols.length === 0) return;
+  const db = getDb();
+  const current = db.prepare('SELECT holders, nansen_holders FROM token_state WHERE ca = ? AND chain = ?').get(ca, chain) as
+    | { holders: number | null; nansen_holders: number | null }
+    | undefined;
+  const holderWillBeFilled =
+    (patch.holders !== undefined && current?.holders == null) ||
+    (patch.nansenHolders !== undefined && current?.nansen_holders == null && (current?.holders == null || current.holders === 0));
   sets.push('fetched_at = excluded.fetched_at');
   const placeholders = cols.map(() => '?').join(', ');
-  getDb()
-    .prepare(
-      `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
-       ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
-    )
-    .run(ca, chain, ...vals, Date.now());
+  const sampledAt = Date.now();
+  db.prepare(
+    `INSERT INTO token_state (ca, chain, ${cols.join(', ')}, fetched_at) VALUES (?, ?, ${placeholders}, ?)
+     ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
+  ).run(ca, chain, ...vals, sampledAt);
+  if (holderWillBeFilled) recordHolderSnapshot(ca, chain, sampledAt, patch.holders !== undefined);
 }
 
 /**
- * market_cap = price × supply. price is owned by DexScreener, supply by GMGN — so the
- * derived value is recomputed after either owner writes. A NULL on either side leaves
- * the last computed market_cap untouched rather than zeroing it.
+ * market_cap = price × supply. The active market provider owns price; GMGN mode
+ * clears the current quote when GMGN cannot provide one rather than displaying a
+ * previous provider's stale value as current. Price/supply are independent writes.
  */
 export function recomputeMarketCap(ca: string, chain: Chain): void {
-  getDb()
+  const result = getDb()
     .prepare('UPDATE token_state SET market_cap = price * supply WHERE ca = ? AND chain = ? AND price IS NOT NULL AND supply IS NOT NULL')
+    .run(ca, chain);
+  if (result.changes > 0) recordMarketCapSnapshot(ca, chain);
+}
+
+/** Mark the current quote unavailable without deleting measured history. */
+export function clearCurrentMarketQuote(ca: string, chain: Chain): void {
+  getDb()
+    .prepare('UPDATE token_state SET price = NULL, market_cap = NULL WHERE ca = ? AND chain = ?')
     .run(ca, chain);
 }
 
@@ -234,10 +301,12 @@ export function restoreTokenLf(ca: string, chain: Chain, genesisBal: number): vo
 export function updateTokenAnalytics(
   ca: string,
   chain: Chain,
-  analytics: { t100Pct?: number; t100Multiple?: number; genesisBal?: number; anchorAt?: number; bal?: { d1?: { peak: number; trough: number }; d7?: { peak: number; trough: number }; d30?: { peak: number; trough: number } } },
+  analytics: { t100Pct?: number; t100Multiple?: number; t100BalanceDrawdown?: { peak: number; trough: number }; genesisBal?: number; anchorAt?: number; bal?: { d1?: { peak: number; trough: number }; d7?: { peak: number; trough: number }; d30?: { peak: number; trough: number } } },
+  observationAt?: number,
 ): void {
-  getDb()
-    .prepare(
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare(
       `UPDATE token_state SET
          t100_pct = ?,
          t100_multiple = ?,
@@ -248,8 +317,7 @@ export function updateTokenAnalytics(
          bal_peak_30d = ?, bal_trough_30d = ?,
          fetched_at = ?
        WHERE ca = ? AND chain = ?`,
-    )
-    .run(
+    ).run(
       analytics.t100Pct ?? null,
       analytics.t100Multiple ?? null,
       analytics.genesisBal ?? null,
@@ -264,6 +332,27 @@ export function updateTokenAnalytics(
       ca,
       chain,
     );
+    if (observationAt !== undefined && typeof analytics.t100Multiple === 'number' && Number.isFinite(analytics.t100Multiple)) {
+      const current = db.prepare(
+        'SELECT t100_history_json FROM token_state WHERE ca = ? AND chain = ?',
+      ).get(ca, chain) as { t100_history_json: string | null } | undefined;
+      const history = current?.t100_history_json
+        ? JSON.parse(current.t100_history_json) as { t: number; value: number; peakBalance?: number; troughBalance?: number }[]
+        : [];
+      const drawdown = analytics.t100BalanceDrawdown;
+      const point = {
+        t: observationAt,
+        value: analytics.t100Multiple,
+        ...(drawdown && Number.isFinite(drawdown.peak) && Number.isFinite(drawdown.trough)
+          ? { peakBalance: drawdown.peak, troughBalance: drawdown.trough }
+          : {}),
+      };
+      const next = [...history, point].slice(-256);
+      db.prepare('UPDATE token_state SET t100_history_json = ? WHERE ca = ? AND chain = ?')
+        .run(JSON.stringify(next), ca, chain);
+      appendAlertMetricObservation(db, ca, chain, 't100', analytics.t100Multiple, observationAt);
+    }
+  })();
 }
 
 /** Nansen token-sweep write — gini card set; absent t100/median keep last value. */
@@ -280,6 +369,7 @@ export function updateNansenHolders(
        WHERE ca = ? AND chain = ?`,
     )
     .run(stats.holders, stats.freshSupplyPct, stats.t100SupplyPct ?? null, stats.medianBalanceUsd ?? null, ca, chain);
+  recordHolderSnapshot(ca, chain, Date.now(), false);
 }
 
 /** top10_rate — written by the holders snapshot slot from the top-10 percentOwnership sum. */

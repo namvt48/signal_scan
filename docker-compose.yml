@@ -38,15 +38,25 @@ services:
     # Chrome renders through /dev/shm; the 64m container default makes it fall back
     # to disk and stall under load, so shm gets its own headroom too.
     shm_size: 2g
+    networks:
+      default: {}
+      signal-scan-gateway:
+        aliases:
+          - "signal-scan-chrome-${INSTANCE:-a}"
     logging: *default-logging
   api:
     build: ./server
     env_file:
       - path: server/.env
         required: false
+      - path: /root/signal-scan-monitor/alchemy-rpc.env
+        required: false
     environment:
       DB_PATH: /data/signal_scan.db
-      CRAWL_WS_ENDPOINT: ws://chrome:3000
+      POLL_FLOWS_MS: "${POLL_FLOWS_MS:-10800000}"
+      SHOW_FOMO: ${SHOW_FOMO:-}
+      MONITOR_API_TOKEN: ${MONITOR_API_TOKEN:-}
+      CRAWL_WS_ENDPOINT: ws://signal-scan-chrome-${INSTANCE:-a}:3000
       NANSEN_CRAWL: "on"
       # Setup queue is serviced independently; TTL/retry clocks gate requests per CA.
       POLL_SETUP_SWEEP_MS: "300000"
@@ -59,14 +69,13 @@ services:
       - chrome
     expose:
       - "3001"
-    # TRAP: listing ANY `networks:` on a service REPLACES its implicit `default`
-    # membership — so `default` MUST be listed explicitly, or web (nginx
-    # `proxy_pass http://api:3001`) loses api AND api loses chrome
-    # (`CRAWL_WS_ENDPOINT: ws://chrome:3000`) → instance a breaks.
+    # Keep default for same-project service membership. Shared-network callers
+    # use instance-specific aliases; Compose still registers generic service names.
     networks:
-      - default
-      - signal-scan-gateway
-    logging: *default-logging
+      default: {}
+      signal-scan-gateway:
+        aliases:
+          - "signal-scan-api-${INSTANCE:-a}"
     restart: unless-stopped
   web:
     build:
@@ -81,6 +90,8 @@ services:
         VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
         VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
         VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+    environment:
+      NGINX_API_UPSTREAM: "signal-scan-api-${INSTANCE:-a}"
     ports:
       # Instance a bind 127.0.0.1 (BIND=127.0.0.1): chỉ Caddy + daemon (đều ở host)
       # vào được; công khai duy nhất qua https://signal-scan.duckdns.org.
@@ -89,12 +100,17 @@ services:
     logging: *default-logging
     depends_on:
       - api
+    networks:
+      default: {}
+      signal-scan-gateway:
+        aliases:
+          - "signal-scan-web-${INSTANCE:-a}"
     restart: unless-stopped
 
 # Shared request-plane gateway net: an EXTERNAL bridge created once on the host
 # (`docker network create signal-scan-gateway`, guarded in `make up` / `make gateway-up`).
 # Not auto-created by Compose, so every `up`/`deploy` for a, b and local dev depends on it.
-# The api joins it to reach the gateway; web/chrome stay on each project's `default`.
+# Per-instance aliases isolate web→API and API→Chrome routing and serve the private monitor.
 networks:
   signal-scan-gateway:
     external: true

@@ -2,6 +2,7 @@
 
 export const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
 export type Chain = (typeof CHAINS)[number];
+export const EVM_CHAINS = ['base', 'bsc', 'robinhood'] as const satisfies readonly Chain[];
 
 export const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 

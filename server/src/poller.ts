@@ -12,25 +12,37 @@ import {
   getSetting,
   setSetting,
   getTokenState,
+  getMetricPollCache,
+  listMetricPollCache,
+  reserveMetricPoll,
+  saveMetricPollResponse,
+  failMetricPoll,
   listCaScoreGateCandidates,
   listCaTargetsMissingEssential,
   listCaTargetsMissingSymbol,
+  getFomoTradeEnrichmentTarget,
   listFomoAlertTargets,
   listFomoPositionTargets,
   listTrackedCas,
+  getFomoApiBalanceSnapshot,
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
-  watchedCasForWallet,
+  updateFomoTradeUsd,
+  upsertFomoApiBalance,
+  upsertFomoApiBalanceSnapshot,
   upsertFomoPosition,
   upsertNansenSeries,
+  watchedCasForWallet,
   type CaScoreGateRow,
   type CaTarget,
+  type MetricPollReservation,
   type TokenStateRow,
   type WalletRow,
 } from './db.js';
-import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, fillTokenMetrics, recomputeMarketCap } from './ingest.js';
-import { fetchFomoPositions } from './fomo-api.js';
+import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, clearCurrentMarketQuote, recomputeMarketCap } from './ingest.js';
+import { fetchFomoBalances, fetchFomoPositions, fetchFomoSwaps, matchFomoBuySwap } from './fomo-api.js';
+import type { FomoPosition } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
@@ -49,12 +61,12 @@ import {
 import { type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
 import { exchangeAnchorLf, RUNG_SPAN_DAYS, seriesReachesStart, t100Mdd } from './snapshot.js';
 import { nansenScore } from './signals.js';
-import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx } from './fomo-holdings.js';
+import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx, type FomoRpcDeps } from './fomo-holdings.js';
 import { getThresholds } from './settings.js';
-import type { MarketDataProvider, MetricKind, MetricPatch } from './providers/provider.js';
+import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo } from './providers/provider.js';
 import { enqueueSetup } from './setup-queue.js';
-import { fetchTokenMeta } from './providers/dexscreener.js';
-import { GatewayDenialError, GatewayTransportError } from './gateway-client.js';
+import { fetchTokenMeta, type DexTokenMeta } from './providers/dexscreener.js';
+import { GatewayTransportError } from './gateway-client.js';
 import { log } from './log.js';
 
 interface PollTask {
@@ -173,23 +185,210 @@ function newCaPairsFirst<T extends { ca: string }>(
  * EXPORTED for the todo-15 fail-open test only (same test-seam precedent as
  * setupSweep / flowsSweep / pacedFor); the scheduler stays the production caller.
  */
+const MIN_MARKET_CAP_QUERY_INTERVAL_MS = 30 * 60_000;
+const METRIC_KINDS: readonly MetricKind[] = ['essential', 'volume', 'gini'];
+
+interface CachedMetricResult {
+  patch: MetricPatch | null;
+  fetched: boolean;
+  responseAt: number | null;
+}
+
+const metricQueriesInFlight = new Map<string, Promise<CachedMetricResult>>();
+
+function metricInterval(kind: MetricKind, requestedMs: number): number {
+  return kind === 'essential' || (config.mode === 'gmgn' && kind === 'volume')
+    ? Math.max(MIN_MARKET_CAP_QUERY_INTERVAL_MS, requestedMs)
+    : requestedMs;
+}
+
+const GMGN_MARKET_CACHE_KIND = 'gmgnMarket';
+const ESSENTIAL_FIELDS: readonly (keyof MetricPatch)[] = [
+  'price', 'supply', 'marketCap', 'liquidity', 'holders', 'symbol', 'xHandle', 'deployedAt',
+];
+const VOLUME_FIELDS: readonly (keyof MetricPatch)[] = ['volume24h', 'buyVol24h', 'sellVol24h', 'volume1h'];
+
+function metricProjection(patch: MetricPatch, fields: readonly (keyof MetricPatch)[]): MetricPatch {
+  return Object.fromEntries(fields.flatMap((field) =>
+    patch[field] !== undefined ? [[field, patch[field]]] : [],
+  )) as MetricPatch;
+}
+
+function hasMetricFields(patch: MetricPatch): boolean {
+  return Object.keys(patch).length > 0;
+}
+
+function sharedMarketMetric(kind: MetricKind): boolean {
+  return config.mode === 'gmgn' && (kind === 'essential' || kind === 'volume');
+}
+function metricFailureInterval(kind: MetricKind, intervalMs: number): number {
+  return kind === 'gini' ? Math.min(intervalMs, config.pollSetupRetryMs) : intervalMs;
+}
+function failureNextAllowedAt(previousFailures: number, intervalMs: number, now: number): number {
+  const backoffMs = Math.min(24 * 60 * 60_000, intervalMs * 2 ** Math.min(previousFailures, 5));
+  return now + Math.max(intervalMs, backoffMs);
+}
+
+function cachedPatch(row: { response_json: string | null } | undefined): MetricPatch | null {
+  if (!row?.response_json) return null;
+  try {
+    const value: unknown = JSON.parse(row.response_json);
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? (value as MetricPatch)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function cachedMetricResult(
+  ca: string,
+  chain: Chain,
+  kind: MetricKind,
+  resourceRow?: ReturnType<typeof getMetricPollCache>,
+): CachedMetricResult {
+  const row = getMetricPollCache(ca, chain, kind);
+  const fallback = resourceRow ? cachedPatch(resourceRow) : null;
+  const patch = cachedPatch(row) ?? (fallback
+    ? metricProjection(fallback, kind === 'essential' ? ESSENTIAL_FIELDS : VOLUME_FIELDS)
+    : null);
+  return { patch, fetched: false, responseAt: row?.response_at ?? resourceRow?.response_at ?? null };
+}
+
+function cacheSharedMarketResponse(
+  ca: string,
+  chain: Chain,
+  responseAt: number,
+  patch: MetricPatch,
+): void {
+  saveMetricPollResponse(
+    ca, chain, GMGN_MARKET_CACHE_KIND, responseAt,
+    responseAt + MIN_MARKET_CAP_QUERY_INTERVAL_MS, patch,
+  );
+  saveMetricPollResponse(
+    ca, chain, 'essential', responseAt,
+    responseAt + metricInterval('essential', MIN_MARKET_CAP_QUERY_INTERVAL_MS),
+    metricProjection(patch, ESSENTIAL_FIELDS),
+  );
+  const volumePatch = metricProjection(patch, VOLUME_FIELDS);
+  if (hasMetricFields(volumePatch)) {
+    saveMetricPollResponse(
+      ca, chain, 'volume', responseAt,
+      responseAt + metricInterval('volume', config.pollVolumeMs),
+      volumePatch,
+    );
+  }
+}
+
+async function cachedMetric(
+  provider: MarketDataProvider,
+  ca: string,
+  chain: Chain,
+  kind: MetricKind,
+  requestedIntervalMs: number,
+): Promise<CachedMetricResult> {
+  const intervalMs = metricInterval(kind, requestedIntervalMs);
+  const shared = sharedMarketMetric(kind);
+  const key = `${chain}:${ca}:${shared ? GMGN_MARKET_CACHE_KIND : kind}`;
+  const active = metricQueriesInFlight.get(key);
+  if (active) return { ...(await active), fetched: false };
+
+  const now = Date.now();
+  const resourceRow = shared ? getMetricPollCache(ca, chain, GMGN_MARKET_CACHE_KIND) : undefined;
+  if (shared && resourceRow && now < resourceRow.next_allowed_at) {
+    return cachedMetricResult(ca, chain, kind, resourceRow);
+  }
+  const reservationKind = shared ? GMGN_MARKET_CACHE_KIND : kind;
+  const reservationInterval = shared ? MIN_MARKET_CAP_QUERY_INTERVAL_MS : intervalMs;
+  const reservation = reserveMetricPoll(ca, chain, reservationKind, now, reservationInterval);
+  if (!reservation.claimed) return cachedMetricResult(ca, chain, kind, reservation.row);
+
+  const kindReservation = shared
+    ? reserveMetricPoll(ca, chain, kind, now, intervalMs)
+    : reservation;
+  if (!kindReservation.claimed) {
+    failMetricPoll(ca, chain, reservationKind, kindReservation.row?.next_allowed_at ?? now + reservationInterval);
+    return cachedMetricResult(ca, chain, kind, kindReservation.row);
+  }
+  const request = (async (): Promise<CachedMetricResult> => {
+    try {
+      const patch = await provider.metric(ca, chain, kind);
+      const responseAt = Date.now();
+      if (kind === 'gini' && patch.nansenFreshPct === undefined) {
+        const retryAt = failureNextAllowedAt(
+          reservation.row?.failure_count ?? 0,
+          metricFailureInterval(kind, intervalMs),
+          responseAt,
+        );
+        failMetricPoll(ca, chain, kind, retryAt);
+        return { patch, fetched: true, responseAt };
+      }
+      if (shared) cacheSharedMarketResponse(ca, chain, responseAt, patch);
+      else saveMetricPollResponse(ca, chain, kind, responseAt, responseAt + intervalMs, patch);
+      return { patch, fetched: true, responseAt };
+    } catch (error) {
+      const nextAllowedAt = failureNextAllowedAt(
+        reservation.row?.failure_count ?? 0,
+        metricFailureInterval(kind, intervalMs),
+        Date.now(),
+      );
+      failMetricPoll(ca, chain, reservationKind, nextAllowedAt);
+      if (shared) failMetricPoll(ca, chain, kind, nextAllowedAt);
+      throw error;
+    }
+  })();
+  metricQueriesInFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (metricQueriesInFlight.get(key) === request) metricQueriesInFlight.delete(key);
+  }
+}
+
+function orderedMetricTargets(cas: readonly CaTarget[], kind: string): CaTarget[] {
+  const now = Date.now();
+  const cutoff = now - config.newCaPriorityMs;
+  const newTargets = new Set(
+    listTrackedCas().filter((c) => isNewCa(c.added_at, cutoff)).map((c) => `${c.chain}:${c.address}`),
+  );
+  const cache = new Map(listMetricPollCache(kind).map((row) => [`${row.chain}:${row.ca}`, row]));
+  return cas
+    .filter((c) => {
+      const row = cache.get(`${c.chain}:${c.address}`);
+      return !row || row.next_allowed_at <= now;
+    })
+    .sort((a, b) => {
+      const aNew = newTargets.has(`${a.chain}:${a.address}`);
+      const bNew = newTargets.has(`${b.chain}:${b.address}`);
+      if (aNew !== bNew) return aNew ? -1 : 1;
+      const aAt = cache.get(`${a.chain}:${a.address}`)?.last_attempt_at ?? 0;
+      const bAt = cache.get(`${b.chain}:${b.address}`)?.last_attempt_at ?? 0;
+      return aAt - bAt || a.address.localeCompare(b.address);
+    });
+}
+
+/**
+ * ONE free app-question per (CA, kind); the durable cache gate is shared by
+ * scheduled sweeps and add-triggered queries.
+ */
 export async function metricSweep(
   provider: MarketDataProvider,
   kind: MetricKind,
   intervalMs: number,
   only?: readonly CaTarget[],
 ): Promise<void> {
-  const cas = only ?? newCasFirst(listTrackedCas());
+  const base = only ?? listTrackedCas().map((c) => ({ address: c.address, chain: c.chain }));
+  const cas = orderedMetricTargets(base, kind);
+  const effectiveInterval = metricInterval(kind, intervalMs);
   await runGatewaySweep(`${kind}Sweep`, (summary) =>
-    pacedFor(cas, intervalMs, async (c) => {
+    pacedFor(cas, effectiveInterval, async (c) => {
       try {
-        const patch = kind === 'essential'
-          ? await withRetry(() => provider.metric(c.address, c.chain, kind), config.essentialRetries)
-          : await provider.metric(c.address, c.chain, kind);
-        if (kind === 'volume') applyVolumeDelta(c.address, c.chain, patch);
-        if (kind === 'essential') writeEssential(c.address, c.chain, patch);
-        else updateTokenMetrics(c.address, c.chain, patch);
+        const result = await cachedMetric(provider, c.address, c.chain, kind, intervalMs);
+        if (!result.fetched || !result.patch) return;
+        applyMetricPatch(c.address, c.chain, kind, result.patch);
       } catch (e) {
+        // Keep the last successful quote and metrics. The cache records this failure
+        // and blocks another attempt until the cadence/backoff expires.
         logProviderError(summary, e, `${kind}Sweep`, c.address);
       }
     }),
@@ -197,26 +396,49 @@ export async function metricSweep(
 }
 
 /**
- * DexScreener OWNS price/symbol (market_cap is derived from price × supply), so the
- * GMGN essential pass only FILLS those while still NULL — it can seed a token with no
- * DEX pair but never clobber the owning sweep's fresher value. Its exclusive columns
- * (liquidity, holders, supply, deployed_at) are a normal overwrite; market_cap is then
- * recomputed from whichever price × supply now stand.
+ * In GMGN mode, only a fresh GMGN quote may update current MC; a missing quote
+ * clears its current value instead of reusing an older provider's price. History
+ * remains untouched. Other modes retain the existing provider-owned price.
  */
-function writeEssential(ca: string, chain: Chain, patch: MetricPatch): void {
-  fillTokenMetrics(ca, chain, {
-    ...(patch.price !== undefined ? { price: patch.price } : {}),
-    ...(patch.symbol !== undefined ? { symbol: patch.symbol } : {}),
-    ...(patch.marketCap !== undefined ? { marketCap: patch.marketCap } : {}),
-  });
+function writeEssential(ca: string, chain: Chain, patch: MetricPatch, mode: string): void {
+  const price = typeof patch.price === 'number' && Number.isFinite(patch.price) && patch.price > 0
+    ? patch.price
+    : undefined;
   updateTokenMetrics(ca, chain, {
+    ...(price !== undefined ? { price } : {}),
+    ...(patch.symbol !== undefined ? { symbol: patch.symbol } : {}),
     ...(patch.liquidity !== undefined ? { liquidity: patch.liquidity } : {}),
     ...(patch.holders !== undefined ? { holders: patch.holders } : {}),
     ...(patch.supply !== undefined ? { supply: patch.supply } : {}),
     ...(patch.xHandle !== undefined ? { xHandle: patch.xHandle } : {}),
     ...(patch.deployedAt !== undefined ? { deployedAt: patch.deployedAt } : {}),
   });
+  if (price === undefined) {
+    if (mode === 'gmgn') clearCurrentMarketQuote(ca, chain);
+    else recomputeMarketCap(ca, chain);
+    return;
+  }
   recomputeMarketCap(ca, chain);
+}
+
+function applyMetricPatch(ca: string, chain: Chain, kind: MetricKind, patch: MetricPatch): void {
+  if (sharedMarketMetric(kind)) {
+    writeEssential(ca, chain, metricProjection(patch, ESSENTIAL_FIELDS), config.mode);
+    const volumePatch = metricProjection(patch, VOLUME_FIELDS);
+    if (hasMetricFields(volumePatch)) {
+      applyVolumeDelta(ca, chain, volumePatch);
+      updateTokenMetrics(ca, chain, volumePatch);
+    }
+    return;
+  }
+  if (kind === 'volume') {
+    applyVolumeDelta(ca, chain, patch);
+    updateTokenMetrics(ca, chain, patch);
+  } else if (kind === 'essential') {
+    writeEssential(ca, chain, patch, config.mode);
+  } else {
+    updateTokenMetrics(ca, chain, patch);
+  }
 }
 
 /**
@@ -244,82 +466,74 @@ export function applyVolumeDelta(ca: string, chain: Chain, patch: MetricPatch): 
 }
 
 /**
- * Ticker floor. `symbol` is written only by essential-data, which rides the browser
- * door — so while CF or a sick Chrome blocks it, every CA renders "—" on the
- * dashboard. This sweep reads the mint from the Solana RPC instead (no browser, no
- * Nansen credits — but getAsset costs 10 DAS credits/call, hence the window bound)
- * and writes ONLY symbol, so it can never mask the essential pass: the gap re-ask
- * is gated on `supply IS NULL`, which stays true.
+ * Missing symbols use the same essential-data query gate as MC. `assetInfo`
+ * shared GMGN's token/info endpoint but previously bypassed its cadence.
  */
 async function symbolBackfillSweep(provider: MarketDataProvider): Promise<void> {
   const cas = listCaTargetsMissingSymbol(config.symbolBackfillWindowMs);
-  if (cas.length === 0) return;
-  await runGatewaySweep('symbolBackfill', (summary) =>
-    pacedFor(cas, config.pollSymbolBackfillMs, async (c) => {
-      try {
-        const info = await provider.assetInfo?.(c.address, c.chain);
-        if (info?.symbol !== undefined || info?.price !== undefined) {
-          fillTokenMetrics(c.address, c.chain, {
-            ...(info.symbol !== undefined ? { symbol: info.symbol } : {}),
-            ...(info.price !== undefined ? { price: info.price } : {}),
-          });
-          recomputeMarketCap(c.address, c.chain);
-        }
-      } catch (e) {
-        logProviderError(summary, e, 'symbolBackfill', c.address);
-      }
-    }),
-  );
+  if (cas.length > 0) await metricSweep(provider, 'essential', config.pollEssentialMs, cas);
 }
 
 /**
- * DexScreener market sweep (keyless + free — deliberately OUTSIDE the
- * MarketDataProvider seam so it keeps landing in every MODE, including when Nansen
- * credits are exhausted or GMGN is throttled). It OWNS symbol/price/icon and walks
- * the WHOLE tracked queue (not just icon-less rows) so price stays fresh every 15 min
- * for tokens GMGN is failing on; market_cap is then recomputed from price × GMGN's
- * supply. NOT pacedFor-shaped: one batch call covers ≤30 CAs, so the await chain IS the
- * pacing. fetchTokenMeta never throws (a failed chunk = nothing for that chunk; the
- * next sweep is the durable retry).
+ * DexScreener is the symbol/icon market metadata source. In GMGN mode, only
+ * GMGN may update price/MC; other modes retain the DexScreener price fallback.
  */
+export function dexMarketPatch(meta: DexTokenMeta, mode: string): MetricPatch {
+  return {
+    ...(meta.iconUrl !== undefined ? { iconUrl: meta.iconUrl } : {}),
+    ...(meta.symbol !== undefined ? { symbol: meta.symbol } : {}),
+    ...(mode !== 'gmgn' && meta.price !== undefined ? { price: meta.price } : {}),
+  };
+}
+
 async function dexMarketSweep(): Promise<void> {
-  const cas: CaTarget[] = listTrackedCas().map((t) => ({ address: t.address, chain: t.chain }));
-  if (cas.length === 0) return;
-  const meta = await fetchTokenMeta(cas.map((c) => c.address));
-  for (const c of cas) {
-    const m = meta.get(c.address);
-    if (m === undefined) continue;
-    updateTokenMetrics(c.address, c.chain, {
-      ...(m.iconUrl !== undefined ? { iconUrl: m.iconUrl } : {}),
-      ...(m.symbol !== undefined ? { symbol: m.symbol } : {}),
-      ...(m.price !== undefined ? { price: m.price } : {}),
-    });
-    recomputeMarketCap(c.address, c.chain);
-  }
+  const targets = orderedMetricTargets(
+    listTrackedCas().map((t) => ({ address: t.address, chain: t.chain })),
+    'dexMeta',
+  );
+  if (targets.length === 0) return;
+  const intervalMs = Math.max(config.pollIconMs, MIN_MARKET_CAP_QUERY_INTERVAL_MS);
+  const reserved = targets.flatMap((c) => {
+    const reservation = reserveMetricPoll(c.address, c.chain, 'dexMeta', Date.now(), intervalMs);
+    return reservation.claimed ? [{ target: c, reservation }] : [];
+  });
+  if (reserved.length === 0) return;
+
+  await runGatewaySweep('dexMarketSweep', async (summary) => {
+    try {
+      const meta = await fetchTokenMeta(reserved.map(({ target }) => target.address));
+      const responseAt = Date.now();
+      for (const { target, reservation } of reserved) {
+        const token = meta.get(target.address);
+        if (!token) {
+          failMetricPoll(
+            target.address,
+            target.chain,
+            'dexMeta',
+            failureNextAllowedAt(reservation.row?.failure_count ?? 0, intervalMs, responseAt),
+          );
+          continue;
+        }
+        saveMetricPollResponse(target.address, target.chain, 'dexMeta', responseAt, responseAt + intervalMs, token);
+        const patch = dexMarketPatch(token, config.mode);
+        updateTokenMetrics(target.address, target.chain, patch);
+        if (patch.price !== undefined) recomputeMarketCap(target.address, target.chain);
+      }
+    } catch (error) {
+      const failedAt = Date.now();
+      for (const { target, reservation } of reserved) {
+        failMetricPoll(
+          target.address,
+          target.chain,
+          'dexMeta',
+          failureNextAllowedAt(reservation.row?.failure_count ?? 0, intervalMs, failedAt),
+        );
+      }
+      logProviderError(summary, error, 'dexMarketSweep');
+    }
+  });
 }
 
-/**
- * essential-data is the ONLY source of supply (the LF denominator) and of
- * deployed_at, and both are write-once: a single CF 403 would leave that CA dark
- * until the next 24h pass, so retry inside the pass before giving up.
- */
-async function withRetry<T>(fn: () => Promise<T>, attempts: number): Promise<T> {
-  const tries = Math.max(1, attempts);
-  let lastError: unknown;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      lastError = e;
-      // A gateway-owned failure is never re-issued in-pass: a transport failure
-      // fails the sweep open, and a gateway denial (429 budget / 503 gated / 401)
-      // is the gateway's own policy — retrying would double the shared credit budget.
-      if (e instanceof GatewayTransportError || e instanceof GatewayDenialError || i === tries - 1) break;
-      await sleep(3_000);
-    }
-  }
-  throw lastError;
-}
 
 // --- official tgm/flows door (T100 + LF since 2026-09-23) ---------------------
 // Narrow TokenFlowsClient seam: setPollerDeps derives it from the NansenApiClient
@@ -533,18 +747,22 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   }
   await runGatewaySweep('setupSweep', async (summary) => {
     for (const c of cas) {
-      if (owesInfo(c.address, c.chain, Date.now())) {
-        try {
-          const patch = await provider.metric(c.address, c.chain, 'gini');
+      if (!owesInfo(c.address, c.chain, Date.now())) continue;
+      try {
+        const result = await cachedMetric(provider, c.address, c.chain, 'gini', config.pollSetupMs);
+        const patch = result.patch;
+        const fresh = patch?.nansenFreshPct;
+        if (result.fetched && patch) updateTokenMetrics(c.address, c.chain, patch);
+        else if (fresh !== undefined && getTokenState(c.address, c.chain)?.nansen_fresh_pct == null && patch) {
           updateTokenMetrics(c.address, c.chain, patch);
-          if (typeof patch.nansenFreshPct === 'number' && Number.isFinite(patch.nansenFreshPct)) {
-            stampSetupCacheField(c.address, c.chain, 'info_at', Date.now());
-            clearSetupRetry(c.address, c.chain, 'info');
-          } else retryLater(c.address, c.chain, 'info');
-        } catch (e) {
-          retryLater(c.address, c.chain, 'info');
-          logProviderError(summary, e, 'setupSweep gini', c.address);
         }
+        if (typeof fresh === 'number' && Number.isFinite(fresh) && result.responseAt !== null) {
+          stampSetupCacheField(c.address, c.chain, 'info_at', result.responseAt);
+          clearSetupRetry(c.address, c.chain, 'info');
+        } else retryLater(c.address, c.chain, 'info');
+      } catch (e) {
+        retryLater(c.address, c.chain, 'info');
+        logProviderError(summary, e, 'setupSweep gini', c.address);
       }
     }
     // Finish the selected Fresh reads before awaiting the credit-door series queue.
@@ -760,19 +978,24 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
   const prev = getSetupCacheEntry(ca, chain);
   const fetchSeries = owesSeries(ca, chain, now);
   const fetched = fetchSeries && flowsClient() ? await seriesAtRung(ca, chain) : undefined;
+  const seriesResponseAt = fetched === undefined ? undefined : Date.now();
   const series = fetched?.points;
   if (fetchSeries && flowsClient()) {
     if (series && series.length > 0) clearSetupRetry(ca, chain, 'series');
     else retryLater(ca, chain, 'series');
   }
   let { t100Pct, t100Multiple, anchorAt, genesisBal } = passThroughAnalytics(st);
+  let t100ObservationAt: number | undefined;
+  let t100BalanceDrawdown: { peak: number; trough: number } | undefined;
   genesisBal ??= prev?.genesis_bal;
   if (series) {
     const g = fetched ? t100Mdd(fetched.t100) : undefined;
     if (g) {
       t100Pct = g.pct;
       t100Multiple = g.multiple;
+      t100BalanceDrawdown = { peak: g.peak, trough: g.trough };
       anchorAt = g.peakAt;
+      t100ObservationAt = seriesResponseAt;
     }
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
@@ -782,7 +1005,7 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     genesisBal = lf.total;
     clearSetupRetry(ca, chain, 'lf');
   } else if (fetchLf && flowsClient()) retryLater(ca, chain, 'lf');
-  updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, genesisBal, anchorAt, bal });
+  updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, t100BalanceDrawdown, genesisBal, anchorAt, bal }, t100ObservationAt);
   const infoAt = getSetupCacheEntry(ca, chain)?.info_at;
   return {
     ca,
@@ -1040,6 +1263,16 @@ export function fomoHoldingsIdle(): Promise<void> {
 export async function fomoHoldingsSweep(): Promise<void> {
   const targets = listFomoAlertTargets();
   if (targets.length === 0) return;
+  const users = new Map<string, { handle: string; targets: { ca: string; chain: Chain }[] }>();
+  for (const t of listFomoPositionTargets()) {
+    const entry = users.get(t.fomo_user_id) ?? { handle: t.handle, targets: [] };
+    users.set(t.fomo_user_id, entry);
+  }
+  for (const t of targets) {
+    const entry = users.get(t.fomo_user_id);
+    if (entry !== undefined) entry.targets.push({ ca: t.ca, chain: t.chain });
+  }
+  scheduleFomoBalanceSweep(users);
   const deps = fomoRpcDeps();
   const supplyCache = new Map<string, number | null>();
   await pacedFor(targets, config.pollWalletsMs, async (t) => {
@@ -1051,12 +1284,125 @@ export async function fomoHoldingsSweep(): Promise<void> {
   });
 }
 
+const FOMO_BALANCE_REFRESH_MS = 24 * 60 * 60 * 1000;
+let fomoBalanceSweepInFlight = false;
+let fomoBalanceSweepDrain: Promise<void> = Promise.resolve();
+
+function scheduleFomoBalanceSweep(users: ReadonlyMap<string, { handle: string; targets: { ca: string; chain: Chain }[] }>): void {
+  if (fomoBalanceSweepInFlight || users.size === 0) return;
+  const now = Date.now();
+  const dueUsers = [...users.entries()].filter(([id]) => {
+    const previous = getFomoApiBalanceSnapshot(id);
+    return previous === undefined || now - previous.checked_at >= FOMO_BALANCE_REFRESH_MS;
+  });
+  if (dueUsers.length === 0) return;
+  fomoBalanceSweepInFlight = true;
+  fomoBalanceSweepDrain = (async () => {
+    try {
+      const deps = fomoRpcDeps();
+      const supplyCache = new Map<string, number | null>();
+      await pacedFor(dueUsers, 600_000, async ([id, user]) => {
+        try {
+          await refreshFomoBalances(id, user.handle, user.targets, deps, supplyCache);
+        } catch (e) {
+          log.error('[poller] fomo balance snapshot', user.handle, e);
+        }
+      });
+    } catch (e) {
+      log.error('[poller] fomo balance sweep', e);
+    } finally {
+      fomoBalanceSweepInFlight = false;
+    }
+  })();
+}
+
+/** Await the background all-chain balances sweep; used by deterministic module tests. */
+export function fomoApiBalancesIdle(): Promise<void> {
+  return fomoBalanceSweepDrain;
+}
+
+/** Refresh all tracked CA balances with one all-chain API snapshot per user/day. */
+async function refreshFomoBalances(
+  fomoUserId: string,
+  handle: string,
+  targets: readonly { ca: string; chain: Chain }[],
+  deps: FomoRpcDeps,
+  supplyCache: Map<string, number | null>,
+): Promise<void> {
+  const previous = getFomoApiBalanceSnapshot(fomoUserId);
+  const checkedAt = Date.now();
+  if (previous !== undefined && checkedAt - previous.checked_at < FOMO_BALANCE_REFRESH_MS) return;
+  const snapshot = await fetchFomoBalances(handle);
+  if (snapshot === null) {
+    upsertFomoApiBalanceSnapshot({
+      fomo_user_id: fomoUserId, checked_at: checkedAt, captured_at: null,
+      complete: false, truncated: false, available: false,
+    });
+    return;
+  }
+
+  const byToken = new Map(snapshot.balances.map((b) => [`${b.chain}:${b.ca}`, b]));
+  const targetsByToken = new Set(targets.map((t) => `${t.chain}:${t.ca}`));
+  for (const b of snapshot.balances) {
+    let pct: number | null = null;
+    if (targetsByToken.has(`${b.chain}:${b.ca}`)) {
+      const key = `${b.chain}:${b.ca}`;
+      let supply = supplyCache.get(key);
+      if (supply === undefined) {
+        supply = getTokenState(b.ca, b.chain)?.supply ?? null;
+        if ((supply === null || supply <= 0) && (b.chain === 'base' || b.chain === 'bsc' || b.chain === 'robinhood')) {
+          try {
+            supply = await deps.evm.tokenSupply(b.ca, b.chain);
+          } catch (e) {
+            log.warn('[poller] fomo API token supply', b.chain, b.ca, e);
+            supply = null;
+          }
+        }
+        supplyCache.set(key, supply);
+      }
+      if (supply !== null && supply > 0) pct = (b.amount / supply) * 100;
+    }
+    upsertFomoApiBalance({
+      fomo_user_id: fomoUserId, ca: b.ca, chain: b.chain, amount: b.amount,
+      pct, captured_at: snapshot.capturedAt,
+    });
+  }
+  if (snapshot.available && snapshot.complete && !snapshot.truncated) {
+    for (const target of targets) {
+      if (byToken.has(`${target.chain}:${target.ca}`)) continue;
+      const key = `${target.chain}:${target.ca}`;
+      let supply = supplyCache.get(key);
+      if (supply === undefined) {
+        supply = getTokenState(target.ca, target.chain)?.supply ?? null;
+        if ((supply === null || supply <= 0) && (target.chain === 'base' || target.chain === 'bsc' || target.chain === 'robinhood')) {
+          try {
+            supply = await deps.evm.tokenSupply(target.ca, target.chain);
+          } catch (e) {
+            log.warn('[poller] fomo API token supply', target.chain, target.ca, e);
+            supply = null;
+          }
+        }
+        supplyCache.set(key, supply);
+      }
+      upsertFomoApiBalance({
+        fomo_user_id: fomoUserId, ca: target.ca, chain: target.chain,
+        amount: 0, pct: supply !== null && supply > 0 ? 0 : null, captured_at: snapshot.capturedAt,
+      });
+    }
+  }
+  upsertFomoApiBalanceSnapshot({
+    fomo_user_id: fomoUserId, checked_at: checkedAt, captured_at: snapshot.capturedAt,
+    complete: snapshot.complete, truncated: snapshot.truncated, available: snapshot.available,
+  });
+}
+
 /** Refresh ONE trader's displayed positions from the FOMO API. Shared by the
  *  periodic sweep and the on-alert kick so both write identical rows. */
-async function refreshFomoPositions(fomoUserId: string, handle: string): Promise<void> {
+async function refreshFomoPositions(fomoUserId: string, handle: string): Promise<FomoPosition[]> {
   const tracked = new Set(listTrackedCas().map((c) => `${c.chain}:${c.address}`));
   const fetchedAt = Date.now();
-  for (const p of await fetchFomoPositions(handle)) {
+  const positions = await fetchFomoPositions(handle);
+  for (const p of positions) {
     if (!tracked.has(`${p.chain}:${p.ca}`)) continue;
     upsertFomoPosition({
       fomo_user_id: fomoUserId,
@@ -1073,16 +1419,31 @@ async function refreshFomoPositions(fomoUserId: string, handle: string): Promise
       fetched_at: fetchedAt,
     });
   }
+  return positions;
 }
 
-/** On-alert refresh (user 2026-10-01): the dash must show the real cost basis the
- *  moment the trade lands, not 3 hours later when the wallet cadence comes round.
- *  Serialized on fomoKickDrain like kickFomoHoldings so an alert burst cannot
- *  stampede the API. */
-export function kickFomoPositions(fomoUserId: string, handle: string): void {
+/** On-alert refresh resolves a missing BUY fill from swaps, using the refreshed
+ *  position ID when available and otherwise requiring one exact CA/time match. */
+export function kickFomoPositions(fomoUserId: string, handle: string, eventId?: string): void {
   if (handle === '' || config.fomoApiKey === '') return;
-  fomoKickDrain = fomoKickDrain.then(() => refreshFomoPositions(fomoUserId, handle));
+  fomoKickDrain = fomoKickDrain.then(async () => {
+    const positions = await refreshFomoPositions(fomoUserId, handle);
+    if (eventId === undefined) return;
+    const trade = getFomoTradeEnrichmentTarget(fomoUserId, eventId);
+    if (trade === undefined || trade.type !== 'buy' || trade.trade_usd !== null) return;
+    const position = positions.find((p) => p.ca === trade.ca && p.chain === trade.chain);
+    const swaps = await fetchFomoSwaps(handle);
+    if (swaps === null) return;
+    const amount = matchFomoBuySwap({
+      ca: trade.ca,
+      chain: trade.chain,
+      ts: trade.ts,
+      tradeId: position?.tradeId ?? null,
+    }, swaps);
+    if (amount !== null) updateFomoTradeUsd(fomoUserId, eventId, amount);
+  });
 }
+
 
 /** Periodic backstop for the kick: re-syncs every displayed (user, CA, chain) on
  *  the wallet cadence, paced over ~10 minutes so a pass stays well under the API's
@@ -1103,7 +1464,7 @@ export async function fomoPositionsSweep(): Promise<void> {
   });
 }
 
-/** Token info + Nansen series for each CA, immediately — plus its wallet links. */
+/** Add hook shares the periodic cache gates; wallet links still get their scoped refresh. */
 export function kickCAs(cas: readonly { address: string; chain: Chain }[]): void {
   if (!pollerDeps) return;
   for (const c of cas) {
@@ -1151,23 +1512,218 @@ export function kickWalletRow(row: WalletRow, ca?: string): void {
   kickWallet(pollerDeps.provider, row.id, row.address, row.chain, ca ? [ca] : watchedCasForWallet(row.id));
 }
 
-/** Pull one CA's token info now (creates token_state → detail 404 fix).
- * Resolves (never rejects) once the row exists — kickCAs chains the T4 early
- * setup pass on it. */
-export function kickToken(provider: MarketDataProvider, address: string, chain: Chain): Promise<void> {
-  return provider
-    .tokenInfo(address, chain)
-    .then((info) => {
+/** Fill a new token's initial row once, then seed each dataset's durable cadence. */
+const tokenInfoBootstraps = new Map<string, Promise<void>>();
+
+function bootstrapMetricPatch(info: TokenInfo, kind: MetricKind): MetricPatch {
+  if (kind === 'essential') {
+    return {
+      ...(typeof info.price === 'number' && info.price > 0 ? { price: info.price } : {}),
+      ...(typeof info.marketCap === 'number' && info.marketCap > 0 ? { marketCap: info.marketCap } : {}),
+      ...(info.supply > 0 ? { supply: info.supply } : {}),
+      ...(info.liquidity > 0 ? { liquidity: info.liquidity } : {}),
+      ...(info.holders > 0 ? { holders: info.holders } : {}),
+      ...(info.symbol !== undefined ? { symbol: info.symbol } : {}),
+      ...(info.deployedAt !== undefined ? { deployedAt: info.deployedAt } : {}),
+    };
+  }
+  if (kind === 'volume') {
+    return {
+      volume24h: info.volume24h,
+      buyVol24h: info.buyVol24h,
+      sellVol24h: info.sellVol24h,
+      ...(info.volume1h !== undefined ? { volume1h: info.volume1h } : {}),
+    };
+  }
+  return info.nansenStats
+    ? {
+        nansenHolders: info.nansenStats.holders,
+        nansenFreshPct: info.nansenStats.freshSupplyPct,
+        ...(info.nansenStats.t100SupplyPct !== undefined ? { nansenT100Pct: info.nansenStats.t100SupplyPct } : {}),
+        ...(info.nansenStats.medianBalanceUsd !== undefined ? { nansenMedianUsd: info.nansenStats.medianBalanceUsd } : {}),
+      }
+    : {};
+}
+
+function bootstrapMarketPatch(info: TokenInfo): MetricPatch {
+  return {
+    ...bootstrapMetricPatch(info, 'essential'),
+    ...bootstrapMetricPatch(info, 'volume'),
+  };
+}
+
+function metricIntervalFor(kind: MetricKind): number {
+  if (kind === 'essential') return MIN_MARKET_CAP_QUERY_INTERVAL_MS;
+  if (kind === 'volume') return metricInterval(kind, config.pollVolumeMs);
+  return config.pollSetupMs;
+}
+
+async function bootstrapTokenInfo(provider: MarketDataProvider, address: string, chain: Chain): Promise<void> {
+  const key = `${chain}:${address}`;
+  const active = tokenInfoBootstraps.get(key);
+  if (active) return active;
+  if (METRIC_KINDS.some((kind) => getMetricPollCache(address, chain, kind))) return;
+
+  const now = Date.now();
+  const intervals = new Map(METRIC_KINDS.map((kind) => [kind, metricIntervalFor(kind)]));
+  const resourceReservation = sharedMarketMetric('essential')
+    ? reserveMetricPoll(address, chain, GMGN_MARKET_CACHE_KIND, now, MIN_MARKET_CAP_QUERY_INTERVAL_MS)
+    : undefined;
+  if (resourceReservation && !resourceReservation.claimed) return;
+  const reservations = new Map<MetricKind, MetricPollReservation>();
+  for (const kind of METRIC_KINDS) {
+    reservations.set(kind, reserveMetricPoll(address, chain, kind, now, intervals.get(kind)!));
+  }
+  if ([...reservations.values()].some((reservation) => !reservation.claimed)) return;
+
+  const request = (async () => {
+    try {
+      const info = await provider.tokenInfo(address, chain);
+      const responseAt = Date.now();
+      if (resourceReservation) {
+        saveMetricPollResponse(
+          address, chain, GMGN_MARKET_CACHE_KIND, responseAt,
+          responseAt + MIN_MARKET_CAP_QUERY_INTERVAL_MS, bootstrapMarketPatch(info),
+        );
+      }
       upsertTokenInfo(info);
       if (info.nansenStats) {
         updateNansenHolders(address, chain, info.nansenStats);
         if (Number.isFinite(info.nansenStats.freshSupplyPct)) {
-          stampSetupCacheField(address, chain, 'info_at', Date.now());
+          stampSetupCacheField(address, chain, 'info_at', responseAt);
           clearSetupRetry(address, chain, 'info');
         }
       }
-    })
-    .catch((e) => log.error('[poller] kickToken', address, e));
+      for (const kind of METRIC_KINDS) {
+        const intervalMs = intervals.get(kind)!;
+        const patch = bootstrapMetricPatch(info, kind);
+        if (kind === 'gini' && patch.nansenFreshPct === undefined) {
+          failMetricPoll(address, chain, kind, responseAt + config.pollSetupRetryMs);
+        } else {
+          saveMetricPollResponse(address, chain, kind, responseAt, responseAt + intervalMs, patch);
+        }
+      }
+    } catch (error) {
+      for (const kind of METRIC_KINDS) {
+        const intervalMs = intervals.get(kind)!;
+        const previousFailures = reservations.get(kind)?.row?.failure_count ?? 0;
+        failMetricPoll(
+          address,
+          chain,
+          kind,
+          failureNextAllowedAt(previousFailures, metricFailureInterval(kind, intervalMs), Date.now()),
+        );
+      }
+      if (resourceReservation) {
+        failMetricPoll(
+          address,
+          chain,
+          GMGN_MARKET_CACHE_KIND,
+          failureNextAllowedAt(
+            resourceReservation.row?.failure_count ?? 0,
+            MIN_MARKET_CAP_QUERY_INTERVAL_MS,
+            Date.now(),
+          ),
+        );
+      }
+      throw error;
+    }
+  })();
+  tokenInfoBootstraps.set(key, request);
+  try {
+    await request;
+  } finally {
+    if (tokenInfoBootstraps.get(key) === request) tokenInfoBootstraps.delete(key);
+  }
+}
+
+async function applyDueMetric(
+  provider: MarketDataProvider,
+  address: string,
+  chain: Chain,
+  kind: MetricKind,
+): Promise<void> {
+  const result = await cachedMetric(provider, address, chain, kind, metricIntervalFor(kind));
+  if (!result.fetched || !result.patch) return;
+  applyMetricPatch(address, chain, kind, result.patch);
+  if (kind === 'gini' && typeof result.patch.nansenFreshPct === 'number' && result.responseAt !== null) {
+    stampSetupCacheField(address, chain, 'info_at', result.responseAt);
+    clearSetupRetry(address, chain, 'info');
+  }
+}
+
+/** Rebuild token_state from persisted provider responses without another request. */
+function rehydrateCachedToken(ca: string, chain: Chain): void {
+  const marketRow = sharedMarketMetric('essential')
+    ? getMetricPollCache(ca, chain, GMGN_MARKET_CACHE_KIND)
+    : undefined;
+  const marketPatch = cachedPatch(marketRow);
+  const essentialRow = getMetricPollCache(ca, chain, 'essential');
+  const essential = cachedPatch(essentialRow)
+    ?? (marketPatch ? metricProjection(marketPatch, ESSENTIAL_FIELDS) : null);
+  if (essential) {
+    const price = typeof essential.price === 'number' && Number.isFinite(essential.price) && essential.price > 0
+      ? essential.price
+      : undefined;
+    const supply = typeof essential.supply === 'number' && Number.isFinite(essential.supply) && essential.supply >= 0
+      ? essential.supply
+      : undefined;
+    const marketCap = price !== undefined && supply !== undefined && Number.isFinite(price * supply)
+      ? price * supply
+      : undefined;
+    updateTokenMetrics(
+      ca,
+      chain,
+      { ...essential, price, supply, marketCap },
+      essentialRow?.response_at ?? marketRow?.response_at ?? Date.now(),
+    );
+  }
+
+  const volumeRow = getMetricPollCache(ca, chain, 'volume');
+  const volume = cachedPatch(volumeRow)
+    ?? (marketPatch ? metricProjection(marketPatch, VOLUME_FIELDS) : null);
+  if (volume && hasMetricFields(volume)) {
+    const responseAt = volumeRow?.response_at ?? marketRow?.response_at ?? Date.now();
+    updateTokenMetrics(
+      ca,
+      chain,
+      {
+        ...volume,
+        ...(volume.volume24h !== undefined
+          ? { vol24hPrev: volume.volume24h, vol24hPrevAt: responseAt }
+          : {}),
+      },
+      responseAt,
+    );
+  }
+
+  const giniRow = getMetricPollCache(ca, chain, 'gini');
+  const gini = cachedPatch(giniRow);
+  if (gini && hasMetricFields(gini)) {
+    updateTokenMetrics(ca, chain, gini, giniRow?.response_at ?? Date.now());
+  }
+}
+
+/** Cold CA add queries once; re-adds restore cached state and fetch only datasets due. */
+export function kickToken(provider: MarketDataProvider, address: string, chain: Chain): Promise<void> {
+  return (async () => {
+    try {
+      if (!METRIC_KINDS.some((kind) => getMetricPollCache(address, chain, kind))) {
+        await bootstrapTokenInfo(provider, address, chain);
+        return;
+      }
+      if (!getTokenState(address, chain)) rehydrateCachedToken(address, chain);
+      await Promise.all(METRIC_KINDS.map(async (kind) => {
+        try {
+          await applyDueMetric(provider, address, chain, kind);
+        } catch (error) {
+          log.error('[poller] kickToken', kind, address, error);
+        }
+      }));
+    } catch (e) {
+      log.error('[poller] kickToken', address, e);
+    }
+  })();
 }
 
 /** Cache one CA's Nansen balance series (one full-series fetch, 3 sliced windows) now. */
@@ -1203,8 +1759,8 @@ export function kickWallet(
 
 /**
  * F1=(b) phase anchor (plan setup-fill-on-add T5): delay until the next
- * `anchorAt + n × intervalMs` boundary at or after `now` — setupSweep's 12h marks
- * count from the systemDeployAt setting, so restarts RE-PHASE to the same
+ * `anchorAt + n × intervalMs` boundary at or after `now` — setupSweep cadence
+ * boundaries count from the systemDeployAt setting, so restarts RE-PHASE to the same
  * boundaries instead of drifting. `now` exactly on a boundary (incl. a fresh
  * deploy, anchor == now) fires immediately: that instant IS boundary n.
  */
@@ -1222,7 +1778,7 @@ export function startPoller(provider: MarketDataProvider, nansenApi: NansenApiCl
       name: 'essentialGapSweep',
       intervalMs: config.pollEssentialGapMs,
       // Too-new CAs are filtered out: a mint Nansen has not indexed yet gains
-      // nothing from a 5-min re-ask — the hourly essentialSweep covers it.
+      // The 30-minute MC cache gate prevents this faster gap sweep from querying early.
       fn: () =>
         metricSweep(
           provider,

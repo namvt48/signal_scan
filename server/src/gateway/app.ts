@@ -1,11 +1,12 @@
 // Gateway HTTP layer (plan request-plane-gateway, todo 2): per-caller bearer
-// auth + public /health + token-gated /metrics, mirroring the api.ts `createApp`
-// shape. NO TLS: the listener is bound to loopback + the private
+// auth + public /health + token-gated /metrics and private monitor telemetry.
+// NO TLS: the listener is bound to loopback + the private
 // `signal-scan-gateway` network (docker-compose.gateway.yml), never the public
 // internet.
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { config } from '../config.js';
+import { matchServiceToken } from '../auth.js';
 import { limiters } from '../ratelimit/index.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type Caller, type CallerTokens } from './auth.js';
@@ -18,7 +19,13 @@ import {
   type LimiterRun,
   type UpstreamFetch,
 } from './contract.js';
-import { GMGN_TOKEN_INFO_PATH, createGmgnKeyPool, gmgnTokenInfoUpstream, handleGmgnTokenInfo } from './gmgn.js';
+import {
+  GMGN_TOKEN_INFO_PATH,
+  GmgnTokenInfoSingleFlight,
+  createGmgnKeyPool,
+  gmgnTokenInfoUpstream,
+  handleGmgnTokenInfo,
+} from './gmgn.js';
 import type { GmgnKeyPool } from './gmgn-keys.js';
 import {
   DEXSCREENER_LIMITER,
@@ -55,6 +62,8 @@ import type { LimiterSnapshot } from '../ratelimit/types.js';
 export interface GatewayAppDeps {
   /** Token surface; defaults to the gateway's own env (config.ts, todo 6). */
   tokens?: CallerTokens;
+  /** Dedicated token for the read-only monitor scrape; grants no gateway caller role. */
+  monitorToken?: string;
   /**
    * Raw upstream transport for the `/v1/proxy` contract route (todos 7/8/9 wire
    * the real provider fetchers). Injectable so the contract is testable with a
@@ -79,14 +88,16 @@ export interface GatewayAppDeps {
   nansenDoor?: DoorPost;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
+  /** Aggregate GMGN egress limiter override (tests). */
+  runEgressLimiter?: LimiterRun;
   /**
-   * Selective TTL cache + single-flight (todo 11). Injectable so tests can
-   * control the clock/TTL; defaults to a fresh in-memory cache. Only the
-   * deterministic-param routes (Nansen token-information/holders, DexScreener
-   * tokens/pairs/search) reach it — GMGN and the time-windowed Nansen flows do
-   * NOT.
+   * Selective in-memory cache + single-flight. Shared public CA market data is
+   * reusable across callers; wallet/user-scoped data is not. GMGN has
+   * single-flight only, with no completed-response TTL.
    */
   cache?: GatewayCache;
+  /** Per-app GMGN in-flight coalescer; injectable to inspect counters in tests. */
+  gmgnSingleFlight?: GmgnTokenInfoSingleFlight;
   /**
    * Budget pre-flight seam (todo 19). Runs AFTER the cache lookup and BEFORE the
    * limiter, so a cache/single-flight hit skips it. Defaults to the app's
@@ -106,14 +117,15 @@ export interface GatewayAppDeps {
  *  `proxyRequest` helper directly. */
 export const PROXY_PATH = '/v1/proxy';
 
-/** Read-only metrics body (todo 20): every limiter key + per-caller credit usage
- *  + cache counters. `text` duplicates the same figures as a greppable summary. */
+/** Read-only metrics: limiter queues, per-caller credit usage, cached market
+ *  data, and GMGN single-flight joins. */
 export interface GatewayMetrics {
   ok: true;
   caller: Caller | null;
   ratelimit: Record<string, LimiterSnapshot>;
   credits: CreditSnapshot;
   cache: CacheStats;
+  gmgnSingleFlight: { joined: number; inflight: number };
   text: string;
 }
 
@@ -123,6 +135,7 @@ export function formatMetricsText(m: Omit<GatewayMetrics, 'text'>): string {
     `gateway ok=${m.ok} caller=${m.caller ?? 'none'}`,
     `credits day=${m.credits.day} budget=${m.credits.budget} half=${m.credits.half} used_a=${m.credits.used.a} used_b=${m.credits.used.b}`,
     `cache hits=${m.cache.hits} misses=${m.cache.misses} joined=${m.cache.joined} size=${m.cache.size} inflight=${m.cache.inflight}`,
+    `gmgn-singleflight joined=${m.gmgnSingleFlight.joined} inflight=${m.gmgnSingleFlight.inflight}`,
   ];
   for (const [key, s] of Object.entries(m.ratelimit)) {
     lines.push(
@@ -164,6 +177,7 @@ async function handleProxy(
 export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   const tokens = deps.tokens ?? callerTokensFromConfig();
   const cache = deps.cache ?? new GatewayCache();
+  const gmgnSingleFlight = deps.gmgnSingleFlight ?? new GmgnTokenInfoSingleFlight();
   const credits = deps.credits ?? new CreditAccountant();
   const app = express();
 
@@ -175,6 +189,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
         method: req.method,
         path: req.path,
         status: res.statusCode,
+        caller: req.caller ?? null,
         dur: Date.now() - t0,
       });
     });
@@ -203,6 +218,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       ratelimit: limiters.snapshot(),
       credits: credits.snapshot(),
       cache: cache.stats(),
+      gmgnSingleFlight: gmgnSingleFlight.snapshot(),
     };
     const text = formatMetricsText(snapshot);
     if (req.query.format === 'text') {
@@ -238,10 +254,10 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     });
   }
 
-  // GMGN token/info (todo 8): a DEDICATED route (not /v1/proxy) because it must
-  // add the fresh client_id + timestamp GMGN mandates — so it is EXCLUDED from
-  // the todo-11 cache/single-flight — and must pass GMGN_TOKEN_INFO_WEIGHT to
-  // the `gmgn` limiter. The real fetcher holds the gateway-held X-APIKEY; tests
+  // add the fresh client_id + timestamp GMGN mandates on each actual upstream
+  // call, so it has no completed-response cache; only simultaneous identical CA
+  // reads single-flight in this gateway. The initiator's priority controls the
+  // single execution. The real fetcher holds the gateway-held X-APIKEY; tests
   // inject `gmgnUpstream`.
   const gmgnPool =
     deps.gmgnPool ??
@@ -249,17 +265,29 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       ? createGmgnKeyPool()
       : undefined);
   const gmgnUpstream = deps.gmgnUpstream ?? gmgnTokenInfoUpstream();
+  app.get('/monitor/metrics', (req, res) => {
+    const authorization = req.header('authorization') ?? '';
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (!matchServiceToken(token, deps.monitorToken ?? config.monitorApiToken)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.json({ ok: true, credits: credits.snapshot(), gmgnKeys: gmgnPool?.stats() ?? [] });
+  });
   app.post(GMGN_TOKEN_INFO_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
     const caller = req.caller;
     if (caller === undefined) {
       send(res, denial(401, 'unauthorized'));
       return;
     }
-    void handleGmgnTokenInfo(req.body, caller, {
-      fetchUpstream: gmgnUpstream,
-      runLimiter: deps.runLimiter,
-      pool: gmgnPool,
-    }).then((result) => send(res, result), next);
+    void gmgnSingleFlight
+      .run(req.body, () => handleGmgnTokenInfo(req.body, caller, {
+        fetchUpstream: gmgnUpstream,
+        runLimiter: deps.runLimiter,
+        runEgressLimiter: deps.runEgressLimiter,
+        pool: gmgnPool,
+      }))
+      .then((result) => send(res, result), next);
   });
 
   // DexScreener (todo 9): a per-CLASS limiter route. The class is picked from
@@ -300,10 +328,8 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     }
     const routeDeps = { fetchUpstream: creditUpstream, runLimiter: deps.runLimiter };
     // Cache lookup + single-flight BEFORE `handleNansenCredit`'s limiter (todo 11);
-    // flows are classified uncacheable inside the cache (moving from/to window).
-    // The budget pre-flight (todo 19) runs inside `dispatch`, AFTER the cache and
-    // BEFORE the limiter, so a hit/joiner is never budget-denied and a denial never
-    // arms the shared gate.
+    // public CA flows are cached only for exact range/label parameters. The
+    // per-caller budget pre-flight runs only for the initiating cache miss.
     void cache
       .dispatch(
         NANSEN_CREDIT_LIMITER,
@@ -315,10 +341,8 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       .then((result) => send(res, result), next);
   });
 
-  // Nansen free browser door (todo 7 seam ii): app-questions through the
-  // relocated DoorPool (`gateway/door.ts`), which owns its own path/door budgets
-  // — no limiter key here, so the never-wired `nansen-door` spec cannot
-  // double-govern. Tests inject `nansenDoor` (the `browserPostJson` seam).
+  // Nansen free browser door public CA reads share across callers for a short
+  // TTL; wallet/profile routes are not classified as cacheable by GatewayCache.
   const doorPost: DoorPost = deps.nansenDoor ?? browserPostJson;
   app.post(NANSEN_DOOR_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
     const caller = req.caller;
@@ -326,12 +350,15 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       send(res, denial(401, 'unauthorized'));
       return;
     }
-    void handleNansenDoor(req.body, { postJson: doorPost }).then(
-      (result) => send(res, result),
-      next,
-    );
+    void cache
+      .dispatch(
+        NANSEN_DOOR_PATH,
+        req.body,
+        caller,
+        () => handleNansenDoor(req.body, { postJson: doorPost, caller }),
+      )
+      .then((result) => send(res, result), next);
   });
-
   app.use('/v1', (_req, res) => {
     res.status(404).json({ error: 'not_found' });
   });

@@ -4,28 +4,35 @@
 // address non-empty → 400; duplicate → 409).
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { CHAINS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
+import { CHAINS, EVM_ADDRESS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
 import { TIERS, isTier, type Tier } from './shared/tier.js';
-import { type AuthDeps, createAuthMiddleware } from './auth.js';
+import { matchServiceToken, type AuthDeps, createAuthMiddleware } from './auth.js';
 import { config } from './config.js';
 import { limiters } from './ratelimit/index.js';
+import { providerRequestCache } from './providers/request-cache.js';
+import { snapshotRpcUsage } from './providers/rpc-usage.js';
+import { HeliusUsagePoller } from './providers/helius-usage.js';
+import { solanaRpcEndpoints } from './providers/solana.js';
 import {
+  acknowledgeAlertMetricObservations,
+  appendAlertMetricObservation,
+  getAlertMetricObservations,
   deleteFomoUser,
   deleteTier,
   deleteTrackedCa,
-  deleteWallet,
+  deleteEvmWalletGroupById,
   findFomoUserByHandle,
   findFomoUserByUserId,
   findTrackedCa,
   findWalletByAddress,
-  getTier,
+  getDb,
   getWallet,
   importFomoUsers,
   importWallets,
   insertFomoTrade,
   insertFomoUser,
   insertTrackedCa,
-  insertWallet,
+  insertEvmWalletGroup,
   isChain,
   isPassTier,
   listFomoUsers,
@@ -37,13 +44,18 @@ import {
   setTrackedCaEntryUsd,
   setTrackedCaNote,
   updateFomoUser,
-  updateWallet,
+  updateEvmWalletGroupById,
   type FomoUserInput,
   type FomoUserRow,
   type ImportCandidate,
   type TrackedCaRow,
   type WalletRow,
+  deleteWallet,
+  getTier,
+  insertWallet,
+  updateWallet,
 } from './db.js';
+import { getTelegramAlertRules, updateTelegramAlertRules } from './telegram-alert-settings.js';
 // Token detail page DISABLED — its 2 endpoints below are commented out too.
 // import { buildTokenDetail } from './detail.js';
 // import { balanceSeries } from './crawl.js';
@@ -62,6 +74,7 @@ import {
 } from './settings.js';
 import { insertTrades } from './ingest.js';
 import { kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
+import { cohortLabelIndex } from './cohort-labels.js';
 
 interface WalletJson {
   id: string;
@@ -71,9 +84,12 @@ interface WalletJson {
   chain: Chain;
   source: string;
   clan: string;
+  rank?: string;
+  groups?: string[];
 }
 
 function toWallet(row: WalletRow): WalletJson {
+  const labels = cohortLabelIndex.get(row.address);
   return {
     id: row.id,
     address: row.address,
@@ -82,6 +98,8 @@ function toWallet(row: WalletRow): WalletJson {
     chain: row.chain,
     source: row.source,
     clan: row.clan ?? '',
+    ...(labels?.rank ? { rank: labels.rank } : {}),
+    ...(labels ? { groups: labels.groups } : {}),
   };
 }
 
@@ -129,7 +147,7 @@ interface WalletBody {
   address: string;
   name: string;
   tags: string[];
-  chain: Chain;
+  chain: Chain | 'evm';
   source: string;
   clan: string;
 }
@@ -138,6 +156,11 @@ type ParseResult<T> = T | { error: string };
 
 function isParseError<T extends object>(r: ParseResult<T>): r is { error: string } {
   return 'error' in r && typeof r.error === 'string';
+}
+type WalletScope = Chain | 'evm';
+
+function isWalletScope(value: unknown): value is WalletScope {
+  return isChain(value) || (config.showFomo && value === 'evm');
 }
 
 function strField(b: Record<string, unknown>, key: string): string {
@@ -153,7 +176,10 @@ function parseWalletBody(body: unknown): ParseResult<WalletBody> {
   const b = body as Record<string, unknown>;
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
-  if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+  if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
+  if (b.chain === 'evm' && !EVM_ADDRESS.test(address)) {
+    return { error: 'invalid EVM address (expected 0x + 40 hex characters)' };
+  }
   if (b.chain === 'sol' && !isSolanaAddress(address)) return { error: 'invalid sol address (base58, 32 bytes)' };
   return { address, name: strField(b, 'name'), tags: tagsField(b), chain: b.chain, source: strField(b, 'source'), clan: strField(b, 'clan') };
 }
@@ -168,7 +194,7 @@ function parseWalletPatch(body: unknown): ParseResult<Partial<WalletBody>> {
     patch.address = address;
   }
   if (b.chain !== undefined) {
-    if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
+    if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
     patch.chain = b.chain;
   }
   if (b.name !== undefined) patch.name = strField(b, 'name');
@@ -603,8 +629,88 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       // is PUBLIC, so `egressIp`/proxy strings are stripped (see fetchGatewayDoors).
       doors: await fetchGatewayDoors(),
       ratelimit: limiters.snapshot(),
+      providerCache: providerRequestCache.stats(),
     });
   });
+  const heliusUsagePoller = new HeliusUsagePoller();
+  const monitorToken = authDeps?.monitorToken ?? config.monitorApiToken;
+  app.get('/api/monitor/metrics', (req, res) => {
+    const authorization = req.headers.authorization;
+    const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (!matchServiceToken(token, monitorToken)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.json({
+      rpcUsage: snapshotRpcUsage(),
+      heliusUsage: heliusUsagePoller.snapshot(solanaRpcEndpoints(), config.heliusProjectIds),
+    });
+  });
+
+  app.get('/api/monitor/alerts', (req, res) => {
+    const afterIdRaw = req.query.afterId;
+    const limitRaw = req.query.limit;
+    const afterId = afterIdRaw === undefined ? 0 : typeof afterIdRaw === 'string' && /^\d+$/.test(afterIdRaw)
+      ? Number(afterIdRaw)
+      : NaN;
+    const limit = limitRaw === undefined ? 100 : typeof limitRaw === 'string' && /^\d+$/.test(limitRaw)
+      ? Number(limitRaw)
+      : NaN;
+    if (!Number.isSafeInteger(afterId) || afterId < 0 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      res.status(400).json({ error: 'afterId must be >= 0 and limit must be 1..200' });
+      return;
+    }
+    const sourceObservations = getAlertMetricObservations(afterId, limit);
+    const signals = sourceObservations.length > 0 ? assembleSignals(Date.now(), true) : [];
+    const signalsByCa = new Map(signals.map((signal) => [`${signal.chain}\0${signal.ca}`, signal]));
+    const observations = sourceObservations.map((observation) => {
+      const signal = signalsByCa.get(`${observation.chain}\0${observation.ca}`);
+      if (!signal) return observation;
+      const wallets = signal.trackedWallets;
+      const fomoUsers = config.showFomo ? signal.fomoUsers : [];
+      const walletNames = wallets
+        .map((wallet) => wallet.name.trim().slice(0, 128))
+        .slice(0, 3);
+      const fomoHandles = fomoUsers.map((user) => user.handle.slice(0, 128)).slice(0, 3);
+      return {
+        ...observation,
+        snapshot: {
+          ...observation.snapshot,
+          ...(signal.iconUrl ? { iconUrl: signal.iconUrl } : {}),
+          ...(signal.xHandle ? { xHandle: signal.xHandle } : {}),
+          tracked: {
+            count: wallets.length + fomoUsers.length,
+            wallets: { names: walletNames, total: wallets.length },
+            fomoUsers: { names: fomoHandles, total: fomoUsers.length },
+          },
+        },
+      };
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      observations,
+      nextId: observations[observations.length - 1]?.id ?? afterId,
+      ...(config.showFomo ? {} : { telegramAlertRules: getTelegramAlertRules() }),
+    });
+
+  });
+  app.post('/api/monitor/alerts/ack', (req, res) => {
+    const body: unknown = req.body;
+    const throughId = typeof body === 'object' && body !== null && !Array.isArray(body)
+      ? Reflect.get(body, 'throughId')
+      : undefined;
+    if (typeof throughId !== 'number' || !Number.isSafeInteger(throughId) || throughId < 0) {
+      res.status(400).json({ error: 'throughId must be a non-negative integer' });
+      return;
+    }
+    if (!acknowledgeAlertMetricObservations(throughId)) {
+      res.status(409).json({ error: 'acknowledgement exceeds the available feed' });
+      return;
+    }
+    res.status(204).end();
+  });
+
 
   // The FE's session probe: who the Bearer token authenticated as. The service
   // token has no email identity → { email: null, role: 'service' }.
@@ -645,6 +751,42 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     if (parsed.allFactors !== undefined) setDebugAllFactors(parsed.allFactors);
     res.json(settingsResponse(result));
   });
+  
+  app.get('/api/telegram-alert-rules', (_req, res) => {
+    if (config.showFomo) {
+      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
+      return;
+    }
+    res.json(getTelegramAlertRules());
+  });
+
+  app.put('/api/telegram-alert-rules', (req, res) => {
+    if (config.showFomo) {
+      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
+      return;
+    }
+    const body: unknown = req.body;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      res.status(400).json({ error: 'body must be a JSON object' });
+      return;
+    }
+    const values = body as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    const ruleKeys = ['fwGrowthPct', 'minFwPct', 't100GrowthPct', 'minMcK', 'maxMcK', 'trackerBuyingK'] as const;
+    for (const key of ruleKeys) {
+      if (values[key] !== undefined) patch[key] = values[key];
+    }
+    if (Object.keys(values).some((key) => !(ruleKeys as readonly string[]).includes(key))) {
+      res.status(400).json({ error: 'unknown Telegram alert rule' });
+      return;
+    }
+    const result = updateTelegramAlertRules(patch);
+    if ('error' in result) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json(result);
+  });
 
   app.get('/api/wallets', (_req, res) => {
     res.json(listWallets().map(toWallet));
@@ -656,15 +798,30 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
+    if (parsed.chain === 'evm') {
+      const inserted = insertEvmWalletGroup({
+        address: parsed.address,
+        name: parsed.name,
+        tags: parsed.tags,
+        source: parsed.source,
+        clan: parsed.clan,
+      });
+      if (!inserted) {
+        res.status(409).json({ error: 'wallet address already exists' });
+        return;
+      }
+      for (const row of inserted) kickWalletRow(row);
+      res.status(201).json(toWallet(inserted[0]));
+      return;
+    }
     if (findWalletByAddress(parsed.address, parsed.chain)) {
       res.status(409).json({ error: 'wallet address already exists' });
       return;
     }
-    const inserted = insertWallet(parsed);
+    const inserted = insertWallet({ ...parsed, chain: parsed.chain as Chain });
     kickWalletRow(inserted);
     res.status(201).json(toWallet(inserted));
   });
-
   app.patch('/api/wallets/:id', (req, res) => {
     const cur = getWallet(req.params.id);
     if (!cur) {
@@ -677,12 +834,44 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     const current = toWallet(cur);
-    const next: WalletBody = { ...current, ...parsed };
+    const actualChain = parsed.chain === 'evm' ? current.chain : parsed.chain ?? current.chain;
+    const next = { ...current, ...parsed, chain: actualChain };
+    if (config.showFomo && current.chain !== 'sol') {
+      if (parsed.chain !== undefined && parsed.chain !== 'evm' && parsed.chain !== current.chain) {
+        res.status(400).json({ error: 'EVM wallet network is fixed to all supported EVM chains' });
+        return;
+      }
+      if (!EVM_ADDRESS.test(next.address)) {
+        res.status(400).json({ error: 'invalid EVM address (expected 0x + 40 hex characters)' });
+        return;
+      }
+      const updated = updateEvmWalletGroupById(cur.id, {
+        address: next.address,
+        name: next.name,
+        tags: next.tags,
+        source: next.source,
+        clan: next.clan,
+      });
+      if (updated === 'duplicate') {
+        res.status(409).json({ error: 'wallet address already exists' });
+        return;
+      }
+      if (!updated) {
+        res.status(404).json({ error: 'not found' });
+        return;
+      }
+      for (const row of updated) kickWalletRow(row);
+      res.json(toWallet(updated[0]));
+      return;
+    }
+    if (parsed.chain === 'evm') {
+      res.status(400).json({ error: 'add this address as an EVM wallet instead of converting a Solana wallet' });
+      return;
+    }
     if (next.chain === 'sol' && !isSolanaAddress(next.address)) {
       res.status(400).json({ error: 'invalid sol address (base58, 32 bytes)' });
       return;
     }
-    // Identity key is (address, chain): a change to EITHER half can collide.
     if (
       (next.address !== current.address || next.chain !== current.chain) &&
       findWalletByAddress(next.address, next.chain)
@@ -690,7 +879,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(409).json({ error: 'wallet address already exists' });
       return;
     }
-    const updated = updateWallet(cur.id, next);
+    const updated = updateWallet(cur.id, { ...next, chain: next.chain });
     if (!updated) {
       res.status(404).json({ error: 'not found' });
       return;
@@ -700,10 +889,13 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   });
 
   app.delete('/api/wallets/:id', (req, res) => {
-    // FK cascade cleans wallet_token_state + wallet_trades.
-    deleteWallet(req.params.id);
+    if (!(config.showFomo && deleteEvmWalletGroupById(req.params.id))) {
+      // FK cascade cleans wallet_token_state + wallet_trades.
+      deleteWallet(req.params.id);
+    }
     res.status(204).end();
   });
+
 
   app.post('/api/wallets/import', (req, res) => {
     const rows = parseImportRows(req.body);
@@ -891,6 +1083,12 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
             ],
             'watch',
           );
+    if (parsed.side === 'buy' && inserted > 0 && parsed.amountUsd !== undefined) {
+      appendAlertMetricObservation(getDb(), parsed.ca, parsed.chain, 'trackerBuy', parsed.amountUsd, parsed.ts, {
+        name: wallet.name,
+        address: wallet.address,
+      });
+    }
     if (parsed.side === 'buy') {
       enqueueTrackedCa({
         address: parsed.ca,
@@ -961,7 +1159,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       kickFomoHoldings(user.id, parsed.chain, parsed.ca, parsed.txHash);
     }
     if (created) {
-      kickFomoPositions(user.id, user.handle);
+      kickFomoPositions(user.id, user.handle, parsed.eventId);
     }
     res.json({ inserted: created ? 1 : 0 });
   });

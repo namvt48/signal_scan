@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { getDb, insertWallet, open } from '../src/db.js';
+import { getAlertMetricObservations, getDb, insertWallet, open } from '../src/db.js';
 import { insertTrades } from '../src/ingest.js';
 import { createApp } from '../src/api.js';
 import type { WalletActivity } from '../src/providers/provider.js';
@@ -75,22 +75,30 @@ test('POST /api/wallet-watch/trades: stores the detected buy with source=watch',
   assert.equal(row.amount_usd, 250);
   assert.equal(row.price, 0.002);
   assert.equal(row.source, 'watch');
+  const observations = getAlertMetricObservations(0, 10);
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]?.metric, 'trackerBuy');
+  assert.equal(observations[0]?.value, 250);
+  assert.equal(observations[0]?.responseAt, 1_758_000_000_000);
+  assert.deepEqual(observations[0]?.snapshot.trackerBuyer, { name: 'CTW', address: WALLET });
 });
 
 test('POST /api/wallet-watch/trades: a repost is a no-op (UNIQUE wallet+ca+tx+side)', async () => {
   const res = await post(trade());
   assert.equal(res.status, 200);
   assert.equal(res.json.inserted, 0);
+  assert.equal(getAlertMetricObservations(0, 10).length, 1, 'a replay cannot append a second BUY observation');
 });
 
 test('POST /api/wallet-watch/trades: unpriced buy still lands (amountUsd/price optional)', async () => {
-  const body = trade({ tx: 'sig-watch-nopx' });
+  const body = trade({ tx: 'sig-watch-nopx', ts: 1_758_000_005_000 });
   delete body.amountUsd;
   delete body.price;
   const res = await post(body);
   assert.equal(res.status, 200);
   assert.equal(res.json.inserted, 1);
   assert.equal(sourceOf('sig-watch-nopx'), 'watch');
+  assert.equal(getAlertMetricObservations(0, 10).some((row) => row.responseAt === body.ts), false);
 });
 
 test('POST /api/wallet-watch/trades: 404 for an address that is not a tracked wallet', async () => {
@@ -108,7 +116,7 @@ test('POST /api/wallet-watch/trades: 400 on a malformed body', async () => {
 });
 
 test('POST /api/wallet-watch/trades: side=sell lands as a trade row, side=transfer never does', async () => {
-  const sell = await post(trade({ tx: 'sig-watch-sell', side: 'sell' }));
+  const sell = await post(trade({ tx: 'sig-watch-sell', ts: 1_758_000_003_000, side: 'sell' }));
   assert.equal(sell.status, 200);
   assert.equal(sell.json.inserted, 1);
   const row = getDb().prepare('SELECT side, source FROM wallet_trades WHERE tx = ?').get('sig-watch-sell') as Record<
@@ -119,10 +127,13 @@ test('POST /api/wallet-watch/trades: side=sell lands as a trade row, side=transf
   assert.equal(row.source, 'watch');
 
   // A transfer is not a trade: the row must NOT exist, only the balance refresh ran.
-  const xfer = await post(trade({ tx: 'sig-watch-xfer', side: 'transfer' }));
+  const xfer = await post(trade({ tx: 'sig-watch-xfer', ts: 1_758_000_004_000, side: 'transfer' }));
   assert.equal(xfer.status, 200);
   assert.equal(xfer.json.inserted, 0);
   assert.equal(sourceOf('sig-watch-xfer'), undefined);
+  const observations = getAlertMetricObservations(0, 10);
+  assert.equal(observations.some((event) => event.responseAt === 1_758_000_003_000), false);
+  assert.equal(observations.some((event) => event.responseAt === 1_758_000_004_000), false);
 });
 
 test('POST /api/wallet-watch/trades: 400 on an unknown side', async () => {

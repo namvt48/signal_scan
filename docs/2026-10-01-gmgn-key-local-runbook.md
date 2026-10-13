@@ -1,6 +1,6 @@
 # GMGN key — runbook chạy từ máy LOCAL
 
-**Ngày:** 2026-10-01 · **Server:** `root@194.163.187.250` · **Instance mặc định:** `a` (`/root/signal_scan`, port 8124)
+**Ngày:** 2026-10-01 · **Server:** `root@167.86.101.228` · **Instance mặc định:** `a` (`/root/signal_scan`, port 8124)
 
 Mục tiêu: từ máy local (kể cả máy mới) tạo/rotate **GMGN API key** và nạp vào đúng chỗ, **không cần thao tác thủ công trên server** ngoài SSH.
 
@@ -12,8 +12,8 @@ Mục tiêu: từ máy local (kể cả máy mới) tạo/rotate **GMGN API key*
 
 ```bash
 ssh-keygen -t ed25519 -C "may-local"        # nếu chưa có ~/.ssh/id_ed25519
-ssh-copy-id root@194.163.187.250            # lần đầu cần password root
-ssh root@194.163.187.250 "echo ok"          # verify SSH
+ssh-copy-id root@167.86.101.228            # lần đầu cần password root
+ssh root@167.86.101.228 "echo ok"          # verify SSH
 
 git clone git@github.com:namvt48/signal_scan.git
 cd signal_scan                              # để dùng `make`
@@ -30,7 +30,7 @@ Server đã có keypair tại `/root/signal_scan/keys/` từ 2026-09-08 → khô
 ```bash
 make gmgn-keygen
 # hoặc lấy trực tiếp, không cần clone repo:
-ssh root@194.163.187.250 "cat /root/signal_scan/keys/gmgn-public.pem"
+ssh root@167.86.101.228 "cat /root/signal_scan/keys/gmgn-public.pem"
 ```
 Copy **nguyên khối** `-----BEGIN PUBLIC KEY----- … -----END PUBLIC KEY-----`.
 (`gmgn-keygen` idempotent — key cũ tồn tại thì in lại, không ghi đè.)
@@ -45,20 +45,20 @@ Copy **nguyên khối** `-----BEGIN PUBLIC KEY----- … -----END PUBLIC KEY-----
 ```bash
 # đặt biến trong shell local, tránh lọt vào lịch sử lệnh nếu muốn
 GMGN_KEY='dán_key_vào_đây'
-ssh root@194.163.187.250 "sed -i 's|^GMGN_API_KEY=.*|GMGN_API_KEY=$GMGN_KEY|' /root/signal-scan-gateway/gateway.env"
+ssh root@167.86.101.228 "sed -i 's|^GMGN_API_KEY=.*|GMGN_API_KEY=$GMGN_KEY|' /root/signal-scan-gateway/gateway.env"
 ```
 Kiểm tra dòng đã có (che value):
 ```bash
-ssh root@194.163.187.250 "sed -E 's/=.*/=<...>/' /root/signal-scan-gateway/gateway.env | grep GMGN"
+ssh root@167.86.101.228 "sed -E 's/=.*/=<...>/' /root/signal-scan-gateway/gateway.env | grep GMGN"
 ```
 
 **A4. Restart gateway + verify:**
 ```bash
 make gateway-up                                              # ssh + up -d
 # hoặc ép recreate để chắc chắn đọc env mới:
-ssh root@194.163.187.250 "cd /root/signal_scan && docker compose -f docker-compose.gateway.yml up -d --force-recreate gateway"
+ssh root@167.86.101.228 "cd /root/signal_scan && docker compose -f docker-compose.gateway.yml up -d --force-recreate gateway"
 
-ssh root@194.163.187.250 "docker ps --format '{{.Names}} {{.Status}}' | grep gateway; \
+ssh root@167.86.101.228 "docker ps --format '{{.Names}} {{.Status}}' | grep gateway; \
   docker logs signal_scan-gateway-1 2>&1 | tail -5"
 ```
 
@@ -70,7 +70,7 @@ Chỉ làm khi key cũ lộ, hoặc bạn muốn key khác.
 
 ```bash
 # B1. xoá keypair cũ trên server (private + public + hex)
-ssh root@194.163.187.250 "rm -f /root/signal_scan/keys/gmgn-public.pem /root/signal_scan/keys/gmgn-private.pem /root/signal_scan/keys/gmgn-private.hex"
+ssh root@167.86.101.228 "rm -f /root/signal_scan/keys/gmgn-public.pem /root/signal_scan/keys/gmgn-private.pem /root/signal_scan/keys/gmgn-private.hex"
 # B2. sinh keypair mới ngay trên server + in public key
 make gmgn-keygen
 ```
@@ -105,6 +105,29 @@ Kiểm qua app: instance **a** port 8124 là **loopback, KHÔNG vào được t�
 | `ssh-keygen -e -m PKCS8 -f id_ed25519.pub` → `unsupported key type ED25519` | key SSH OpenSSH không convert PEM được | không dùng key git cho GMGN; dùng `keys/gmgn-public.pem` |
 | GMGN 403 liên tục | IP server không được allowlist / bị ban | kiểm allowlist trên gmgn.ai, chờ cooldown 10–15' |
 | `make gmgn-keygen` không ra key | sai `INSTANCE`/`REMOTE_DIR` | mặc định instance `a` → `/root/signal_scan`; chỉnh `make gmgn-keygen INSTANCE=b` nếu cần |
+
+## GMGN 429 / shared-IP ban
+
+GMGN applies the temporary ban to the gateway egress IP, not just the API key.
+The gateway therefore limits all GMGN token-info keys together to **1 request/s,
+burst 1, concurrency 1**. A 429 blocks the shared queue until the upstream reset
+time (plus a small safety margin); missing, malformed, or stale reset data falls
+back to a 60-second cooldown. `Retry-After` delta/date values are normalized too.
+Concurrent provider requests for the same chain + CA share only the in-flight
+request; completed responses are not cached.
+
+When GMGN reports `RATE_LIMIT_BANNED`:
+
+1. Stop both API containers and the `wallet-watch` service so they cannot keep
+   feeding requests into the gateway.
+2. Keep the gateway running; wait until the GMGN reset/cooldown has elapsed.
+3. Send one token-info probe through the gateway. Do not probe directly from
+   the server repeatedly.
+4. If the probe succeeds, start both API containers and `wallet-watch`. If it
+   returns another 429, stop them again and honor the new reset time.
+
+Do not work around a shared-IP ban by switching API keys; every key exits from
+the same gateway egress.
 
 ---
 

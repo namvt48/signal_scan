@@ -4,7 +4,8 @@ import { open } from '../src/db.js';
 import { updateTokenMetrics } from '../src/ingest.js';
 import { applyVolumeDelta } from '../src/poller.js';
 import { CompositeProvider } from '../src/providers/composite.js';
-import { parseTokenInfo, type GmgnProvider, type GmgnTokenInfoResponse } from '../src/providers/gmgn.js';
+import { GatewayClient } from '../src/gateway-client.js';
+import { GmgnMarketProvider, parseTokenInfo, type GmgnProvider, type GmgnTokenInfoResponse } from '../src/providers/gmgn.js';
 import type { MarketDataProvider } from '../src/providers/provider.js';
 
 // Live capture 2026-09-24, GET openapi.gmgn.ai/v1/token/info?chain=sol on MINI.
@@ -71,24 +72,44 @@ test('parseTokenInfo: throws on a non-zero code and on a data-less body', () => 
   assert.throws(() => parseTokenInfo({ code: 0 }), /no data/);
 });
 
-test('GmgnMarketProvider.metric: essential and volume are DISJOINT field sets', async () => {
+test('GMGN essential and volume metrics expose their shared token/info fields', async () => {
   const gmgn: GmgnProvider = {
     name: 'gmgn',
-    metric: async (_ca, _chain, kind) => {
-      const p = parseTokenInfo(MINI);
-      return kind === 'volume'
-        ? { volume24h: p.volume24h, buyVol24h: p.buyVol24h, sellVol24h: p.sellVol24h, volume1h: p.volume1h }
-        : { price: p.price, holders: p.holders, symbol: p.symbol };
-    },
+    metric: async () => parseTokenInfo(MINI),
     assetInfo: async () => ({}),
   };
   const ess = await gmgn.metric('ca', 'sol', 'essential');
   assert.equal(ess.price, 0.0026489706);
   assert.equal(ess.holders, 2923);
-  assert.equal(ess.volume24h, undefined, 'essential must not carry volume');
+  assert.equal(ess.volume24h, 425137.45927614);
   const vol = await gmgn.metric('ca', 'sol', 'volume');
   assert.equal(vol.volume24h, 425137.45927614);
-  assert.equal(vol.price, undefined, 'volume must not carry price');
+  assert.equal(vol.price, 0.0026489706);
+});
+
+test('GmgnMarketProvider: concurrent essential and volume for one CA share one upstream call', async () => {
+  let calls = 0;
+  const gateway = {
+    call: async () => {
+      calls++;
+      await Promise.resolve();
+      return { status: 200, body: JSON.stringify(MINI), headers: {} };
+    },
+  } as unknown as GatewayClient;
+  const gmgn = new GmgnMarketProvider('', gateway);
+
+  const [essential, volume] = await Promise.all([
+    gmgn.metric('ca', 'sol', 'essential'),
+    gmgn.metric('ca', 'sol', 'volume'),
+  ]);
+  assert.equal(calls, 1);
+  assert.equal(essential.price, 0.0026489706);
+  assert.equal(essential.volume24h, 425137.45927614);
+  assert.equal(volume.volume24h, 425137.45927614);
+  assert.equal(volume.price, 0.0026489706);
+
+  await gmgn.metric('ca', 'sol', 'essential');
+  assert.equal(calls, 2, 'completed requests are not cached; next call gets a fresh gateway request');
 });
 
 test('CompositeProvider: routes essential+volume to GMGN, gini to Nansen', async () => {
@@ -164,13 +185,15 @@ test('CompositeProvider.metric: a gated GMGN essential door falls back to Nansen
     },
     metric: async (_ca, _chain, kind) => {
       calls.push(`nansen:${kind}`);
-      return { price: 3, supply: 4, symbol: 'NAN', deployedAt: 123 };
+      return { price: 3, marketCap: 12, supply: 4, symbol: 'NAN', deployedAt: 123 };
     },
     walletTokenHoldings: async () => [],
   };
   const patch = await new CompositeProvider(gmgn, nansen).metric('ca', 'sol', 'essential');
   assert.equal(patch.symbol, 'NAN');
   assert.equal(patch.supply, 4);
+  assert.equal(patch.price, undefined, 'Nansen fallback must not replace GMGN-owned price');
+  assert.equal(patch.marketCap, undefined, 'MC stays unknown until a fresh GMGN price arrives');
   assert.deepEqual(calls, ['gmgn:essential', 'nansen:essential']);
 });
 
@@ -197,6 +220,8 @@ test('CompositeProvider.tokenInfo: a gated GMGN essential door keeps the CA writ
   const info = await new CompositeProvider(gmgn, nansen).tokenInfo('ca', 'sol');
   assert.equal(info.symbol, 'NAN');
   assert.equal(info.supply, 4);
+  assert.equal(info.price, undefined);
+  assert.equal(info.marketCap, undefined);
   assert.equal(info.nansenStats?.freshSupplyPct, 5);
 });
 

@@ -1,26 +1,50 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Download, PencilSimple, Plus, Trash, Upload } from '@phosphor-icons/react';
-import { CHAINS, type Chain, type Wallet } from '../types';
-import { dataStore, parseWalletsCsv, type ImportRow, type ParsedImportRow } from '../services/dataStore';
-import { SHOW_CLAN } from '../config';
+import { CHAINS, type Wallet, type WalletScope } from '../types';
+import { dataStore, parseWalletsCsv, type ImportRow, type ParsedImportRow, type WalletWritePatch } from '../services/dataStore';
+import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { Button, ConfirmDialog, CopyButton, EmptyState, ErrorState, IconButton, Modal, Select, SkeletonRows, TableShell, Td, TextField, Th, walletNameClass } from './ui';
 import { useAuth } from '../auth/use-auth';
 
 interface Draft {
   address: string;
   name: string;
-  chain: Chain;
+  chain: WalletScope;
   source: string;
   clan: string;
 }
 
-const EMPTY_DRAFT: Draft = { address: '', name: '', chain: CHAINS[0], source: '', clan: '' };
+type DisplayWallet = Omit<Wallet, 'chain'> & { chain: WalletScope };
+
+function displayWallets(rows: Wallet[]): DisplayWallet[] {
+  if (!SHOW_FOMO) return rows;
+  const solana: DisplayWallet[] = [];
+  const evmGroups = new Map<string, Wallet[]>();
+  for (const wallet of rows) {
+    if (wallet.chain === 'sol') {
+      solana.push(wallet);
+      continue;
+    }
+    const key = wallet.address.toLowerCase();
+    evmGroups.set(key, [...(evmGroups.get(key) ?? []), wallet]);
+  }
+  const evm = [...evmGroups.values()].map((members) => {
+    const preferred = members.find((wallet) => wallet.chain === 'base')
+      ?? members.find((wallet) => wallet.chain === 'bsc')
+      ?? members[0];
+    if (!preferred) throw new Error('cannot display an empty EVM wallet group');
+    return { ...preferred, chain: 'evm' as const };
+  });
+  return [...solana, ...evm].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+const EMPTY_DRAFT: Draft = { address: '', name: '', chain: 'sol', source: '', clan: '' };
 
 function toMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function downloadCsv(wallets: Wallet[]): void {
+function downloadCsv(wallets: DisplayWallet[]): void {
   const esc = (v: string) => (/[",\n\r]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v);
   const lines = [
     SHOW_CLAN ? 'address,name,tags,chain,source,clan' : 'address,name,tags,chain,source',
@@ -38,7 +62,7 @@ function downloadCsv(wallets: Wallet[]): void {
   URL.revokeObjectURL(url);
 }
 
-function WalletModal({ initial, onClose, onSave }: { initial: Wallet | null; onClose: () => void; onSave: (draft: Draft) => Promise<void> }) {
+function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | null; onClose: () => void; onSave: (draft: Draft) => Promise<void> }) {
   const [draft, setDraft] = useState<Draft>(
     initial ? { address: initial.address, name: initial.name, chain: initial.chain, source: initial.source, clan: initial.clan ?? '' } : EMPTY_DRAFT,
   );
@@ -49,6 +73,10 @@ function WalletModal({ initial, onClose, onSave }: { initial: Wallet | null; onC
     e.preventDefault();
     if (!draft.address.trim()) {
       setErr('Address is required');
+      return;
+    }
+    if (draft.chain === 'evm' && !/^0x[0-9a-fA-F]{40}$/.test(draft.address.trim())) {
+      setErr('Enter a valid EVM address (0x + 40 hex characters)');
       return;
     }
     if (!draft.name.trim()) {
@@ -82,12 +110,17 @@ function WalletModal({ initial, onClose, onSave }: { initial: Wallet | null; onC
           </label>
         )}
         <div className="flex gap-3">
-          <label className="block w-28">
-            <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Chain</span>
-            <Select value={draft.chain} onChange={(e) => setDraft({ ...draft, chain: e.target.value as Chain })} className="w-full font-mono uppercase">
-              {CHAINS.map((c) => (
-                <option key={c} value={c}>
-                  {c}
+          <label className="block w-40">
+            <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Network</span>
+            <Select value={draft.chain} onChange={(e) => setDraft({ ...draft, chain: e.target.value as WalletScope })} className="w-full font-mono uppercase">
+              {(initial && SHOW_FOMO
+                ? [initial.chain]
+                : SHOW_FOMO
+                  ? ['sol', 'evm'] as WalletScope[]
+                  : CHAINS
+              ).map((chain) => (
+                <option key={chain} value={chain}>
+                  {chain === 'evm' ? 'EVM (Base · BSC · Robinhood)' : chain}
                 </option>
               ))}
             </Select>
@@ -112,10 +145,10 @@ function WalletModal({ initial, onClose, onSave }: { initial: Wallet | null; onC
 }
 
 export default function WalletsPage() {
-  const [wallets, setWallets] = useState<Wallet[] | null>(null);
+  const [wallets, setWallets] = useState<DisplayWallet[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [modal, setModal] = useState<'new' | Wallet | null>(null);
-  const [confirm, setConfirm] = useState<Wallet | null>(null);
+  const [modal, setModal] = useState<'new' | DisplayWallet | null>(null);
+  const [confirm, setConfirm] = useState<DisplayWallet | null>(null);
   const [preview, setPreview] = useState<ParsedImportRow[] | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [tagDrafts, setTagDrafts] = useState<Record<string, string>>({});
@@ -129,7 +162,7 @@ export default function WalletsPage() {
     dataStore
       .listWallets()
       .then((ws) => {
-        if (alive) setWallets(ws);
+        if (alive) setWallets(displayWallets(ws));
       })
       .catch((e: unknown) => {
         if (alive) setError(toMsg(e));
@@ -142,26 +175,26 @@ export default function WalletsPage() {
   async function saveWallet(draft: Draft) {
     const payload = { ...draft, address: draft.address.trim(), name: draft.name.trim(), source: draft.source.trim() };
     if (modal === 'new') {
-      const added = await dataStore.addWallet({ ...payload, tags: [] });
-      setWallets((ws) => (ws ? [...ws, added].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })) : [added]));
+      await dataStore.addWallet({ ...payload, tags: [] });
     } else if (modal) {
-      const updated = await dataStore.updateWallet(modal.id, payload);
-      setWallets((ws) => ws?.map((w) => (w.id === updated.id ? updated : w)) ?? null);
+      await dataStore.updateWallet(modal.id, payload);
     }
+    setWallets(displayWallets(await dataStore.listWallets()));
     setModal(null);
   }
 
   async function removeWallet(id: string) {
     await dataStore.deleteWallet(id);
-    setWallets((ws) => ws?.filter((w) => w.id !== id) ?? null);
+    setWallets(displayWallets(await dataStore.listWallets()));
   }
 
-  async function patchWallet(id: string, patch: Partial<Omit<Wallet, 'id'>>) {
-    const updated = await dataStore.updateWallet(id, patch);
-    setWallets((ws) => ws?.map((w) => (w.id === updated.id ? updated : w)) ?? null);
+  async function patchWallet(id: string, patch: WalletWritePatch) {
+    await dataStore.updateWallet(id, patch);
+    setWallets(displayWallets(await dataStore.listWallets()));
   }
 
-  async function addTag(w: Wallet) {
+
+  async function addTag(w: DisplayWallet) {
     const tag = (tagDrafts[w.id] ?? '').trim();
     if (!tag || w.tags.includes(tag)) return;
     const next = { ...tagDrafts };
@@ -184,7 +217,7 @@ export default function WalletsPage() {
     if (rows.length === 0) return;
     await dataStore.importWallets(rows);
     setPreview(null);
-    setWallets(await dataStore.listWallets());
+    setWallets(displayWallets(await dataStore.listWallets()));
   }
 
   if (error) return <ErrorState message={error} onRetry={() => window.location.reload()} />;
@@ -192,12 +225,14 @@ export default function WalletsPage() {
   if (!wallets) {
     return (
       <TableShell>
-        <table className="w-full min-w-[860px] border-collapse text-left">
+        <table className="w-full min-w-[1120px] border-collapse text-left">
           <thead>
             <tr>
               <Th className="w-10">STT</Th>
               <Th className="w-[1%]">Address</Th>
               <Th className="w-full">Name</Th>
+              <Th className="w-16 text-center">Rank</Th>
+              <Th className="min-w-[140px]">Group</Th>
               {SHOW_CLAN && <Th className="w-16">Clan</Th>}
               <Th className="min-w-[220px]">Tags</Th>
               <Th className="w-16">Chain</Th>
@@ -205,7 +240,7 @@ export default function WalletsPage() {
               <Th className="w-16 text-right">Actions</Th>
             </tr>
           </thead>
-          <SkeletonRows rows={6} cols={SHOW_CLAN ? 8 : 7} />
+          <SkeletonRows rows={6} cols={SHOW_CLAN ? 10 : 9} />
         </table>
       </TableShell>
     );
@@ -311,12 +346,14 @@ export default function WalletsPage() {
         />
       ) : (
         <TableShell>
-          <table className="w-full min-w-[860px] border-collapse text-left">
+          <table className="w-full min-w-[1120px] border-collapse text-left">
             <thead>
               <tr>
                 <Th className="w-10">STT</Th>
                 <Th className="w-[1%]">Address</Th>
                 <Th className="w-full">Name</Th>
+                <Th className="w-16 text-center">Rank</Th>
+                <Th className="min-w-[140px]">Group</Th>
                 {SHOW_CLAN && <Th className="w-16">Clan</Th>}
                 <Th className="min-w-[220px]">Tags</Th>
                 <Th className="w-16">Chain</Th>
@@ -332,6 +369,22 @@ export default function WalletsPage() {
                     <CopyButton value={w.address} label={w.address} />
                   </Td>
                   <Td className="font-mono text-ink"><span className={walletNameClass(w.tags)}>{w.name}</span></Td>
+                  <Td className="text-center font-mono">
+                    {w.rank ? <span className="cohort-rank" data-rank={w.rank}>{w.rank}</span> : <span className="text-muted">—</span>}
+                  </Td>
+                  <Td>
+                    {w.groups?.length ? (
+                      <div className="flex max-w-[190px] flex-wrap gap-1">
+                        {w.groups.map((group) => (
+                          <span key={group} className="cohort-group" title={group} aria-label={group}>
+                            {group.split('_', 1)[0]}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-muted">—</span>
+                    )}
+                  </Td>
                   {SHOW_CLAN && <Td className="font-mono">{w.clan || '-'}</Td>}
                   <Td>
                     <div className="flex flex-wrap items-center gap-1">

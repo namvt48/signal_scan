@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { getDb, getTokenState, insertTrackedCa, insertWallet, open } from '../src/db.js';
 import { insertSnapshot, insertTrades, replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, upsertTokenInfo } from '../src/ingest.js';
 import { assembleSignals, computeBalanceRanges, computeT100Pct, sanitizeSymbol, sumHoldingAmount, trackedWalletStats } from '../src/signals.js';
+import { cohortLabelIndex } from '../src/cohort-labels.js';
 import { setDebugAllFactors, thresholdDefaults, updateThresholds } from '../src/settings.js';
 import type { HolderRow, TokenInfo, WalletActivity } from '../src/providers/provider.js';
 
@@ -147,6 +148,30 @@ test('assembleSignals: trackedWallets = watch-buy members only, per-wallet 24h s
   assert.equal(ct01.balUsd, 1e7 * 0.001);
   // Token total = Σ rows (contract: the FE's rows always add up to the token figure).
   assert.equal(sig.trackedInflow, sig.trackedWallets.reduce((sum, w) => sum + w.inflow, 0));
+});
+
+test('assembleSignals joins cohort labels by wallet address and preserves multiple groups', () => {
+  cohortLabelIndex.replaceFromPayload({
+    schema: 'canonical_cohort_label_index_v1',
+    wallets: [{
+      wallet: 'wallet-addr-1',
+      label: { labels: { rank: 'A' } },
+      group_labels: { qualified_labels: ['G3_NARRATIVE_BASKET', 'G4_UNICON_HOLDER'] },
+    }],
+  });
+
+  try {
+    const signal = assembleSignals(NOW).find((item) => item.ca === CA_A);
+    assert.ok(signal);
+    assert.deepEqual(
+      { rank: signal.trackedWallets[0]?.rank, groups: signal.trackedWallets[0]?.groups },
+      { rank: 'A', groups: ['G3_NARRATIVE_BASKET', 'G4_UNICON_HOLDER'] },
+    );
+    assert.equal(signal.trackedWallets[1]?.rank, undefined);
+    assert.equal(signal.trackedWallets[1]?.groups, undefined);
+  } finally {
+    cohortLabelIndex.replaceFromPayload({ schema: 'canonical_cohort_label_index_v1', wallets: [] });
+  }
 });
 
 test('trackedWallets: sell subtracts from wallet AND token net, counts, balUsd present/omitted, sell-only wallet absent', () => {

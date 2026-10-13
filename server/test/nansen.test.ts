@@ -1,7 +1,10 @@
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { extremesFromStats, fiboDelayMs, holdersGiniBody, hourlyStatsBody, NansenWebCrawler, parseGiniStats, type HourlyStatsRow, type PostJson } from '../src/providers/nansen.js';
 import { GatewayClient } from '../src/gateway-client.js';
+import { providerRequestCache } from '../src/providers/request-cache.js';
+
+beforeEach(() => providerRequestCache.clear());
 
 test('fiboDelayMs: 1,1,2,3,5,8,13 × base (the credit-door retry spacing)', () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map((n) => fiboDelayMs(n, 1_000)), [1_000, 1_000, 2_000, 3_000, 5_000, 8_000, 13_000]);
@@ -407,6 +410,28 @@ test('NansenApiClient.currentBalance: gateway URL + envelope unwrap + data[0] pa
     globalThis.fetch = (async () =>
       new Response(JSON.stringify({ status: 200, body: JSON.stringify({ data: [] }), headers: {} }), { status: 200 })) as typeof fetch;
     assert.equal(await new NansenApiClient('key', gw).currentBalance('W', 'sol', 'caX'), undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+test('NansenApiClient.tokenInformation: first-add requests receive critical gateway priority', async () => {
+  const origFetch = globalThis.fetch;
+  let sent: Record<string, unknown> = {};
+  const gw = new GatewayClient({ baseUrl: 'http://gateway:8130', callerToken: 'tok' });
+  try {
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      sent = JSON.parse(String(init?.body));
+      const upstream = { data: { symbol: 'NEW', token_details: { market_cap_usd: 10 } } };
+      return new Response(
+        JSON.stringify({ status: 200, body: JSON.stringify(upstream), headers: {} }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const info = await new NansenApiClient('key', gw).tokenInformation('base', '0xToken');
+    assert.equal(info.symbol, 'NEW');
+    assert.equal(sent.endpoint, '/api/v1/tgm/token-information');
+    assert.equal(sent.priority, 0);
   } finally {
     globalThis.fetch = origFetch;
   }

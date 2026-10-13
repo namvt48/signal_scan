@@ -19,6 +19,8 @@ Fixtures dựng từ capture THẬT `.omo/evidence/fomo-user-watch/task-0-alert-
  10. key không xuất hiện trong state persist lẫn log bắt được.
 """
 
+import base64
+from datetime import datetime, timezone
 import contextlib
 import email.message
 import hashlib
@@ -464,8 +466,17 @@ class _FakeConn:
     async def __aexit__(self, *a):
         return False
 
+class _BrokenConn:
+    async def __aenter__(self):
+        raise ConnectionError(f"connection failed for {KEY}")
+
+    async def __aexit__(self, *a):
+        return False
+
+
 
 fh = reset(users=[{"handle": SOL_BUY["trader"], "source": "csv"}])
+feed.DIAGNOSTIC_LOG_PATH = os.path.join(TMP, "fomo-ws-run.jsonl")
 _fake_ws = types.ModuleType("websockets")
 _fake_ws.__dict__["connect"] = lambda url, **kw: _FakeConn(
     [WELCOME, json.dumps(SOL_BUY)]
@@ -489,6 +500,55 @@ try:
         os.path.exists(feed.HEARTBEAT), "(10) heartbeat fomo được touch trong run_feed"
     )
     check("socket connected" in out, "(10) có log line socket connected")
+    run_log = feed.DIAGNOSTIC_LOG_PATH
+    run_rows = [json.loads(line) for line in open(run_log, encoding="utf-8")]
+    run_events = {row["event"] for row in run_rows}
+    check(
+        {"watcher_started", "ws_connected", "frame_received", "ingest_attempt",
+         "frame_decision", "watcher_stopped"} <= run_events,
+        "(10) JSONL logs lifecycle, raw frame, ingest and decision",
+    )
+    check(
+        all(
+            datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).tzinfo
+            == timezone.utc
+            for row in run_rows
+        ),
+        "(10) lifecycle and frame events have UTC timestamps",
+    )
+    check(
+        KEY not in open(run_log, encoding="utf-8").read()
+        and (os.stat(run_log).st_mode & 0o777) == 0o600,
+        "(10) diagnostic file excludes WS key and has mode 0600",
+    )
+    _fake_ws.__dict__["connect"] = lambda url, **kw: _BrokenConn()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        try:
+            feed.run_feed(
+                KEY,
+                ws_url=f"ws://127.0.0.1:9/ws/alerts?api_key={KEY}",
+                once=True,
+            )
+        except SystemExit as ex:
+            disconnect_error = str(ex)
+        else:
+            disconnect_error = ""
+    run_rows = [json.loads(line) for line in open(run_log, encoding="utf-8")]
+    disconnect_rows = [
+        row for row in run_rows if row["event"] == "ws_disconnected"
+    ]
+    check(
+        bool(disconnect_rows)
+        and disconnect_rows[-1]["reconnect_scheduled"] is False
+        and disconnect_rows[-1]["endpoint"] == "ws://127.0.0.1:9/ws/alerts",
+        "(10) disconnect record timestamps socket failure without URL query",
+    )
+    check(
+        KEY not in disconnect_error and KEY not in open(run_log, encoding="utf-8").read(),
+        "(10) websocket failure and URL query do not expose key",
+    )
 finally:
     if _old_ws is None:
         sys.modules.pop("websockets", None)
@@ -532,6 +592,349 @@ try:
     )
 finally:
     restore()
+
+# ---------- (13) retry có giới hạn, chỉ ack sau ingest thành công ----------
+
+from unittest.mock import patch  # noqa: E402
+
+
+class RetryHTTP(FakeHTTP):
+    def __init__(self, outcomes, *, committed=None):
+        super().__init__([{"handle": SOL_BUY["trader"]}])
+        self.outcomes = iter(outcomes)
+        self.attempts = []
+        self.committed = committed if committed is not None else set()
+        self.commit_count = 0
+
+    def _commit_once(self, event_id):
+        if event_id not in self.committed:
+            self.committed.add(event_id)
+            self.commit_count += 1
+
+    def __call__(self, req, timeout=None):
+        if req.full_url.endswith("/api/fomo-users"):
+            return super().__call__(req, timeout)
+        body = json.loads(req.data)
+        self.attempts.append(body)
+        outcome = next(self.outcomes)
+        if outcome == "commit-timeout":
+            self._commit_once(body["eventId"])
+            raise TimeoutError("response lost")
+        if outcome != 200:
+            raise urllib.error.HTTPError(
+                req.full_url, outcome, "temporary", email.message.Message(), None
+            )
+        self._commit_once(body["eventId"])
+        return _Resp(b'{"inserted":1}')
+
+
+class RetryGetHTTP:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, req, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise urllib.error.HTTPError(
+                req.full_url, 502, "temporary", email.message.Message(), None
+            )
+        return _Resp(json.dumps([{"handle": "fresh-watch"}]).encode())
+
+
+class ReadTimeoutResponse(_Resp):
+    def read(self):
+        raise TimeoutError("response body stalled")
+
+
+class RetryReadTimeoutHTTP:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, req, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ReadTimeoutResponse(b"")
+        return _Resp(json.dumps([{"handle": "fresh-after-read-timeout"}]).encode())
+
+
+http = RetryReadTimeoutHTTP()
+reset()
+feed._wl["handles"] = {"stale-watch"}
+urllib.request.urlopen = http
+try:
+    with patch.object(feed.time, "sleep") as sleep:
+        feed.refresh_watch_list(force=True)
+    check(http.calls == 2, "(13) GET body timeout retries")
+    check(
+        feed._wl["handles"] == {"fresh-after-read-timeout"},
+        "(13) read timeout retry updates watch list",
+    )
+    check(sleep.call_count == 1, "(13) read timeout uses bounded backoff")
+finally:
+    restore()
+
+
+http = RetryGetHTTP()
+reset()
+urllib.request.urlopen = http
+try:
+    with patch.object(feed.time, "sleep") as sleep:
+        feed.refresh_watch_list(force=True)
+    check(http.calls == 2, "(13) watch-list GET retries one 502")
+    check(feed._wl["handles"] == {"fresh-watch"}, "(13) GET retry updates watch list")
+    check(sleep.call_count == 1, "(13) GET retry backs off once")
+    feed.refresh_watch_list()
+    check(http.calls == 2, "(13) successful GET still respects refresh cadence")
+finally:
+    restore()
+
+
+for outcomes, want_attempts, success in (
+    ([502, 200], 2, True),
+    ([503, 503, 503], 3, False),
+    ([401], 1, False),
+    ([403], 1, False),
+    (["commit-timeout", 200], 2, True),
+):
+    reset()
+    http = RetryHTTP(outcomes)
+    urllib.request.urlopen = http
+    feed._wl["handles"] = {SOL_BUY["trader"]}
+    st = {}
+    try:
+        with patch.object(feed.time, "sleep") as sleep:
+            captured(feed.handle_frame, json.dumps(SOL_BUY), st)
+        check(len(http.attempts) == want_attempts, f"(13) {outcomes}: attempts bounded")
+        check(
+            (SOL_BUY["eventId"] in feed._seen) == success
+            and st.get("emitted", 0) == int(success),
+            f"(13) {outcomes}: chỉ ack ingest thành công",
+        )
+        check(sleep.call_count == want_attempts - 1, f"(13) {outcomes}: bounded backoff")
+        if success:
+            check(http.commit_count == 1, "(13) cùng eventId chỉ commit một lần")
+        else:
+            http.outcomes = iter([200])
+            captured(feed.handle_frame, json.dumps(SOL_BUY), st)
+            check(st.get("emitted") == 1, "(13) replay sau fail vẫn ingest được")
+    finally:
+        restore()
+
+
+# ---------- (14) timestamped JSONL frame diagnostics ----------
+
+
+
+DIAG_PATH = os.path.join(TMP, "fomo-ws.jsonl")
+SERVICE_SECRET = "service-token-secret-for-test"
+fh = reset(users=[{"handle": SOL_BUY["trader"], "source": "csv"}])
+try:
+    feed.configure_diagnostics(
+        DIAG_PATH, secret_values=(KEY, SERVICE_SECRET)
+    )
+    payload = {
+        **SOL_BUY,
+        "apiKey": KEY,
+        "serviceToken": SERVICE_SECRET,
+    }
+    raw_alert = json.dumps(payload)
+    captured(feed.handle_frame, raw_alert, {})
+    captured(feed.handle_frame, raw_alert, {})  # duplicate
+    captured(feed.handle_frame, "not-json", {})
+    outsider = {**SOL_BUY, "trader": "not-on-watch", "eventId": "outsider-event"}
+    captured(feed.handle_frame, json.dumps(outsider), {})
+    unsupported = {**SOL_BUY, "alertType": "thesis", "eventId": "thesis-event"}
+    captured(feed.handle_frame, json.dumps(unsupported), {})
+    non_alert = {**SOL_BUY, "type": "update", "eventId": "not-alert-event"}
+    missing_ca = {**SOL_BUY, "eventId": "missing-ca-event"}
+    missing_ca.pop("tokenAddress")
+    unsupported_chain = {**SOL_BUY, "chain": "ethereum", "eventId": "bad-chain-event"}
+    missing_event_id = {**SOL_BUY}
+    missing_event_id.pop("eventId")
+    invalid_timestamp = {**SOL_BUY, "ts": 0, "eventId": "bad-ts-event"}
+    for rejected in (
+        non_alert,
+        missing_ca,
+        unsupported_chain,
+        missing_event_id,
+        invalid_timestamp,
+    ):
+        captured(feed.handle_frame, json.dumps(rejected), {})
+    binary_junk = b"\x00\xff"
+    captured(feed.handle_frame, binary_junk, {})
+    captured(feed.handle_frame, "[]", {})
+
+    http = RetryHTTP([403])
+    urllib.request.urlopen = http
+    failed_alert = {**SOL_BUY, "eventId": "failed-ingest-event"}
+    captured(feed.handle_frame, json.dumps(failed_alert), {})
+
+    rows = [json.loads(line) for line in open(DIAG_PATH, encoding="utf-8")]
+    received = [row for row in rows if row["event"] == "frame_received"]
+    decisions = [row for row in rows if row["event"] == "frame_decision"]
+    check(len(received) == 13, "(14) mọi text/binary frame có raw record")
+    check(len(decisions) == 13, "(14) mọi frame có decision record")
+    check(
+        all(row["frame_id"] for row in received + decisions),
+        "(14) cùng frame có ID để nối raw và decision",
+    )
+    check(
+        all(
+            datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).tzinfo
+            == timezone.utc
+            for row in rows
+        ),
+        "(14) JSONL timestamp ISO-8601 UTC",
+    )
+    by_id = {row["frame_id"]: row for row in decisions}
+    accepted = next(row for row in received if row["payload"].get("encoding") == "text")
+    check(
+        by_id[accepted["frame_id"]]["reason"] == "ingested",
+        "(14) logged raw frame correlates to successful ingest",
+    )
+    raw_payload = accepted["payload"]["data"]
+    check(
+        json.loads(raw_payload)["token"] == SOL_BUY["token"],
+        "(14) frame content retained without redacting public ticker",
+    )
+    check(
+        KEY not in open(DIAG_PATH, encoding="utf-8").read()
+        and SERVICE_SECRET not in open(DIAG_PATH, encoding="utf-8").read()
+        and json.loads(raw_payload)["apiKey"] == "***"
+        and json.loads(raw_payload)["serviceToken"] == "***",
+        "(14) key/service token redacted from diagnostic payload",
+    )
+    binary_record = next(
+        row
+        for row in received
+        if row["payload"].get("encoding") == "base64"
+    )
+    check(
+        binary_record["payload"]["data"] == "AP8=",
+        "(14) binary frame bytes retained losslessly as base64",
+    )
+    reasons = {row.get("reason") for row in decisions}
+    check(
+        {
+            "ingested",
+            "duplicate",
+            "invalid_json",
+            "unwatched_trader",
+            "unsupported_alert_type",
+            "ingest_failed",
+            "not_json_object",
+            "not_alert_message",
+            "missing_token_address",
+            "unsupported_chain",
+            "missing_event_id",
+            "invalid_timestamp",
+        }
+        <= reasons,
+        "(14) diagnostic decisions distinguish filter, duplicate and ingest failure",
+    )
+    binary_credentials = feed._diagnostic_payload(
+        json.dumps({"apiKey": KEY, "serviceToken": SERVICE_SECRET}).encode()
+    )
+    decoded_binary = base64.b64decode(binary_credentials["data"])
+    check(
+        KEY.encode() not in decoded_binary and SERVICE_SECRET.encode() not in decoded_binary,
+        "(14) binary payload credential values are redacted",
+    )
+    query_secret = feed._diagnostic_payload(f"wss://host/ws?key={KEY}")
+    check(
+        KEY not in query_secret["data"] and "key=***" in query_secret["data"],
+        "(14) URL query credentials are redacted",
+    )
+    token_query = feed._diagnostic_payload("https://host/ws?token=opaque-secret")
+    check(
+        "opaque-secret" not in token_query["data"] and "token=***" in token_query["data"],
+        "(14) generic token query credentials are redacted",
+    )
+    feed.close_diagnostics()
+    old_max_bytes = feed._DIAGNOSTIC_MAX_BYTES
+    try:
+        feed._DIAGNOSTIC_MAX_BYTES = 128
+        feed.configure_diagnostics(DIAG_PATH)
+        for index in range(30):
+            feed._diagnostic("rotation_probe", index=index, payload="x" * 80)
+        feed.close_diagnostics()
+        rotated = [
+            path
+            for path in [DIAG_PATH]
+            + [f"{DIAG_PATH}.{n}" for n in range(1, feed._DIAGNOSTIC_BACKUPS + 1)]
+            if os.path.exists(path)
+        ]
+        check(
+            1 < len(rotated) <= feed._DIAGNOSTIC_BACKUPS + 1
+            and all((os.stat(path).st_mode & 0o777) == 0o600 for path in rotated),
+            "(14) JSONL rotates within backup bound and files remain mode 0600",
+        )
+    finally:
+        feed._DIAGNOSTIC_MAX_BYTES = old_max_bytes
+        feed.close_diagnostics()
+finally:
+    restore()
+    feed.close_diagnostics()
+
+
+# ---------- (15) diagnostics failures never block alert ingestion ----------
+
+blocked_path = os.path.join(TMP, "not-a-directory")
+with open(blocked_path, "w", encoding="utf-8") as blocked_file:
+    blocked_file.write("file")
+fh = reset(users=[{"handle": SOL_BUY["trader"], "source": "csv"}])
+st = {"emitted": 0}
+setup_warning = io.StringIO()
+try:
+    with contextlib.redirect_stderr(setup_warning):
+        feed.configure_diagnostics(
+            os.path.join(blocked_path, "fomo-ws.jsonl"), secret_values=(KEY,)
+        )
+    captured(feed.handle_frame, json.dumps(SOL_BUY), st)
+    check(
+        len(fh.posted) == 1 and st["emitted"] == 1,
+        "(15) JSONL setup failure does not block alert ingestion",
+    )
+    check(
+        setup_warning.getvalue().count("! fomo diagnostics disabled") == 1
+        and "FileExistsError" in setup_warning.getvalue(),
+        "(15) setup failure emits one bounded stderr warning",
+    )
+finally:
+    restore()
+    feed.close_diagnostics()
+
+fh = reset(users=[{"handle": SOL_BUY["trader"], "source": "csv"}])
+st = {"emitted": 0}
+try:
+    feed.configure_diagnostics(DIAG_PATH, secret_values=(KEY,))
+    handler = feed._DIAGNOSTIC_LOGGER.handlers[0]
+    handler.stream.close()
+    handler.stream = None
+    with patch.object(handler, "_open", side_effect=OSError("disk full")):
+        _, write_output = captured(feed.handle_frame, json.dumps(SOL_BUY), st)
+    check(
+        len(fh.posted) == 1 and st["emitted"] == 1,
+        "(15) JSONL write failure does not drop an alert",
+    )
+    check(
+        not feed._DIAGNOSTIC_LOGGER.handlers
+        and write_output.count("! fomo diagnostics disabled") == 1,
+        "(15) write failure disables sink after one warning",
+    )
+    warning_line = next(
+        line for line in write_output.splitlines() if "! fomo diagnostics disabled" in line
+    )
+    check(
+        "disk full" not in warning_line
+        and SOL_BUY["trader"] not in warning_line
+        and SOL_BUY["eventId"] not in warning_line,
+        "(15) diagnostic warning excludes error and frame contents",
+    )
+finally:
+    restore()
+    feed.close_diagnostics()
+
 
 assert fail == 0, f"{fail} check sai"
 print(f"PASS: fomo-watch {total - fail}/{total} (offline, deterministic)")

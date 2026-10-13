@@ -21,7 +21,7 @@ export function ChainBadge({ chain }: { chain: Chain }) {
       alt={name}
       loading="lazy"
       decoding="async"
-      className="h-5 w-5 rounded-full object-contain ring-2 ring-surface"
+      className={`h-5 w-5 object-contain ring-2 ring-surface ${chain === 'robinhood' ? 'rounded-md' : 'rounded-full'}`}
     />
   );
 }

@@ -6,7 +6,7 @@
 1. **Lấy public key:** `make gmgn-keygen` — in lại public key (idempotent, không sinh key mới nếu đã có).
 2. **Tạo API key:** mở **https://gmgn.ai/ai** → paste TOÀN BỘ khối `-----BEGIN PUBLIC KEY-----...-----END PUBLIC KEY-----` → tạo key → nhận **GMGN_API_KEY**.
 3. **Tạo .env trên server:** `make gmgn-env` — tự điền sẵn `MODE=gmgn` + `GMGN_PRIVATE_KEY` (đọc từ `keys/gmgn-private.hex`, đúng format PKCS8-DER hex mà `loadSigningKey` cần). Còn thiếu 2 giá trị sẽ được in ra.
-4. **Điền tay 2 giá trị còn lại:** `ssh root@194.163.187.250 "nano /root/signal_scan/server/.env"`:
+4. **Điền tay 2 giá trị còn lại:** `ssh root@167.86.101.228 "nano /root/signal_scan/server/.env"`:
    - `GMGN_API_KEY` — key từ bước 2
    - `GMGN_BASE_URL` — base URL của Agent API, xem trong dashboard GMGN sau khi tạo key
 5. **Kích hoạt:** `make restart` → `make gmgn-status` phải thấy `MODE=gmgn` + health OK.
@@ -28,11 +28,11 @@ Limit theo docs (20/4 rps) **lạc quan hơn thực tế** — sweep holders đ�
 
 **Thủ tục khi dính 429:**
 ```bash
-ssh root@194.163.187.250 "cd /root/signal_scan && docker compose stop api"   # ngừng bắn ngay
+ssh root@167.86.101.228 "cd /root/signal_scan && docker compose stop api"   # ngừng bắn ngay
 # chờ 10-15', probe 1 call đơn:
-ssh root@194.163.187.250 'curl -s -o /dev/null -w "%{http_code}\n" "https://openapi.gmgn.ai/v1/user/info?timestamp=$(date +%s)&client_id=$(cat /proc/sys/kernel/random/uuid)" -H "X-APIKEY: <KEY>"'
+ssh root@167.86.101.228 'curl -s -o /dev/null -w "%{http_code}\n" "https://openapi.gmgn.ai/v1/user/info?timestamp=$(date +%s)&client_id=$(cat /proc/sys/kernel/random/uuid)" -H "X-APIKEY: <KEY>"'
 # 200 rồi thì:
-ssh root@194.163.187.250 "cd /root/signal_scan && docker compose start api"
+ssh root@167.86.101.228 "cd /root/signal_scan && docker compose start api"
 ```
 Nếu lặp lại: giảm `RATE_*_RPS` một nửa hoặc tăng `POLL_*_MS` trước khi start.
 
@@ -42,14 +42,14 @@ Nếu lặp lại: giảm `RATE_*_RPS` một nửa hoặc tăng `POLL_*_MS` trư
 
 `make api-log` chạy 1-2 phút đầu sẽ thấy `tokenSweep done` — rồi:
 ```bash
-curl -s http://194.163.187.250:8124/api/signals | python3 -m json.tool | head -40
+curl -s http://167.86.101.228:8124/api/signals | python3 -m json.tool | head -40
 ```
 Số holders/volume/fresh% sẽ khác hẳn mock và thay đổi thật theo từng sweep. Kiểm thêm: `wallet_activity` historical depth (open item #1 của docs) bằng cách xem số rows trong `wallet_trades` sau sweep wallet đầu tiên.
 
 ## Rollback (30 giây)
 
 ```bash
-ssh root@194.163.187.250 "rm /root/signal_scan/server/.env"
+ssh root@167.86.101.228 "rm /root/signal_scan/server/.env"
 make restart   # quay về MODE=mock, data synthetic, pipeline không gián đoạn
 ```
 

@@ -490,7 +490,7 @@ export function ErrorState({ message, onRetry }: { message: string; onRetry?: ()
 
 // --- modal ------------------------------------------------------------------------------
 
-export function Modal({ title, onClose, children, className = '' }: { title: string; onClose: () => void; children: ReactNode; className?: string }) {
+export function Modal({ title, onClose, children, className = '', wide = false }: { title: string; onClose: () => void; children: ReactNode; className?: string; wide?: boolean }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -505,7 +505,7 @@ export function Modal({ title, onClose, children, className = '' }: { title: str
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div role="dialog" aria-modal="true" aria-label={title} className={`w-full max-w-md rounded-xl border border-line bg-surface p-5 shadow-2xl ${className}`}>
+      <div role="dialog" aria-modal="true" aria-label={title} className={`w-full ${wide ? 'max-w-5xl' : 'max-w-md'} rounded-xl border border-line bg-surface p-5 shadow-2xl ${className}`}>
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-ink">{title}</h2>
           <IconButton onClick={onClose} aria-label="Close">

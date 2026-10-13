@@ -1,8 +1,7 @@
-"""Feed EVM (Base + BSC): WS `eth_subscribe('logs')` 2 sub/chain (topic from/to
-của ví — plan D7) + backfill `eth_getLogs` chunked từ block đã xử lý cuối khi
-reconnect/restart; chỉ emit sau N confirmations. IO side — logic thuần ở
-`watchers/evm/classify.py`. Mọi HTTP đi qua `config.http_json` ⇒ test monkeypatch
-seam đó, không cần mạng. T8, plan evm-base-bsc.
+"""Feed EVM: WS `eth_subscribe('logs')` where available, poll `eth_getLogs`
+chunked for all supported chains; backfill from last processed block and emit
+only after confirmations. IO side — logic pure in `watchers/evm/classify.py`.
+All HTTP goes through `config.http_json` so tests can monkeypatch that seam.
 
 State: `st["evm"][chain]["last_block"]` — lưu SAU mỗi chunk hoàn thành ⇒
 reconnect/restart không mất khúc giữa (continuity, R1). Provider giới hạn
@@ -15,6 +14,7 @@ import os
 import sys
 import time
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 
 from watchers.common import config, emit, price
@@ -23,14 +23,17 @@ from watchers.evm import classify as cl
 
 DEFAULT_RPC = {
     "base": "https://mainnet.base.org",
-    # Keyless endpoint duy nhất chạy cả getLogs + receipt; giới hạn ~50 block/getLogs
-    # (nên dùng --chunk 50). Có Alchemy key thì override qua BSC_RPC_URL.
-    "bsc": "https://1rpc.io/bnb",
+    # Topic-only eth_getLogs works here; configure BSC_RPC_URL to use another provider.
+    "bsc": "https://bsc-rpc.publicnode.com",
+    # Robinhood official HTTP RPC; WS requires provider-specific configuration.
+    "robinhood": "https://rpc.mainnet.chain.robinhood.com",
 }
 DEFAULT_CONFIRMATIONS = (
     8  # Base ~2s / BSC ~3s block ⇒ ~16-24s trễ, ngoài độ sâu reorg thường
 )
 DEFAULT_CHUNK = 500  # R2: bề rộng eth_getLogs; halve khi provider chê range
+POLL_MAX_CHUNKS_PER_CHAIN = 16
+_BSC_LOGS_POOL = ThreadPoolExecutor(max_workers=2)
 _SEEN_MAX = 4096
 
 _seen_tx: set[str] = (
@@ -44,37 +47,65 @@ _tracked: set[tuple[str, str]] = set()  # (chain, ca) đã POST tracked-cas tron
 # ---------- transport ----------
 
 
+def rpc_urls(chain):
+    """Configured endpoints in order, followed by the public endpoint once."""
+    env = {
+        "base": "BASE_RPC_URL",
+        "bsc": "BSC_RPC_URL",
+        "robinhood": "ROBINHOOD_RPC_URL",
+    }[chain]
+    configured = [url.strip() for url in os.environ.get(env, "").split(",") if url.strip()]
+    return list(dict.fromkeys((*configured, DEFAULT_RPC[chain])))
+
+
 def rpc_url(chain):
-    env = "BASE_RPC_URL" if chain == "base" else "BSC_RPC_URL"
-    return os.environ.get(env) or DEFAULT_RPC[chain]
+    """First configured endpoint; used for websocket derivation and cursor scope."""
+    return rpc_urls(chain)[0]
 
 
 def wss_url(chain):
-    env = "BASE_WSS_URL" if chain == "base" else "BSC_WSS_URL"
+    env = {
+        "base": "BASE_WSS_URL",
+        "bsc": "BSC_WSS_URL",
+        "robinhood": "ROBINHOOD_WSS_URL",
+    }[chain]
     u = os.environ.get(env)
     if u:
         return u
+    if chain == "robinhood":
+        return None
     return rpc_url(chain).replace("https://", "wss://").replace("http://", "ws://")
 
 
 def evm_rpc(chain, method, params, tries=3):
-    """JSON-RPC HTTP 1 chain; RuntimeError khi error object / chết mạng sau `tries`."""
-    url = rpc_url(chain)
-    last = None
-    for i in range(tries):
-        try:
-            out = config.http_json(
-                url,
-                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=20,
-            )
-            if isinstance(out, dict) and "error" in out:
-                raise RuntimeError(str((out["error"] or {}).get("message"))[:120])
-            return out.get("result") if isinstance(out, dict) else None
-        except Exception as e:
-            last = e
-            time.sleep(0.5 * (i + 1))
-    raise RuntimeError(f"evm rpc {chain} {method}: {last}")
+    """Call the configured primary, then public fallback after retriable errors."""
+    last_category = "unknown error"
+    for url in rpc_urls(chain):
+        for i in range(tries):
+            try:
+                out = config.http_json(
+                    url,
+                    {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                    timeout=20,
+                )
+                if isinstance(out, dict) and "error" in out:
+                    raise RuntimeError(str((out["error"] or {}).get("message"))[:120])
+                return out.get("result") if isinstance(out, dict) else None
+            except Exception as e:
+                message = str(e).lower()
+                if method == "eth_getLogs" and "specify an address" in message:
+                    raise
+                if any(word in message for word in ("exceed", "range")):
+                    last_category = "provider range limit"
+                elif any(word in message for word in ("limit", "too many", "results")):
+                    last_category = "provider request limit"
+                else:
+                    last_category = type(e).__name__
+                if i < tries - 1:
+                    time.sleep(0.5 * (i + 1))
+    raise RuntimeError(f"evm rpc {chain} {method} failed ({last_category})")
+
+
 
 
 def block_number(chain):
@@ -91,6 +122,21 @@ def get_logs(chain, a, b, topics):
         [{"fromBlock": hex(a), "toBlock": hex(b), "topics": topics}],
     )
     return r if isinstance(r, list) else []
+
+def _range_logs(chain, start, end, wallets):
+    """Fetch both transfer directions concurrently only on BSC's one-block RPC."""
+    topics = cl.sub_topics(wallets)
+    if chain != "bsc":
+        return [
+            log
+            for topic in topics
+            for log in get_logs(chain, start, end, topic)
+        ]
+    futures = [
+        _BSC_LOGS_POOL.submit(get_logs, chain, start, end, topic) for topic in topics
+    ]
+    wait(futures)
+    return [log for future in futures for log in future.result()]
 
 
 def confirmed(block, latest, conf):
@@ -224,16 +270,51 @@ def process_tx(chain, t, wallets):
     transfers = [
         d for d in (cl.decode_transfer_log(x) for x in rc.get("logs") or []) if d
     ]
+    transaction = evm_rpc(chain, "eth_getTransactionByHash", [txh])
     out = []
     for w in wallets:
-        if not any(x["from"] == w or x["to"] == w for x in transfers):
+        wallet_transfers = [x for x in transfers if x["from"] == w or x["to"] == w]
+        if not wallet_transfers:
             continue
+        enriched = list(transfers)
+        # Native input counts only when wallet sent native value to this
+        # allowlisted router tx and received an ERC-20 in its receipt.
+        if (
+            isinstance(transaction, dict)
+            and str(transaction.get("from") or "").lower() == w
+            and int(transaction.get("value") or "0x0", 16) > 0
+            and any(x["to"] == w for x in wallet_transfers)
+        ):
+            enriched.append(
+                {
+                    "tx": txh,
+                    "ca": cl.WRAPPED_NATIVE[chain],
+                    "from": w,
+                    "to": to.lower(),
+                    "value": int(transaction["value"], 16),
+                }
+            )
+        # Native output requires canonical wrapped-native Withdrawal indexed
+        # to wallet plus an outgoing ERC-20 leg in this allowlisted router tx.
+        if any(x["from"] == w for x in wallet_transfers):
+            for log in rc.get("logs") or []:
+                amount = cl.decode_withdrawal_log(log, chain, w)
+                if amount:
+                    enriched.append(
+                        {
+                            "tx": txh,
+                            "ca": cl.WRAPPED_NATIVE[chain],
+                            "from": to.lower(),
+                            "to": w,
+                            "value": amount,
+                        }
+                    )
         ev = cl.classify_swap(
             chain,
             w,
             {
                 "to": to,
-                "transfers": transfers,
+                "transfers": enriched,
                 "decimals_of": lambda ca: token_decimals(chain, ca),
             },
         )
@@ -256,37 +337,41 @@ def process_log(chain, log, wallets):
 
 
 def backfill(chain, wallets, st, opts):
-    """Quét (last_block+1 .. latest-conf+1) bằng eth_getLogs chunked; halve chunk
-    khi provider chê range (R2); save state sau MỖI chunk ⇒ không hở khúc nào."""
+    """Fetch a bounded block slice; persist cursor and provider range size."""
     latest = block_number(chain)
     end = latest - opts["conf"] + 1
     if end < 0:
-        return
+        return True
     cs = st.setdefault("evm", {}).setdefault(chain, {})
     start = int(cs.get("last_block") or 0) + 1
     if not cs.get("last_block"):
         start = end  # cold start = bắt đầu từ tip, không bò lại lịch sử
     if start > end:
-        return
+        return True
     wl = set(wallets)
-    span = max(1, opts["span"])
+    endpoint = rpc_url(chain)
+    cached_span = cs.get("chunk_span") if cs.get("chunk_rpc") == endpoint else None
+    span = max(1, int(cached_span or opts["span"]))
     print(
         f"# backfill {chain}: block {start}..{end} (latest {latest}, conf {opts['conf']}, chunk {span})",
         flush=True,
     )
     todo, i = cl.chunk_ranges(start, end, span), 0
+    max_chunks = opts.get("max_chunks")
     while i < len(todo):
         a, b = todo[i]
         try:
-            logs = []
-            for topics in cl.sub_topics(wl):
-                logs.extend(get_logs(chain, a, b, topics))
+            logs = _range_logs(chain, a, b, wl)
         except RuntimeError as e:
             msg = str(e).lower()
             if b > a and any(
-                k in msg for k in ("exceed", "range", "limit", "too many", "results")
+                k in msg
+                for k in ("exceed", "range", "limit", "too many", "results", "specify an address")
             ):
                 span = max(1, (b - a + 1) // 2)
+                cs["chunk_rpc"] = endpoint
+                cs["chunk_span"] = span
+                st_mod.save_state(st)
                 todo, i = cl.chunk_ranges(a, end, span), 0  # chia lại phần còn lại
                 print(
                     f"# getLogs {chain} chê range → halve chunk còn {span}: {str(e)[:80]}",
@@ -308,28 +393,42 @@ def backfill(chain, wallets, st, opts):
         st_mod.save_state(st)
         st_mod._beat()
         i += 1
+        if max_chunks and i >= max_chunks and b < end:
+            return False
+    return True
 
 
 # ---------- feeds ----------
 
 
 def run_poll_feed(per, st, opts):
-    """Fallback không-WS / --once: mỗi vòng backfill cả 2 chain, refresh config."""
+    """Poll each chain in bounded chunks; don't let a lagging chain starve others."""
+    poll_opts = {
+        **opts,
+        "max_chunks": opts.get("max_chunks", POLL_MAX_CHUNKS_PER_CHAIN),
+    }
     while True:
         r = opts.get("refresh")
         if r:
             r(per)
+        backlog = False
         for chain, wallets in per.items():
-            if wallets:
-                backfill(chain, wallets, st, opts)
+            if wallets and not backfill(chain, wallets, st, poll_opts):
+                backlog = True
         st_mod.save_state(st)
         if opts.get("once"):
             return
-        time.sleep(opts["sleep"])
+        if not backlog:
+            time.sleep(opts["sleep"])
         st_mod._beat()
 
 
 def run_ws_feed(per, st, opts):
+    for chain, wallets in per.items():
+        if wallets and not wss_url(chain):
+            raise RuntimeError(
+                f"feed=ws requires {chain.upper()}_WSS_URL; use --feed poll otherwise"
+            )
     try:
         import websockets
     except ImportError:

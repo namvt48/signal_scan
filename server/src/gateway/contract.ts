@@ -46,7 +46,7 @@
 // forwarded: nothing downstream needs it, and fewer forwarded fields is less
 // leakage. Any header outside the allowlist is dropped.
 
-import { HttpError, type Priority, type RunOpts } from '../ratelimit/types.js';
+import { HttpError, LimiterUnavailableError, type Priority, type RunOpts } from '../ratelimit/types.js';
 import { limiters } from '../ratelimit/index.js';
 
 /** The credit-attributable callers (single source of truth: `auth.ts`). */
@@ -203,9 +203,19 @@ export function parseGatedUntil(err: unknown): string | null {
   return match === null ? null : match[1];
 }
 
-/** The one header value that arms a gate (`x-ratelimit-reset`, else retry-after). */
+/** Normalize upstream reset values to epoch seconds for `Gate.note`. */
 function armHeaderValue(headers: AllowlistedHeaders): string | null {
-  return headers['x-ratelimit-reset'] ?? headers['retry-after'] ?? null;
+  const reset = headers['x-ratelimit-reset'];
+  if (reset !== undefined) return reset;
+
+  const retryAfter = headers['retry-after'];
+  if (retryAfter === undefined) return null;
+  const deltaSeconds = Number(retryAfter);
+  if (Number.isFinite(deltaSeconds) && deltaSeconds >= 0) {
+    return String(Math.ceil(Date.now() / 1000 + deltaSeconds));
+  }
+  const retryAtMs = Date.parse(retryAfter);
+  return Number.isFinite(retryAtMs) ? String(Math.ceil(retryAtMs / 1000)) : null;
 }
 
 /**
@@ -220,6 +230,12 @@ export function mapLimiterError(err: unknown): DispatchResult {
   }
   if (err instanceof HttpError) {
     return buildEnvelope(err.status, null, {});
+  }
+  if (err instanceof LimiterUnavailableError) {
+    if (err.reason === 'gate' && err.retryAt !== null) {
+      return denial(503, 'gated', { [GATED_HEADER]: new Date(err.retryAt).toISOString() });
+    }
+    return denial(503, 'overloaded');
   }
   const gatedUntil = parseGatedUntil(err);
   if (gatedUntil !== null) {
@@ -243,7 +259,7 @@ export async function proxyRequest(
   deps: ProxyDeps,
 ): Promise<DispatchResult> {
   const run: LimiterRun = deps.runLimiter ?? ((api, opts, fn) => limiters.run(api, opts, fn));
-  const opts: RunOpts = { priority: req.priority ?? 1, path: req.endpoint, ...deps.runOpts };
+  const opts: RunOpts = { priority: req.priority ?? 1, path: req.endpoint, ...deps.runOpts, caller };
   try {
     const envelope = await run(req.provider, opts, async () => {
       const upstream = await deps.fetchUpstream(req, caller);

@@ -111,8 +111,8 @@ export async function nansenSeries(ca: string, chain: Chain, date: SeriesDate, l
  * Fallback: our own hourly snapshots (short history, grows over time).
  */
 /**
- * CACHE-ONLY endpoint: setupSweep là writer duy nhất (một pass 12h paced trên
- * toàn bộ queue) — dashboard click KHÔNG BAO GIỜ sinh request lên Nansen. Cache
+ * CACHE-ONLY endpoint: setupSweep là writer duy nhất (metrics refresh on their
+ * independent freshness intervals) — dashboard click KHÔNG BAO GIỜ sinh request lên Nansen. Cache
  * miss (CA chưa đến lượt sweep) -> phục series snapshot nội bộ tạm thời.
  */
 export async function balanceSeries(

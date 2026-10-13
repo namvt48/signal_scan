@@ -1,8 +1,9 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import type { NansenThresholds, Settings } from '../types';
+import type { NansenThresholds, Settings, TelegramAlertRules } from '../types';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors, setAllFactors as setAllFactorsFlag } from '../services/debugFlags';
 import { Button, Modal, TextField } from './ui';
+import { SHOW_FOMO } from '../config';
 
 type ThresholdKey = keyof NansenThresholds;
 
@@ -95,12 +96,16 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
   const [settings, setSettings] = useState<Settings | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const allFactors = useAllFactors();
-  const [error, setError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [signalError, setSignalError] = useState<string | null>(null);
+  const [signalSaved, setSignalSaved] = useState(false);
+  const [signalSaving, setSignalSaving] = useState(false);
+  const [telegramDraft, setTelegramDraft] = useState<TelegramAlertRules | null>(null);
+  const [telegramError, setTelegramError] = useState<string | null>(null);
+  const [telegramSaved, setTelegramSaved] = useState(false);
+  const [telegramSaving, setTelegramSaving] = useState(false);
 
   const renderField = (spec: FieldSpec) => {
-    /* Grouped fields can't be <input type="number"> — browsers reject "," in it. */
-    const g = spec.grouped === true;
+    const grouped = spec.grouped === true;
     return (
       <div key={spec.key}>
         <label htmlFor={`settings-${spec.key}`} className="block text-xs font-medium text-ink">
@@ -108,14 +113,15 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
         </label>
         <TextField
           id={`settings-${spec.key}`}
-          type={g ? 'text' : 'number'}
-          {...(g
+          type={grouped ? 'text' : 'number'}
+          {...(grouped
             ? ({ inputMode: 'numeric' } as const)
             : ({ min: spec.min ?? 0, max: spec.max, step: spec.step ?? 'any', inputMode: 'decimal' } as const))}
           value={draft?.[spec.key] ?? ''}
           onChange={(e) => {
             const raw = e.target.value;
-            setDraft((prev) => (prev ? { ...prev, [spec.key]: g ? regroup(raw) : raw } : prev));
+            setSignalSaved(false);
+            setDraft((prev) => (prev ? { ...prev, [spec.key]: grouped ? regroup(raw) : raw } : prev));
           }}
           className="mt-1.5"
         />
@@ -123,104 +129,202 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
       </div>
     );
   };
+  const renderTelegramField = (key: keyof TelegramAlertRules, label: string, min = 0, max?: number) => (
+    <div key={key}>
+      <label htmlFor={`telegram-${key}`} className="block text-xs font-medium text-ink">{label}</label>
+      <TextField
+        id={`telegram-${key}`}
+        type="number"
+        min={min}
+        max={max}
+        step="any"
+        value={telegramDraft?.[key] ?? ''}
+        onChange={(e) => {
+          setTelegramSaved(false);
+          setTelegramDraft((prev) => prev ? { ...prev, [key]: Number(e.target.value) } : prev);
+        }}
+        className="mt-1.5"
+      />
+    </div>
+  );
+
 
   useEffect(() => {
     let alive = true;
-    dataStore
-      .getSettings()
-      .then((s) => {
-        if (!alive) return;
-        setSettings(s);
-        setDraft(toDraft(s.values));
-      })
-      .catch((e: unknown) => {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+    dataStore.getSettings().then((next) => {
+      if (!alive) return;
+      setSettings(next);
+      setDraft(toDraft(next.values));
+    }).catch((e: unknown) => {
+      if (alive) setSignalError(e instanceof Error ? e.message : String(e));
+    });
+    if (!SHOW_FOMO) {
+      dataStore.getTelegramAlertRules().then((rules) => {
+        if (alive) setTelegramDraft(rules);
+      }).catch((e: unknown) => {
+        if (alive) setTelegramError(e instanceof Error ? e.message : String(e));
       });
+    }
     return () => {
       alive = false;
     };
   }, []);
 
-  async function submit(e: FormEvent) {
+  async function submitSignal(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!draft) return;
     const parsed = parse(draft);
     if (!parsed.ok) {
-      setError(parsed.error);
+      setSignalError(parsed.error);
+      setSignalSaved(false);
       return;
     }
-    setSaving(true);
-    setError(null);
+    setSignalSaving(true);
+    setSignalError(null);
+    setSignalSaved(false);
     try {
       const next = await dataStore.updateSettings({ ...parsed.values });
+      setSettings(next);
       onSaved?.(next);
-      onClose();
+      setSignalSaved(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setSignalError(err instanceof Error ? err.message : String(err));
     } finally {
-      setSaving(false);
+      setSignalSaving(false);
+    }
+  }
+
+  async function submitTelegramRules(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!telegramDraft) return;
+    const { minMcK, maxMcK, ...otherRules } = telegramDraft;
+    if (Object.values(otherRules).some((value) => !Number.isFinite(value) || value < 0) ||
+        telegramDraft.minFwPct > 100 ||
+        [minMcK, maxMcK].some((value) => !Number.isFinite(value) || (value !== -1 && value < 0)) ||
+        (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK)) {
+      setTelegramError('MC bounds must be -1 or ≥ 0 with Min MC ≤ Max MC; other thresholds must be non-negative and Min FW ≤ 100.');
+      setTelegramSaved(false);
+      return;
+    }
+    setTelegramSaving(true);
+    setTelegramError(null);
+    setTelegramSaved(false);
+    try {
+      const next = await dataStore.updateTelegramAlertRules(telegramDraft);
+      setTelegramDraft(next);
+      setTelegramSaved(true);
+    } catch (err) {
+      setTelegramError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTelegramSaving(false);
     }
   }
 
   return (
-    <Modal title="Signal thresholds" onClose={onClose}>
-      {!draft ? (
-        <p className="text-xs text-muted">{error ?? 'Loading…'}</p>
-      ) : (
-        <form onSubmit={(e) => void submit(e)}>
-          <div className="space-y-4">
-            {FIELDS.map((f) => {
-              /* A band's upper edge is rendered by its lower edge's field, never on its own. */
-              if (BANDS.some((b) => b.hi === f.key)) return null;
-              const band = BANDS.find((b) => b.lo === f.key);
-              if (!band) return renderField(f);
-              return (
-                <div key={band.title} className="rounded-md border border-line p-3">
-                  <span className="block text-xs font-medium text-ink">{band.title}</span>
-                  <div className="mt-2 grid grid-cols-2 gap-3">
-                    {renderField(FIELDS.find((x) => x.key === band.lo)!)}
-                    {renderField(FIELDS.find((x) => x.key === band.hi)!)}
+    <Modal
+      title="Threshold settings"
+      onClose={onClose}
+      wide
+      className="max-h-[calc(100vh-2rem)] overflow-y-auto"
+    >
+      <div className={`grid grid-cols-1 gap-4 ${SHOW_FOMO ? '' : 'lg:grid-cols-2'}`}>
+        <section className="rounded-lg border border-line p-4" aria-labelledby="signal-thresholds-title">
+          <h3 id="signal-thresholds-title" className="text-sm font-semibold text-ink">Signal thresholds</h3>
+          {signalError && <p role="alert" className="mt-2 text-xs text-neg">{signalError}</p>}
+          {signalSaved && <p role="status" className="mt-2 text-xs text-pos">Signal thresholds saved.</p>}
+          {!draft ? (
+            <p className="mt-3 text-xs text-muted">{signalError ?? 'Loading signal thresholds…'}</p>
+          ) : (
+            <form onSubmit={(e) => void submitSignal(e)} className="mt-3">
+              <div className="space-y-4">
+                {FIELDS.map((field) => {
+                  if (BANDS.some((band) => band.hi === field.key)) return null;
+                  const band = BANDS.find((item) => item.lo === field.key);
+                  if (!band) return renderField(field);
+                  return (
+                    <div key={band.title} className="rounded-md border border-line p-3">
+                      <span className="block text-xs font-medium text-ink">{band.title}</span>
+                      <div className="mt-2 grid grid-cols-2 gap-3">
+                        {renderField(FIELDS.find((item) => item.key === band.lo)!)}
+                        {renderField(FIELDS.find((item) => item.key === band.hi)!)}
+                      </div>
+                    </div>
+                  );
+                })}
+                <label htmlFor="settings-all-factors" className="flex items-center gap-2 text-xs font-medium text-ink">
+                  <input
+                    id="settings-all-factors"
+                    type="checkbox"
+                    checked={allFactors}
+                    onChange={(e) => setAllFactorsFlag(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-accent"
+                  />
+                  Show all factors (debug)
+                </label>
+              </div>
+              <div className="mt-4 flex items-center justify-between gap-2">
+                <Button
+                  variant="ghost"
+                  disabled={!settings || signalSaving}
+                  onClick={() => {
+                    if (!settings) return;
+                    setDraft(toDraft(settings.defaults));
+                    setSignalError(null);
+                    setSignalSaved(false);
+                    setAllFactorsFlag(false);
+                  }}
+                >
+                  Reset to defaults
+                </Button>
+                <Button type="submit" disabled={signalSaving}>
+                  {signalSaving ? 'Saving…' : 'Save signal thresholds'}
+                </Button>
+              </div>
+            </form>
+          )}
+        </section>
+
+        {!SHOW_FOMO && (
+          <section className="rounded-lg border border-line p-4" aria-labelledby="telegram-thresholds-title">
+            <h3 id="telegram-thresholds-title" className="text-sm font-semibold text-ink">Telegram alert thresholds</h3>
+            <p className="mt-1 text-xs text-muted">
+              Saved separately from signal thresholds. MC values are in K USD; -1 disables either bound. Tracker Buying is per-wallet BUY amount in USD; 0 disables it.
+            </p>
+            <p className="mt-1 text-xs text-muted">
+              FW alerts require current FW &gt;= Min FW and growth &gt; FW growth; the previous FW baseline may be below Min FW.
+            </p>
+            {telegramError && <p role="alert" className="mt-2 text-xs text-neg">{telegramError}</p>}
+            {telegramSaved && <p role="status" className="mt-2 text-xs text-pos">Telegram alert thresholds saved.</p>}
+            {!telegramDraft ? (
+              <p className="mt-3 text-xs text-muted">{telegramError ?? 'Loading Telegram thresholds…'}</p>
+            ) : (
+              <form onSubmit={(e) => void submitTelegramRules(e)} className="mt-3">
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-xs font-medium text-ink">Market cap filter · K USD</p>
+                    <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
+                    <div className="mt-2 grid grid-cols-2 gap-3">
+                      {renderTelegramField('minMcK', 'Min MC', -1)}
+                      {renderTelegramField('maxMcK', 'Max MC', -1)}
+                    </div>
                   </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    {renderTelegramField('fwGrowthPct', 'FW growth (%)')}
+                    {renderTelegramField('minFwPct', 'Min FW (%)', 0, 100)}
+                  </div>
+                  {renderTelegramField('t100GrowthPct', 'T100 growth (%)')}
+                  {renderTelegramField('trackerBuyingK', 'Tracker Buying > (K USD)')}
                 </div>
-              );
-            })}
-            <div>
-              <label htmlFor="settings-all-factors" className="flex items-center gap-2 text-xs font-medium text-ink">
-                <input
-                  id="settings-all-factors"
-                  type="checkbox"
-                  checked={allFactors}
-                  onChange={(e) => setAllFactorsFlag(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-accent"
-                />
-                Show all factors (debug)
-              </label>
-            </div>
-          </div>
-          {error && <p className="mt-3 text-xs text-neg">{error}</p>}
-          <div className="mt-5 flex items-center justify-between gap-2">
-            <Button
-              variant="ghost"
-              disabled={saving}
-              onClick={() => {
-                if (!settings) return;
-                setDraft(toDraft(settings.defaults));
-                setAllFactorsFlag(false);
-              }}
-            >
-              Reset to defaults
-            </Button>
-            <div className="flex gap-2">
-              <Button variant="ghost" disabled={saving} onClick={onClose}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={saving}>
-                {saving ? 'Saving…' : 'Save'}
-              </Button>
-            </div>
-          </div>
-        </form>
-      )}
+                <div className="mt-4 flex justify-end">
+                  <Button type="submit" disabled={telegramSaving}>
+                    {telegramSaving ? 'Saving…' : 'Save Telegram thresholds'}
+                  </Button>
+                </div>
+              </form>
+            )}
+          </section>
+        )}
+      </div>
     </Modal>
   );
 }

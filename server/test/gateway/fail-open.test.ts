@@ -54,6 +54,7 @@ test('todo15: a fetch rejection is typed GatewayTransportError (the fail-open in
 });
 
 test('todo15: gateway UNREACHABLE → the sweep completes without throwing and warns', async () => {
+  open(':memory:');
   const provider = gmgnVia((async () => {
     throw new TypeError('fetch failed');
   }) as unknown as typeof fetch);

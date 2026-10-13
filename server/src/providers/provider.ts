@@ -1,6 +1,5 @@
 // MarketDataProvider — the extension seam. Poller + API only know this
-// interface; live data comes from Nansen since 2026-09-09 (mock stays for
-// MOCK mode).
+// interface; live metrics are routed by the active provider/composite field ownership.
 
 import type { Chain } from '../shared/chain.js';
 import type { AssetInfo } from './solana.js';
@@ -8,7 +7,8 @@ import type { AssetInfo } from './solana.js';
 export interface TokenInfo {
   ca: string;
   chain: Chain;
-  price: number;
+  /** Current USD quote; absent if the active provider has no fresh trusted price. */
+  price?: number;
   holders: number;
   /** DEX 24h volume, USD (buy+sell). */
   volume24h: number;
@@ -16,7 +16,8 @@ export interface TokenInfo {
   sellVol24h: number;
   /** DEX trailing-1h volume, USD. Absent when the 1h door failed for this CA. */
   volume1h?: number;
-  marketCap: number;
+  /** Current USD market cap; absent when there is no fresh trusted quote. */
+  marketCap?: number;
   liquidity: number;
   supply: number;
   /** Token deploy time, epoch ms (Nansen essential-data.deployedTimestamp) — persisted write-once. */

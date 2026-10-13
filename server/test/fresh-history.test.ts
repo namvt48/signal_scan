@@ -1,7 +1,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { findTrackedCa, getTokenState, insertTrackedCa, open, setTrackedCaNote } from '../src/db.js';
-import { updateTokenMetrics } from '../src/ingest.js';
+import { updateTokenAnalytics, updateTokenMetrics } from '../src/ingest.js';
 import { assembleSignals } from '../src/signals.js';
 
 const CA = 'fresh-history-regression-ca';
@@ -24,6 +24,31 @@ test('Fresh snapshots include unchanged successful readings and appear in signal
   updateTokenMetrics(CA, 'sol', { nansenFreshPct: 15 });
   const changed = JSON.parse(getTokenState(CA, 'sol')?.fresh_history_json ?? '[]') as { t: number; value: number }[];
   assert.deepEqual(changed.map((p) => p.value), [12, 12, 15]);
+});
+
+test('T100 analytics history carries peak/trough balances into signals', () => {
+  const ca = `${CA}-t100`;
+  insertTrackedCa({ address: ca, chain: 'sol', note: '' });
+  updateTokenMetrics(ca, 'sol', { supply: 1_000, price: 1, symbol: 'T100' });
+  updateTokenAnalytics(ca, 'sol', { t100Pct: 40, t100Multiple: 1.67, t100BalanceDrawdown: { peak: 167, trough: 100 } }, 1_000);
+  updateTokenAnalytics(ca, 'sol', { t100Pct: 25, t100Multiple: 1.33, t100BalanceDrawdown: { peak: 133, trough: 100 } }, 2_000);
+
+  const state = getTokenState(ca, 'sol');
+  const history = JSON.parse(state?.t100_history_json ?? '[]') as { t: number; value: number; peakBalance?: number; troughBalance?: number }[];
+  assert.deepEqual(history, [
+    { t: 1_000, value: 1.67, peakBalance: 167, troughBalance: 100 },
+    { t: 2_000, value: 1.33, peakBalance: 133, troughBalance: 100 },
+  ]);
+  const signal = assembleSignals(Date.now(), true).find((row) => row.ca === ca && row.chain === 'sol');
+  assert.deepEqual(signal?.nansen.t100History, history);
+  assert.equal(signal?.nansen.t100?.multiple, 1.33);
+});
+
+test('T100 history stays empty without a successful series timestamp', () => {
+  const ca = `${CA}-t100-no-sample`;
+  updateTokenMetrics(ca, 'sol', { supply: 1_000, price: 1, symbol: 'EMPTY' });
+  updateTokenAnalytics(ca, 'sol', { t100Pct: 40, t100Multiple: 1.67 });
+  assert.equal(getTokenState(ca, 'sol')?.t100_history_json, null);
 });
 
 test('metric patches without Fresh never fabricate Fresh history', () => {

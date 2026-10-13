@@ -23,6 +23,7 @@ import { readFileSync } from 'node:fs';
 import puppeteer, { type Page } from 'puppeteer-core';
 import { config } from '../config.js';
 import { log, timed } from '../log.js';
+import type { Priority } from '../ratelimit/types.js';
 
 // ---------------------------------------------------------------------------
 // Frozen contract (decisions.md "T2/T3 FROZEN INTERFACE CONTRACT") — shapes
@@ -220,10 +221,29 @@ interface Door {
 }
 
 type DoorConnWithEgress = DoorConn & { egressIp?: string | null };
+interface PendingDoorAcquire {
+  path: string;
+  caller: string;
+  priority: Priority;
+  enqueuedAt: number;
+  resolve: (door: Door | null) => void;
+}
+
+export interface DoorRequestOptions {
+  /** Authenticated gateway caller; absent for internal browser-door use. */
+  caller?: string;
+  priority?: Priority;
+}
+
+const DOOR_QUEUE_MAX = 256;
+const DOOR_PRIORITY_AGING_MS = 30_000;
 
 export class DoorPool {
   private readonly deps: DoorPoolDeps;
   private readonly doors: Door[];
+  private readonly pendingAcquires: PendingDoorAcquire[] = [];
+  private readonly lastCaller = new Map<Priority, string>();
+  private drainingAcquires = false;
   private seq = 0;
   /** One-shot per blackout so an exhausted pool is loud once, not once per request. */
   private exhaustedLogged = false;
@@ -272,9 +292,10 @@ export class DoorPool {
    * Route + fetch + classify + react (D5/D7). Never throws: no live door or
    * router wait-cap → {status:503,json:null}; requery fail → {status:<original|502>,json:null}.
    */
-  async postJson(url: string, body: unknown): Promise<{ status: number; json: unknown | null }> {
+  async postJson(url: string, body: unknown, options: DoorRequestOptions = {}): Promise<{ status: number; json: unknown | null }> {
     const path = pathKey(url);
-    const door = await this.acquire(path);
+    const priority = options.priority ?? (path === 'tgm-essential-data' ? 0 : path === 'tgm-volume-details' ? 2 : 1);
+    const door = await this.acquire(path, options.caller ?? 'internal', priority);
     if (!door) return { status: 503, json: null };
     let res = await this.dispatch(door, url, body, path);
     let cls = classify(res);
@@ -327,40 +348,124 @@ export class DoorPool {
 
   // -- routing (D7) ----------------------------------------------------------
 
-  /** Wait-loop: eligible door now, else poll 250ms while doors are alive, cap 65s. */
-  private async acquire(path: string): Promise<Door | null> {
-    const t0 = this.deps.now();
-    for (;;) {
-      this.tick();
-      const d = this.pick(path, -1);
-      if (d) {
-        this.exhaustedLogged = false;
-        return d;
-      }
-      // Every door retired: revive the broken-proxy ones whose cooldown elapsed, then
-      // poll. Without this, one bad minute on the chrome side = permanent blackout.
-      if (!this.doors.some((x) => x.state !== 'retired')) {
-        if (this.rearmRetired(this.deps.now())) {
-          await this.deps.sleep(ROUTER_POLL_MS);
-          continue;
-        }
-        if (!this.exhaustedLogged) {
-          this.exhaustedLogged = true;
-          this.deps.log('[pool] ALL DOORS RETIRED — pool exhausted, serving 503 until re-arm');
+  /** Admit queued work by urgency and caller round-robin when a budget slot opens. */
+  private acquire(path: string, caller: string, priority: Priority): Promise<Door | null> {
+    if (this.pendingAcquires.length >= DOOR_QUEUE_MAX) {
+      const now = this.deps.now();
+      let victimIndex = -1;
+      let victimPriority = priority;
+      for (let i = 0; i < this.pendingAcquires.length; i += 1) {
+        const job = this.pendingAcquires[i];
+        if (job === undefined) continue;
+        const effective = this.effectivePriority(job, now);
+        if (effective <= priority) continue;
+        if (
+          victimIndex === -1 ||
+          effective > victimPriority ||
+          (effective === victimPriority && job.enqueuedAt < this.pendingAcquires[victimIndex]!.enqueuedAt)
+        ) {
+          victimIndex = i;
+          victimPriority = effective;
         }
       }
-      // Throttled/penalized/warming doors are ALIVE — wait for their slot, not 503.
-      const alive = this.doors.some((x) => x.state !== 'retired');
-      // R2: measured retry-after (37-47min) >> cap — if the earliest alive-door
-      // slot is already beyond the cap, 503 NOW instead of blind-polling the
-      // full 65s per request (D7: wait for the earliest slot, not a wall).
-      // earliest===0 (unknown/warming) keeps the old poll → never a false 503.
-      const earliest = this.earliestSlot();
-      if (!alive || earliest - t0 >= ROUTER_WAIT_CAP_MS || this.deps.now() - t0 >= ROUTER_WAIT_CAP_MS) {
-        this.deps.log(`[pool] no door budget for ${path} — skip`);
-        return null;
+      if (victimIndex === -1) {
+        this.deps.log(`[pool] admission queue full path=${path} — skip`);
+        return Promise.resolve(null);
       }
-      await this.deps.sleep(ROUTER_POLL_MS);
+      const [victim] = this.pendingAcquires.splice(victimIndex, 1);
+      victim?.resolve(null);
+      this.deps.log(`[pool] admission queue displaced background path=${victim?.path ?? '-'}`);
+    }
+    return new Promise((resolve) => {
+      this.pendingAcquires.push({ path, caller, priority, enqueuedAt: this.deps.now(), resolve });
+      queueMicrotask(() => { void this.drainAcquireQueue(); });
+    });
+  }
+
+  private effectivePriority(job: PendingDoorAcquire, now: number): Priority {
+    return (
+      job.priority === 0
+        ? 0
+        : Math.max(1, job.priority - Math.floor((now - job.enqueuedAt) / DOOR_PRIORITY_AGING_MS))
+    ) as Priority;
+  }
+
+  private async drainAcquireQueue(): Promise<void> {
+    if (this.drainingAcquires) return;
+    this.drainingAcquires = true;
+    try {
+      while (this.pendingAcquires.length > 0) {
+        const now = this.deps.now();
+        this.tick();
+        for (let i = this.pendingAcquires.length - 1; i >= 0; i -= 1) {
+          const job = this.pendingAcquires[i];
+          if (job === undefined || now - job.enqueuedAt < ROUTER_WAIT_CAP_MS) continue;
+          this.pendingAcquires.splice(i, 1);
+          this.deps.log(`[pool] no door budget for ${job.path} — skip`);
+          job.resolve(null);
+        }
+        if (this.pendingAcquires.length === 0) break;
+
+        const ordered = this.pendingAcquires
+          .map((job, index) => ({
+            job,
+            index,
+            effective: this.effectivePriority(job, now),
+          }))
+          .sort((a, b) => {
+            if (a.effective !== b.effective) return a.effective - b.effective;
+            const last = this.lastCaller.get(a.effective);
+            const aWasLast = a.job.caller === last;
+            const bWasLast = b.job.caller === last;
+            return Number(aWasLast) - Number(bWasLast) || a.job.enqueuedAt - b.job.enqueuedAt;
+          });
+
+        let admitted = false;
+        for (const candidate of ordered) {
+          const door = this.pick(candidate.job.path, -1);
+          if (door === null) continue;
+          this.pendingAcquires.splice(candidate.index, 1);
+          this.lastCaller.set(candidate.effective, candidate.job.caller);
+          this.exhaustedLogged = false;
+          candidate.job.resolve(door);
+          admitted = true;
+          // Let postJson dispatch and stamp this door before choosing another.
+          await Promise.resolve();
+          break;
+        }
+        if (admitted) continue;
+
+        const alive = this.doors.some((door) => door.state !== 'retired');
+        if (!alive) {
+          if (this.rearmRetired(now)) {
+            await this.deps.sleep(ROUTER_POLL_MS);
+            continue;
+          }
+          if (!this.exhaustedLogged) {
+            this.exhaustedLogged = true;
+            this.deps.log('[pool] ALL DOORS RETIRED — pool exhausted, serving 503 until re-arm');
+          }
+          for (const job of this.pendingAcquires.splice(0)) job.resolve(null);
+          break;
+        }
+
+        const earliest = this.earliestSlot();
+        if (earliest > 0) {
+          for (let i = this.pendingAcquires.length - 1; i >= 0; i -= 1) {
+            const job = this.pendingAcquires[i];
+            if (job === undefined || earliest - job.enqueuedAt < ROUTER_WAIT_CAP_MS) continue;
+            this.pendingAcquires.splice(i, 1);
+            this.deps.log(`[pool] no door budget for ${job.path} — skip`);
+            job.resolve(null);
+          }
+        }
+        if (this.pendingAcquires.length > 0) {
+          const expiryAt = Math.min(...this.pendingAcquires.map((job) => job.enqueuedAt + ROUTER_WAIT_CAP_MS));
+          await this.deps.sleep(Math.max(1, Math.min(ROUTER_POLL_MS, expiryAt - this.deps.now())));
+        }
+      }
+    } finally {
+      this.drainingAcquires = false;
     }
   }
 
@@ -834,16 +939,19 @@ function getPool(): DoorPool {
 }
 
 /**
- * Injection point for NansenMarketProvider (index.ts) and nansenSeries —
- * signature frozen. Delegates to the door pool; NEVER throws: exhausted pool
- * degrades to {status:503,json:null}, failed requery to {status:<original|502>}.
- * Callers already throw on non-200 (nansenSeries / NansenWebCrawler), so the
- * poller logs + moves on — and a 429 can no longer escape as data (the old
- * non-403 passthrough bug at crawl.ts:145 pre-pool).
+ * Injection point for NansenMarketProvider and nansenSeries. Existing two-arg
+ * calls remain compatible; gateway calls may pass caller/priority metadata.
+ * Delegates to DoorPool and NEVER throws: exhausted pool degrades to
+ * {status:503,json:null}; failed requery to {status:<original|502>}. Callers
+ * already throw on non-200, so the poller logs + moves on.
  */
-export async function browserPostJson<T = unknown>(url: string, body: unknown): Promise<{ status: number; json: T | null }> {
+export async function browserPostJson<T = unknown>(
+  url: string,
+  body: unknown,
+  options?: DoorRequestOptions,
+): Promise<{ status: number; json: T | null }> {
   return timed('crawl postJson', { path: pathKey(url) }, async () => {
-    const { status, json } = await getPool().postJson(url, body);
+    const { status, json } = await getPool().postJson(url, body, options);
     return { status, json: json as T | null };
   });
 }

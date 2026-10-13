@@ -10,7 +10,7 @@
 //
 // Run anywhere:  node scripts/probe_nansen_evm.mjs
 // Run on instance B (sidecar exists):
-//   ssh root@194.163.187.250 'cd /root/signal_scan_b && docker compose -p signal_scan_b cp scripts/probe_nansen_evm.mjs api:/app/probe_nansen_evm.mjs && docker compose -p signal_scan_b exec api node /app/probe_nansen_evm.mjs'
+//   ssh root@167.86.101.228 'cd /root/signal_scan_b && docker compose -p signal_scan_b cp scripts/probe_nansen_evm.mjs api:/app/probe_nansen_evm.mjs && docker compose -p signal_scan_b exec api node /app/probe_nansen_evm.mjs'
 // (inside the api container puppeteer-core resolves from /app/node_modules)
 //
 // Writes evidence/T2-nansen-evm-probe.json. NEVER prints keys/cookies/proxy creds.

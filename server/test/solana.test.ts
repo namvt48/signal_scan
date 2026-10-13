@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   isCreditExhausted,
@@ -11,6 +11,10 @@ import {
   TOKEN_2022_PROGRAM_ID,
 } from '../src/providers/solana.js';
 import { config } from '../src/config.js';
+import { providerRequestCache } from '../src/providers/request-cache.js';
+import { clearRpcUsage, snapshotRpcUsage } from '../src/providers/rpc-usage.js';
+
+beforeEach(() => providerRequestCache.clear());
 
 function account(mint: string, tokenAmount: Record<string, unknown>): unknown {
   return { account: { data: { parsed: { info: { mint, tokenAmount } } } } };
@@ -68,6 +72,34 @@ test('parseTokenAccounts: an empty value array is a legitimate empty result (no 
   const m = parseTokenAccounts({ jsonrpc: '2.0', id: 1, result: { value: [] } });
   assert.equal(m.size, 0);
 });
+test('SolanaRpcClient registers idle endpoint identities without exposing URLs', () => {
+  clearRpcUsage();
+  try {
+    const endpoints = [
+      'https://rpc-a.example/?api-key=SECRET_A',
+      'https://rpc-b.example/?api-key=SECRET_B',
+    ];
+    new SolanaRpcClient(endpoints, 30_000, 'application');
+    new SolanaRpcClient(endpoints, 30_000, 'fomo');
+    const usage = snapshotRpcUsage();
+    assert.equal(usage.length, 4);
+    assert.deepEqual(
+      usage.map((item) => [item.source, item.endpointIndex, item.requests]),
+      [
+        ['application', 0, 0],
+        ['application', 1, 0],
+        ['fomo', 0, 0],
+        ['fomo', 1, 0],
+      ],
+    );
+    assert.ok(usage.every((item) => /^[a-f0-9]{64}$/.test(item.endpointId ?? '')));
+    assert.equal(JSON.stringify(usage).includes('SECRET_'), false);
+    assert.equal(JSON.stringify(usage).includes('rpc-a.example'), false);
+  } finally {
+    clearRpcUsage();
+  }
+});
+
 
 test('SolanaRpcClient: sends both programIds, falls back to the next endpoint, counts one request per call', async () => {
   const origFetch = globalThis.fetch;
@@ -357,7 +389,7 @@ test('SolanaRpcClient: credit-exhaustion delivered as HTTP 200 also retires the 
     const m = await client.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID);
     assert.equal(m.get('mintA'), 5);
     hits.length = 0;
-    await client.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID);
+    await client.getTokenAccountsByOwner('WALLET-SECOND', SPL_TOKEN_PROGRAM_ID);
     assert.deepEqual(hits, ['https://e2.example']);
   } finally {
     globalThis.fetch = origFetch;
@@ -388,7 +420,7 @@ test('SolanaRpcClient: an ordinary 429 (-32005 / plain text) still retries the S
 
     // NOT retired: the next call still starts on endpoint #1.
     hits.length = 0;
-    await client.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID);
+    await client.getTokenAccountsByOwner('WALLET-SECOND', SPL_TOKEN_PROGRAM_ID);
     assert.equal(hits[0], 'https://e1.example');
   } finally {
     globalThis.fetch = origFetch;
@@ -419,5 +451,64 @@ test('SolanaRpcClient: with EVERY endpoint retired the request still goes out (f
     assert.ok(hits.length >= 1, `expected the fallback to attempt a request, got ${String(hits.length)} hits`);
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('SolanaRpcClient caches identical public reads and returns caller-owned Maps', async () => {
+  const origFetch = globalThis.fetch;
+  const hits: string[] = [];
+  try {
+    globalThis.fetch = (async (url: unknown) => {
+      hits.push(String(url));
+      return new Response(JSON.stringify(value([
+        account('mintA', { uiAmountString: '5', amount: '5', decimals: 0 }),
+      ])), { status: 200 });
+    }) as typeof fetch;
+    const client = new SolanaRpcClient(['https://solana-cache.test']);
+    const sibling = new SolanaRpcClient(['https://solana-cache.test']);
+    const [first, joined] = await Promise.all([
+      client.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID),
+      sibling.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID),
+    ]);
+    assert.equal(hits.length, 1, 'concurrent equivalent RPC reads use one admitted upstream call');
+    first.set('caller-mutation', 9);
+    assert.equal(joined.has('caller-mutation'), false);
+    const cached = await client.getTokenAccountsByOwner('WALLET', SPL_TOKEN_PROGRAM_ID);
+    assert.deepEqual([...cached], [['mintA', 5]]);
+    assert.equal(hits.length, 1, 'the short public-data TTL avoids a repeated request');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('SolanaRpcClient records source-tagged usage for each attempted endpoint', async () => {
+  const originalFetch = globalThis.fetch;
+  clearRpcUsage();
+  try {
+    globalThis.fetch = async (input) => {
+      if (String(input).includes('telemetry-dead')) return new Response('unavailable', { status: 503 });
+      return new Response(JSON.stringify(value([
+        account('mintA', { uiAmountString: '5', amount: '5', decimals: 0 }),
+      ])), { status: 200 });
+    };
+    const client = new SolanaRpcClient(
+      ['https://solana-telemetry-dead', 'https://solana-telemetry-live'],
+      30_000,
+      'fomo',
+    );
+    const holdings = await client.getTokenAccountsByOwner('TELEMETRY_WALLET', { mint: 'TELEMETRY_MINT' });
+    assert.equal(holdings.get('mintA'), 5);
+    assert.deepEqual(
+      snapshotRpcUsage().map(({ provider, source, chain, endpointIndex, requests, successes, failures, creditExhausted }) => ({
+        provider, source, chain, endpointIndex, requests, successes, failures, creditExhausted,
+      })),
+      [
+        { provider: 'solana', source: 'fomo', chain: 'solana', endpointIndex: 0, requests: 1, successes: 0, failures: 1, creditExhausted: 0 },
+        { provider: 'solana', source: 'fomo', chain: 'solana', endpointIndex: 1, requests: 1, successes: 1, failures: 0, creditExhausted: 0 },
+      ],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    clearRpcUsage();
   }
 });

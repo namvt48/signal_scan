@@ -1,7 +1,7 @@
 // Fix D regression (2026-09-29): per-field crawl TTL. The marker means "we actually
 // OBTAINED this field's data at T", not "we made a call at T" — empty data must not
-// stamp. gini/fresh% keeps the 6h clock (POLL_SETUP_MS); the T100 series gets its own
-// 12h clock (POLL_FLOWS_MS). Absence at runtime ⇒ never obtained ⇒ stale; legacy
+// stamp. gini/fresh% keeps the 6h clock (POLL_SETUP_MS); the T100 series now uses a
+// 3h clock (POLL_FLOWS_MS). Absence at runtime ⇒ never obtained ⇒ stale; legacy
 // entries (no marker) are backfilled from taken_at ONCE at load, not at read time.
 // Env BEFORE the src imports (node:test = one process per file): the crawl gate is
 // forced, the retry ladder is flattened to its 60s floor so a clock-advanced pass can
@@ -159,7 +159,8 @@ function tempCache(): string {
 test('isInfoFresh / isSeriesFresh: TTL boundaries — no marker means never obtained', () => {
   const now = Date.now();
   const INFO = config.pollSetupMs; // 6h
-  const SERIES = config.pollFlowsMs; // 12h
+  const SERIES = config.pollFlowsMs; // 3h
+  assert.equal(SERIES, 3 * HOUR, 'Top100 flow series defaults to a 3h refresh/cache TTL');
 
   assert.equal(isInfoFresh(entryFor('a', { info_at: now - (INFO - 1) }), now), true);
   assert.equal(isInfoFresh(entryFor('b', { info_at: now - INFO }), now), false);
@@ -283,7 +284,7 @@ test('needsSetup: info_at 7h old re-asks gini even though series_at is fresh', a
   await setupSweep(provider);
 
   assert.equal(metricCalls.get(ca), 1, 'gini 7h old (> 6h TTL) must be re-asked');
-  assert.equal(seriesCalls, 0, 'series 1h old (< 12h TTL) applies from cache — no flows fetch');
+  assert.equal(seriesCalls, 0, 'series 1h old (< 3h TTL) applies from cache — no flows fetch');
 });
 
 test('refreshSeries: stale series_at fetches; inside the TTL it applies from cache', async () => {
@@ -297,12 +298,12 @@ test('refreshSeries: stale series_at fetches; inside the TTL it applies from cac
   upsertTokenInfo(info(ca, now));
   updateTokenAnalytics(ca, CHAIN, { genesisBal: 120 }); // known LF → the exchange call is skipped
 
-  const young = config.pollFlowsMs - HOUR; // just inside the 12h TTL
+  const young = config.pollFlowsMs - HOUR; // just inside the 3h TTL
   putSetupCacheEntry(entryFor(ca, { taken_at: now - young, series_at: now - young }));
   await refreshSeries(ca, CHAIN);
   assert.equal(seriesCalls, 0, 'series_at inside the TTL is applied from cache, never fetched');
 
-  const old = config.pollFlowsMs + HOUR; // just past the 12h TTL
+  const old = config.pollFlowsMs + HOUR; // just past the 3h TTL
   putSetupCacheEntry(entryFor(ca, { taken_at: now - old, series_at: now - old }));
   await refreshSeries(ca, CHAIN);
   assert.equal(seriesCalls, 1, 'series_at past the TTL must trigger one T100 fetch');

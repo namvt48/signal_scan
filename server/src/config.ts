@@ -105,11 +105,11 @@ export const config = {
   /** Wallet HOLDINGS sweep — credit-free on EVERY chain since T5: sol via Solana
    * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
-  /** Official T100-series refresh interval and cache TTL (12h).
+  /** Official T100-series refresh interval and cache TTL (3h).
    * LF is write-once; missing LF retries independently without re-buying T100.
    * Gateway limits pace the queue independently of this interval.
    * Fresh% uses pollSetupMs (6h, browser door — 0 Nansen credits). */
-  pollFlowsMs: posNum('POLL_FLOWS_MS', 43_200_000),
+  pollFlowsMs: posNum('POLL_FLOWS_MS', 10_800_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */
   nansenRetries: num('NANSEN_RETRIES', 6),
@@ -197,6 +197,11 @@ export const config = {
   /** Static Bearer token for the wallet_watch daemon (role 'service'). A long
    * random secret; compared in constant time (auth.ts matchServiceToken). */
   serviceToken: str('SERVICE_TOKEN', ''),
+  /** Helius usage project IDs aligned by index with SOLANA_RPC_URL endpoints. */
+  heliusProjectIds: str('HELIUS_PROJECT_IDS', '').split(',').map((id) => id.trim()).filter(Boolean),
+  showFomo: str('SHOW_FOMO', '') === 'on',
+  /** Dedicated Bearer secret for the central Monitor service; empty disables it. */
+  monitorApiToken: str('MONITOR_API_TOKEN', ''),
   /** DEV ONLY (temporary): `AUTH_DISABLED=1` short-circuits the auth middleware
    * and grants every request the admin principal — no Bearer token needed. Set
    * it inline at process start; NEVER in a deployed env. Default '' = off. */

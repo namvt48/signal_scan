@@ -26,7 +26,10 @@ let defaultDeps: FomoRpcDeps | null = null;
 
 /** Lazily-built shared clients. Tests pass their own deps; production uses these. */
 export function fomoRpcDeps(): FomoRpcDeps {
-  return (defaultDeps ??= { evm: new EvmRpcClient(evmRpcEndpoints), sol: new SolanaRpcClient(solanaRpcEndpoints()) });
+  return (defaultDeps ??= {
+    evm: new EvmRpcClient(evmRpcEndpoints, 30_000, undefined, 'fomo'),
+    sol: new SolanaRpcClient(solanaRpcEndpoints(), 30_000, 'fomo'),
+  });
 }
 
 /** EVM ⟺ this chain has an EVM chainId (the ONE chain map — no hardcoded list). */
@@ -57,9 +60,9 @@ async function tokenSupply(deps: FomoRpcDeps, chain: Chain, ca: string): Promise
   return isEvmChain(chain) ? deps.evm.tokenSupply(ca, chain) : deps.sol.getTokenSupply(ca);
 }
 
-/** Re-measure one (user, ca, chain): Σ the user's wallets on that chain, then
- *  upsert ONE fomo_holdings row. `supplyCache` (keyed chain:ca) is the sweep's
- *  per-pass memo. No wallet, or no successful wallet read → nothing written. */
+/** Re-measure one (user, ca, chain): Σ all the user's wallets on that chain,
+ *  then upsert ONE fomo_holdings row. Any failed wallet read leaves the last
+ *  complete aggregate untouched. */
 export async function refreshFomoHolding(
   fomoUserId: string,
   chain: Chain,
@@ -76,15 +79,11 @@ export async function refreshFomoHolding(
     supplyCache?.set(supplyKey, supply);
   }
   let total = 0;
-  let measured = false;
   for (const w of wallets) {
     const amount = await walletAmount(deps, w.address, chain, ca);
-    if (amount !== null) {
-      total += amount;
-      measured = true;
-    }
+    if (amount === null) return;
+    total += amount;
   }
-  if (!measured) return;
   const pct = supply !== null && supply > 0 ? (total / supply) * 100 : null;
   upsertFomoHolding({
     fomo_user_id: fomoUserId,

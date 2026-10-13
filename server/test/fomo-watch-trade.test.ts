@@ -184,6 +184,14 @@ test('POST /api/fomo-watch/trades: tradeUsd is optional → NULL, and a non-numb
   assert.equal(rowOf('evt-fomo-tradeusd-bad'), undefined);
 });
 
+test('POST /api/fomo-watch/trades: non-positive BUY tradeUsd stays unresolved for swap enrichment', async () => {
+  for (const [eventId, tradeUsd] of [['evt-zero-buy-tradeusd', 0], ['evt-negative-buy-tradeusd', -1]] as const) {
+    const res = await post(trade({ eventId, tradeUsd }));
+    assert.equal(res.status, 200);
+    assert.equal(rowOf(eventId)?.trade_usd, null);
+  }
+});
+
 test('POST /api/fomo-watch/trades: ca is canonicalized (EVM folded, sol verbatim)', async () => {
   const res = await post(
     trade({ eventId: 'evt-fomo-evm', chain: 'base', tokenAddress: '0xABCdef1234567890AbCdEf1234567890ABCdEF12' }),

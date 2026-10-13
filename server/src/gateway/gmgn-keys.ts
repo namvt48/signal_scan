@@ -30,13 +30,15 @@ export interface GmgnKeyPick {
 }
 
 export interface GmgnKeyStat {
+  index: number;
   limiterKey: string;
   weight: number;
   served: number;
+  attempts: number;
+  failures: number;
   authFails: number;
   downUntil: number;
 }
-
 export class GmgnKeyPool {
   private readonly keys: readonly GmgnKey[];
   private readonly upstreams: readonly UpstreamFetch[];
@@ -46,7 +48,9 @@ export class GmgnKeyPool {
   private readonly cooldownMs: number;
   private readonly logFn: (line: string) => void;
   private readonly served: number[];
+  private readonly attempts: number[];
   private readonly authFails: number[];
+  private readonly failures: number[];
   private readonly downUntil: number[];
   private cursor = 0;
 
@@ -59,7 +63,9 @@ export class GmgnKeyPool {
     this.cooldownMs = deps.downCooldownMs ?? 600_000;
     this.logFn = deps.log ?? (() => {});
     this.served = deps.keys.map(() => 0);
+    this.attempts = deps.keys.map(() => 0);
     this.authFails = deps.keys.map(() => 0);
+    this.failures = deps.keys.map(() => 0);
     this.downUntil = deps.keys.map(() => 0);
   }
 
@@ -96,11 +102,12 @@ export class GmgnKeyPool {
     return Number.isFinite(earliest) ? Math.max(earliest, now) : now;
   }
 
-  /**
-   * Feed one upstream outcome back. 2xx clears the 401 streak; a 401 advances it and
-   * parks the key `down` once the threshold is reached. 429/403 are the limiter's own
-   * gate to arm (per key), so nothing is tracked here for them.
-   */
+  /** Count a selected-key upstream invocation; rate-limiter retries call this again. */
+  recordAttempt(index: number): void {
+    this.attempts[index] += 1;
+  }
+
+  /** Feed one HTTP outcome back. 2xx clears the 401 streak; a 401 advances it. */
   record(index: number, status: number): void {
     if (status >= 200 && status < 300) {
       this.served[index] += 1;
@@ -108,6 +115,7 @@ export class GmgnKeyPool {
       this.downUntil[index] = 0;
       return;
     }
+    this.failures[index] += 1;
     if (status !== 401) return;
     this.authFails[index] += 1;
     if (this.authFails[index] < this.threshold) return;
@@ -117,11 +125,19 @@ export class GmgnKeyPool {
     );
   }
 
+  /** Count transport failures where no upstream HTTP status was received. */
+  recordFailure(index: number): void {
+    this.failures[index] += 1;
+  }
+
   stats(): GmgnKeyStat[] {
     return this.keys.map((k, i) => ({
+      index: i,
       limiterKey: k.limiterKey,
       weight: k.weight,
       served: this.served[i],
+      attempts: this.attempts[i],
+      failures: this.failures[i],
       authFails: this.authFails[i],
       downUntil: this.downUntil[i],
     }));

@@ -34,6 +34,14 @@ Do not read the `FOMO by` counts as platform-wide activity, and do not sum them 
 market share or a volume figure. The column answers one narrow question: "did a trader
 on our watch list take a large position in this coin recently, and how big was it".
 
+The dashboard's aggregate `Tracked Holding` is unknown (`—`) until at least one
+FOMO user's holding percentage has been measured. Missing measurements are not
+treated as zero; a measured zero remains `0%`. On instance B, holdings come from
+fresh balance/position snapshots or wallet-based measurements, not from alert fields.
+If a balance snapshot has an amount but no percentage, the backend derives the share
+only when a positive token supply is known; otherwise it remains unknown.
+
+
 ---
 
 ## 1. Putting traders on the watch list
@@ -273,8 +281,13 @@ python3 -m watchers.fomo --once --api-url http://127.0.0.1:8125
 The daemon opens exactly **one** socket to `wss://api.fomoapi.io/ws/alerts`, matches
 alerts locally against the watch list (refreshed from `GET /api/fomo-users` about every
 300 seconds), dedupes by `eventId`, and POSTs each survivor individually to
-`/api/fomo-watch/trades`. On a 404 from the ingest it treats the watch list as stale and
-refreshes it once.
+`/api/fomo-watch/trades`. GET and POST retry transient network errors and HTTP 429/500/502/503/504
+up to three attempts total, with bounded exponential backoff (0.5s, 1s; numeric
+`Retry-After` is capped at 2s). Other HTTP errors are not retried. A failed POST is not marked
+deduped or persisted, so a replayed alert can be tried again; a successful POST is acknowledged
+only after its response, and repeated attempts reuse `eventId` for server-side idempotency.
+On a 404 from the ingest it treats the watch list as stale and refreshes it once without retrying
+the stale POST.
 
 ---
 
@@ -357,11 +370,54 @@ nothing. There is no entry-size gate (per the user's request).
 two are never combined. Rendered signed (`text-pos`/`text-neg`) inside the nested
 `FomoTable`, between `Buy $` and `Age`.
 
-**Out of scope (explicitly dropped by the user).** Tracking a FOMO user's **% holding**
-is impossible from this feed: a FOMO alert carries no wallet address, no token amount,
-and no price, so neither holdings nor supply can be derived. `trackedHolding` in the
-dashboard belongs to tracked **wallets** (nansen holdings + gmgn supply), a different
-data source.
+**Amendment 2026-10-08 - derive FOMO holding percentage from balance snapshots.**
+The alert feed itself still has no wallet address or token amount, so it cannot
+provide a holding. Instance B's `Tracked Holding` comes from separate fresh balance,
+position, or wallet measurements. When a fresh API balance supplies an amount but
+omits its percentage, the backend computes `amount / supply × 100` only for a known,
+positive supply. Missing measurements remain unknown; a measured zero remains zero.
+
+## 12. Timestamped WebSocket diagnostics
+
+The FOMO watcher writes a private, rotating JSONL trace to
+`/opt/fomo-watch/logs/fomo-ws.jsonl`. It records each application frame returned by
+`ws.recv()` before parsing, including control payloads and frames later ignored, then
+records the processing decision and each ingest HTTP attempt. WebSocket protocol-level
+ping/pong frames are handled internally by the library and are not returned by `recv()`.
+`frame_id` joins `frame_received`, `frame_decision`, `frame_state`, `ingest_attempt`,
+and `ingest_failure` rows. Timestamps are ISO-8601 UTC with millisecond precision.
+Text frames are retained as text; binary frames are losslessly base64-encoded.
+
+Credential-like fields, configured service/API credentials, and credential query
+parameters are redacted. The directory is mode `0700`; log files are mode `0600`.
+The handler rolls over at 16 MiB per file and retains ten backups (about 176 MiB total
+for normal-sized frames); one unusually large frame can exceed the rollover threshold.
+Older rows are removed as backups rotate. The trace starts only after deployment and
+does not recover earlier frames or trigger historical API queries.
+
+If directory setup, write, rotation, or shutdown I/O fails, the watcher emits one
+bounded stderr warning, disables the JSONL sink for the current process, and continues
+processing alerts. Diagnostics resume after the next service restart.
+
+Deploy only the watcher with `make fomo-watch-deploy`. The target checks instance B's
+health, installs the private log directory, compiles the watcher remotely, and restarts
+`fomo-watch.service`; it does not rebuild or restart either dashboard.
+
+## 13. Market-cap history chart and dashboard timezone
+
+The MC cell opens the same interactive history-chart treatment used by Fresh Wallet
+on both instance builds. It records at most 96 samples per CA from existing market
+data writes; opening the chart makes no upstream request. No pre-deploy market-cap
+history was stored, so the curve accumulates from the first new metric update.
+
+The chart shows at most 32 points. Denser histories are averaged into time buckets;
+the tooltip and point list show how many source samples each average represents.
+Stored history remains unaggregated.
+
+Absolute timestamps shown in the dashboards use `Asia/Ho_Chi_Minh` (UTC+7), including
+chart axes and tooltips. API/storage timestamps remain epoch milliseconds or UTC
+machine timestamps; relative ages and time-window filters remain durations/epoch-based.
+
 
 ## Source index
 

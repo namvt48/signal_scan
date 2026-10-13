@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { BalanceChart, TokenDetail } from '../types';
 import { getBalanceChart, getTokenDetail } from '../services/tokenDetail';
-import { compact, pct, usd } from '../lib/format';
+import { compact, formatTime, pct, usd } from '../lib/format';
 import { CopyButton, ErrorState, SkeletonRows, TableShell, Td, Th } from './ui';
 
 // Balance chart 24h — the green Nansen "Balance" series (top-100 total, tokens).
@@ -141,7 +141,7 @@ export default function TokenDetailPage({ chain, ca, onBack }: { chain: string; 
           <p className="text-xs text-muted">Balance (Top 100, 24h)</p>
           {chart && chart.points.length > 1 && (
             <p className="font-mono text-[11px] text-muted">
-              data to {new Date(String(chart.points[chart.points.length - 1]!.t)).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
+              data to {formatTime(String(chart.points[chart.points.length - 1]!.t))}
               {chart.cachedAt ? ` · crawled ${Math.max(0, Math.round((Date.now() - chart.cachedAt) / 60_000))}m ago` : ' · own snapshots'}
             </p>
           )}

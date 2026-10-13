@@ -269,7 +269,7 @@ test('chart replay uses series freshness and timestamp, not a later Fresh% stamp
   open(':memory:');
   loadSetupCache(tempCacheFile());
   const now = Date.now();
-  const seriesAt = now - (config.pollSetupMs + config.pollFlowsMs) / 2;
+  const seriesAt = now - config.pollFlowsMs / 2;
   const deployedAt = seriesAt - 2 * DAY;
   seedTokenRow(deployedAt);
   putSetupCacheEntry({

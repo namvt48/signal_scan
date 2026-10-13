@@ -21,7 +21,7 @@ import { EvmRpcClient } from './evm.js';
 import { solanaRpcEndpoints, SolanaRpcClient, type AssetInfo } from './solana.js';
 import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo, WalletActivity, WalletTokenHolding } from './provider.js';
 import { log, timed } from '../log.js';
-import { HttpError } from '../ratelimit/types.js';
+import { HttpError, type Priority } from '../ratelimit/types.js';
 import { gatewayClientFromEnv, GatewayClient, GW_NANSEN_CREDIT_PATH } from '../gateway-client.js';
 
 export interface BalanceRange {
@@ -363,9 +363,9 @@ export class NansenApiClient implements TokenFlowsClient {
    * `nansen-credit` limiter, the fibo retry and the apikey injection. An upstream
    * 4xx/5xx arrives as HTTP 200 + `envelope.status`; a gateway denial (429 budget /
    * 503 gated) is thrown as HttpError by the transport. */
-  private async post<T>(path: string, body: unknown): Promise<T> {
+  private async post<T>(path: string, body: unknown, priority: Priority = 1): Promise<T> {
     return timed('nansen post', { path }, async () => {
-      const env = await this.gateway.call(GW_NANSEN_CREDIT_PATH, { endpoint: path, body, priority: 1 });
+      const env = await this.gateway.call(GW_NANSEN_CREDIT_PATH, { endpoint: path, body, priority });
       const costHeader = env.headers['x-nansen-credits-cost'];
       const cost = costHeader === undefined ? undefined : Number(costHeader);
       if (costHeader !== undefined) {
@@ -436,11 +436,15 @@ export class NansenApiClient implements TokenFlowsClient {
 
   /** ONE credit: full token info row for a first-add CA (name/logo/socials/supply/MC/holders). */
   async tokenInformation(chain: string, ca: string): Promise<TokenInformation> {
-    const json = await this.post<{ data?: TokenInformation }>(NANSEN_TOKEN_INFORMATION_PATH, {
-      chain: nansenApiChain(chain),
-      token_address: ca,
-      timeframe: '1d',
-    });
+    const json = await this.post<{ data?: TokenInformation }>(
+      NANSEN_TOKEN_INFORMATION_PATH,
+      {
+        chain: nansenApiChain(chain),
+        token_address: ca,
+        timeframe: '1d',
+      },
+      0,
+    );
     if (!json.data) throw new Error('nansen token-information: no data');
     return json.data;
   }
@@ -692,10 +696,11 @@ export class NansenMarketProvider implements MarketDataProvider {
    * needs that 0 to delete the stale row.
    *
    * No `cas` → every tracked CA on the wallet's chain (the broad legacy call).
-   * Non-sol (base/bsc) → EVM JSON-RPC (providers/evm.ts): ONE Multicall3 eth_call
-   * per wallet batches balanceOf for every asked CA plus decimals() for the
-   * uncached ones — credit-free, same 0-never-dropped contract (plan D5; the
-   * Nansen credit door currentBalance is retired for these chains).
+   * Non-sol (base/bsc/robinhood) → EVM JSON-RPC (providers/evm.ts): ONE
+   * Multicall3 eth_call batches balanceOf and uncached decimals() calls, credit-free.
+   * Successful zero balances are preserved; reverted/nonstandard calls are omitted
+   * so the writer retains the last known value (the Nansen credit door currentBalance
+   * is retired for these chains).
    */
   async walletTokenHoldings(wallet: string, chain: Chain, cas?: readonly string[]): Promise<WalletTokenHolding[]> {
     const wanted = cas ?? this.trackedCas().filter((c) => c.chain === chain).map((c) => c.address);

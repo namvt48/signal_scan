@@ -1,5 +1,5 @@
 // User 2026-09-23: a CA keeps being queried for setup (fresh% / T100 / LF /
-// series) until it is FULLY populated — only then does it enter the 12h cadence —
+// series) until it is FULLY populated — only then does it enter the 3h cadence —
 // and a CA that keeps coming back EMPTY (brand-new token, no data yet) backs off
 // instead of being hammered on every pass.
 // Env BEFORE the src imports (node:test = one process per file). POLL_SETUP_MS
@@ -104,7 +104,7 @@ function countingProvider(now: number, metricCalls: Map<string, number>): Market
   };
 }
 
-test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on the 12h cache', async () => {
+test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on the 3h cache', async () => {
   open(':memory:');
   loadSetupCache(join(mkdtempSync(join(tmpdir(), 'setup-retry-')), 'nansen-cache.json'));
   const now = Date.now();
@@ -139,13 +139,13 @@ test('setup retry: missing setup is re-queried every pass; a COMPLETE CA sits on
   });
 
   await setupSweep(provider);
-  assert.equal(metricCalls.get(DONE) ?? 0, 0, 'COMPLETE + fresh cache: must NOT be re-queried (12h cadence)');
+  assert.equal(metricCalls.get(DONE) ?? 0, 0, 'COMPLETE + fresh cache: must NOT be re-queried (3h cadence)');
   assert.equal(metricCalls.get(TODO), 1, 'INCOMPLETE setup: must be re-queried');
   assert.ok(getSetupCacheEntry(TODO, CHAIN), 'the retry must actually fetch + cache the missing setup');
   assert.ok(getTokenState(TODO, CHAIN)?.t100_multiple != null, 'and write T100 into the row');
 
   await setupSweep(provider);
-  assert.equal(metricCalls.get(TODO), 1, 'now complete → on the 12h cadence, no further retry');
+  assert.equal(metricCalls.get(TODO), 1, 'now complete → on the 3h cadence, no further retry');
 });
 
 test('setup TTL authoritative: a FRESH cache entry with an INCOMPLETE row is NOT re-asked', async () => {

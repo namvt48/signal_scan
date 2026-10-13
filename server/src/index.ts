@@ -13,6 +13,7 @@ import type { MarketDataProvider } from './providers/provider.js';
 import { startPoller } from './poller.js';
 import { cacheKey, loadSetupCache, pruneSetupCache } from './setup-cache.js';
 import { createApp } from './api.js';
+import { cohortLabelIndex } from './cohort-labels.js';
 
 open(config.dbPath);
 seedIfEmpty();
@@ -64,6 +65,10 @@ function buildProvider(): MarketDataProvider {
 const provider = buildProvider();
 
 startPoller(provider, nansenApi);
+cohortLabelIndex.start(
+  (error) => log.warn('[cohort-labels] refresh failed', error),
+  (wallets) => log.info(`[cohort-labels] refreshed ${wallets} wallet labels`),
+);
 
 createApp(provider.name).listen(config.port, () => {
   log.info(

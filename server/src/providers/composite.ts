@@ -18,18 +18,17 @@ export class CompositeProvider implements MarketDataProvider {
     this.name = `${gmgn.name}+${nansen.name}`;
   }
 
-  /** gini (fresh/T100/median) → Nansen; volume → GMGN. essential → GMGN, falling
-   * back to Nansen's free essential door when GMGN is gated/429: a GMGN-only
-   * essential left supply/deployed_at NULL for ~60% of the FOMO queue, which
-   * cascades to the LF denominator (2026-10-02). Any other GMGN failure still
-   * propagates — GMGN owns volume. */
+  /** gini → Nansen; volume → GMGN. Essential prefers GMGN and falls back to
+   * Nansen for supply/deployed_at/supporting fields when GMGN is gated. Fallback
+   * price and MC are omitted: only a fresh GMGN quote owns current MC in this mode. */
   async metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
     if (kind === 'gini') return this.nansen.metric(ca, chain, kind);
     try {
       return await this.gmgn.metric(ca, chain, kind);
     } catch (e) {
       if (kind !== 'essential') throw e;
-      return this.nansen.metric(ca, chain, kind);
+      const fallback = await this.nansen.metric(ca, chain, kind);
+      return { ...fallback, price: undefined, marketCap: undefined };
     }
   }
 
@@ -60,13 +59,13 @@ export class CompositeProvider implements MarketDataProvider {
     return {
       ca,
       chain,
-      price: ess.price ?? 0,
+      ...(ess.price !== undefined ? { price: ess.price } : {}),
       holders,
       volume24h: vol.volume24h ?? 0,
       buyVol24h: vol.buyVol24h ?? 0,
       sellVol24h: vol.sellVol24h ?? 0,
       ...(vol.volume1h !== undefined ? { volume1h: vol.volume1h } : {}),
-      marketCap: ess.marketCap ?? 0,
+      ...(ess.marketCap !== undefined ? { marketCap: ess.marketCap } : {}),
       liquidity: ess.liquidity ?? 0,
       supply: ess.supply ?? 0,
       ...(ess.deployedAt !== undefined ? { deployedAt: ess.deployedAt } : {}),

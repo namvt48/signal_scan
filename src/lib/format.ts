@@ -51,9 +51,48 @@ export function balRange(r?: BalRange): string {
   return fmtNum(r.peak / r.trough);
 }
 
-/** 07 Sep 2026 */
+const UI_TIME_ZONE = 'Asia/Ho_Chi_Minh';
+const dateFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: UI_TIME_ZONE,
+  day: '2-digit',
+  month: 'short',
+  year: 'numeric',
+});
+const dateTimeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: UI_TIME_ZONE,
+  day: '2-digit',
+  month: 'short',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+const timeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: UI_TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+
+function displayDate(value: number | string): Date | null {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+export function formatTimestamp(value: number | string): string {
+  const date = displayDate(value);
+  return date ? dateTimeFormatter.format(date) : '—';
+}
+
+export function formatTime(value: number | string): string {
+  const date = displayDate(value);
+  return date ? timeFormatter.format(date) : '—';
+}
+
+/** Date portion of an ISO timestamp, formatted in UTC+7. */
 export function fmtDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  const date = displayDate(iso);
+  return date ? dateFormatter.format(date) : '—';
 }
 
 /**

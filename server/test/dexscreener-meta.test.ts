@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { getDb, open } from '../src/db.js';
 import { fillTokenMetrics, recomputeMarketCap, updateTokenMetrics } from '../src/ingest.js';
 import { parseTokenMeta, type DexTokensResponse } from '../src/providers/dexscreener.js';
+import { dexMarketPatch } from '../src/poller.js';
 
 before(() => open(':memory:'));
 
@@ -26,6 +27,19 @@ test('parseTokenMeta: market fields from the deepest pair, icon from the deepest
   assert.equal(meta?.symbol, 'NEW', 'symbol comes from the deepest pair overall');
   assert.equal(meta?.price, 3.1, 'price comes from the deepest pair overall');
   assert.equal(meta?.iconUrl, 'https://cdn.dexscreener.com/deep', 'icon comes from the deepest pair that carries a valid one');
+});
+
+test('DexScreener cannot write MC price in GMGN mode', () => {
+  const meta = {
+    iconUrl: 'https://cdn.dexscreener.com/bank',
+    symbol: 'BANK',
+    price: 0.00011274277,
+  };
+  assert.deepEqual(dexMarketPatch(meta, 'gmgn'), {
+    iconUrl: meta.iconUrl,
+    symbol: 'BANK',
+  });
+  assert.equal(dexMarketPatch(meta, 'nansen').price, meta.price);
 });
 
 test('parseTokenMeta: checksummed EVM folds to lowercase, sol base58 keeps its case', () => {

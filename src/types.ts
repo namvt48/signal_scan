@@ -1,5 +1,7 @@
 export const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
 export type Chain = (typeof CHAINS)[number];
+export const EVM_CHAINS = ['base', 'bsc', 'robinhood'] as const satisfies readonly Chain[];
+export type WalletScope = Chain | 'evm';
 
 export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B', 'P'] as const;
 export type Tier = (typeof TIERS)[number];
@@ -15,6 +17,9 @@ export interface Wallet {
   source: string;
   /** Display-only clan label (user 2026-09-24). Absent/empty = unlabelled. */
   clan?: string;
+  /** PnL cohort metadata, refreshed hourly by the server. */
+  rank?: string;
+  groups?: string[];
 }
 
 /** One FOMO trader on the watch list (mirrors server `fomo_users`). */
@@ -52,6 +57,8 @@ export interface NansenSetup {
   rawFresh?: number;
   /** Top100 sliding max drawdown: pct = max (peak−trough)/peak×100, multiple = peak/trough (optional until first series write). */
   t100?: { pct: number; multiple?: number };
+  /** Timestamped T100 multiple observations; legacy samples may lack balance provenance. */
+  t100History?: { t: number; value: number; peakBalance?: number; troughBalance?: number }[];
   /**
    * Low float: the top-100 cohort balance AT price=0 (genesis series A), in
    * TOKEN UNITS — not a market cap (semantics changed 2026-09-10).
@@ -69,10 +76,13 @@ export interface BalRange {
 export interface TrackedWalletStat {
   /** Wallet display name. */
   name: string;
-  /** Display-only clan label beside the name (user 2026-09-24). Absent/empty = unlabelled. */
+  /** Display-only clan label (user 2026-09-24). Absent/empty = unlabelled. */
   clan?: string;
-  /** Wallet tags, so the FE can style the name (e.g. "Unicon" → rainbow). Absent on older payloads. */
+  /** Wallet tags, so the FE can style the name (e.g. "Unicon" → rainbow). */
   tags?: string[];
+  /** PnL cohort rank and all qualifying behavior groups, refreshed hourly. */
+  rank?: string;
+  groups?: string[];
   /** Net USD this wallet put into the CA over the window: Σ buys − Σ sells. May be negative. */
   inflow: number;
   /** watch BUY count in the window. */
@@ -87,7 +97,8 @@ export interface TrackedWalletStat {
 
 /**
  * One watched FOMO trader's activity on a token (large trades only). buyUsd is BUY size
- * and sellPnlUsd is SELL realised PnL — reported separately, never combined into a net figure.
+ * for the trailing 24h, or null if any in-window BUY amount is unresolved; sellPnlUsd is
+ * SELL realised PnL — reported separately, never combined into a net figure.
  */
 export interface FomoUserStat {
   handle: string;
@@ -95,7 +106,7 @@ export interface FomoUserStat {
   /** Display chips (mirrors FomoUser.tags); absent when the user has none. */
   tags?: string[];
   clan?: string;
-  buyUsd: number;
+  buyUsd: number | null;
   /** Σ realised PnL on SELL rows. May be negative. NOT sell volume. */
   sellPnlUsd: number;
   buys: number;
@@ -106,6 +117,8 @@ export interface FomoUserStat {
   holdingAmount?: number;
   /** Share of total supply held; absent when never measured or supply unknown. */
   holdingPct?: number;
+  /** Current token balance USD for this user's (chain, CA) position. */
+  balUsd?: number;
 }
 
 export interface TokenSignal {
@@ -125,10 +138,23 @@ export interface TokenSignal {
   note?: string;
   buyVol24h?: number;
   sellVol24h?: number;
-  nansen: NansenSetup & { freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number };
+  nansen: NansenSetup & { freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number; t100History?: { t: number; value: number; peakBalance?: number; troughBalance?: number }[] };
   holders: number;
+  /** Historical displayed holder counts, from successful existing metric writes. */
+  holdersHistory?: { t: number; value: number }[];
   /** Market cap USD (price × circulating supply); absent until a sweep writes one. */
   marketCap?: number;
+  /** Historical market-cap readings from existing market-data updates (epoch ms). */
+  marketCapHistory?: { t: number; value: number }[];
+  /** Last successful upstream response times for displayed market datasets (epoch ms). */
+  dataUpdatedAt?: {
+    marketCap?: number;
+    volume24h?: number;
+    holders?: number;
+    fresh?: number;
+    symbol?: number;
+    icon?: number;
+  };
   /** Net USD tracked wallets put in over the last 24h (buys − sells); may be negative. */
   trackedInflow: number;
   /**
@@ -136,9 +162,9 @@ export interface TokenSignal {
    * Orders the table (newest activity first).
    */
   trackedActivityAt: number;
-  /** Latest captured FOMO BUY for this (chain, CA); 0/absent when no BUY is known. */
-  fomoBuyAt?: number;
-  /** Percent of supply held by tracked wallets. */
+  /** Latest captured FOMO buy/sell or native watch trade for this (chain, CA), across all history. */
+  fomoActivityAt?: number;
+  /** Percentage of token supply held across linked tracked wallets; native-wallet metric. */
   trackedHolding: number;
   /** DEX 24h buy + sell volume in USD. */
   volume24h: number;
@@ -217,3 +243,15 @@ export interface Settings {
 
 /** PUT /api/settings body: threshold patch plus the debug flags. */
 export type SettingsPatch = Partial<NansenThresholds> & { allFactors?: boolean };
+
+export interface TelegramAlertRules {
+  fwGrowthPct: number;
+  minFwPct: number;
+  t100GrowthPct: number;
+  /** Min market cap in thousands of USD; -1 disables this bound. */
+  minMcK: number;
+  /** Max market cap in thousands of USD; -1 disables this bound. */
+  maxMcK: number;
+  /** Thousands of USD; 0 disables Tracker Buying alerts. */
+  trackerBuyingK: number;
+}

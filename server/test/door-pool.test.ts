@@ -69,6 +69,7 @@ interface FakeDoor {
   responder: Responder;
   fetchCount: number;
   fetchTimes: number[]; // virtual timestamp of every fetch (proves waits/quarantines)
+  requestBodies: unknown[];
   invalidateCount: number;
   closeCount: number;
   outstanding: number;
@@ -76,19 +77,21 @@ interface FakeDoor {
   blocked: Array<() => void>;
 }
 
-function makeDoor(clock: Clock): FakeDoor {
+function makeDoor(clock: Clock, requestBodies: unknown[]): FakeDoor {
   const d: FakeDoor = {
     responder: () => okJson({ data: 'ok' }),
     fetchCount: 0,
     fetchTimes: [],
+    requestBodies,
     invalidateCount: 0,
     closeCount: 0,
     outstanding: 0,
     holdNext: false,
     blocked: [],
     conn: {
-      fetch: async (_url, _body, _timeoutMs) => {
+      fetch: async (_url, body, _timeoutMs) => {
         d.fetchCount += 1;
+        d.requestBodies.push(body);
         d.fetchTimes.push(clock.now());
         d.outstanding += 1;
         try {
@@ -123,9 +126,13 @@ interface Harness {
   clock: Clock;
   connectSpecs: DoorSpec[];
   logs: string[];
+  requestBodies: unknown[];
 }
 
-function makeHarness(over: Partial<DoorPoolConfig> = {}): Harness {
+function makeHarness(
+  over: Partial<DoorPoolConfig> = {},
+  sleep?: (clock: Clock, ms: number) => Promise<void>,
+): Harness {
   const clock = makeClock();
   const config: DoorPoolConfig = {
     wsEndpoint: 'ws://chrome:3000',
@@ -138,14 +145,15 @@ function makeHarness(over: Partial<DoorPoolConfig> = {}): Harness {
     quarantineJitterMs: 0, // quarantine = retryAfter*1000 exactly → deterministic clock jumps
     ...over,
   };
+  const requestBodies: unknown[] = [];
   const doors: FakeDoor[] = [];
-  for (let i = 0; i < Math.max(1, config.proxies.length); i++) doors.push(makeDoor(clock));
+  for (let i = 0; i < Math.max(1, config.proxies.length); i++) doors.push(makeDoor(clock, requestBodies));
   const connectSpecs: DoorSpec[] = [];
   const logs: string[] = [];
   const deps: DoorPoolDeps = {
     config,
     now: () => clock.now(),
-    sleep: (ms) => clock.sleep(ms),
+    sleep: (ms) => sleep?.(clock, ms) ?? clock.sleep(ms),
     log: (line) => {
       logs.push(line);
     },
@@ -157,7 +165,7 @@ function makeHarness(over: Partial<DoorPoolConfig> = {}): Harness {
       return doors[Math.min(idx, doors.length - 1)]!.conn;
     },
   };
-  return { pool: new DoorPool(deps), doors, clock, connectSpecs, logs };
+  return { pool: new DoorPool(deps), doors, clock, connectSpecs, logs, requestBodies };
 }
 
 const tick = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
@@ -599,4 +607,38 @@ test('re-arm: a real403-reputation retire stays terminal (a 403-ing IP is not re
   const r = await h.pool.postJson(nu('after'), {});
   assert.equal(r.status, 503, 'reputation-retired doors are not re-armed');
   assert.equal(statOf(h, 0).state, 'retired');
+});
+test('DoorPool: essential work dispatches before queued background volume at a shared quota reset', async () => {
+  const h = makeHarness({ proxies: [px(1), px(2)], pathBudget: 1, doorCapPerMin: 1 });
+  await startPool(h);
+
+  for (const [caller, id] of [['a', 'seed-a'], ['b', 'seed-b']] as const) {
+    const seeded = await h.pool.postJson(nu('tgm-volume-details'), { id }, { caller, priority: 2 });
+    assert.equal(seeded.status, 200);
+  }
+  const volume = h.pool.postJson(
+    nu('tgm-volume-details'),
+    { id: 'background-volume' },
+    { caller: 'a', priority: 2 },
+  );
+  const essential = h.pool.postJson(
+    nu('tgm-essential-data'),
+    { id: 'new-ca-essential' },
+    { caller: 'b', priority: 0 },
+  );
+
+  const [volumeResult, essentialResult] = await Promise.all([volume, essential]);
+  assert.equal(essentialResult.status, 200);
+  assert.equal(volumeResult.status, 200);
+  const requestIds = h.requestBodies.slice(2).map((body) => {
+    if (typeof body !== 'object' || body === null || !('id' in body) || typeof body.id !== 'string') {
+      throw new Error('expected each dispatched request to carry a string id');
+    }
+    return body.id;
+  });
+  assert.deepEqual(
+    requestIds,
+    ['new-ca-essential', 'background-volume'],
+    'urgent CA work uses the first slot without increasing either door quota',
+  );
 });

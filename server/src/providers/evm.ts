@@ -22,12 +22,17 @@
 // error messages NEVER carry the endpoint URL — it can carry the shared Alchemy
 // key (same reason solana.ts wraps thrown fetches in SafeRpcError).
 
+import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { log, timed } from '../log.js';
+import { limiters } from '../ratelimit/index.js';
+import { HttpError } from '../ratelimit/types.js';
 import type { Chain } from '../shared/chain.js';
 import { chainSlugs } from '../shared/chain-slugs.js';
 import type { WalletTokenHolding } from './provider.js';
-
+import { providerRequestCache, RequestCache } from './request-cache.js';
+import type { RpcSource } from './rpc-usage.js';
+import { recordRpcAttempt, recordRpcOutcome } from './rpc-usage.js';
 export const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 export const AGGREGATE3_SELECTOR = '82ad56cb';
 export const BALANCE_OF_SELECTOR = '70a08231';
@@ -51,9 +56,10 @@ const KEYLESS_RPC: Partial<Record<Chain, string>> = {
  *  may carry the shared Alchemy key. */
 export class SafeEvmError extends Error {}
 
-/** Ordered, de-duplicated endpoint list: env primary first, keyless fallback once. */
-export function evmEndpointList(envUrl: string, keyless: string | undefined): string[] {
-  return [...new Set([envUrl, keyless ?? ''].filter((u) => u !== ''))];
+/** Ordered, de-duplicated comma-separated env endpoints, then the public fallback. */
+export function evmEndpointList(envUrls: string, keyless: string | undefined): string[] {
+  const configured = envUrls.split(',').map((url) => url.trim()).filter(Boolean);
+  return [...new Set([...configured, keyless?.trim() ?? ''].filter(Boolean))];
 }
 
 /** chainId (from the ONE map, shared/chain-slugs.ts — never a second copy) null
@@ -195,23 +201,24 @@ function decimalsKey(chain: Chain, ca: string): string {
 
 export class EvmRpcClient {
   readonly name = 'evm-rpc';
-
-  /** chain:lower(ca) → decimals(); in-memory per client (plan D5). A miss costs
-   *  one extra sub-call INSIDE the same batch, never a second round trip. */
   private readonly decimalsCache = new Map<string, number>();
+  private readonly endpointScopes = new Map<Chain, string>();
+  private readonly requestCache: RequestCache;
 
   constructor(
     private readonly endpointsFor: (chain: Chain) => readonly string[] = evmRpcEndpoints,
     private readonly timeoutMs = 30_000,
-  ) {}
+    requestCache = providerRequestCache,
+    private readonly source: RpcSource = 'application',
+  ) {
+    this.requestCache = requestCache;
+  }
 
   /**
-   * Holdings in TOKEN UNITS for the (wallet, CA) pairs asked for — the exact
-   * contract of the sol path: a CA the wallet does not hold comes back amount 0,
-   * never dropped (the writer needs the 0 to delete the stale row). Only a CA
-   * whose scale is unknowable (decimals sub-call failed AND balance > 0, or
-   * non-uint256 balanceOf data) is skipped with a log line — a wrong number is
-   * worse than a stale row.
+   * Holdings in TOKEN UNITS for the (wallet, CA) pairs asked for. A successful
+   * balanceOf returning zero is a real zero; a reverted call or unknown scale
+   * is omitted so callers preserve their last known value rather than inventing
+   * a zero. Non-uint256 balanceOf data is omitted for the same reason.
    */
   async walletTokenHoldings(wallet: string, chain: Chain, cas: readonly string[]): Promise<WalletTokenHolding[]> {
     if (!ADDRESS_RE.test(wallet)) throw new Error(`evm rpc: wallet is not an EVM address (${wallet.slice(0, 10)})`);
@@ -247,7 +254,7 @@ export class EvmRpcClient {
       const r = results[i];
       if (r === undefined) return;
       if (!r.success) {
-        rows.push({ ca, amount: 0 }); // reverted (no code / non-standard): not held — 0 clears the stale row
+        log.warn(`[evm] ${chain} ${ca.slice(0, 10)}: balanceOf reverted — skipped`);
         return;
       }
       const raw = decodeUint256(r.returnData);
@@ -320,26 +327,54 @@ export class EvmRpcClient {
     if (endpoints.length === 0) {
       throw new Error(`evm rpc: no endpoint for ${chain} (set BASE_RPC_URL/BSC_RPC_URL/ROBINHOOD_RPC_URL)`);
     }
-    let last = 'error';
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-        const json = (await res.json().catch(() => null)) as { result?: unknown; error?: unknown } | null;
-        const rpcError = json?.error;
-        if (!res.ok || json === null || (rpcError !== undefined && rpcError !== null)) {
-          throw new SafeEvmError(`evm rpc ${res.status}${rpcError ? ` ${JSON.stringify(rpcError).slice(0, 80)}` : ''}`);
+    const scope = this.endpointScopes.get(chain) ?? createHash('sha256').update(endpoints.join('\0')).digest('hex');
+    this.endpointScopes.set(chain, scope);
+    const key = `${scope}|evm|${chain}|${method}|${JSON.stringify(params)}`;
+    const ttlMs = method === 'eth_call' && params[1] === 'latest' ? 2_000
+      : method === 'eth_getTransactionByHash' ? 300_000 : 0;
+    return this.requestCache.run(key, ttlMs, async () => {
+      let last = 'error';
+      for (const [index, endpoint] of endpoints.entries()) {
+        try {
+          const limiter = index === 0 ? 'evm-rpc' : 'evm-rpc-fallback';
+          const res = await limiters.run(limiter, { priority: 1 }, async () => {
+            recordRpcAttempt('evm', this.source, chain, index);
+            let response: Response;
+            try {
+              response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+                signal: AbortSignal.timeout(this.timeoutMs),
+              });
+            } catch (error) {
+              recordRpcOutcome('evm', this.source, chain, index, false);
+              throw error;
+            }
+            if (!response.ok) {
+              recordRpcOutcome('evm', this.source, chain, index, false, response.status === 402);
+              throw new HttpError(response.status, response.headers.get('retry-after'), `evm rpc ${response.status}`);
+            }
+            return response;
+          });
+          const json = (await res.json().catch(() => null)) as { result?: unknown; error?: unknown } | null;
+          const rpcError = json?.error;
+          if (json === null || (rpcError !== undefined && rpcError !== null)) {
+            recordRpcOutcome('evm', this.source, chain, index, false);
+            throw new SafeEvmError(`evm rpc ${res.status}${rpcError ? ` ${JSON.stringify(rpcError).slice(0, 80)}` : ''}`);
+          }
+          if (json.result === undefined) {
+            recordRpcOutcome('evm', this.source, chain, index, false);
+            throw new SafeEvmError(`evm rpc: malformed ${method} body`);
+          }
+          recordRpcOutcome('evm', this.source, chain, index, true);
+          return json.result;
+        } catch (e) {
+          last = e instanceof SafeEvmError || e instanceof HttpError ? e.message : e instanceof Error ? e.name : 'error';
         }
-        if (json.result === undefined) throw new SafeEvmError(`evm rpc: malformed ${method} body`);
-        return json.result;
-      } catch (e) {
-        last = e instanceof SafeEvmError ? e.message : e instanceof Error ? e.name : 'error';
       }
-    }
-    throw new Error(`evm rpc ${method} failed (${chain}): ${last.slice(0, 160)}`);
+      throw new Error(`evm rpc ${method} failed (${chain}): ${last.slice(0, 160)}`);
+    }, (result) => result !== null);
   }
+
 }

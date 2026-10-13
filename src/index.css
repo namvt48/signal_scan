@@ -101,6 +101,36 @@ body {
   color: transparent;
 }
 
+.cohort-rank {
+  display: inline-flex;
+  min-width: 1.25rem;
+  justify-content: center;
+  border: 1px solid #D9E1D6;
+  border-radius: 4px;
+  background: #EDF1EA;
+  padding: 1px 3px;
+  color: #55645C;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.cohort-rank[data-rank="S"] { border-color: #F3D36A; background: #FEF3C7; color: #854D0E; }
+.cohort-rank[data-rank="A"] { border-color: #86EFAC; background: #DCFCE7; color: #166534; }
+.cohort-rank[data-rank="B"] { border-color: #93C5FD; background: #DBEAFE; color: #1E40AF; }
+.cohort-rank[data-rank="C"] { border-color: #FDBA74; background: #FFEDD5; color: #9A3412; }
+.cohort-rank[data-rank="D"] { border-color: #FDA4AF; background: #FFE4E6; color: #9F1239; }
+
+.cohort-group {
+  display: inline-block;
+  border-radius: 3px;
+  background: #EDF1EA;
+  padding: 1px 3px;
+  color: #55645C;
+  font-size: 9px;
+  line-height: 1.2;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   ::before,
@@ -176,3 +206,126 @@ body {
 .hero-accent{ color:var(--c-warn); }
 
 @media (max-width:820px){ .stat-row{ grid-template-columns:repeat(2,1fr); } }
+/* Dashboard A gets a one-pixel readability bump; B keeps the reference sizes. */
+.dashboard-a .stat-tile .lbl { font-size:12.5px; }
+.dashboard-a .section-head .meta { font-size:13px; }
+.dashboard-a .filter-label { font-size:12px; }
+.dashboard-a .filter-chip,
+.dashboard-a .mc-filter-input { font-size:13px; }
+.dashboard-a .tier-select { font-size:12.5px; }
+.dashboard-a .frame > .overflow-x-auto > table > thead > tr > th { font-size:13.5px; }
+.dashboard-a .frame > .overflow-x-auto > table > tbody > tr > td { font-size:14px; }
+.dashboard-a .frame > .overflow-x-auto > table > tbody > tr > td [class~="text-[13px]"] { font-size:14px; }
+
+/* Give the shared Tracked/FOMO breakdowns enough room without changing other modals. */
+.trade-breakdown-modal {
+  width: min(1700px, calc(100vw - 32px)) !important;
+  max-width: none !important;
+  max-height: 90vh;
+}
+.trade-breakdown-modal > .trade-breakdown-content {
+  max-height: calc(90vh - 88px);
+}
+.trade-breakdown-modal > div:first-child h2 { font-size: 16.8px; }
+.trade-breakdown-content table th { font-size: 10.8px !important; }
+.trade-breakdown-content table td { font-size: 13.2px !important; }
+.trade-breakdown-content .cohort-rank { font-size: 12px !important; }
+.trade-breakdown-content .cohort-group { font-size: 10.8px !important; }
+.trade-breakdown-content h3 { font-size: 12px !important; }
+.trade-breakdown-content > p,
+.trade-breakdown-content p.text-xs { font-size: 14.4px !important; }
+/* ---------- per-token note ---------- */
+.signal-ticker-col{ width:var(--ticker-width,128px) !important; }
+.ticker-cell{ white-space: nowrap; }
+.note-flag{
+  display:inline-flex; align-items:center; justify-content:center;
+  width:32px; height:32px; flex:none; margin-left:6px; vertical-align:middle; position:relative;
+  background:transparent; color:#9AA597; border:1px solid var(--c-line);
+  cursor:pointer; line-height:1; padding:0;
+  opacity:0; transition:opacity .15s ease, background .15s ease, color .15s ease, border-color .15s ease;
+}
+.note-flag svg{ display:block; }
+.frame tbody tr:hover .note-flag,
+.note-flag:focus-visible{ opacity:1; }
+.note-flag:hover{ background:var(--c-good-ink); color:var(--c-pos); border-color:rgba(62,125,82,0.45); }
+.note-flag:focus-visible{ outline:2px solid var(--c-pos); outline-offset:2px; }
+.note-flag.has-note{ opacity:1; width:42px; height:42px; border:none; border-radius:0; background:transparent; margin-left:4px; top:0; transition:transform .12s ease; }
+.note-flag.has-note:hover{ background:transparent; transform:scale(1.1); }
+.note-flag-mark{ position:relative; display:inline-flex; width:42px; height:42px; align-items:center; justify-content:center; color:#E5A900; }
+.note-flag-alert{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:15px; font-weight:900; line-height:1; }
+
+/* Shared floating surface for the editor and saved-note tooltip. */
+.note-pop{
+  position:fixed; z-index:1001; --ax:50%;
+  overflow:visible; box-sizing:border-box;
+  background:var(--c-surface); border:1px solid var(--c-line); border-radius:14px;
+  color:var(--c-ink);
+  box-shadow:0 12px 32px rgba(30,40,32,.14), 0 1px 3px rgba(30,40,32,.06);
+  animation:notePopIn .12s ease-out;
+}
+@keyframes notePopIn{ from{ opacity:0 } to{ opacity:1 } }
+.note-pop::after{
+  content:""; position:absolute; left:var(--ax); width:10px; height:10px; margin-left:-5px;
+  background:var(--c-surface); transform:rotate(45deg); border-radius:2px;
+}
+.note-pop.below::after{ top:-6px; border-left:1px solid var(--c-line); border-top:1px solid var(--c-line); }
+.note-pop.above::after{ bottom:-6px; border-right:1px solid var(--c-line); border-bottom:1px solid var(--c-line); }
+.note-editor::after{ width:20px; height:20px; margin-left:-10px; }
+.note-editor.below::after{ top:-11px; }
+.note-editor.above::after{ bottom:-11px; }
+.note-pop-content{ box-sizing:border-box; max-height:inherit; overflow-y:auto; }
+.note-editor{ width:2080px; min-height:var(--editor-min-height,520px); padding:0; }
+.note-editor-content{ display:flex; min-height:var(--editor-min-height,520px); flex-direction:column; padding:44px 52px; }
+.note-ed-head{ display:flex; align-items:center; gap:24px; margin-bottom:24px; }
+.note-ed-ico{ width:64px; height:64px; border-radius:14px; background:var(--c-good-ink); color:var(--c-pos); display:flex; align-items:center; justify-content:center; flex:none; }
+.note-ed-title{ overflow:hidden; font-size:21px; font-weight:800; color:var(--c-ink); text-overflow:ellipsis; white-space:nowrap; }
+.note-ed-title span{ font-weight:600; color:var(--c-muted); }
+.note-editor .note-editor-textarea{
+  display:block; width:100%; box-sizing:border-box; min-height:480px; flex:1; resize:vertical;
+  font-family:"Plus Jakarta Sans",sans-serif; font-size:25px; line-height:1.55; color:var(--c-ink);
+  padding:9px 11px; border-radius:10px; border:1px solid var(--c-line); background:#F7F9F6; outline:none;
+  transition:border-color .12s ease, background .12s ease;
+}
+.note-editor .note-editor-textarea:focus{ border-color:rgba(62,125,82,0.55); background:#fff; }
+.note-editor .note-editor-textarea::placeholder{ color:#A3AC9F; }
+.note-ed-foot{ display:flex; align-items:center; gap:6px; margin-top:10px; }
+.note-ed-hint{ flex:1; font-size:10px; color:#A3AC9F; }
+.note-ed-count{ font-size:10.5px; color:#A3AC9F; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.note-ed-error{ margin:7px 0 0; color:var(--c-neg); font-size:11px; }
+.note-btn{
+  border:none; cursor:pointer; font-family:inherit; font-size:11.5px; font-weight:700;
+  padding:6px 12px; border-radius:999px; transition:background .12s ease, color .12s ease;
+}
+.note-btn.ghost{ background:none; color:var(--c-muted); }
+.note-btn.ghost:hover{ background:#FBEDEA; color:#B4483A; }
+.note-btn.primary{ background:var(--c-pos); color:#fff; }
+.note-btn.primary:hover{ background:#336a45; }
+.note-btn:disabled{ cursor:wait; opacity:.6; }
+.note-tip{ width:max-content; max-width:min(2080px,calc(100vw - 24px)); min-width:min(1200px,calc(100vw - 24px)); padding:0; pointer-events:auto; }
+.note-tip::after{ width:20px; height:20px; margin-left:-10px; }
+.note-tip.below::after{ top:-11px; }
+.note-tip.above::after{ bottom:-11px; }
+.note-tip-content{ padding:44px 52px 44px 60px; }
+.note-tip::before{ content:""; position:absolute; left:0; top:48px; bottom:48px; width:6px; border-radius:0 6px 6px 0; background:#F2B01E; }
+.note-tip-head{ font-size:21px; font-weight:700; color:var(--c-muted); margin-bottom:8px; }
+.note-tip-head b{ color:var(--c-ink); font-weight:800; }
+.note-tip-body{ font-size:25px; line-height:1.55; color:var(--c-ink); white-space:pre-wrap; word-break:break-word; }
+.note-tip-foot{ margin-top:16px; font-size:20px; color:#A3AC9F; }
+@media (max-width: 767px) {
+  .note-tip-foot{ margin-top:16px; font-size:20px; }
+  .note-tip { max-height: min(1440px, calc(100vh - 24px)); }
+  .frame > .overflow-x-auto > table { min-width: 1200px !important; }
+  .signal-tier-col { width: 52px !important; }
+  .signal-mc-col { width: 76px !important; }
+  .signal-ca-col { width: 104px !important; }
+  .signal-tracked-col { width: 480px !important; }
+}
+
+@media (max-width:520px){
+  .note-editor .note-ed-hint{ max-width:74px; }
+  .note-editor .note-btn{ padding:6px 9px; }
+}
+
+@media (hover:none){
+  .note-flag{ opacity:1; }
+}

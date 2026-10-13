@@ -3,13 +3,16 @@ import { MagnifyingGlass, XLogo } from '@phosphor-icons/react';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
-import { ENTRY_VOLUME_THRESHOLD, SHOW_CLAN, SHOW_FOMO } from '../config';
+import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
-import { ago, compact, fmtInt, fmtNum, pct, shortAddr, usd } from '../lib/format';
-import { freshPercentageInRange, percentageInRange, volumeClass } from '../lib/signalMetrics';
+import { ago, compact, formatTimestamp, pct, shortAddr, usd } from '../lib/format';
+import { freshPercentageInRange, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
-import { CheckSquare, Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
+import { T100Chart } from './T100Chart';
+import { HolderCountChart } from './HolderCountChart';
+import { MarketCapChart } from './MarketCapChart';
+import { Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { ChainBadge } from './ChainBadge';
 import { useAuth } from '../auth/use-auth';
 
@@ -38,35 +41,34 @@ function SetupValue({ value, pass }: { value: string; pass: boolean }) {
  */
 /** Column share of the wallet table — declared on <col> so widths survive with no header row. */
 const WALLET_COLS: readonly string[] = SHOW_CLAN
-  ? ['30%', '12%', '15%', '11%', '17%', '15%']
-  : ['34%', '17%', '13%', '19%', '17%'];
+  ? ['19%', '10%', '8%', '14%', '18%', '11%', '12%', '8%']
+  : ['21%', '8%', '16%', '19%', '11%', '14%', '11%'];
 
 /*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Trades / Buy $ / Sell PnL / Age.
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Bal / Trades / Buy $ / Sell PnL / Age.
  * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
  * line up row for row. Shares track each column's widest content (user 2026-10-01):
  * the old split starved the right pair (Sell PnL ↔ Age ~16px) and left Clan/Trades
  * with >100px of dead space, so the horizontal rhythm read ragged.
  */
 const FOMO_COLS: readonly string[] = SHOW_CLAN
-  ? ['24%', '11%', '13%', '16%', '16%', '20%']
-  : ['30%', '16%', '17%', '20%', '17%'];
+  ? ['21%', '10%', '14%', '12%', '15%', '15%', '13%']
+  : ['26%', '16%', '14%', '16%', '16%', '12%'];
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
 /** Keep ticker text readable beside its note button in both deployment variants. */
-const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2568px]' : 'min-w-[2184px]';
+const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
 
 /**
- * Row value behind the three "Tracked" columns. The FOMO dash has no wallet watch-list,
- * so they read the FOMO aggregate instead (user 2026-10-01, extended 2026-10-02): Inflow =
- * Σ FOMO large-BUY $, Holding = Σ the users' hold %, "Tracked in" = the FOMO user count.
- * Display, sort AND filter all read these, so the number shown can never disagree with
- * the one being ordered/filtered.
+ * FOMO rows retain FOMO-user inflow/holding semantics. The FOMO `Tracked in`
+ * count includes both matched FOMO users and native wallets that traded this CA;
+ * their names remain separate in the breakdown so identities are not conflated.
  */
-const rowInflow = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.reduce((n, u) => n + u.buyUsd, 0) : s.trackedInflow);
-const rowHolding = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.reduce((n, u) => n + (u.holdingPct ?? 0), 0) : s.trackedHolding);
-const rowTrackedIn = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.length : s.trackedWallets.length);
+const rowInflow = (s: TokenSignal): number | null => (SHOW_FOMO ? sumKnownUsd(s.fomoUsers.map((u) => u.buyUsd)) : s.trackedInflow);
+const rowHolding = (s: TokenSignal): number | undefined => (SHOW_FOMO ? sumKnownPercentages(s.fomoUsers.map((u) => u.holdingPct)) : s.trackedHolding);
+const rowHoldingPartial = (s: TokenSignal): boolean => SHOW_FOMO && s.fomoUsers.some((user) => user.holdingPct === undefined);
+const rowTrackedIn = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.length + s.trackedWallets.length : s.trackedWallets.length);
 
 /**
  * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
@@ -84,11 +86,13 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
       {head && (
         <thead>
           <tr className="font-mono text-[9px] font-bold uppercase tracking-[0.03em] text-[#9AA79C]">
-            <th className="pb-1 pr-3 text-left">Wallet</th>
-            {SHOW_CLAN && <th className="pb-1 pr-3 text-left">Clan</th>}
-            <th className="pb-1 pr-3 text-right">Bal</th>
-            <th className="pb-1 pr-3 text-right">TXs</th>
-            <th className="pb-1 pr-3 text-right">Inflow</th>
+            <th className="pb-1 pr-2 text-left">Wallet</th>
+            {SHOW_CLAN && <th className="pb-1 pr-2 text-left">Clan</th>}
+            <th className="pb-1 pr-1 text-center">Rank</th>
+            <th className="pb-1 pr-1 text-left">Group</th>
+            <th className="whitespace-nowrap pb-1 pr-1 text-right">Bal</th>
+            <th className="pb-1 pr-2 text-right">TXs</th>
+            <th className="pb-1 pr-2 text-right">Inflow</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
@@ -96,7 +100,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
       <tbody>
         {wallets.map((w) => (
           <tr key={w.name}>
-            <td className="py-1 pr-3 text-[11px]">
+            <td className="py-1 pr-2 text-[11px]">
               <span className="block truncate font-medium text-ink" title={w.name}>
                 <span className={walletNameClass(w.tags)}>{w.name}</span>
               </span>
@@ -112,15 +116,35 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
                 )}
               </td>
             )}
-            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums text-ink2">
-              {w.balUsd !== undefined ? usd(w.balUsd) : '—'}
+            <td className="py-1 pr-1 text-center font-mono text-[10px]">
+              {w.rank ? (
+                <span className="cohort-rank" data-rank={w.rank}>{w.rank}</span>
+              ) : (
+                <span className="text-muted">—</span>
+              )}
             </td>
-            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
+            <td className="py-1 pr-1 font-mono text-[9px]">
+              {w.groups?.length ? (
+                <span className="inline-flex gap-1 whitespace-nowrap" aria-label={w.groups.join(', ')}>
+                  {w.groups.map((group) => (
+                    <span key={group} className="cohort-group" title={group}>
+                      {group.split('_', 1)[0]}
+                    </span>
+                  ))}
+                </span>
+              ) : (
+                <span className="text-muted">—</span>
+              )}
+            </td>
+            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2">
+              <span className={trackedUsdClass(w.balUsd)}>{w.balUsd !== undefined ? usd(w.balUsd) : '—'}</span>
+            </td>
+            <td className="py-1 pr-2 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{w.buys}</span>
               <span className="text-muted">/</span>
               <span className="font-semibold text-neg">{w.sells}</span>
             </td>
-            <td className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${w.inflow >= 0 ? 'text-pos' : 'text-neg'}`}>
+            <td className={`py-1 pr-2 text-right font-mono text-[11px] font-medium tabular-nums ${w.inflow >= 0 ? 'text-pos' : 'text-neg'}`}>
               <span className={volumeClass(w.inflow, 'inflow')}>{usd(w.inflow)}</span>
             </td>
             <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(w.lastTs)}</td>
@@ -132,7 +156,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
 }
 
 /*
- * FOMO breakdown rows (User / Clan? / Trades / Buy $ / Sell PnL / Age), sibling of WalletTable.
+ * FOMO breakdown rows (User / Clan? / Bal / Trades / Buy $ / Sell PnL / Age), sibling of WalletTable.
  * `buyUsd` is Σ large-BUY size and `sellPnlUsd` is Σ realised PnL on SELL rows — reported
  * separately, never a net figure. Newest trade first; long handles truncate; numerics
  * right-aligned mono like the wallet rows.
@@ -151,6 +175,7 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
           <tr className="font-mono text-[9px] font-bold uppercase tracking-[0.03em] text-[#9AA79C]">
             <th className="pb-1 pr-3 text-left">User</th>
             {SHOW_CLAN && <th className="pb-1 pr-3 text-left">Clan</th>}
+            <th className="whitespace-nowrap pb-1 pr-1 text-right">Bal</th>
             <th className="pb-1 pr-3 text-right">Trades</th>
             <th className="pb-1 pr-3 text-right">Buy $</th>
             <th className="pb-1 pr-3 text-right">Sell PnL</th>
@@ -177,13 +202,16 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
                 )}
               </td>
             )}
+            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current held token balance in USD">
+              <span className={trackedUsdClass(u.balUsd)}>{u.balUsd !== undefined ? usd(u.balUsd) : '—'}</span>
+            </td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{u.buys}</span>
               <span className="text-muted">/</span>
               <span className="font-semibold text-neg">{u.sells}</span>
             </td>
-            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-pos" title="Σ large BUY sizes — not net inflow/PnL">
-              <span className={volumeClass(u.buyUsd, 'buy')}>{usd(u.buyUsd)}</span>
+            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-pos" title="24h BUY spend; — when any in-window amount is unavailable">
+              <span className={volumeClass(u.buyUsd ?? undefined, 'buy')}>{u.buyUsd === null ? '—' : usd(u.buyUsd)}</span>
             </td>
             <td
               className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${u.sellPnlUsd >= 0 ? 'text-pos' : 'text-neg'}`}
@@ -267,7 +295,7 @@ function Hero({ count }: { count: number }) {
           it becomes <span className="text-neg">price</span>
         </h1>
         <p className="mt-4 max-w-[440px] text-[14.5px] leading-[1.5] text-ink2">
-          Top <b className="font-bold text-ink">{count} tokens</b> ranked by {SHOW_FOMO ? 'latest FOMO buy' : 'latest tracked wallet activity'}.
+          Top <b className="font-bold text-ink">{count} tokens</b> ranked by {SHOW_FOMO ? 'latest FOMO or native-wallet trade' : 'latest tracked wallet activity'}.
         </p>
       </div>
       <div className="relative flex h-[220px] items-center justify-center">
@@ -360,14 +388,13 @@ const HL_HEAD = 'text-center!';
  * Centered header cell. Th's px-5 + nowrap left this column's content box (143.7px at
  * a 1950px table, 110px once the table is pinned to min-w-[1500px]) NARROWER than its
  * own label, so the label overflowed right and text-center stopped centering it —
- * "Tracked Holding" sat 6.1px and "Entry" 3.7px right of their columns. px-3 gives the
- * label room; whitespace-normal lets it wrap instead of overflow at min-w. The sort
- * caret rides in the gutter that frees up.
+ * "Tracked Holding" sat 6.1px to the right of its column. px-3 gives the label room;
+ * whitespace-normal lets it wrap instead of overflow at min-w. The sort caret rides in the gutter that frees up.
  */
 const C_HEAD = `${HL_HEAD} px-3! whitespace-normal!`;
 
 type SortKey = 'holders' | 'trackedIn' | 'trackedInflow' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
-/** null = default newest activity on A / newest FOMO BUY on B — no column armed. */
+/** null = default newest activity on A / newest social or native trade on B — no column armed. */
 type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null;
 
 /** Nansen-setup factors the dashboard filter bar ANDs together. */
@@ -441,23 +468,23 @@ function SignalHead({
     <tr>
       {allFactors && <Th className="w-10 text-center!">STT</Th>}
       <Th className="w-20 px-2.5! text-center!">{null}</Th>
-      <Th className="w-32">Ticker</Th>
-      <Th className="w-16 text-center!">Tier</Th>
+      <Th className="signal-ticker-col">Ticker</Th>
+      <Th className="signal-tier-col w-16 text-center!">Tier</Th>
       <SortTh
         label="MC"
         col="mc"
         sort={sort}
         onSort={onSort}
-        className="w-24 text-center! px-3! whitespace-normal!"
+        className="signal-mc-col w-24 text-center! px-3! whitespace-normal!"
         subLabel={
           thresholds && (thresholds.minMc > 0 || thresholds.maxMc > 0) ? (
             <span className="mt-1 block font-mono text-[10px] font-medium text-muted">{mcBand(thresholds)}</span>
           ) : undefined
         }
       />
-      <Th className="w-40 text-center!">CA</Th>
+      <Th className="signal-ca-col w-40 text-center!">CA</Th>
       <Th
-        className={`${SHOW_FOMO ? 'w-[768px]' : 'w-96'} text-center!`}
+        className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'} text-center!`}
         title={
           SHOW_FOMO
             ? 'FOMO watch-list activity. Buy $ is the sum of large BUY sizes, not net inflow or PnL.'
@@ -470,6 +497,7 @@ function SignalHead({
             <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
               <span className="text-left">User</span>
               {SHOW_CLAN && <span className="text-left">Clan</span>}
+              <span className="whitespace-nowrap pr-1 text-right" title="Current held token balance in USD">Bal</span>
               <span className="pr-3 text-right">Trades</span>
               <span className="pr-3 text-right" title="Σ large BUY sizes — not net inflow/PnL">
                 Buy $
@@ -486,21 +514,23 @@ function SignalHead({
             <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: WALLET_COLS.join(' ') }}>
               <span className="text-left">Wallet</span>
               {SHOW_CLAN && <span className="text-left">Clan</span>}
-              <span className="pr-3 text-right">Bal</span>
-              <span className="pr-3 text-right">TXs</span>
-              <span className="pr-3 text-right">Inflow</span>
+              <span className="pr-1 text-center">Rank</span>
+              <span className="pr-1 text-left">Group</span>
+              <span className="whitespace-nowrap pr-1 text-right">Bal</span>
+              <span className="pr-2 text-right">TXs</span>
+              <span className="pr-2 text-right">Inflow</span>
               <span className="pl-1 text-left">Age</span>
             </span>
           </>
         )}
       </Th>
-      <SortTh label="Tracked in" col="trackedIn" sort={sort} onSort={onSort} className="w-20 text-center!" />
+      <SortTh label="Tracked in" col="trackedIn" sort={sort} onSort={onSort} className="w-16 text-center!" />
       <SortTh
         label="Top100"
         col="t100"
         sort={sort}
         onSort={onSort}
-        className={`w-24 ${C_HEAD} ${NS_HEAD} ${NS_START}`}
+        className={`w-20 ${C_HEAD} ${NS_HEAD} ${NS_START}`}
         subLabel={thresholds ? <span className="mt-1 block font-mono text-[10px] font-medium text-muted">≥ {thresholds.t100MinMultiple}</span> : undefined}
       />
       <SortTh
@@ -508,7 +538,7 @@ function SignalHead({
         col="lf"
         sort={sort}
         onSort={onSort}
-        className={`w-24 ${C_HEAD} ${NS_HEAD}`}
+        className={`w-20 ${C_HEAD} ${NS_HEAD}`}
         subLabel={
           thresholds ? (
             <span className="mt-1 block font-mono text-[10px] font-medium text-muted">
@@ -522,17 +552,14 @@ function SignalHead({
         col="fresh"
         sort={sort}
         onSort={onSort}
-        className={`w-24 ${C_HEAD} ${NS_HEAD} ${NS_END}`}
+        className={`w-20 ${C_HEAD} ${NS_END}`}
         subLabel={thresholds ? <span className="mt-1 block font-mono text-[10px] font-medium text-muted">≥ {thresholds.freshMinPct}%</span> : undefined}
       />
-      <SortTh label="Holder" col="holders" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
-      <SortTh label="Tracked Inflow" col="trackedInflow" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
-      <SortTh label="Tracked Holding" col="trackedHolding" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
-      <SortTh label="1H Volume" col="volume1h" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
-      <SortTh label="24H Volume" col="volume24h" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
-      <Th className={`w-28 ${C_HEAD}`} title="Gross DEX buy volume in the last 24 hours">Buying 24H</Th>
-      <Th className={`w-28 ${C_HEAD}`} title="Gross DEX sell volume in the last 24 hours — not realised PnL">Sell 24H</Th>
-      <Th className="w-14 text-center! px-3! whitespace-normal!">Entry</Th>
+      <SortTh label="Holder" col="holders" sort={sort} onSort={onSort} className={`w-20 ${C_HEAD}`} />
+      <SortTh label="Tracked Inflow" col="trackedInflow" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
+      <SortTh label="Tracked Holding" col="trackedHolding" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
+      <SortTh label="1H Volume" col="volume1h" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
+      <SortTh label="24H Volume" col="volume24h" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
     </tr>
   );
 }
@@ -606,7 +633,7 @@ export default function SignalTable({
           <thead>
             <SignalHead allFactors={allFactors} />
           </thead>
-          <SkeletonRows rows={8} cols={(allFactors ? 19 : 18) + FOMO_EXTRA} />
+          <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
         </table>
       </TableShell>
     );
@@ -620,7 +647,10 @@ export default function SignalTable({
   // Client-side filters. mcPass fails open on absent marketCap, matching the
   // server's convention — unknown is not evidence.
   const nansenPass = (s: TokenSignal) => nansenFilter.size === 0 || [...nansenFilter].every((k) => s.nansen.pass[k]);
-  const holdingPass = (s: TokenSignal) => !holdingOnly || rowHolding(s) > 0;
+  const holdingPass = (s: TokenSignal) => {
+    const holding = rowHolding(s);
+    return !holdingOnly || (holding !== undefined && holding > 0);
+  };
   // Inputs are entered in THOUSANDS of dollars (the label says "K$") — multiply by
   // 1000 to compare against the raw-USD marketCap, same as the reference design.
   const mcPass = (s: TokenSignal) => {
@@ -656,7 +686,7 @@ export default function SignalTable({
     return <EmptyState title="No signals yet" hint="Signals will appear once the alpha engine starts streaming tokens." />;
   }
 
-  const sortVal = (s: TokenSignal, key: SortKey): number | undefined =>
+  const sortVal = (s: TokenSignal, key: SortKey): number | null | undefined =>
     key === 'holders'
       ? s.holders
       : key === 'trackedInflow'
@@ -683,17 +713,18 @@ export default function SignalTable({
     const ap = a.tier === 'P' ? 1 : 0;
     const bp = b.tier === 'P' ? 1 : 0;
     if (ap !== bp) return ap - bp;
-    // Default: newest FOMO BUY on B; newest wallet-watch activity on A.
+    // Default FOMO order includes buys and sells from social users and native wallets.
     if (!sort) return SHOW_FOMO
-      ? (b.fomoBuyAt ?? 0) - (a.fomoBuyAt ?? 0)
+      ? (b.fomoActivityAt ?? 0) - (a.fomoActivityAt ?? 0)
       : b.trackedActivityAt - a.trackedActivityAt;
     const av = sortVal(a, sort.key);
     const bv = sortVal(b, sort.key);
     // A metric with no value yet (1H volume before its first sweep) sinks in BOTH directions.
-    if (av === undefined || bv === undefined) return av === bv ? 0 : av === undefined ? 1 : -1;
+    if (av == null || bv == null) return av === bv ? 0 : av == null ? 1 : -1;
     return sort.dir === 'asc' ? av - bv : bv - av;
   });
   const visible: TokenSignal[] = mode === 'rated' ? ratedVisible : sorted;
+  const tickerWidth = visible.reduce((width, signal) => Math.max(width, (signal.symbol?.length ?? 1) * 12 + 64), 128);
   const totalVolume = visible.reduce((acc, s) => acc + s.volume24h, 0);
 
   /* First click arms a column (desc for these magnitudes); clicking it again flips the direction. */
@@ -746,7 +777,7 @@ export default function SignalTable({
         ];
 
   const ratedEmpty = mode === 'rated' && visible.length === 0;
-  const colCount = (allFactors ? 19 : 18) + FOMO_EXTRA;
+  const colCount = (allFactors ? 16 : 15) + FOMO_EXTRA;
 
   return (
     <div className="w-full">
@@ -761,7 +792,7 @@ export default function SignalTable({
               : `${ratedAll.length}/${signals.length} tokens tiered`
             : sort
               ? `sorted by ${SORT_LABEL[sort.key]}, ${sort.dir === 'asc' ? 'ascending' : 'descending'}`
-              : SHOW_FOMO ? 'sorted by latest FOMO buy' : 'sorted by tracked activity'}
+              : SHOW_FOMO ? 'sorted by latest FOMO or native-wallet trade' : 'sorted by tracked activity'}
         </span>
       </div>
       {tierError && <p className="px-1 pb-2 text-[12px] font-semibold text-neg">Tier update failed: {tierError}</p>}
@@ -855,7 +886,7 @@ export default function SignalTable({
       ) : (
         <div className="frame">
           <div className="overflow-x-auto">
-            <table className={`w-full ${TABLE_MIN_W} table-fixed border-collapse text-left`}>
+            <table className={`w-full ${TABLE_MIN_W} table-fixed border-collapse text-left`} style={{ '--ticker-width': `${tickerWidth}px` } as CSSProperties}>
               <thead>
                 <SignalHead
                   thresholds={thresholds}
@@ -873,7 +904,9 @@ export default function SignalTable({
                   </tr>
                 ) : (
                   visible.map((s, i) => {
-                    const green = s.volume24h < ENTRY_VOLUME_THRESHOLD;
+                    const inflow = rowInflow(s);
+                    const holding = rowHolding(s);
+                    const holdingPartial = rowHoldingPartial(s);
                     const isPass = s.tier === 'P';
                     return (
                       <tr
@@ -897,53 +930,62 @@ export default function SignalTable({
                             )}
                           </div>
                         </Td>
-                        <Td className="w-32">
+                        <Td className="signal-ticker-col">
                           <span
-                            className="flex items-center gap-[2px] text-[13.5px] font-bold text-ink"
+                            className="ticker-cell flex items-center gap-[2px] text-[13.5px] font-bold text-ink"
                             title={s.symbol ? `$${s.symbol.toUpperCase()}` : undefined}
                           >
                             <span aria-hidden className="text-pos">
                               $
                             </span>
-                            <span className="min-w-0 truncate">{s.symbol?.toUpperCase() ?? '—'}</span>
+                            <span className="min-w-max">{s.symbol?.toUpperCase() ?? '—'}</span>
                             <TokenNote ca={s.ca} chain={s.chain} symbol={s.symbol} note={s.note} onSaved={(note) => {
                               setSignals((rows) => rows?.map((row) => row.ca === s.ca && row.chain === s.chain ? { ...row, note } : row) ?? rows);
                               notifyTierChange?.();
                             }} />
                           </span>
                         </Td>
-                        <Td className="w-16 text-center">
+                        <Td className="signal-tier-col w-16 text-center">
                           {isAdmin ? (
                             <TierSelect tier={s.tier} onChange={(t) => onTierChange(s, t)} />
                           ) : (
                             <TierBadge tier={s.tier} />
                           )}
                         </Td>
-                        <Td className="w-24 text-center font-mono text-[13px] tabular-nums text-ink2">
-                          {s.marketCap !== undefined ? usd(s.marketCap) : '—'}
+                        <Td
+                          className="signal-mc-col w-24 text-center font-mono text-[13px] tabular-nums text-ink2"
+                          title={s.dataUpdatedAt?.marketCap != null ? `Market cap response: ${formatTimestamp(s.dataUpdatedAt.marketCap)}` : undefined}
+                        >
+                          <MarketCapChart ca={s.ca} symbol={s.symbol} marketCap={s.marketCap} history={s.marketCapHistory} />
                         </Td>
-                        <Td className="w-40 text-center">
+                        <Td className="signal-ca-col w-40 text-center">
                           <CaCell ca={s.ca} chain={s.chain} xHandle={s.xHandle} />
                         </Td>
-                        <Td className={SHOW_FOMO ? 'w-[768px]' : 'w-96'}>
+                        <Td className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'}`}>
                           {SHOW_FOMO ? (
-                            <div className="min-w-0">
-                              {s.fomoUsers.length === 0 ? (
-                                <Pill active={false}>none</Pill>
-                              ) : (
-                                <>
+                            <div className="min-w-0 space-y-1.5">
+                              {s.fomoUsers.length > 0 && (
+                                <section>
+                                  <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">FOMO users</div>
                                   <FomoTable users={s.fomoUsers.slice(0, 3)} />
-                                  {s.fomoUsers.length > 3 && (
-                                    <button
-                                      type="button"
-                                      onClick={() => setFomoPopup(s)}
-                                      className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
-                                      title="Xem toàn bộ FOMO user đã trade token này"
-                                    >
-                                      +{s.fomoUsers.length - 3} more
-                                    </button>
-                                  )}
-                                </>
+                                </section>
+                              )}
+                              {s.trackedWallets.length > 0 && (
+                                <section className={s.fomoUsers.length > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
+                                  <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">Native wallets</div>
+                                  <WalletTable wallets={s.trackedWallets.slice(0, 3)} />
+                                </section>
+                              )}
+                              {s.fomoUsers.length === 0 && s.trackedWallets.length === 0 && <Pill active={false}>none</Pill>}
+                              {(s.fomoUsers.length > 3 || s.trackedWallets.length > 3) && (
+                                <button
+                                  type="button"
+                                  onClick={() => setFomoPopup(s)}
+                                  className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
+                                  title="Xem toàn bộ FOMO users và native wallets đã trade token này"
+                                >
+                                  View all — {s.fomoUsers.length} users · {s.trackedWallets.length} wallets
+                                </button>
                               )}
                             </div>
                           ) : s.trackedWallets.length === 0 ? (
@@ -964,39 +1006,59 @@ export default function SignalTable({
                             </div>
                           )}
                         </Td>
-                        <Td className="w-20 text-center font-mono text-[13px] tabular-nums text-ink2">{rowTrackedIn(s)}</Td>
-                        <Td className={`w-24 ${NS_CELL} ${NS_START}`}>
-                          <SetupValue value={s.nansen.t100?.multiple !== undefined ? fmtNum(s.nansen.t100.multiple) : '—'} pass={s.nansen.pass.t100} />
+                        <Td className="w-16 text-center font-mono text-[13px] tabular-nums text-ink2">{rowTrackedIn(s)}</Td>
+                        <Td className={`w-20 ${NS_CELL} ${NS_START}`}>
+                          <T100Chart
+                            ca={s.ca}
+                            symbol={s.symbol}
+                            multiple={s.nansen.t100?.multiple}
+                            pass={s.nansen.pass.t100}
+                            history={s.nansen.t100History}
+                            updatedAt={s.nansen.t100History?.at(-1)?.t}
+                          />
                         </Td>
-                        <Td className={`w-24 ${NS_CELL}`}>
+                        <Td className={`w-20 ${NS_CELL}`}>
                           <SetupValue value={s.nansen.lf !== undefined ? compact(s.nansen.lf) : '—'} pass={s.nansen.pass.lf} />
                         </Td>
-                        <Td className={`w-24 ${NS_CELL} ${NS_END}`}>
-                          <FreshWalletChart ca={s.ca} symbol={s.symbol} fresh={s.nansen.fresh} pass={s.nansen.pass.fresh} history={s.nansen.freshHistory} updatedAt={s.nansen.freshUpdatedAt} />
+                        <Td className={`w-20 ${NS_CELL} ${NS_END}`}>
+                          <FreshWalletChart ca={s.ca} symbol={s.symbol} fresh={s.nansen.fresh} pass={s.nansen.pass.fresh} history={s.nansen.freshHistory} marketCapHistory={s.marketCapHistory} updatedAt={s.dataUpdatedAt?.fresh ?? s.nansen.freshUpdatedAt} />
                         </Td>
-                        <Td className="w-24 text-center font-mono tabular-nums text-[13px] text-ink2">{fmtInt(s.holders)}</Td>
-                        <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2"><span className={volumeClass(rowInflow(s), 'inflow')}>{usd(rowInflow(s))}</span></div>
+                        <Td
+                          className="w-20 text-center font-mono tabular-nums text-[13px] text-ink2"
+                          title={s.dataUpdatedAt?.holders != null ? `Holder response: ${formatTimestamp(s.dataUpdatedAt.holders)}` : undefined}
+                        >
+                          <HolderCountChart
+                            ca={s.ca}
+                            symbol={s.symbol}
+                            holders={s.holders}
+                            history={s.holdersHistory}
+                            updatedAt={s.holdersHistory?.at(-1)?.t ?? s.dataUpdatedAt?.holders}
+                            valueClassName={holderCountClass(s.holders)}
+                          />
                         </Td>
-                        <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{pct(rowHolding(s))}</div>
+                        <Td className="w-24">
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={inflow === null ? 'One or more in-window FOMO BUY amounts are unavailable' : undefined}><span className={volumeClass(inflow ?? undefined, 'inflow')}>{inflow === null ? '—' : usd(inflow)}</span></div>
                         </Td>
-                        <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">
+                        <Td className="w-24">
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={holdingPartial ? 'Partial measured FOMO-user holdings; unknown users are omitted' : undefined}>
+                            <span className={trackedHoldingClass(holding)}>{holding !== undefined ? `${holdingPartial ? '≈' : ''}${pct(holding)}` : '—'}</span>
+                          </div>
+                        </Td>
+                        <Td className="w-24">
+                          <div
+                            className="text-center font-mono text-[13px] tabular-nums text-ink2"
+                            title={s.dataUpdatedAt?.volume24h != null ? `Volume response: ${formatTimestamp(s.dataUpdatedAt.volume24h)}` : undefined}
+                          >
                             {s.volume1h !== undefined ? usd(s.volume1h) : '—'}
                           </div>
                         </Td>
-                        <Td className="w-28">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">{usd(s.volume24h)}</div>
-                        </Td>
-                        <Td className="w-28 text-center font-mono text-[13px] tabular-nums text-ink2">
-                          <span className={volumeClass(s.buyVol24h, 'buy')}>{s.buyVol24h !== undefined ? usd(s.buyVol24h) : '—'}</span>
-                        </Td>
-                        <Td className="w-28 text-center font-mono text-[13px] tabular-nums">
-                          <span className={volumeClass(s.sellVol24h, 'sell')}>{s.sellVol24h !== undefined ? usd(s.sellVol24h) : '—'}</span>
-                        </Td>
-                        <Td className="w-14 text-center">
-                          <CheckSquare ok={green} title={`24H volume ${usd(s.volume24h)} · entry threshold ${usd(ENTRY_VOLUME_THRESHOLD)}`} />
+                        <Td className="w-24">
+                          <div
+                            className="text-center font-mono text-[13px] tabular-nums text-ink2"
+                            title={s.dataUpdatedAt?.volume24h != null ? `Volume response: ${formatTimestamp(s.dataUpdatedAt.volume24h)}` : undefined}
+                          >
+                            <span className={volume24hClass(s.volume24h)}>{usd(s.volume24h)}</span>
+                          </div>
                         </Td>
                       </tr>
                     );
@@ -1012,19 +1074,33 @@ export default function SignalTable({
         <Modal
           title={`Tracked by — ${walletsPopup.symbol ?? walletsPopup.ca} (${walletsPopup.trackedWallets.length} wallets)`}
           onClose={() => setWalletsPopup(null)}
+          className="trade-breakdown-modal"
         >
-          <div className="max-h-72 overflow-auto">
+          <div className="trade-breakdown-content overflow-auto">
             <WalletTable wallets={walletsPopup.trackedWallets} head />
           </div>
         </Modal>
       )}
       {SHOW_FOMO && fomoPopup && (
         <Modal
-          title={`FOMO by — ${fomoPopup.symbol ?? fomoPopup.ca} (${fomoPopup.fomoUsers.length} users)`}
+          title={`FOMO by — ${fomoPopup.symbol ?? fomoPopup.ca} (${fomoPopup.fomoUsers.length} users · ${fomoPopup.trackedWallets.length} native wallets)`}
           onClose={() => setFomoPopup(null)}
+          className="trade-breakdown-modal"
         >
-          <div className="max-h-72 overflow-auto">
-            <FomoTable users={fomoPopup.fomoUsers} head />
+          <div className="trade-breakdown-content space-y-4 overflow-auto">
+            <p className="font-mono text-xs text-ink2">
+              Tracked holding: {rowHolding(fomoPopup) !== undefined
+                ? `${rowHoldingPartial(fomoPopup) ? '≈' : ''}${pct(rowHolding(fomoPopup)!)}`
+                : '— (not measured)'}
+            </p>
+            <section>
+              <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">FOMO users</h3>
+              {fomoPopup.fomoUsers.length > 0 ? <FomoTable users={fomoPopup.fomoUsers} head /> : <p className="text-xs text-muted">No FOMO users traded this CA.</p>}
+            </section>
+            <section className="border-t border-line pt-3">
+              <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">Native wallets</h3>
+              {fomoPopup.trackedWallets.length > 0 ? <WalletTable wallets={fomoPopup.trackedWallets} head /> : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
+            </section>
           </div>
         </Modal>
       )}

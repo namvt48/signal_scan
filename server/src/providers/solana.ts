@@ -27,10 +27,14 @@
 // the SUSTAINED rate from this box that matters: 300ms and 500ms both tripped it,
 // 600ms (1.7 rps, ~17 req/10s) does not.
 
+import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { timed } from '../log.js';
 import { limiters } from '../ratelimit/index.js';
 import { HttpError } from '../ratelimit/types.js';
+import { providerRequestCache } from './request-cache.js';
+import type { RpcSource } from './rpc-usage.js';
+import { recordRpcAttempt, recordRpcOutcome, registerRpcEndpoint } from './rpc-usage.js';
 
 /** Classic SPL Token program. */
 export const SPL_TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
@@ -211,16 +215,20 @@ export function parseSolanaTransferOwner(json: unknown): string | null {
 
 export class SolanaRpcClient {
   readonly name = 'solana-rpc';
-
-  /** Credit-exhausted endpoints: endpoint → epoch ms until which it is skipped.
-   *  In-memory per client, keyed by endpoint string (never logged — carries the token). */
   private readonly retiredUntil = new Map<string, number>();
+  private readonly requestCache = providerRequestCache;
+  private readonly cacheScope: string;
 
   constructor(
     private readonly endpoints: readonly string[],
     private readonly timeoutMs = 30_000,
+    private readonly source: RpcSource = 'application',
   ) {
     if (endpoints.length === 0) throw new Error('solana rpc: no endpoints configured');
+    this.cacheScope = createHash('sha256').update(endpoints.join('\0')).digest('hex');
+    this.endpoints.forEach((endpoint, endpointIndex) => {
+      registerRpcEndpoint('solana', this.source, 'solana', endpointIndex, endpoint);
+    });
   }
 
   /** Retires an endpoint whose key ran out of credits for config.solanaRpcRetireMs. */
@@ -242,25 +250,32 @@ export class SolanaRpcClient {
    *  A credit-EXHAUSTED 429 is different: retire the endpoint and throw a SafeRpcError —
    *  the layer only retries HttpError, so exhaustion must not burn the retry budget. */
   private async post(endpoint: string, payload: unknown): Promise<Response> {
+    const endpointIndex = this.endpoints.indexOf(endpoint);
     return limiters.run('solana-rpc', { priority: 1 }, async () => {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      recordRpcAttempt('solana', this.source, 'solana', endpointIndex);
+      let res: Response;
+      try {
+        res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (error) {
+        recordRpcOutcome('solana', this.source, 'solana', endpointIndex, false);
+        throw error;
+      }
       if (res.status === 429) {
-        // Detached clone: reading it leaves the original body readable by the caller.
-        const body = (await res.clone().json().catch(() => null)) as unknown;
+        const body: unknown = await res.clone().json().catch(() => null);
         if (isCreditExhausted(body)) {
+          recordRpcOutcome('solana', this.source, 'solana', endpointIndex, false, true);
           this.retire(endpoint);
           throw new SafeRpcError('solana rpc 429 credit exhausted (endpoint retired)');
         }
-      }
-      if (res.status === 429) {
+        recordRpcOutcome('solana', this.source, 'solana', endpointIndex, false);
         throw new HttpError(res.status, res.headers.get('retry-after'), `solana rpc ${res.status}`);
       }
-      // Only 429 is layer-retryable: a dead (5xx) endpoint must fall through at once, not burn retries.
+      recordRpcOutcome('solana', this.source, 'solana', endpointIndex, res.ok);
       return res;
     });
   }
@@ -277,8 +292,10 @@ export class SolanaRpcClient {
     filter: string | { mint: string },
   ): Promise<Map<string, number>> {
     const kind = typeof filter === 'string' ? 'program' : 'mint';
+    const key = `${this.cacheScope}|solana|getTokenAccountsByOwner|${JSON.stringify([wallet, filter])}`;
     return timed('solana getTokenAccountsByOwner', { wallet: wallet.slice(0, 6), kind }, () =>
-      this.fetchOwnerAccounts(wallet, filter),
+      this.requestCache.run(key, 2_000, () => this.fetchOwnerAccounts(wallet, filter))
+        .then((result) => new Map(result)),
     );
   }
 
@@ -320,7 +337,12 @@ export class SolanaRpcClient {
    * TokenInfo down. Returns {} when no endpoint yields anything.
    */
   async getAssetInfo(mint: string): Promise<AssetInfo> {
-    return timed('solana getAsset', { mint: mint.slice(0, 6) }, () => this.fetchAssetInfo(mint));
+    const key = `${this.cacheScope}|solana|getAsset|${mint}`;
+    return timed('solana getAsset', { mint: mint.slice(0, 6) }, () =>
+      this.requestCache.run(key, 15_000, () => this.fetchAssetInfo(mint),
+        (info) => Object.keys(info).length > 0)
+        .then((info) => ({ ...info })),
+    );
   }
 
   private async fetchAssetInfo(mint: string): Promise<AssetInfo> {
@@ -346,47 +368,54 @@ export class SolanaRpcClient {
   /** getTransaction → the trader's wallet via parseSolanaTransferOwner. Opportunistic:
    *  null on every failure (unknown tx, parse gap, dead endpoints) — never throws. */
   async getTransactionOwner(signature: string): Promise<string | null> {
-    for (const endpoint of this.activeEndpoints()) {
-      try {
-        const res = await this.post(endpoint, {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTransaction',
-          params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
-        });
-        const json = (await res.json().catch(() => null)) as unknown;
-        if (isCreditExhausted(json)) {
-          this.retire(endpoint);
-          continue;
+    const key = `${this.cacheScope}|solana|getTransaction|${signature}`;
+    return this.requestCache.run(key, 300_000, async () => {
+      for (const endpoint of this.activeEndpoints()) {
+        try {
+          const res = await this.post(endpoint, {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
+          });
+          const json = (await res.json().catch(() => null)) as unknown;
+          if (isCreditExhausted(json)) {
+            this.retire(endpoint);
+            continue;
+          }
+          const rpcError = (json as { error?: unknown } | null)?.error;
+          if (!res.ok || !json || rpcError) continue;
+          return parseSolanaTransferOwner(json);
+        } catch {
+          // next endpoint, then give up
         }
-        const rpcError = (json as { error?: unknown } | null)?.error;
-        if (!res.ok || !json || rpcError) continue;
-        return parseSolanaTransferOwner(json);
-      } catch {
-        // next endpoint, then give up
       }
-    }
-    return null;
+      return null;
+    }, (owner) => owner !== null);
   }
 
   /** getTokenSupply(mint) → UI total supply; null when unavailable. */
   async getTokenSupply(mint: string): Promise<number | null> {
-    for (const endpoint of this.activeEndpoints()) {
-      try {
-        const res = await this.post(endpoint, { jsonrpc: '2.0', id: 1, method: 'getTokenSupply', params: [mint] });
-        const json = (await res.json().catch(() => null)) as unknown;
-        if (isCreditExhausted(json)) {
-          this.retire(endpoint);
-          continue;
+    const key = `${this.cacheScope}|solana|getTokenSupply|${mint}`;
+    return this.requestCache.run(key, 30_000, async () => {
+      for (const endpoint of this.activeEndpoints()) {
+        try {
+          const res = await this.post(endpoint, { jsonrpc: '2.0', id: 1, method: 'getTokenSupply', params: [mint] });
+          const json = (await res.json().catch(() => null)) as unknown;
+          if (isCreditExhausted(json)) {
+            this.retire(endpoint);
+            continue;
+          }
+          const rpcError = (json as { error?: unknown } | null)?.error;
+          if (!res.ok || !json || rpcError) continue;
+          const supply = parseTokenSupply(json);
+          if (supply !== null) return supply;
+        } catch {
+          // next endpoint, then give up
         }
-        const rpcError = (json as { error?: unknown } | null)?.error;
-        if (!res.ok || !json || rpcError) continue;
-        const supply = parseTokenSupply(json);
-        if (supply !== null) return supply;
-      } catch {
-        // next endpoint, then give up
       }
-    }
-    return null;
+      return null;
+    }, (supply) => supply !== null);
   }
 }
+

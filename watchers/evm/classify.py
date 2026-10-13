@@ -3,24 +3,35 @@ allowlist DEX router, classify buy/sell, chia chunk block-range, dựng body
 trade/event. KHÔNG IO — mọi hàm unit-test offline được. IO (WS/RPC) ở
 `watchers/evm/feed.py`. T8, plan evm-base-bsc (D7).
 
-Mọi địa chỉ router/quote dưới đây ĐÃ verify kèm nguồn (docs chính thức hoặc
-explorer name tag) — xem `evidence/T8-routers.txt`. KHÔNG thêm địa chỉ chưa
-verify. EVM address không phân biệt hoa/thường ⇒ khoá map đều lowercase.
+Router and quote addresses are verified against official deployment documentation;
+Robinhood sources are cited beside its mappings. Do not add unverified addresses.
+EVM addresses are case-insensitive, so map keys are lowercase.
 """
 
+WITHDRAWAL_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
+WRAPPED_NATIVE = {
+    "base": "0x4200000000000000000000000000000000000006",
+    "bsc": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    "robinhood": "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+}
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 DECIMALS_SELECTOR = "0x313ce567"  # decimals()
-EVM_CHAINS = ("base", "bsc")
+EVM_CHAINS = ("base", "bsc", "robinhood")
+DEFAULT_EVM_CHAINS = ("base", "bsc")
 
-EXPLORER_TX = {"base": "https://basescan.org/tx/", "bsc": "https://bscscan.com/tx/"}
+EXPLORER_TX = {
+    "base": "https://basescan.org/tx/",
+    "bsc": "https://bscscan.com/tx/",
+    "robinhood": "https://robinhoodchain.blockscout.com/tx/",
+}
 
-# Allowlist DEX router per chain (D7). Swap NGOÀI allowlist ⇒ bỏ qua (chống noise:
-# transfer thường, airdrop, aggregator lạ). Nguồn verify: evidence/T8-routers.txt.
+# Allowlist DEX router per chain (D7). Swap outside the allowlist is ignored.
+# Robinhood deployments (chain 4663) verified by official Uniswap docs:
+# https://developers.uniswap.org/docs/protocols/v3/deployments/v3-robinhood-chain-deployments
 ROUTERS = {
     "base": {
         "0x2626664c2603336e57b271c5c0b26f421741e481": "uniswap-v3",
         "0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43": "aerodrome",
-        # BaseSwap router THẬT (seed trong plan sai suffix …Fe37A921 — xem evidence)
         "0x327df1e6de05895d2ab08513aadd9313fe505d86": "baseswap",
     },
     "bsc": {
@@ -29,10 +40,14 @@ ROUTERS = {
         "0x3a6d8ca21d1cf76f653a67577fa0d27453350dd8": "biswap",
         "0x0eb6949e725a295ecb3beacfc3766610bc970bef": "biswap-smart",
     },
+    "robinhood": {
+        "0xcaf681a66d020601342297493863e78c959e5cb2": "uniswap-v3",
+        "0x8876789976decbfcbbbe364623c63652db8c0904": "uniswap-universal",
+    },
 }
 
-# Quote token per chain — chân "tiền" của swap: ví NHẬN quote = SELL token kia,
-# ví GỬI quote = BUY token kia. Token ngoài list này coi là token đích (CA).
+# Robinhood official token contracts:
+# https://docs.robinhood.com/chain/contracts/
 QUOTE_TOKENS = {
     "base": {
         "0x4200000000000000000000000000000000000006": "WETH",
@@ -45,9 +60,14 @@ QUOTE_TOKENS = {
         "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
         "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",
     },
+    "robinhood": {
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73": "WETH",
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168": "USDG",
+    },
 }
 
-
+# Native legs are reconstructed from transaction value or wrapped-native
+# Withdrawal events only for routers in the allowlist above.
 # ---------- topic / address ----------
 
 
@@ -114,6 +134,26 @@ def decode_transfer_log(log):
         "to": topic_to_address(topics[2]),
         "value": value,
     }
+
+def decode_withdrawal_log(log, chain, wallet):
+    """Decode only Withdrawal events from this chain's wrapped native token."""
+    if not isinstance(log, dict):
+        return None
+    topics = log.get("topics") or []
+    if (
+        str(log.get("address") or "").lower() != WRAPPED_NATIVE.get(chain)
+        or len(topics) < 2
+        or str(topics[0]).lower() != WITHDRAWAL_TOPIC
+        or topic_to_address(topics[1]) != wallet.lower()
+    ):
+        return None
+    data = log.get("data") or ""
+    try:
+        if len(data) != 66 or not data.startswith("0x"):
+            return None
+        return int(data, 16)
+    except ValueError:
+        return None
 
 
 # ---------- router / chunk ----------

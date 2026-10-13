@@ -1,138 +1,74 @@
-// Selective TTL cache + single-flight dedupe for the gateway
-// (plan request-plane-gateway, todo 11; draft Decisions 3 + 7).
-//
-// WHAT IS CACHED (deterministic params only)
-//   * Nansen credit `token-information` + `holders`.
-//   * DexScreener tokens / pairs / search.
-// EXCLUDED BY CONSTRUCTION:
-//   * GMGN - it mints a fresh `client_id`/`timestamp` per call (`gateway/gmgn.ts`,
-//     `providers/gmgn.ts:176-177`), so a replayed body would fail AUTH_INVALID;
-//     its route never reaches this module.
-//   * Nansen `flows` - its params carry a MOVING `{from,to}` window, so caching
-//     or deduping it would be a false hit (one key serving a different series);
-//     `classifyRequest` returns null for it, and the normalization below never
-//     rounds the window to fake a collision.
-//   * DexScreener profiles / boosts - live lists, outside the todo-11 scope.
-//
-// CREDIT ATTRIBUTION (draft Decision 7)
-//   For a CREDIT-bearing Nansen endpoint the key INCLUDES THE CALLER, so caller
-//   a's credit call can never be collapsed with - nor TTL-hit by - caller b's.
-//   Cross-caller sharing exists ONLY for the non-credit DexScreener class. The
-//   initiator runs the limiter once and pays its own real cost; every joiner
-//   (same-caller credit single-flight OR cross-caller non-credit dedupe) pays
-//   ZERO because it never reaches the limiter/budget path. A same-caller credit
-//   single-flight therefore charges the caller exactly ONE for N concurrent
-//   identical calls.
-//
-// REQUEST ORDER (pinned)
-//   auth -> cache lookup -> budget pre-flight (todo 19; the `preflight` seam) ->
-//   limiters.run(...) -> upstream. A cache OR single-flight hit SHORT-CIRCUITS
-//   here, BEFORE the pre-flight, so a 0-credit hit is never budget-denied. The
-//   `preflight` hook defaults to a no-op; when todo 19 lands it returns a
-//   `denial(429,'budget_exceeded')` to deny and `undefined` to allow.
-//
-// NORMALIZATION (deterministic; documented so keys never collide by accident)
-//   key = `${provider}|${stableStringify(bodyMinusPriority)}|${credit?caller:'*'}`
-//   * Object keys are sorted LEXICOGRAPHICALLY at every depth, so the key is
-//     independent of property order.
-//   * Array order is PRESERVED (it is semantic - e.g. an address list).
-//   * Scalars use JSON.stringify; `undefined` object members are dropped.
-//   * `priority` is EXCLUDED - it changes scheduling, never the upstream body.
-//   * NO rounding / trimming / case-folding: a moving `{from,to}` window stays
-//     distinct, so a time window can never be rounded into a fake hit.
-//
-// NO external store: a per-process `Map` (draft Decision 3 - Redis would force a
-// distributed rewrite). Read-only; nothing is persisted, a restart starts cold.
-// Only 2xx upstream results are stored: a non-2xx throws `UpstreamError` inside
-// the limiter and maps to a non-2xx envelope, which `isCacheable` rejects.
+// Selective TTL cache + single-flight for public market queries.
+// Nansen CA queries share across callers; the initiator alone pays/preflights.
+// Wallet/profile APIs remain uncached. GMGN single-flight is implemented separately.
+// Keys preserve exact semantic ranges/labels, strip scheduling priority, and
+// normalize only known CA fields for known EVM chains. Solana stays case-sensitive.
+// Stored results are bounded in memory and require successful non-null JSON bodies.
 
+import { EVM_ADDRESS } from '../shared/chain.js';
 import { config } from '../config.js';
-import { NANSEN_CREDIT_LIMITER } from './nansen.js';
+import { NANSEN_CREDIT_LIMITER, NANSEN_DOOR_PATH } from './nansen.js';
 import { DEXSCREENER_LIMITER } from './dexscreener.js';
 import type { Caller } from './auth.js';
 import type { DispatchResult } from './contract.js';
 
-/** Nansen credit path for token-information (`providers/nansen.ts:52`). */
-const NANSEN_TOKEN_INFORMATION_PATH = '/api/v1/tgm/token-information';
-/** Nansen credit path for holders (cost 5; 150 with `premium_labels`). */
-const NANSEN_HOLDERS_PATH = '/api/v1/tgm/holders';
-/** DexScreener endpoint names with DETERMINISTIC params (`gateway/dexscreener.ts`). */
-const DEX_CACHEABLE_ENDPOINTS: ReadonlySet<string> = new Set(['tokens', 'pairs', 'search']);
+const NANSEN_MARKET_PATHS: ReadonlySet<string> = new Set([
+  '/api/v1/tgm/token-information',
+  '/api/v1/tgm/holders',
+  '/api/v1/tgm/flows',
+]);
+const NANSEN_DOOR_ENDPOINTS: ReadonlySet<string> = new Set([
+  'tgm-essential-data', 'tgm-volume-details', 'tgm-holders-gini-stats',
+]);
+const DEX_CACHEABLE_ENDPOINTS: ReadonlySet<string> = new Set(['tokens', 'pairs', 'search', 'profiles', 'boosts']);
+const EVM_CHAINS = new Set(['ethereum', 'base', 'bsc', 'arbitrum', 'polygon', 'optimism', 'avalanche', 'linea', 'zksync']);
+const TOKEN_FIELDS = new Set(['tokenAddress', 'token_address', 'contractAddress', 'contract_address', 'pairId']);
 
-/** TTL class -> the matching config knob (env-tunable, todo 6). */
-export type CacheTtlClass = 'nansen' | 'dex';
+export type CacheTtlClass = 'nansen' | 'flows' | 'door' | 'dex';
+export interface CachePolicy { credit: boolean; ttlClass: CacheTtlClass }
 
-export interface CachePolicy {
-  /** Credit-bearing -> the caller is part of the key; a joiner pays 0. */
-  credit: boolean;
-  ttlClass: CacheTtlClass;
-}
-
-/**
- * Classify a gateway request as cacheable (with its credit/ttl class), or null
- * when it MUST NOT be cached/deduped. `provider` is the route class the HTTP
- * layer passes; the discriminating `endpoint` rides the request body (the
- * `endpoint` field of the todo-3 contract request).
- */
 export function classifyRequest(provider: string, rawBody: unknown): CachePolicy | null {
   const endpoint = readEndpoint(rawBody);
   if (endpoint === null) return null;
   if (provider === NANSEN_CREDIT_LIMITER) {
     const path = endpointPath(endpoint);
-    if (path === NANSEN_TOKEN_INFORMATION_PATH || path === NANSEN_HOLDERS_PATH) {
-      return { credit: true, ttlClass: 'nansen' };
+    if (NANSEN_MARKET_PATHS.has(path)) {
+      return { credit: true, ttlClass: path === '/api/v1/tgm/flows' ? 'flows' : 'nansen' };
     }
-    return null; // flows (moving window) + the dead profiler endpoints.
+    return null;
   }
-  if (provider === DEXSCREENER_LIMITER) {
-    if (DEX_CACHEABLE_ENDPOINTS.has(endpoint)) return { credit: false, ttlClass: 'dex' };
-    return null; // profiles / boosts.
+  if (provider === NANSEN_DOOR_PATH && NANSEN_DOOR_ENDPOINTS.has(endpoint)) {
+    return { credit: false, ttlClass: 'door' };
   }
-  return null; // gmgn / the generic proxy: never cached.
+  if (provider === DEXSCREENER_LIMITER && DEX_CACHEABLE_ENDPOINTS.has(endpoint)) {
+    return { credit: false, ttlClass: 'dex' };
+  }
+  return null;
 }
 
-/**
- * Budget pre-flight seam (todo 19). Called AFTER the cache lookup and BEFORE the
- * limiter. Return a denial (e.g. `denial(429,'budget_exceeded')`) to
- * short-circuit, or `undefined` to allow. Defaults to a no-op.
- */
-export type Preflight = (
-  provider: string,
-  rawBody: unknown,
-  caller: Caller,
-) => DispatchResult | undefined | Promise<DispatchResult | undefined>;
+export type Preflight = (provider: string, rawBody: unknown, caller: Caller) =>
+  DispatchResult | undefined | Promise<DispatchResult | undefined>;
 
 export interface GatewayCacheOptions {
-  /** Injectable clock (tests); defaults to `Date.now`. */
   now?: () => number;
-  /** Nansen TTL override; defaults to `config.cacheTtlNansenMs`. */
   ttlNansenMs?: number;
-  /** DexScreener TTL override; defaults to `config.cacheTtlDexscreenerMs`. */
   ttlDexscreenerMs?: number;
+  ttlFlowsMs?: number;
+  ttlDoorMs?: number;
+  maxEntries?: number;
+  maxInflight?: number;
 }
 
-interface Entry {
-  expiresAt: number;
-  result: DispatchResult;
-}
-
-/** Cache lookup counters + live sizes (observability / todo-20 metrics / tests). */
+interface Entry { expiresAt: number; result: DispatchResult }
 export interface CacheStats {
-  /** Fresh stored entry returned (short-circuits before pre-flight/limiter). */
-  hits: number;
-  /** No fresh entry for a cacheable key -> an initiator ran (absent or expired). */
-  misses: number;
-  /** Requests that joined an in-flight call (dedupe; neither hit nor miss). */
-  joined: number;
-  /** Live cached-entry count. */
-  size: number;
-  /** In-flight single-flight count. */
-  inflight: number;
+  hits: number; misses: number; joined: number; size: number; inflight: number;
 }
+
+
 
 /**
- * In-memory TTL cache + single-flight for deterministic-param endpoints. One
- * instance per gateway app; read-only with respect to everything downstream.
+ * Bounded per-process TTL cache + single-flight. Cacheable requests are public CA
+ * market data, so cache keys intentionally omit caller while retaining full body.
  */
 export class GatewayCache {
   private readonly entries = new Map<string, Entry>();
@@ -143,126 +79,101 @@ export class GatewayCache {
   private readonly now: () => number;
   private readonly ttlNansenMs: number;
   private readonly ttlDexscreenerMs: number;
+  private readonly ttlFlowsMs: number;
+  private readonly ttlDoorMs: number;
+  private readonly maxEntries: number;
+  private readonly maxInflight: number;
 
   constructor(opts: GatewayCacheOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.ttlNansenMs = opts.ttlNansenMs ?? config.cacheTtlNansenMs;
     this.ttlDexscreenerMs = opts.ttlDexscreenerMs ?? config.cacheTtlDexscreenerMs;
+    this.ttlFlowsMs = opts.ttlFlowsMs ?? 30_000;
+    this.ttlDoorMs = opts.ttlDoorMs ?? 30_000;
+    this.maxEntries = opts.maxEntries ?? 1000;
+    this.maxInflight = opts.maxInflight ?? 256;
   }
 
-  /**
-   * Run one request through the pinned order. `run` is the limiter+upstream call
-   * (built by the HTTP layer); it is invoked for the initiator only, so a hit or
-   * a joiner performs no limiter call and no budget pre-flight.
-   */
-  async dispatch(
-    provider: string,
-    rawBody: unknown,
-    caller: Caller,
-    run: () => Promise<DispatchResult>,
-    preflight?: Preflight,
-  ): Promise<DispatchResult> {
+  async dispatch(provider: string, rawBody: unknown, caller: Caller,
+    run: () => Promise<DispatchResult>, preflight?: Preflight): Promise<DispatchResult> {
     const policy = classifyRequest(provider, rawBody);
     if (policy === null) return this.runUncached(provider, rawBody, caller, run, preflight);
-
-    const key = cacheKey(provider, rawBody, policy.credit, caller);
+    const key = cacheKey(provider, rawBody, false, caller);
     const cached = this.entries.get(key);
     if (cached !== undefined) {
       if (cached.expiresAt > this.now()) {
         this.hits += 1;
-        return cached.result; // HIT: before pre-flight
+        return cached.result;
       }
-      this.entries.delete(key); // stale
+      this.entries.delete(key);
     }
     const joined = this.inflight.get(key);
     if (joined !== undefined) {
       this.joined += 1;
-      return joined; // joiner: zero cost, no pre-flight
+      return joined;
+    }
+    if (this.inflight.size >= this.maxInflight) {
+      return { status: 503, payload: { error: 'cache_inflight_limit' } };
     }
     this.misses += 1;
-
-    const ttlMs = policy.ttlClass === 'nansen' ? this.ttlNansenMs : this.ttlDexscreenerMs;
+    const ttlMs = policy.ttlClass === 'flows' ? this.ttlFlowsMs
+      : policy.ttlClass === 'door' ? this.ttlDoorMs
+        : policy.ttlClass === 'nansen' ? this.ttlNansenMs : this.ttlDexscreenerMs;
     const promise = this.runInitiator(key, ttlMs, provider, rawBody, caller, run, preflight);
     this.inflight.set(key, promise);
-    try {
-      return await promise;
-    } finally {
-      if (this.inflight.get(key) === promise) this.inflight.delete(key);
-    }
+    try { return await promise; }
+    finally { if (this.inflight.get(key) === promise) this.inflight.delete(key); }
   }
 
-  /** Live cached-entry count (observability / tests). */
-  size(): number {
-    return this.entries.size;
-  }
-
-  /** In-flight single-flight count (observability / tests). */
-  inflightCount(): number {
-    return this.inflight.size;
-  }
-
-  /** Total requests that joined an in-flight call (observability / tests). */
-  joinedCount(): number {
-    return this.joined;
-  }
-
-  /** Hit/miss/join counters + live sizes (observability / todo-20 metrics / tests). */
+  size(): number { return this.entries.size; }
+  inflightCount(): number { return this.inflight.size; }
+  joinedCount(): number { return this.joined; }
   stats(): CacheStats {
-    return {
-      hits: this.hits,
-      misses: this.misses,
-      joined: this.joined,
-      size: this.entries.size,
-      inflight: this.inflight.size,
-    };
+    return { hits: this.hits, misses: this.misses, joined: this.joined,
+      size: this.entries.size, inflight: this.inflight.size };
   }
 
-  private async runUncached(
-    provider: string,
-    rawBody: unknown,
-    caller: Caller,
-    run: () => Promise<DispatchResult>,
-    preflight?: Preflight,
-  ): Promise<DispatchResult> {
+  private async runUncached(provider: string, rawBody: unknown, caller: Caller,
+    run: () => Promise<DispatchResult>, preflight?: Preflight): Promise<DispatchResult> {
     const denied = await preflight?.(provider, rawBody, caller);
     if (denied !== undefined) return denied;
     return run();
   }
 
-  private async runInitiator(
-    key: string,
-    ttlMs: number,
-    provider: string,
-    rawBody: unknown,
-    caller: Caller,
-    run: () => Promise<DispatchResult>,
-    preflight?: Preflight,
-  ): Promise<DispatchResult> {
+  private async runInitiator(key: string, ttlMs: number, provider: string, rawBody: unknown,
+    caller: Caller, run: () => Promise<DispatchResult>, preflight?: Preflight): Promise<DispatchResult> {
     const denied = await preflight?.(provider, rawBody, caller);
     if (denied !== undefined) return denied;
     const result = await run();
-    if (isCacheable(result)) this.entries.set(key, { expiresAt: this.now() + ttlMs, result });
+    if (isCacheable(result) && this.maxEntries > 0) {
+      while (this.entries.size >= this.maxEntries) {
+        const oldest = this.entries.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.entries.delete(oldest);
+      }
+      this.entries.set(key, { expiresAt: this.now() + ttlMs, result });
+    }
     return result;
   }
 }
 
-/** Build the deterministic cache key (see the NORMALIZATION note above). */
-export function cacheKey(
-  provider: string,
-  rawBody: unknown,
-  credit: boolean,
-  caller: Caller,
-): string {
-  const scope = credit ? caller : '*';
-  return `${provider}|${stableStringify(stripPriority(rawBody))}|${scope}`;
+
+/** Semantic key; caller scope is intentionally omitted for public market data. */
+export function cacheKey(provider: string, rawBody: unknown, _credit: boolean, _caller: Caller): string {
+  return `${provider}|${stableStringify(stripPriority(rawBody))}`;
 }
 
-/** Only a 2xx upstream envelope is cacheable; a denial or non-2xx is not. */
 function isCacheable(result: DispatchResult): boolean {
-  if (result.status !== 200) return false;
-  const payload = result.payload;
-  if (!('status' in payload)) return false;
-  return payload.status >= 200 && payload.status < 300;
+  if (result.status !== 200 || !('status' in result.payload)) return false;
+  const { status, body } = result.payload;
+  if (status < 200 || status >= 300 || body === null) return false;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== 'object' || parsed === null) return false;
+    const record = parsed as Record<string, unknown>;
+    return record.error == null && !(typeof record.status === 'number' && record.status >= 400) &&
+      !(typeof record.code === 'number' && record.code !== 0);
+  } catch { return false; }
 }
 
 function readEndpoint(rawBody: unknown): string | null {
@@ -276,7 +187,13 @@ function endpointPath(endpoint: string): string {
   return q === -1 ? endpoint : endpoint.slice(0, q);
 }
 
-/** Drop the scheduling-only `priority` member so it cannot split the key. */
+function normalizeAddressList(addresses: string): string {
+  return addresses
+    .split(',')
+    .map((address) => (EVM_ADDRESS.test(address) ? address.toLowerCase() : address))
+    .join(',');
+}
+
 function stripPriority(rawBody: unknown): unknown {
   if (typeof rawBody !== 'object' || rawBody === null || Array.isArray(rawBody)) return rawBody;
   const out: Record<string, unknown> = {};
@@ -286,16 +203,30 @@ function stripPriority(rawBody: unknown): unknown {
   return out;
 }
 
-/** Stable JSON: object keys sorted at every depth; array order preserved. */
-function stableStringify(value: unknown): string {
+function stableStringify(value: unknown, inheritedChain?: string): string {
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v, inheritedChain)).join(',')}]`;
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map((v: unknown) => stableStringify(v)).join(',')}]`;
   const obj = value as Record<string, unknown>;
+  const chain = typeof obj.chain === 'string'
+    ? obj.chain.toLowerCase()
+    : typeof obj.chainId === 'string'
+      ? obj.chainId.toLowerCase()
+      : inheritedChain;
   const parts: string[] = [];
   for (const key of Object.keys(obj).sort()) {
     const member = obj[key];
     if (member === undefined) continue;
-    parts.push(`${JSON.stringify(key)}:${stableStringify(member)}`);
+    const normalized =
+      key === 'addresses' && typeof member === 'string'
+        ? normalizeAddressList(member)
+        : TOKEN_FIELDS.has(key) &&
+            typeof member === 'string' &&
+            EVM_ADDRESS.test(member) &&
+            chain !== undefined &&
+            EVM_CHAINS.has(chain)
+          ? member.toLowerCase()
+          : member;
+    parts.push(`${JSON.stringify(key)}:${stableStringify(normalized, chain)}`);
   }
   return `{${parts.join(',')}}`;
 }

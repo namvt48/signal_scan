@@ -34,6 +34,170 @@ const CHAIN_BY_API_NAME: Record<string, Chain> = {
 };
 
 const PAGE_CAP = 4;
+export interface FomoBalance {
+  ca: string;
+  chain: Chain;
+  amount: number;
+}
+
+export interface FomoBalanceSnapshot {
+  balances: FomoBalance[];
+  capturedAt: number;
+  complete: boolean;
+  truncated: boolean;
+  available: boolean;
+}
+
+export interface FomoSwapLeg {
+  address: string;
+  usd: number | null;
+}
+
+/** One on-chain fill from `/v2/users/{handle}/swaps`; unlike `trades`, this is
+ *  an individual swap, not an aggregated position. */
+export interface FomoSwap {
+  chain: Chain;
+  at: number;
+  tradeIdOut: string | null;
+  tokenIn: FomoSwapLeg;
+  tokenOut: FomoSwapLeg;
+}
+
+export interface FomoBuySwapTarget {
+  ca: string;
+  chain: Chain;
+  ts: number;
+  tradeId: string | null;
+}
+
+
+function toSwapLeg(value: unknown): FomoSwapLeg | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || !('address' in value) || !('usd' in value)) return null;
+  if (typeof value.address !== 'string' || value.address === '') return null;
+  const usd = value.usd;
+  if (usd !== null && (typeof usd !== 'number' || !Number.isFinite(usd) || usd < 0)) return null;
+  return { address: value.address, usd };
+}
+
+function toSwap(value: unknown): FomoSwap | null | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || !('chain' in value) || !('at' in value) || !('tokenIn' in value) || !('tokenOut' in value)) return null;
+  if (typeof value.chain !== 'string') return null;
+  const chain = CHAIN_BY_API_NAME[value.chain];
+  if (chain === undefined) return undefined;
+  const at = timestampMs(value.at);
+  const tokenIn = toSwapLeg(value.tokenIn);
+  const tokenOut = toSwapLeg(value.tokenOut);
+  if (at === null || tokenIn === null || tokenOut === null) return null;
+  return { chain, at, tradeIdOut: 'tradeIdOut' in value ? strOrNull(value.tradeIdOut) : null, tokenIn, tokenOut };
+}
+
+/** Resolve a BUY only when exactly one swap matches the FOMO position, token,
+ *  chain, and alert's five-second timestamp bucket. `tokenIn.usd` is the USD
+ *  value of what the trader spent; position marks are not used as fill size. */
+export function matchFomoBuySwap(target: FomoBuySwapTarget, swaps: readonly FomoSwap[]): number | null {
+  const ca = canonicalCa(target.ca, target.chain);
+  const matches = swaps.filter((swap) =>
+    swap.chain === target.chain &&
+    canonicalCa(swap.tokenOut.address, swap.chain) === ca &&
+    (target.tradeId === null || swap.tradeIdOut === target.tradeId) &&
+    swap.at >= target.ts &&
+    swap.at < target.ts + 5_000,
+  );
+  if (matches.length !== 1) return null;
+  const match = matches[0]!;
+  if (match.tradeIdOut === null) return null;
+  const amount = match.tokenIn.usd;
+  return amount !== null && amount > 0 ? amount : null;
+}
+
+/** One recent page of individual fills. A partial upstream response cannot
+ *  prove uniqueness, so it is deliberately left unresolved. */
+export async function fetchFomoSwaps(handle: string): Promise<FomoSwap[] | null> {
+  if (config.fomoApiKey === '') return null;
+  const url = new URL(`${config.fomoApiBase}/v2/users/${encodeURIComponent(handle)}/swaps`);
+  url.searchParams.set('limit', '100');
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { authorization: `Bearer ${config.fomoApiKey}` },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (res.ok) {
+        const body: unknown = await res.json();
+        if (typeof body !== 'object' || body === null || Array.isArray(body) || !('swaps' in body) || !Array.isArray(body.swaps) || ('partial' in body && body.partial === true) || ('available' in body && body.available === false)) return null;
+        const swaps: FomoSwap[] = [];
+        for (const raw of body.swaps) {
+          const swap = toSwap(raw);
+          if (swap === null) return null;
+          if (swap !== undefined) swaps.push(swap);
+        }
+        return swaps;
+      }
+      if (res.status !== 429 && res.status !== 503) {
+        log.warn(`[fomo-api] ${handle} swaps -> HTTP ${res.status}`);
+        return null;
+      }
+    } catch (e) {
+      log.warn(`[fomo-api] ${handle} swaps attempt ${attempt}: ${String(e)}`);
+    }
+    if (attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+  }
+  log.error(`[fomo-api] ${handle} swaps gave up after ${ATTEMPTS} attempts`);
+  return null;
+}
+
+const timestampMs = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value < 10_000_000_000 ? value * 1000 : value;
+  if (typeof value === 'string') {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
+
+/** One all-chain snapshot per trader; incomplete metadata is preserved for callers. */
+export async function fetchFomoBalances(handle: string): Promise<FomoBalanceSnapshot | null> {
+  if (config.fomoApiKey === '') return null;
+  const url = `${config.fomoApiBase}/v2/users/${encodeURIComponent(handle)}/balances`;
+  try {
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${config.fomoApiKey}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as Record<string, unknown>;
+    const capturedAt = timestampMs(body.capturedAt);
+    if (capturedAt === null || !Array.isArray(body.holdings)) return null;
+    const available = body.available !== false;
+    let complete = body.complete === true;
+    const truncated = body.truncated === true || body.upstreamTruncated === true;
+    const balances: FomoBalance[] = [];
+    for (const item of body.holdings) {
+      if (item === null || typeof item !== 'object') {
+        complete = false;
+        continue;
+      }
+      const raw = item as Record<string, unknown>;
+      const chain = CHAIN_BY_API_NAME[String(raw.chain)];
+      const token = raw.token as Record<string, unknown> | undefined;
+      const address = typeof token?.address === 'string' ? token.address : '';
+      const amount = raw.amount;
+      if (chain === undefined) continue;
+      if (address === '' || typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+        complete = false;
+        continue;
+      }
+      balances.push({ ca: canonicalCa(address, chain), chain, amount });
+    }
+    return { balances, capturedAt, complete, truncated, available };
+  } catch (e) {
+    log.warn(`[fomo-api] ${handle} balances: ${String(e)}`);
+    return null;
+  }
+}
+
 const ATTEMPTS = 3;
 const TIMEOUT_MS = 20_000;
 

@@ -1,6 +1,6 @@
 # Watcher host units — gateway egress env (request-plane-gateway)
 
-Host `root@194.163.187.250`. The host systemd watchers reach the request-plane gateway on
+Host `root@167.86.101.228`. The host systemd watchers reach the request-plane gateway on
 **loopback** (`http://127.0.0.1:8130`); the gateway is deployed separately (plan todo 21).
 This is the deploy/provisioning runbook for the two units. **Never commit the token value
 — this file references env file PATHS only.**

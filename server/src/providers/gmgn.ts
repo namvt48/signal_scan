@@ -129,6 +129,8 @@ export interface GmgnProvider {
 }
 
 export class GmgnMarketProvider implements GmgnProvider {
+  private readonly inFlight = new Map<string, Promise<MetricPatch>>();
+
   readonly name = 'gmgn';
 
   constructor(
@@ -137,35 +139,15 @@ export class GmgnMarketProvider implements GmgnProvider {
   ) {
     void this.apiKey;
   }
-
   /**
-   * ONE token/info call per kind, split into the two DISJOINT field sets the
-   * sweeps own (essential: state; volume: flows) so the hourly essential and
-   * volume passes never overwrite each other's columns. `gini` is Nansen's —
-   * the composite never routes it here, and returning {} keeps that explicit.
+   * Essential and volume share one upstream token/info response. Return its
+   * full projection so the poller can cache both data sets at the same time.
+   * `gini` is Nansen's and is never routed here.
    */
   async metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
     if (kind === 'gini') return {};
     const priority: Priority = kind === 'volume' ? 2 : 1;
-    const p = await this.fetchTokenInfo(ca, chain, priority);
-    if (kind === 'volume') {
-      return {
-        volume24h: p.volume24h ?? 0,
-        buyVol24h: p.buyVol24h ?? 0,
-        sellVol24h: p.sellVol24h ?? 0,
-        volume1h: p.volume1h ?? 0,
-      };
-    }
-    return {
-      ...(p.price !== undefined ? { price: p.price } : {}),
-      ...(p.supply !== undefined ? { supply: p.supply } : {}),
-      ...(p.marketCap !== undefined ? { marketCap: p.marketCap } : {}),
-      ...(p.liquidity !== undefined ? { liquidity: p.liquidity } : {}),
-      ...(p.holders !== undefined ? { holders: p.holders } : {}),
-      ...(p.symbol !== undefined ? { symbol: p.symbol } : {}),
-      ...(p.xHandle !== undefined ? { xHandle: p.xHandle } : {}),
-      ...(p.deployedAt !== undefined ? { deployedAt: p.deployedAt } : {}),
-    };
+    return this.fetchTokenInfo(ca, chain, priority);
   }
 
   /** Symbol/supply/price floor with no browser door — lets the ticker backfill run while Nansen CF-blocks. */
@@ -178,13 +160,23 @@ export class GmgnMarketProvider implements GmgnProvider {
     };
   }
 
-  private async fetchTokenInfo(ca: string, chain: Chain, priority: Priority): Promise<MetricPatch> {
-    return timed('gmgn token/info', { ca, chain }, async () => {
+  private fetchTokenInfo(ca: string, chain: Chain, priority: Priority): Promise<MetricPatch> {
+    const key = `${chain}\0${ca}`;
+    const active = this.inFlight.get(key);
+    if (active) return active;
+
+    const request = timed('gmgn token/info', { ca, chain }, async () => {
       const env = await this.gateway.call(GW_GMGN_TOKEN_INFO_PATH, { ca, chain, priority });
       if (env.status < 200 || env.status >= 300 || env.body === null) {
         throw new HttpError(env.status, env.headers['x-ratelimit-reset'] ?? null, `gmgn token/info ${env.status}`.slice(0, 200));
       }
       return parseTokenInfo(JSON.parse(env.body) as GmgnTokenInfoResponse);
     });
+    this.inFlight.set(key, request);
+    const clear = () => {
+      if (this.inFlight.get(key) === request) this.inFlight.delete(key);
+    };
+    void request.then(clear, clear);
+    return request;
   }
 }

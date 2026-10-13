@@ -6,10 +6,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
-import { CHAINS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
+import { CHAINS, EVM_ADDRESS, EVM_CHAINS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
 import { type Tier } from './shared/tier.js';
 import { config } from './config.js';
 import { MOCK_CA_POOL } from './providers/mock.js';
+import type { AlertMetric, AlertMetricObservation, AlertMetricSnapshot } from './alert-feed.js';
 
 export interface WalletRow {
   id: string;
@@ -89,7 +90,28 @@ export interface TokenStateRow {
   fresh_updated_at: number | null;
   /** JSON-encoded {t,value} snapshots from successful existing Fresh metric updates. */
   fresh_history_json: string | null;
+  /** JSON-encoded {t,value} samples from successful T100 analytics refreshes. */
+  t100_history_json: string | null;
+  /** JSON-encoded {t,value} samples of the displayed holder count. */
+  holders_history_json: string | null;
+  /** JSON-encoded {t,value} market-cap samples from existing metric updates. */
+  market_cap_history_json: string | null;
   fetched_at: number | null;
+}
+export interface MetricPollCacheRow {
+  ca: string;
+  chain: Chain;
+  kind: string;
+  last_attempt_at: number;
+  response_at: number | null;
+  next_allowed_at: number;
+  failure_count: number;
+  response_json: string | null;
+}
+
+export interface MetricPollReservation {
+  claimed: boolean;
+  row: MetricPollCacheRow | undefined;
 }
 
 export interface SnapshotRow {
@@ -151,8 +173,38 @@ CREATE TABLE IF NOT EXISTS token_state (
   fetched_at INTEGER,
   fresh_updated_at INTEGER,
   fresh_history_json TEXT,
+  t100_history_json TEXT,
+  holders_history_json TEXT,
+  market_cap_history_json TEXT,
   PRIMARY KEY (ca, chain)
 );
+CREATE TABLE IF NOT EXISTS metric_poll_cache (
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  last_attempt_at INTEGER NOT NULL,
+  response_at INTEGER,
+  next_allowed_at INTEGER NOT NULL,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  response_json TEXT,
+  PRIMARY KEY (ca, chain, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_metric_poll_due ON metric_poll_cache(kind, next_allowed_at);
+CREATE TABLE IF NOT EXISTS alert_metric_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  metric TEXT NOT NULL CHECK(metric IN ('fresh', 't100', 'trackerBuy')),
+  value REAL NOT NULL,
+  response_at INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_metric_observations_feed ON alert_metric_observations(id);
+CREATE TABLE IF NOT EXISTS alert_metric_feed_state (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  acknowledged_id INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO alert_metric_feed_state (singleton, acknowledged_id) VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS holder_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ca TEXT,
@@ -296,6 +348,27 @@ CREATE TABLE IF NOT EXISTS fomo_holdings (
 );
 CREATE INDEX IF NOT EXISTS idx_fomo_holdings_ca_chain ON fomo_holdings(ca, chain);
 
+-- API balance rows are separate from RPC measurements; marker survives empty,
+-- incomplete and failed snapshots so scheduled refreshes stay within budget.
+CREATE TABLE IF NOT EXISTS fomo_api_holdings (
+  fomo_user_id TEXT NOT NULL REFERENCES fomo_users(id) ON DELETE CASCADE,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  amount REAL NOT NULL,
+  pct REAL,
+  captured_at INTEGER NOT NULL,
+  PRIMARY KEY (fomo_user_id, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_fomo_api_holdings_ca_chain ON fomo_api_holdings(ca, chain);
+CREATE TABLE IF NOT EXISTS fomo_api_balance_snapshots (
+  fomo_user_id TEXT PRIMARY KEY REFERENCES fomo_users(id) ON DELETE CASCADE,
+  checked_at INTEGER NOT NULL,
+  captured_at INTEGER,
+  complete INTEGER NOT NULL,
+  truncated INTEGER NOT NULL,
+  available INTEGER NOT NULL
+);
+
 -- Per (user, CA, chain) position straight from the FOMO API — the AUTHORITATIVE
 -- spend. cost_basis_usd is the money actually paid, where fomo_trades.usd_value is
 -- the position's mark-to-market VALUE (a stock): reading the latter as money made
@@ -343,6 +416,47 @@ export function open(path: string): void {
   // (delete wallet -> trades/balances cleaned) depend on this.
   instance.pragma('foreign_keys = ON');
   instance.exec(SCHEMA);
+  const alertTable = instance.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_metric_observations'",
+  ).get() as { sql: string } | undefined;
+  if (alertTable !== undefined && !alertTable.sql.includes("'trackerBuy'")) {
+    const migrateAlertMetric = instance.transaction(() => {
+      const oldSequence = instance!.prepare(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'alert_metric_observations'",
+      ).get() as { seq: number } | undefined;
+      const oldMaxId = instance!.prepare(
+        'SELECT COALESCE(MAX(id), 0) AS id FROM alert_metric_observations',
+      ).get() as { id: number };
+      const highWatermark = Math.max(oldSequence?.seq ?? 0, oldMaxId.id);
+      instance!.exec(`
+        DROP INDEX IF EXISTS idx_alert_metric_observations_feed;
+        ALTER TABLE alert_metric_observations RENAME TO alert_metric_observations_old;
+        CREATE TABLE alert_metric_observations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ca TEXT NOT NULL,
+          chain TEXT NOT NULL,
+          metric TEXT NOT NULL CHECK(metric IN ('fresh', 't100', 'trackerBuy')),
+          value REAL NOT NULL,
+          response_at INTEGER NOT NULL,
+          snapshot_json TEXT NOT NULL
+        );
+        INSERT INTO alert_metric_observations SELECT * FROM alert_metric_observations_old;
+        DROP TABLE alert_metric_observations_old;
+        CREATE INDEX idx_alert_metric_observations_feed ON alert_metric_observations(id);
+      `);
+      const newSequence = instance!.prepare(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'alert_metric_observations'",
+      ).get() as { seq: number } | undefined;
+      if (highWatermark > (newSequence?.seq ?? 0)) {
+        if (newSequence === undefined) {
+          instance!.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run('alert_metric_observations', highWatermark);
+        } else {
+          instance!.prepare('UPDATE sqlite_sequence SET seq = ? WHERE name = ?').run(highWatermark, 'alert_metric_observations');
+        }
+      }
+    });
+    migrateAlertMetric();
+  }
   // Migration for DBs created before the balance-range columns (idempotent).
   const cols = (instance.pragma('table_info(token_state)') as { name: string }[]).map((c) => c.name);
   for (const col of ['vol_1h', 'vol_24h_prev', 'bal_peak_24h', 'bal_trough_24h', 'bal_peak_7d', 'bal_trough_7d', 'bal_peak_30d', 'bal_trough_30d', 'fresh_rate', 'nansen_holders', 'nansen_fresh_pct', 'nansen_t100_pct', 'nansen_median_usd', 't100_multiple', 'genesis_bal']) {
@@ -350,6 +464,9 @@ export function open(path: string): void {
   }
   if (!cols.includes('fresh_updated_at')) instance.exec('ALTER TABLE token_state ADD COLUMN fresh_updated_at INTEGER');
   if (!cols.includes('fresh_history_json')) instance.exec('ALTER TABLE token_state ADD COLUMN fresh_history_json TEXT');
+  if (!cols.includes('t100_history_json')) instance.exec('ALTER TABLE token_state ADD COLUMN t100_history_json TEXT');
+  if (!cols.includes('market_cap_history_json')) instance.exec('ALTER TABLE token_state ADD COLUMN market_cap_history_json TEXT');
+  if (!cols.includes('holders_history_json')) instance.exec('ALTER TABLE token_state ADD COLUMN holders_history_json TEXT');
 
   // deployed_at/anchor_at store epoch ms — INTEGER affinity (separate from the REAL list above).
   if (!cols.includes('deployed_at')) instance.exec('ALTER TABLE token_state ADD COLUMN deployed_at INTEGER');
@@ -508,12 +625,40 @@ export function open(path: string): void {
     instance.prepare('UPDATE token_state SET genesis_bal = NULL').run();
     setSetting('lfRule', LF_RULE);
   }
-  // System deploy anchor (plan setup-fill-on-add T5): the setupSweep 12h phase
+  // System deploy anchor (plan setup-fill-on-add T5): setupSweep cadence phase
   // counts from THIS instant, not from process boot — restarts re-phase to the
   // same boundaries instead of drifting (the old i*20s stagger). Written once,
   // never overwritten: settings survives restarts AND table resets, so the
   // cadence phase is stable across both.
   if (getSetting('systemDeployAt') === undefined) setSetting('systemDeployAt', String(Date.now()));
+  if (config.showFomo) backfillFomoEvmWalletGroups(instance);
+}
+function backfillFomoEvmWalletGroups(db: Database.Database): void {
+  const rows = db
+    .prepare(`SELECT * FROM wallets WHERE chain IN (${EVM_CHAINS.map(() => '?').join(',')})
+      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 ELSE 2 END`)
+    .all(...EVM_CHAINS) as WalletRow[];
+  const groups = new Map<string, WalletRow[]>();
+  for (const row of rows) {
+    if (!EVM_ADDRESS.test(row.address)) continue;
+    const key = row.address.toLowerCase();
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  if (groups.size === 0) return;
+  const insert = db.prepare(
+    'INSERT INTO wallets (id, address, name, tags, chain, source, clan) VALUES (?, ?, ?, ?, ?, ?, ?)',
+  );
+  db.transaction(() => {
+    for (const [address, members] of groups) {
+      const template = members[0];
+      if (!template) continue;
+      const present = new Set(members.map((row) => row.chain));
+      for (const chain of EVM_CHAINS) {
+        if (present.has(chain)) continue;
+        insert.run(randomUUID(), address, template.name, template.tags, chain, template.source, template.clan ?? '');
+      }
+    }
+  })();
 }
 
 export function getDb(): Database.Database {
@@ -627,6 +772,78 @@ export function deleteWallet(id: string): void {
   getDb().prepare('DELETE FROM wallets WHERE id = ?').run(id);
 }
 
+export function findEvmWalletGroup(address: string): WalletRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM wallets WHERE lower(address) = ? AND chain IN (${EVM_CHAINS.map(() => '?').join(',')})
+      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 ELSE 2 END`)
+    .all(address.trim().toLowerCase(), ...EVM_CHAINS) as WalletRow[];
+}
+
+type EvmWalletInput = Omit<WalletInput, 'chain'>;
+
+function insertEvmWalletRow(db: Database.Database, input: EvmWalletInput, address: string, chain: Chain): WalletRow {
+  const row: WalletRow = {
+    id: randomUUID(),
+    address,
+    name: input.name,
+    tags: JSON.stringify(input.tags),
+    chain,
+    source: input.source,
+    clan: input.clan ?? '',
+  };
+  db.prepare('INSERT INTO wallets (id, address, name, tags, chain, source, clan) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(row.id, row.address, row.name, row.tags, row.chain, row.source, row.clan);
+  return row;
+}
+
+function insertEvmWalletRows(db: Database.Database, input: EvmWalletInput, address: string): WalletRow[] {
+  return EVM_CHAINS.map((chain) => insertEvmWalletRow(db, input, address, chain));
+}
+
+/** Atomically add one EVM address to all supported networks; undefined means duplicate. */
+export function insertEvmWalletGroup(input: EvmWalletInput): WalletRow[] | undefined {
+  const address = input.address.trim().toLowerCase();
+  if (!EVM_ADDRESS.test(address)) throw new Error('invalid EVM address');
+  const db = getDb();
+  return db.transaction(() => {
+    if (findEvmWalletGroup(address).length) return undefined;
+    return insertEvmWalletRows(db, input, address);
+  })();
+}
+
+/** Update shared metadata/address for all chain members without changing wallet IDs. */
+export function updateEvmWalletGroupById(
+  id: string,
+  input: EvmWalletInput,
+): WalletRow[] | 'duplicate' | undefined {
+  const db = getDb();
+  const current = getWallet(id);
+  if (!current || current.chain === 'sol') return undefined;
+  const address = input.address.trim().toLowerCase();
+  if (!EVM_ADDRESS.test(address)) throw new Error('invalid EVM address');
+  const previous = current.address.toLowerCase();
+  return db.transaction(() => {
+    if (address !== previous && findEvmWalletGroup(address).length) return 'duplicate';
+    db.prepare(`UPDATE wallets SET address = ?, name = ?, tags = ?, source = ?, clan = ?
+      WHERE lower(address) = ? AND chain IN (${EVM_CHAINS.map(() => '?').join(',')})`)
+      .run(address, input.name, JSON.stringify(input.tags), input.source, input.clan ?? '', previous, ...EVM_CHAINS);
+    const existing = findEvmWalletGroup(address);
+    const present = new Set(existing.map((row) => row.chain));
+    for (const chain of EVM_CHAINS) {
+      if (!present.has(chain)) insertEvmWalletRow(db, input, address, chain);
+    }
+    return findEvmWalletGroup(address);
+  })();
+}
+
+/** Delete the whole EVM group; wallet trade/holding rows cascade by wallet id. */
+export function deleteEvmWalletGroupById(id: string): boolean {
+  const current = getWallet(id);
+  if (!current || current.chain === 'sol') return false;
+  getDb().prepare(`DELETE FROM wallets WHERE lower(address) = ? AND chain IN (${EVM_CHAINS.map(() => '?').join(',')})`)
+    .run(current.address.toLowerCase(), ...EVM_CHAINS);
+  return true;
+}
 /** One CSV import row before validation (chain arrives as an arbitrary string). */
 export interface ImportCandidate {
   address: string;
@@ -663,6 +880,30 @@ export function importWallets(
         skipped.push({ row: i, reason: 'address is empty' });
         return;
       }
+      if (r.chain === 'evm') {
+        if (!config.showFomo) {
+          skipped.push({ row: i, reason: 'invalid chain "evm" (expected one of sol, base, bsc, robinhood)' });
+          return;
+        }
+        const canonicalAddress = address.toLowerCase();
+        if (!EVM_ADDRESS.test(canonicalAddress)) {
+          skipped.push({ row: i, reason: 'invalid EVM address (expected 0x + 40 hex characters)' });
+          return;
+        }
+        if (findEvmWalletGroup(canonicalAddress).length) {
+          skipped.push({ row: i, reason: 'duplicate address' });
+          return;
+        }
+        insertEvmWalletRows(db, {
+          address: canonicalAddress,
+          name: r.name.trim(),
+          tags: r.tags,
+          source: r.source.trim(),
+          clan: (r.clan ?? '').trim(),
+        }, canonicalAddress);
+        added += 1;
+        return;
+      }
       if (!isChain(r.chain)) {
         skipped.push({ row: i, reason: `invalid chain "${r.chain}" (expected one of ${CHAINS.join(', ')})` });
         return;
@@ -673,7 +914,7 @@ export function importWallets(
         skipped.push({ row: i, reason: 'invalid sol address (base58, 32 bytes)' });
         return;
       }
-      const res = ins.run(randomUUID(), address, r.name.trim(), JSON.stringify(r.tags), r.chain, r.source.trim(), (r.clan ?? '').trim());
+      const res = ins.run(randomUUID(), canonicalCa(address, r.chain), r.name.trim(), JSON.stringify(r.tags), r.chain, r.source.trim(), (r.clan ?? '').trim());
       if (res.changes === 0) {
         skipped.push({ row: i, reason: 'duplicate address' });
       } else {
@@ -1244,6 +1485,213 @@ export function allTokenStates(): Map<string, TokenStateRow> {
   return new Map(rows.map((r) => [`${r.chain}:${r.ca}`, r]));
 }
 
+/** Cached provider payload and durable query gate for one (CA, chain, dataset). */
+export function getMetricPollCache(ca: string, chain: Chain, kind: string): MetricPollCacheRow | undefined {
+  return getDb()
+    .prepare('SELECT * FROM metric_poll_cache WHERE ca = ? AND chain = ? AND kind = ?')
+    .get(canonicalCa(ca, chain), chain, kind) as MetricPollCacheRow | undefined;
+}
+
+/** Reserve a due query atomically before network I/O; repeated callers cannot burst. */
+export function reserveMetricPoll(
+  ca: string,
+  chain: Chain,
+  kind: string,
+  now: number,
+  intervalMs: number,
+): MetricPollReservation {
+  const canon = canonicalCa(ca, chain);
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db
+      .prepare('SELECT * FROM metric_poll_cache WHERE ca = ? AND chain = ? AND kind = ?')
+      .get(canon, chain, kind) as MetricPollCacheRow | undefined;
+    if (row && now < row.next_allowed_at) return { claimed: false, row };
+    db.prepare(
+      `INSERT INTO metric_poll_cache
+         (ca, chain, kind, last_attempt_at, next_allowed_at, failure_count)
+       VALUES (?, ?, ?, ?, ?, 0)
+       ON CONFLICT(ca, chain, kind) DO UPDATE SET
+         last_attempt_at = excluded.last_attempt_at,
+         next_allowed_at = excluded.next_allowed_at`,
+    ).run(canon, chain, kind, now, now + intervalMs);
+    return { claimed: true, row };
+  })();
+}
+
+/** Commit successful responses and Fresh observations atomically. */
+export function saveMetricPollResponse(
+  ca: string,
+  chain: Chain,
+  kind: string,
+  responseAt: number,
+  nextAllowedAt: number,
+  response: unknown,
+): void {
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO metric_poll_cache
+         (ca, chain, kind, last_attempt_at, response_at, next_allowed_at, failure_count, response_json)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+       ON CONFLICT(ca, chain, kind) DO UPDATE SET
+         last_attempt_at = excluded.last_attempt_at,
+         response_at = excluded.response_at,
+         next_allowed_at = excluded.next_allowed_at,
+         failure_count = 0,
+         response_json = excluded.response_json`,
+    ).run(canonicalCa(ca, chain), chain, kind, responseAt, responseAt, nextAllowedAt, JSON.stringify(response));
+    const fresh = kind === 'gini' ? freshValue(response) : undefined;
+    if (fresh !== undefined) appendAlertMetricObservation(db, ca, chain, 'fresh', fresh, responseAt);
+  })();
+}
+
+function freshValue(response: unknown): number | undefined {
+  if (typeof response !== 'object' || response === null || Array.isArray(response)) return undefined;
+  const value = Reflect.get(response, 'nansenFreshPct');
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
+    ? value
+    : undefined;
+}
+
+export function appendAlertMetricObservation(
+  db: Database.Database,
+  ca: string,
+  chain: Chain,
+  metric: AlertMetric,
+  value: number,
+  responseAt: number,
+  trackerBuyer?: { name: string; address: string },
+): void {
+  const canonical = canonicalCa(ca, chain);
+  const state = db.prepare(`
+    SELECT symbol, market_cap, market_cap_history_json, supply, nansen_fresh_pct, t100_multiple, genesis_bal
+    FROM token_state WHERE ca = ? AND chain = ?
+  `).get(canonical, chain) as {
+    symbol: string | null;
+    market_cap: number | null;
+    market_cap_history_json: string | null;
+    supply: number | null;
+    nansen_fresh_pct: number | null;
+    t100_multiple: number | null;
+    genesis_bal: number | null;
+  } | undefined;
+  const holdings = db.prepare(`
+    SELECT COALESCE(SUM(s.token_amount), 0) AS amount
+    FROM wallet_token_state s
+    WHERE s.ca = ? AND s.chain = ?
+      AND EXISTS (
+        SELECT 1 FROM wallet_trades t
+        WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
+          AND t.side = 'buy' AND t.source = 'watch'
+      )
+  `).get(canonical, chain) as { amount: number };
+  let marketCapAt: number | null = null;
+  if (state?.market_cap != null && state.market_cap_history_json !== null) {
+    try {
+      const history: unknown = JSON.parse(state.market_cap_history_json);
+      if (Array.isArray(history)) {
+        const last = history[history.length - 1] as { t?: unknown; value?: unknown } | undefined;
+        if (last !== undefined && last.value === state.market_cap && typeof last.t === 'number' && Number.isSafeInteger(last.t)) {
+          marketCapAt = last.t;
+        }
+      }
+    } catch {
+      marketCapAt = null;
+    }
+  }
+  const snapshot: AlertMetricSnapshot = {
+    capturedAt: Date.now(),
+    symbol: state?.symbol ?? null,
+    marketCap: state?.market_cap ?? null,
+    marketCapAt,
+    freshPct: metric === 'fresh' ? value : state?.nansen_fresh_pct ?? null,
+    t100Multiple: metric === 't100' ? value : state?.t100_multiple ?? null,
+    lf: state?.genesis_bal ?? null,
+    trackedHoldingPct: state === undefined
+      ? null
+      : state.supply != null && state.supply > 0
+        ? (holdings.amount / state.supply) * 100
+        : 0,
+    ...(metric === 'trackerBuy' && trackerBuyer
+      ? { trackerBuyer: { name: trackerBuyer.name.slice(0, 128), address: trackerBuyer.address.slice(0, 128) } }
+      : {}),
+  };
+  db.prepare(`
+    INSERT INTO alert_metric_observations (ca, chain, metric, value, response_at, snapshot_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(canonical, chain, metric, value, responseAt, JSON.stringify(snapshot));
+}
+
+/** Ordered, durable metric observations consumed by the central Monitor. */
+export function getAlertMetricObservations(afterId: number, limit: number): AlertMetricObservation[] {
+  const rows = getDb().prepare(`
+    SELECT id, ca, chain, metric, value, response_at, snapshot_json
+    FROM alert_metric_observations WHERE id > ? ORDER BY id LIMIT ?
+  `).all(afterId, limit) as {
+    id: number;
+    ca: string;
+    chain: Chain;
+    metric: AlertMetric;
+    value: number;
+    response_at: number;
+    snapshot_json: string;
+  }[];
+  return rows.map((row) => ({
+    id: row.id,
+    ca: row.ca,
+    chain: row.chain,
+    metric: row.metric,
+    value: row.value,
+    responseAt: row.response_at,
+    snapshot: JSON.parse(row.snapshot_json) as AlertMetricSnapshot,
+  }));
+}
+
+/** Ack only after Monitor has durably committed its cursor and outbox. */
+export function acknowledgeAlertMetricObservations(throughId: number): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const highWatermark = db.prepare(
+      'SELECT COALESCE(MAX(id), 0) AS id FROM alert_metric_observations',
+    ).get() as { id: number };
+    const acknowledged = db.prepare(
+      'SELECT acknowledged_id FROM alert_metric_feed_state WHERE singleton = 1',
+    ).get() as { acknowledged_id: number };
+    if (!Number.isSafeInteger(throughId) || throughId < acknowledged.acknowledged_id) return false;
+    if (throughId === acknowledged.acknowledged_id) return true;
+    if (throughId > highWatermark.id) return false;
+    db.prepare('UPDATE alert_metric_feed_state SET acknowledged_id = ? WHERE singleton = 1').run(throughId);
+    db.prepare('DELETE FROM alert_metric_observations WHERE id <= ?').run(throughId);
+    return true;
+  })();
+}
+
+/** Record failure/backoff without replacing the last successful response. */
+export function failMetricPoll(
+  ca: string,
+  chain: Chain,
+  kind: string,
+  nextAllowedAt: number,
+): void {
+  getDb()
+    .prepare(
+      `UPDATE metric_poll_cache SET next_allowed_at = ?, failure_count = failure_count + 1
+       WHERE ca = ? AND chain = ? AND kind = ?`,
+    )
+    .run(nextAllowedAt, canonicalCa(ca, chain), chain, kind);
+}
+
+/** One read for the signal DTO and fair poll ordering. */
+export function listMetricPollCache(kind?: string): MetricPollCacheRow[] {
+  if (kind === undefined) {
+    return getDb().prepare('SELECT * FROM metric_poll_cache').all() as MetricPollCacheRow[];
+  }
+  return getDb()
+    .prepare('SELECT * FROM metric_poll_cache WHERE kind = ?')
+    .all(kind) as MetricPollCacheRow[];
+}
+
 /** Newest fetched_at across token_state — health endpoint freshness signal. */
 export function maxTokenFetchedAt(): number | null {
   const row = getDb().prepare('SELECT MAX(fetched_at) AS latest FROM token_state').get() as {
@@ -1395,6 +1843,14 @@ export interface FomoTradeInput {
   ts: number;
   source?: string;
 }
+export interface FomoTradeEnrichmentTarget {
+  ca: string;
+  chain: Chain;
+  type: 'buy' | 'sell';
+  ts: number;
+  trade_usd: number | null;
+}
+
 
 export function listFomoUsers(): FomoUserRow[] {
   return getDb().prepare('SELECT * FROM fomo_users ORDER BY name').all() as FomoUserRow[];
@@ -1573,6 +2029,11 @@ export function importFomoUsers(rows: readonly FomoUserInput[]): ImportResult {
  * the store.
  */
 export function insertFomoTrade(input: FomoTradeInput): boolean {
+  const tradeUsd =
+    input.type === 'buy' && input.trade_usd != null &&
+      (!Number.isFinite(input.trade_usd) || input.trade_usd <= 0)
+      ? null
+      : input.trade_usd ?? null;
   const res = getDb()
     .prepare(
       `INSERT INTO fomo_trades (fomo_user_id, event_id, ca, chain, type, usd_value, trade_usd, price, token, ts, source, created_at)
@@ -1586,13 +2047,36 @@ export function insertFomoTrade(input: FomoTradeInput): boolean {
       input.chain,
       input.type,
       input.usd_value ?? null,
-      input.trade_usd ?? null,
+      tradeUsd,
       input.price ?? null,
       input.token ?? null,
       input.ts,
       input.source ?? 'fomo',
       Date.now(),
     );
+  return res.changes > 0;
+}
+
+export function getFomoTradeEnrichmentTarget(fomoUserId: string, eventId: string): FomoTradeEnrichmentTarget | undefined {
+  return getDb()
+    .prepare(
+      `SELECT ca, chain, type, ts, trade_usd
+         FROM fomo_trades
+        WHERE fomo_user_id = ? AND event_id = ?`,
+    )
+    .get(fomoUserId, eventId) as FomoTradeEnrichmentTarget | undefined;
+}
+
+/** Fill only a still-unknown BUY amount; alert-provided tradeUsd stays authoritative. */
+export function updateFomoTradeUsd(fomoUserId: string, eventId: string, amount: number): boolean {
+  if (!Number.isFinite(amount) || amount <= 0) return false;
+  const res = getDb()
+    .prepare(
+      `UPDATE fomo_trades
+          SET trade_usd = ?
+        WHERE fomo_user_id = ? AND event_id = ? AND type = 'buy' AND trade_usd IS NULL`,
+    )
+    .run(amount, fomoUserId, eventId);
   return res.changes > 0;
 }
 
@@ -1667,6 +2151,62 @@ export function listFomoAlertTargets(): { fomo_user_id: string; ca: string; chai
       ca: string;
       chain: Chain;
     }[];
+}
+
+export interface FomoApiBalanceRow {
+  fomo_user_id: string;
+  ca: string;
+  chain: Chain;
+  amount: number;
+  pct: number | null;
+  captured_at: number;
+}
+
+export interface FomoApiBalanceSnapshot {
+  fomo_user_id: string;
+  checked_at: number;
+  captured_at: number | null;
+  complete: boolean;
+  truncated: boolean;
+  available: boolean;
+}
+
+export function getFomoApiBalanceSnapshot(fomoUserId: string): FomoApiBalanceSnapshot | undefined {
+  const row = getDb().prepare('SELECT * FROM fomo_api_balance_snapshots WHERE fomo_user_id = ?').get(fomoUserId) as
+    | (Omit<FomoApiBalanceSnapshot, 'complete' | 'truncated' | 'available'> & {
+        complete: number;
+        truncated: number;
+        available: number;
+      })
+    | undefined;
+  return row === undefined ? undefined : {
+    ...row,
+    complete: row.complete !== 0,
+    truncated: row.truncated !== 0,
+    available: row.available !== 0,
+  };
+}
+
+export function upsertFomoApiBalanceSnapshot(input: FomoApiBalanceSnapshot): void {
+  getDb().prepare(
+    `INSERT INTO fomo_api_balance_snapshots
+       (fomo_user_id, checked_at, captured_at, complete, truncated, available)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(fomo_user_id) DO UPDATE SET checked_at=excluded.checked_at,
+       captured_at=COALESCE(excluded.captured_at, fomo_api_balance_snapshots.captured_at),
+       complete=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.complete ELSE excluded.complete END,
+       truncated=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.truncated ELSE excluded.truncated END,
+       available=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.available ELSE excluded.available END`,
+  ).run(input.fomo_user_id, input.checked_at, input.captured_at, Number(input.complete), Number(input.truncated), Number(input.available));
+}
+
+export function upsertFomoApiBalance(input: FomoApiBalanceRow): void {
+  getDb().prepare(
+    `INSERT INTO fomo_api_holdings (fomo_user_id, ca, chain, amount, pct, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+       amount=excluded.amount, pct=excluded.pct, captured_at=excluded.captured_at`,
+  ).run(input.fomo_user_id, canonicalCa(input.ca, input.chain), input.chain, input.amount, input.pct, input.captured_at);
 }
 
 export interface FomoHoldingInput {

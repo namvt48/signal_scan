@@ -174,7 +174,7 @@ function DashboardShell() {
           </div>
         </div>
       </header>
-      <main className="w-full px-4 py-6 sm:px-6">
+      <main className={`w-full px-4 py-6 sm:px-6 ${SHOW_FOMO ? '' : 'dashboard-a'}`}>
         {visited.has('dashboard') && (
           <div className={tab === 'dashboard' ? undefined : 'hidden'}>
             <SignalTable

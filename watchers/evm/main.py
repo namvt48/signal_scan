@@ -22,16 +22,20 @@ from watchers.evm import feed
 _wallets_path = ""  # set trong main() — refresh_cfg dùng lại
 
 
-def load_wallets(path):
-    """→ ({chain: [addr lowercase]}, nguồn 'api'|'file'). API chết/sai shape ⇒
-    fallback file: chỉ dòng đúng dạng EVM address (0x + 40 hex) vào CẢ 2 chain
-    (file không phân biệt chain — như semantics wallets.txt cũ của Sol)."""
-    per: dict[str, list[str]] = {c: [] for c in cl.EVM_CHAINS}
+def load_wallets(path, chains=None):
+    """Load API rows for selected chains; legacy file fallback spans selected chains."""
+    chains = tuple(chains or cl.DEFAULT_EVM_CHAINS)
+    per: dict[str, list[str]] = {c: [] for c in chains}
     try:
         data = config.http_json(f"{config._api_url}/api/wallets", timeout=5)
         if isinstance(data, list):
             for w in data:
                 if not isinstance(w, dict):
+                    continue
+                tags = w.get("tags")
+                if isinstance(tags, list) and any(
+                    isinstance(tag, str) and tag.strip().casefold() == "status:exclude" for tag in tags
+                ):
                     continue
                 c, a = w.get("chain"), w.get("address")
                 if c in per and isinstance(a, str) and a and a.lower() not in per[c]:
@@ -52,14 +56,12 @@ def load_wallets(path):
 
 
 def refresh_cfg(per):
-    """Refresh wallets + min_usd từ API, fail-soft (feed gọi mỗi vòng poll /
-    trước mỗi lần (re)connect WS). Mutate per IN-PLACE (slice) như
-    load_config_from_api của Sol để mọi feed giữ reference thấy list mới.
-    API chết ⇒ giữ nguyên (timeout không được xoá ví)."""
-    v = config._api_min_usd()
-    if v is not None:
-        config.min_usd = v
-    new, src = load_wallets(_wallets_path)
+    """Refresh wallet lists/minimum from API without changing selected chains."""
+    if not getattr(config, "_evm_ignore_api_min_usd", False):
+        v = config._api_min_usd()
+        if v is not None:
+            config.min_usd = v
+    new, src = load_wallets(_wallets_path, per.keys())
     if src == "api":
         for c in per:
             per[c][:] = new[c]
@@ -67,7 +69,7 @@ def refresh_cfg(per):
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="EVM (Base + BSC) wallet swap watcher — mirror của watchers.sol (T8/D7)"
+        description="EVM wallet swap watcher — Base, BSC and Robinhood"
     )
     ap.add_argument("--wallets", default=os.path.join(HERE, "wallets.txt"))
     ap.add_argument(
@@ -81,7 +83,17 @@ def main() -> None:
         default="ws",
         help="ws = eth_subscribe logs/ví (mặc định); poll = eth_getLogs chunked",
     )
+    ap.add_argument(
+        "--chains",
+        default=",".join(cl.DEFAULT_EVM_CHAINS),
+        help="comma-separated chain list (default: base,bsc; FOMO: base,bsc,robinhood)",
+    )
     ap.add_argument("--min-usd", type=float, default=0.5)
+    ap.add_argument(
+        "--no-min-usd-gate",
+        action="store_true",
+        help="FOMO: emit every classified trade regardless of USD size or API setting",
+    )
     ap.add_argument(
         "--jsonl",
         default="",
@@ -116,6 +128,9 @@ def main() -> None:
         help="feed poll: nghỉ giữa các vòng quét (giây)",
     )
     args = ap.parse_args()
+    chains = tuple(c.strip().lower() for c in args.chains.split(",") if c.strip())
+    if not chains or any(c not in cl.EVM_CHAINS for c in chains):
+        ap.error(f"--chains must contain supported chains: {', '.join(cl.EVM_CHAINS)}")
 
     # State/heartbeat file RIÊNG — patch chỉ tại đây (xem docstring module).
     st_mod.STATE_PATH = os.path.join(HERE, "evm_watch_state.json")
@@ -124,15 +139,16 @@ def main() -> None:
     config._api_url = args.api_url.rstrip("/")
     config._track = args.track
     config._cfg_cli_min_usd = args.min_usd
-    config.min_usd = args.min_usd
-    v = config._api_min_usd()
-    if v is not None:
-        config.min_usd = v
-        print(f"# min_usd=${v:g} source=api", flush=True)
+    config._evm_ignore_api_min_usd = args.no_min_usd_gate
+    config.min_usd = 0.0 if args.no_min_usd_gate else args.min_usd
+    if not args.no_min_usd_gate:
+        v = config._api_min_usd()
+        if v is not None:
+            config.min_usd = v
+            print(f"# min_usd=${v:g} source=api", flush=True)
 
-    global _wallets_path
     _wallets_path = args.wallets
-    per, src = load_wallets(args.wallets)
+    per, src = load_wallets(args.wallets, chains)
     n = sum(len(v) for v in per.values())
     if not n:
         sys.exit(
@@ -140,15 +156,14 @@ def main() -> None:
         )
 
     st = st_mod.load_state()
+    counts = " ".join(f"{c}={len(per[c])}" for c in chains)
     print(
-        f"# evm watch base={len(per['base'])} bsc={len(per['bsc'])} ví (source={src})"
+        f"# evm watch {counts} ví (source={src})"
         f" | feed={args.feed} | conf={args.confirmations} | min ${config.min_usd}",
         flush=True,
     )
-    print(
-        f"# rpc base={_mask(feed.rpc_url('base'))} bsc={_mask(feed.rpc_url('bsc'))}",
-        flush=True,
-    )
+    endpoints = " ".join(f"rpc_{c}={_mask(feed.rpc_url(c))}" for c in chains)
+    print(f"# {endpoints}", flush=True)
     opts = {
         "conf": args.confirmations,
         "span": args.chunk,

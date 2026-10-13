@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import urllib.error
+from urllib.parse import urlsplit, urlunsplit
 import urllib.request
 from collections import Counter
 from datetime import timedelta, timezone
@@ -44,8 +45,13 @@ _rpc_rr = 0  # round-robin index: trải traffic qua MỌI key thay vì dồn v�
 
 
 def _mask(url: str) -> str:
-    """Che api-key khỏi log — banner khởi động không được in secret ra journal."""
-    return f"{url.split('api-key=')[0]}api-key=***" if "api-key=" in url else url
+    """Redact URL path tokens and query credentials before writing to logs."""
+    parts = urlsplit(url)
+    path = parts.path
+    if path.strip("/"):
+        prefix = path.rsplit("/", 1)[0]
+        path = f"{prefix}/***" if prefix else "/***"
+    return urlunsplit((parts.scheme, parts.netloc, path, "***" if parts.query else "", ""))
 
 
 WSOL = "So11111111111111111111111111111111111111112"

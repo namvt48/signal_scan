@@ -1,0 +1,4 @@
+signal-scan.duckdns.org:8443 {
+	encode gzip
+	reverse_proxy 127.0.0.1:8126
+}

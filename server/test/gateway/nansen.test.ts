@@ -194,6 +194,29 @@ test('(b) the free-door route calls the DoorPool ONCE and returns the raw body',
     assert.deepEqual(seen[0].body, body, 'the upstream POST body is forwarded verbatim');
   });
 });
+test('Nansen Door schedules essential/new-CA ahead of background volume across callers', async () => {
+  const seen: { endpoint: string; caller?: string; priority?: number }[] = [];
+  const door: DoorPost = async (url, _body, options) => {
+    seen.push({
+      endpoint: url.slice(url.lastIndexOf('/') + 1),
+      caller: options?.caller,
+      priority: options?.priority,
+    });
+    return { status: 200, json: { data: [] } };
+  };
+
+  await withServer({ nansenDoor: door }, async (base) => {
+    const body = { parameters: { tokenAddress: 'CA', chain: 'base' } };
+    const essential = await post(base, NANSEN_DOOR_PATH, { endpoint: 'tgm-essential-data', body }, TOKENS.a);
+    const volume = await post(base, NANSEN_DOOR_PATH, { endpoint: 'tgm-volume-details', body }, TOKENS.b);
+    assert.equal(essential.status, 200);
+    assert.equal(volume.status, 200);
+    assert.deepEqual(seen, [
+      { endpoint: 'tgm-essential-data', caller: 'a', priority: 0 },
+      { endpoint: 'tgm-volume-details', caller: 'b', priority: 2 },
+    ]);
+  });
+});
 
 test('(c) an upstream 429 propagates status + x-ratelimit-reset and is NOT swallowed', async () => {
   let calls = 0;
@@ -240,7 +263,7 @@ test('(c2) a DoorPool 429 propagates as a distinct envelope status', async () =>
   });
 });
 
-test('(d) a second concurrent credit call is QUEUED by the concurrency cap — never dropped', async () => {
+test('(d) distinct concurrent credit calls queue at the concurrency cap — never dropped', async () => {
   // Pin the cap so the test is independent of any RL_* env override.
   const specs = buildSpecs(1);
   specs[NANSEN_CREDIT_LIMITER] = { ...specs[NANSEN_CREDIT_LIMITER], maxConcurrency: 2 };
@@ -256,16 +279,19 @@ test('(d) a second concurrent credit call is QUEUED by the concurrency cap — n
   };
 
   await withServer({ nansenCreditUpstream: upstream, runLimiter }, async (base) => {
-    const body = { endpoint: CREDIT_ENDPOINT, body: CREDIT_BODY };
-    const p1 = post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
-    const p2 = post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
+    const body = (ca: string) => ({
+      endpoint: CREDIT_ENDPOINT,
+      body: { ...CREDIT_BODY, token_address: ca },
+    });
+    const p1 = post(base, NANSEN_CREDIT_PATH, body('CA-1'), TOKENS.a);
+    const p2 = post(base, NANSEN_CREDIT_PATH, body('CA-2'), TOKENS.a);
 
     await waitFor(() => calls === 2);
     assert.equal(registry.snapshot()[NANSEN_CREDIT_LIMITER].inFlight, 2, 'both slots are occupied');
 
-    const p3 = post(base, NANSEN_CREDIT_PATH, body, TOKENS.a);
+    const p3 = post(base, NANSEN_CREDIT_PATH, body('CA-3'), TOKENS.a);
     await waitFor(() => registry.snapshot()[NANSEN_CREDIT_LIMITER].queued === 1);
-    assert.equal(calls, 2, 'the 3rd call is QUEUED at the cap — not dispatched, not dropped');
+    assert.equal(calls, 2, 'the 3rd distinct CA is QUEUED at the cap');
 
     releases[0]();
     await waitFor(() => calls === 3);

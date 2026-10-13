@@ -22,6 +22,7 @@ import {
 import { LimiterRegistry } from '../../src/ratelimit/registry.js';
 import { buildSpecs } from '../../src/ratelimit/spec.js';
 import type { RunOpts } from '../../src/ratelimit/types.js';
+import { LimiterUnavailableError } from '../../src/ratelimit/types.js';
 
 const TOKENS: CallerTokens = {
   a: 'token-a-secret',
@@ -181,6 +182,7 @@ test('the request body reaches upstream unchanged and priority reaches the limit
     assert.equal(rec.calls[0].api, 'nansen');
     assert.equal(rec.calls[0].opts.priority, 0);
     assert.equal(rec.calls[0].opts.path, '/api/v1/tgm/flows');
+    assert.equal(rec.calls[0].opts.caller, 'a');
   });
 });
 
@@ -238,6 +240,60 @@ test('an armed limiter gate maps the next call to 503 {error:"gated"} + x-gatewa
     assert.ok(second.headers.get(GATED_HEADER));
   });
 });
+test('Retry-After delta is normalized before arming the GMGN gate', async () => {
+  const registry = new LimiterRegistry(buildSpecs(10));
+  const runLimiter: LimiterRun = (api, opts, job) => registry.run(api, opts, job);
+  let calls = 0;
+  const upstream: UpstreamFetch = async () => {
+    calls += 1;
+    return { status: 429, body: null, headers: { 'retry-after': '30' } };
+  };
+  const request = {
+    provider: 'gmgn',
+    endpoint: '/defi/router/v1/sol/tx/get_swap_route',
+    priority: 1,
+  };
+
+  await withServer({ upstream, runLimiter }, async (base) => {
+    const before = Date.now();
+    const first = await post(base, PROXY_PATH, request, TOKENS.a);
+    const after = Date.now();
+    assert.equal((first.json as GatewayEnvelope).status, 429);
+    const gateUntil = registry.snapshot().gmgn.gateUntil;
+    assert.ok(gateUntil >= before + 32_000, '30s Retry-After plus the 2s gate margin');
+    assert.ok(gateUntil <= after + 33_000, 'delta is not misread as an epoch timestamp');
+
+    const second = await post(base, PROXY_PATH, request, TOKENS.a);
+    assert.equal(second.status, 503);
+    assert.equal(calls, 1);
+  });
+});
+
+test('Retry-After HTTP-date is normalized and retains the gate margin', async () => {
+  const registry = new LimiterRegistry(buildSpecs(10));
+  const runLimiter: LimiterRun = (api, opts, job) => registry.run(api, opts, job);
+  const retryAt = new Date(Date.now() + 45_000).toUTCString();
+  let calls = 0;
+  const upstream: UpstreamFetch = async () => {
+    calls += 1;
+    return { status: 429, body: null, headers: { 'retry-after': retryAt } };
+  };
+  const request = {
+    provider: 'gmgn',
+    endpoint: '/defi/router/v1/sol/tx/get_swap_route',
+    priority: 1,
+  };
+
+  await withServer({ upstream, runLimiter }, async (base) => {
+    const first = await post(base, PROXY_PATH, request, TOKENS.a);
+    assert.equal((first.json as GatewayEnvelope).status, 429);
+    assert.equal(registry.snapshot().gmgn.gateUntil, Date.parse(retryAt) + 2_000);
+
+    const second = await post(base, PROXY_PATH, request, TOKENS.a);
+    assert.equal(second.status, 503);
+    assert.equal(calls, 1);
+  });
+});
 
 test('gateway-generated denials are non-200 {error:...}', async () => {
   const upstream: UpstreamFetch = async () => ({
@@ -269,5 +325,31 @@ test('gateway-generated denials are non-200 {error:...}', async () => {
 
     // No denial ever reached upstream.
     assert.equal(rec.calls.length, 0);
+  });
+});
+
+test('bounded limiter admission returns a generic 503 or a gate-aware retry header', async () => {
+  let reason: 'queue-full' | 'gate' = 'queue-full';
+  const runLimiter: LimiterRun = async () => {
+    const until = reason === 'gate' ? Date.now() + 30_000 : null;
+    throw new LimiterUnavailableError('nansen-credit', reason, until);
+  };
+  const upstream: UpstreamFetch = async () => ({
+    status: 200,
+    body: '{"ok":true}',
+    headers: { 'content-type': 'application/json' },
+  });
+
+  await withServer({ upstream, runLimiter }, async (base) => {
+    const request = { provider: 'nansen', endpoint: '/api/v1/tgm/flows', priority: 1 };
+    const overloaded = await post(base, PROXY_PATH, request, TOKENS.a);
+    assert.equal(overloaded.status, 503);
+    assert.deepEqual(overloaded.json, { error: 'overloaded' });
+
+    reason = 'gate';
+    const gated = await post(base, PROXY_PATH, request, TOKENS.b);
+    assert.equal(gated.status, 503);
+    assert.deepEqual(gated.json, { error: 'gated' });
+    assert.ok(Date.parse(gated.headers.get(GATED_HEADER) ?? '') > Date.now());
   });
 });

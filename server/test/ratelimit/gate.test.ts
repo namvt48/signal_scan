@@ -18,6 +18,18 @@ test('Gate: a configured quota status closes for its cooldown', () => {
   assert.equal(g.blocked(600_000), true);
   assert.equal(g.blocked(605_001), false);
 });
+test('Gate: missing, malformed, and stale reset headers use the fallback cooldown', () => {
+  for (const header of [null, 'not-a-reset', '5']) {
+    const g = new Gate({
+      statuses: [429],
+      header: 'x-ratelimit-reset',
+      fallbackCooldownMs: 5_000,
+    });
+    g.note(429, header, 10_000);
+    assert.equal(g.until, 15_000);
+    assert.equal(g.blocked(14_999), true);
+  }
+});
 
 test('Gate: an unlisted status is ignored', () => {
   const g = new Gate({ statuses: [429], header: 'x-ratelimit-reset' });
