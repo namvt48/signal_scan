@@ -91,6 +91,8 @@ export interface TrackedWalletStat {
   sells: number;
   /** Current token balance USD for this (wallet, CA) — ABSENT when never measured. */
   balUsd?: number;
+  /** Current token balance as a share of total supply; absent when balance/supply is unknown. */
+  holdingPct?: number;
   /** Epoch ms of the wallet's newest watch trade for this CA; 0 = none. */
   lastTs: number;
 }
@@ -127,13 +129,13 @@ export interface TokenSignal {
   chain: Chain;
   /** Ticker (Nansen essential-data, as-is e.g. "MINI") — table uppercases it; absent until first sweep. */
   symbol?: string;
-  /** Token icon URL from the API; absent/empty/404 falls back to the letter avatar. */
+  /** CA-keyed API avatar URL; returns the verified source image or a deterministic CA identicon. */
   iconUrl?: string;
   /** X (Twitter) handle for the token's account, no leading '@'; absent → the CA cell falls back to an X search link. */
   xHandle?: string;
-  /** Tracked wallets interacting with this token, sorted by name by the server. */
+  /** Tracked-wallet activity for this CA. */
   trackedWallets: TrackedWalletStat[];
-  /** FOMO watch-list users who EVER bought this (ca, chain), newest-trade-first; 24h stats. */
+  /** FOMO watch-list activity for this CA. */
   fomoUsers: FomoUserStat[];
   note?: string;
   buyVol24h?: number;
@@ -159,7 +161,7 @@ export interface TokenSignal {
   trackedInflow: number;
   /**
    * Epoch ms of the newest tracked trade — buy OR sell — from a member wallet; 0 = none yet.
-   * Orders the table (newest activity first).
+   * Dashboard A uses this as its default sort key (newest activity first); B sorts by FOMO user lastTs.
    */
   trackedActivityAt: number;
   /** Latest captured FOMO buy/sell or native watch trade for this (chain, CA), across all history. */
@@ -174,6 +176,7 @@ export interface TokenSignal {
   /** Balance-distribution extremes per lookback window (absent window = no snapshot data yet). */
   balanceRange?: { d1?: BalRange; d7?: BalRange; d30?: BalRange };
 }
+
 
 /** One top-100 holder row (CA detail page). Includes exchange-classified rows (addrType 2). */
 export interface Top100Holder {
@@ -254,4 +257,11 @@ export interface TelegramAlertRules {
   maxMcK: number;
   /** Thousands of USD; 0 disables Tracker Buying alerts. */
   trackerBuyingK: number;
+}
+
+export interface PeriodicScanSettings {
+  enabled: boolean;
+  intervalHours: number;
+  maxVolume24hUsd: number;
+  maxLowFloatTokens: number;
 }

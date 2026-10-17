@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import type { MonitorConfig } from './config.js';
-import type { MetricSample, ServiceSample } from './types.js';
+import type { FomoApiHealthStatus, FomoApiSample, MetricSample, ServiceSample } from './types.js';
 import { MonitorStore } from './store.js';
 
 interface RpcUsageMetric {
@@ -46,6 +46,10 @@ function field(value: unknown, key: string): unknown {
 
 function finiteNonNegative(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function finiteNonNegativeInteger(value: unknown): value is number {
+  return finiteNonNegative(value) && Number.isInteger(value);
 }
 
 function heliusErrorDetail(error: string): string {
@@ -158,10 +162,12 @@ export class MonitorCollector {
       this.readFomoUsage(ts),
     ]);
     const collected = telemetry.flatMap((result) => result.metrics);
+    const fomoApiSamples = telemetry.flatMap((result) => result.fomoApiSamples);
     const metrics = this.aggregateSolanaMetrics(this.aggregateHeliusMetrics(collected));
     services.push(...telemetry.map((result) => result.service));
     this.store.recordServices(services, ts);
     this.store.recordMetrics(metrics, ts);
+    this.store.recordFomoApiSamples(fomoApiSamples, ts);
     this.store.prune(ts);
   }
 
@@ -232,7 +238,7 @@ export class MonitorCollector {
     id: string,
     name: string,
     url: string,
-  ): Promise<{ service: ServiceSample; metrics: CollectedMetric[] }> {
+  ): Promise<{ service: ServiceSample; metrics: CollectedMetric[]; fomoApiSamples: FomoApiSample[] }> {
     const started = this.now();
     try {
       const response = await this.fetcher(url, {
@@ -244,12 +250,14 @@ export class MonitorCollector {
         ? field(body, 'credits') !== undefined || Array.isArray(field(body, 'gmgnKeys'))
         : Array.isArray(field(body, 'rpcUsage'));
       if (!response.ok || !expectedPayload) throw new Error(`HTTP ${response.status}`);
+      const instance = id === 'api-a-telemetry' ? 'A' : 'B';
       const metrics = id === 'gateway-telemetry'
         ? this.gatewayMetrics(body)
         : [
-          ...this.rpcMetrics(body, id === 'api-a-telemetry' ? 'api-a' : 'api-b'),
+          ...this.rpcMetrics(body, `api-${instance.toLowerCase()}`),
           ...this.heliusMetrics(body),
         ];
+      const fomoApiSamples = id === 'gateway-telemetry' ? [] : this.fomoApiSamples(body, instance);
       return {
         service: {
           id,
@@ -261,6 +269,7 @@ export class MonitorCollector {
           detail: 'Private metrics endpoint reachable',
         },
         metrics,
+        fomoApiSamples,
       };
     } catch (error) {
       const kind = error instanceof Error && error.message.startsWith('HTTP ') ? error.message : error instanceof Error ? error.name : 'Error';
@@ -275,6 +284,7 @@ export class MonitorCollector {
           detail: `Metrics scrape failed: ${kind}`,
         },
         metrics: [],
+        fomoApiSamples: [],
       };
     }
   }
@@ -315,6 +325,71 @@ export class MonitorCollector {
     return result;
   }
 
+  private fomoApiSamples(body: unknown, instance: 'A' | 'B'): FomoApiSample[] {
+    const usage = field(body, 'fomoApiUsage');
+    const sampledAtMs = field(usage, 'sampledAtMs');
+    const upstream = field(usage, 'upstream');
+    const endpoints = field(usage, 'endpoints');
+    if (!finiteNonNegative(sampledAtMs) || !Array.isArray(endpoints)) return [];
+    const apiStatusRaw = field(upstream, 'apiStatus');
+    const liveDataStatusRaw = field(upstream, 'liveDataStatus');
+    const apiStatus: FomoApiHealthStatus =
+      apiStatusRaw === 'operational' || apiStatusRaw === 'degraded' || apiStatusRaw === 'down' ? apiStatusRaw : 'unknown';
+    const liveDataStatus: FomoApiHealthStatus =
+      liveDataStatusRaw === 'operational' || liveDataStatusRaw === 'degraded' || liveDataStatusRaw === 'down'
+        ? liveDataStatusRaw
+        : 'unknown';
+    const samples: FomoApiSample[] = [];
+    for (const raw of endpoints) {
+      const endpoint = field(raw, 'endpoint');
+      const operations = field(raw, 'operations');
+      const attemptedOperations = field(raw, 'attemptedOperations');
+      const attempts = field(raw, 'attempts');
+      const attemptFailures = field(raw, 'attemptFailures');
+      const successes = field(raw, 'successes');
+      const noData = field(raw, 'noData');
+      const incomplete = field(raw, 'incomplete');
+      const failures = field(raw, 'failures');
+      const deferred = field(raw, 'deferred');
+      const creditsCost = field(raw, 'creditsCost');
+      const lastOutcome = field(raw, 'lastOutcome');
+      const lastOutcomeAtMs = field(raw, 'lastOutcomeAtMs');
+      if ((endpoint !== 'positions' && endpoint !== 'swaps') ||
+          !finiteNonNegativeInteger(operations) ||
+          !finiteNonNegativeInteger(attemptedOperations) ||
+          !finiteNonNegativeInteger(attempts) ||
+          !finiteNonNegativeInteger(attemptFailures) ||
+          !finiteNonNegativeInteger(successes) ||
+          !finiteNonNegativeInteger(noData) ||
+          !finiteNonNegativeInteger(incomplete) ||
+          !finiteNonNegativeInteger(failures) ||
+          !finiteNonNegativeInteger(deferred) ||
+          !finiteNonNegative(creditsCost) ||
+          (lastOutcome !== null && typeof lastOutcome !== 'string') ||
+          (lastOutcomeAtMs !== null && !finiteNonNegative(lastOutcomeAtMs))) continue;
+      samples.push({
+        instance,
+        endpoint,
+        operations,
+        attemptedOperations,
+        attempts,
+        attemptFailures,
+        successes,
+        noData,
+        incomplete,
+        failures,
+        deferred,
+        creditsCost,
+        lastOutcome,
+        lastOutcomeAtMs,
+        sampledAtMs,
+        upstreamApiStatus: apiStatus,
+        upstreamLiveDataStatus: liveDataStatus,
+        stale: false,
+      });
+    }
+    return samples;
+  }
   private heliusMetrics(body: unknown): CollectedMetric[] {
     const usage = field(body, 'heliusUsage');
     if (!Array.isArray(usage)) return [];
@@ -492,7 +567,7 @@ export class MonitorCollector {
     return result;
   }
 
-  private async readFomoUsage(now: number): Promise<{ service: ServiceSample; metrics: MetricSample[] }> {
+  private async readFomoUsage(now: number): Promise<{ service: ServiceSample; metrics: MetricSample[]; fomoApiSamples: FomoApiSample[] }> {
     try {
       const raw: unknown = JSON.parse(await readFile(this.config.fomoUsagePath, 'utf8'));
       const usage = parseFomoUsage(raw);
@@ -526,6 +601,7 @@ export class MonitorCollector {
           detail: stale ? `Credit snapshot stale (${Math.floor(ageMs / 60_000)}m old)` : usage.error ?? 'FOMO /v2/me snapshot current',
         },
         metrics: [metric],
+        fomoApiSamples: [],
       };
     } catch (error) {
       const kind = error instanceof Error && error.message === 'invalid_usage_snapshot' ? 'Invalid FOMO usage snapshot' : 'FOMO usage snapshot unavailable';
@@ -540,6 +616,7 @@ export class MonitorCollector {
           detail: kind,
         },
         metrics: [],
+        fomoApiSamples: [],
       };
     }
   }

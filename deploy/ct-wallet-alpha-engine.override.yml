@@ -1,0 +1,16 @@
+# The only API consumers are Signal Scan API instances on this private network.
+services:
+  ct-wallet:
+    environment:
+      AUTH_ENABLED: "0"
+      CT_WALLET_AUTO_REFRESH: "0"
+      CT_WALLET_SKIP_STARTUP_BACKFILL: "1"
+    networks:
+      cohort-labels:
+        aliases:
+          - ct-wallet-alpha-engine
+
+networks:
+  cohort-labels:
+    external: true
+    name: signal-scan-cohort-labels

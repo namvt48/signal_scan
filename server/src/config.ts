@@ -39,9 +39,12 @@ function resolveMode(): ProviderMode {
 }
 
 const dbPath = str('DB_PATH', './data/signal_scan.db');
+const marketDbPath = str('MARKET_DB_PATH', '');
 
 export const config = {
   port: num('PORT', 3001),
+  /** Shared market DB attached through API read views; the gateway owns writes. */
+  marketDbPath,
   dbPath,
   /** File cache for the setup indicators (t100/lf) — plan setup-fill-on-add §4.
    * Survives DB-table wipes and `make deploy` (rsync `--exclude data`). The
@@ -70,7 +73,7 @@ export const config = {
   /** Fresh% TTL. T100 has its own pollFlowsMs TTL; LF is fetched until known.
    * Setup and flows queues are serviced by the gateway limits, not spread
    * across these freshness intervals. */
-  pollSetupMs: num('POLL_SETUP_MS', 21_600_000),
+  pollSetupMs: num('POLL_SETUP_MS', 10_800_000),
   /** setupSweep scheduler cadence; independent of failed-field retry backoff. */
   pollSetupSweepMs: posNum('POLL_SETUP_SWEEP_MS', 300_000),
 
@@ -95,20 +98,15 @@ export const config = {
     * credits per call, so a mint that never resolves must not be retried forever
     * (the 24h essential pass still covers it). */
   symbolBackfillWindowMs: num('SYMBOL_BACKFILL_WINDOW_MS', 3_600_000),
-  /** Icon backfill (DexScreener /latest/dex/tokens): keyless + free, ONE batch
-    * call covers ≤30 CAs, so a slow cadence is plenty even for a big queue. */
+  /** Icon backfill cadence; both DexScreener and GMGN retry from the shared CA queue. */
   pollIconMs: num('POLL_ICON_MS', 900_000),
-  /** How long a CA stays eligible for the icon sweep. Generous by design: a
-    * no-pair mint costs a share of one free batch call per sweep, unlike the
-    * credit-bound symbol floor — the window only trims ancient dead rows. */
-  iconWindowMs: num('ICON_WINDOW_MS', 30 * 86_400_000),
   /** Wallet HOLDINGS sweep — credit-free on EVERY chain since T5: sol via Solana
    * RPC (getTokenAccountsByOwner), base/bsc via one Multicall3 eth_call per wallet. */
   pollWalletsMs: num('POLL_WALLETS_MS', 900_000),
   /** Official T100-series refresh interval and cache TTL (3h).
    * LF is write-once; missing LF retries independently without re-buying T100.
    * Gateway limits pace the queue independently of this interval.
-   * Fresh% uses pollSetupMs (6h, browser door — 0 Nansen credits). */
+   * Fresh% uses pollSetupMs (3h, browser door — 0 Nansen credits). */
   pollFlowsMs: posNum('POLL_FLOWS_MS', 10_800_000),
   /** Credit-door retry: NANSEN_RETRIES attempts, spaced 1,1,2,3,5,8,13,… ×
    * NANSEN_RETRY_BASE_MS (fibonacci). 6 retries ≈ 20s/call, 7 ≈ 33s. */
@@ -177,11 +175,9 @@ export const config = {
     .map(Number)
     .filter((n) => Number.isFinite(n) && n > 0),
 
-  /** FOMO API (api.fomoapi.io) key — the AUTHORITATIVE per-position source:
-   * `costBasisUsd` (money actually spent, not the alert's position VALUE),
-   * `amount` and `priceUsd`. Absent -> fomoPositionsSweep no-ops, so dev and
-   * instance A are unaffected (user 2026-10-01: the dash read 70.7K for a
-   * 59.8K spend because it aggregated the alert's mark-to-market usdValue). */
+  /** FOMO positions refresh on alerts; without the API key, only captured alert
+   *  data is stored. Alerts lack token amounts, so positions are needed for Bal;
+   *  a missing BUY tradeUsd additionally uses exact swap matching. */
   fomoApiKey: str('FOMO_API_KEY', ''),
   fomoApiBase: str('FOMO_API_BASE', 'https://api.fomoapi.io'),
 

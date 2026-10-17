@@ -6,6 +6,7 @@ import { CHART_POINT_HIT_RADIUS, findNearestChartPointIndex, type ChartPointPosi
 
 type Point = HistoryPoint;
 type Position = { top: number; left: number };
+type ChartTooltipPosition = { top: number; left: number };
 type InteractivePoint = ChartPointPosition & {
   t: number;
   value: number;
@@ -46,7 +47,7 @@ const PLOT_LEFT = 82;
 const PLOT_RIGHT = 502;
 const PLOT_TOP = 22;
 const PLOT_HEIGHT = 136;
-const balanceFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 3 });
+const balanceFormatter = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 0 });
 
 function formatValue(value: number, unit: Props['unit']): string {
   if (unit === 'multiple') return value.toFixed(2);
@@ -88,6 +89,9 @@ export function MetricHistoryChart({
   const [open, setOpen] = useState(false);
   const [activePoint, setActivePoint] = useState<number | null>(null);
   const [position, setPosition] = useState<Position | null>(null);
+  const [pointTooltipPosition, setPointTooltipPosition] = useState<ChartTooltipPosition | null>(null);
+  const chartPlot = useRef<HTMLDivElement>(null);
+  const pointTooltip = useRef<HTMLDivElement>(null);
   const openRef = useRef(false);
   const clickPinned = useRef(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -101,6 +105,7 @@ export function MetricHistoryChart({
     setOpen(false);
     setActivePoint(null);
     setPosition(null);
+    setPointTooltipPosition(null);
   };
   const toggleClick = () => {
     setActivePoint(null);
@@ -170,12 +175,15 @@ export function MetricHistoryChart({
     ? coords[activePointData.historyIndex - 1]
     : undefined;
   const decreaseDetail = previousPrimaryPoint && activePointData?.value !== undefined && activePointData.value < previousPrimaryPoint.value
-    ? ` · Decrease: ${formatValue(previousPrimaryPoint.value, unit)} → ${formatValue(activePointData.value, unit)}`
+    ? `Decrease: ${formatValue(previousPrimaryPoint.value, unit)} → ${formatValue(activePointData.value, unit)}`
     : '';
   const balanceDetail = activePointData?.series === 'primary'
     && activePointData.peakBalance != null
+    && Number.isFinite(activePointData.peakBalance)
     && activePointData.troughBalance != null
-    ? ` · T100 balance: ${balanceFormatter.format(activePointData.peakBalance)} → ${balanceFormatter.format(activePointData.troughBalance)}`
+    && Number.isFinite(activePointData.troughBalance)
+    && activePointData.peakBalance > activePointData.troughBalance
+    ? `T100 balance: ${balanceFormatter.format(activePointData.peakBalance)} → ${balanceFormatter.format(activePointData.troughBalance)}`
     : '';
   const focusPoint = (index: number) => popup.current?.querySelectorAll<SVGCircleElement>('[data-chart-point]')[index]?.focus();
   const updateActivePointFromPointer = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -192,6 +200,38 @@ export function MetricHistoryChart({
       setActivePoint(null);
     }
   };
+
+  useLayoutEffect(() => {
+    const plot = chartPlot.current;
+    const tooltip = pointTooltip.current;
+    if (!open || !activePointData || !plot || !tooltip) {
+      setPointTooltipPosition(null);
+      return;
+    }
+    const place = () => {
+      const plotBounds = plot.getBoundingClientRect();
+      const tooltipBounds = tooltip.getBoundingClientRect();
+      const x = (activePointData.x / 520) * plotBounds.width;
+      const y = (activePointData.y / 190) * plotBounds.height;
+      const maxLeft = Math.max(8, plotBounds.width - tooltipBounds.width - 8);
+      const left = Math.max(8, Math.min(x - tooltipBounds.width / 2, maxLeft));
+      const preferredTop = y >= tooltipBounds.height + 16 ? y - tooltipBounds.height - 8 : y + 8;
+      const maxTop = Math.max(8, plotBounds.height - tooltipBounds.height - 8);
+      const top = Math.max(8, Math.min(preferredTop, maxTop));
+      setPointTooltipPosition((current) =>
+        current?.left === left && current.top === top ? current : { left, top },
+      );
+    };
+    place();
+    const resizeObserver = new ResizeObserver(place);
+    resizeObserver.observe(plot);
+    resizeObserver.observe(tooltip);
+    window.addEventListener('resize', place);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', place);
+    };
+  }, [open, activePointData?.x, activePointData?.y]);
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -277,13 +317,13 @@ export function MetricHistoryChart({
           <strong className="text-sm">{label}{symbol ? ` · ${symbol}` : ''}</strong>
           <span className={`text-sm ${colorClass}`}>{currentLabel}</span>
         </div>
-        <p id={`${popupId}-point-detail`} role="status" aria-live="polite" className={`mb-2 flex h-10 w-full items-center gap-2 overflow-x-auto overflow-y-hidden whitespace-nowrap rounded bg-surface2 px-2 py-1 ${pointDetailClassName} text-ink2`}>
+        <p id={`${popupId}-point-detail`} role="status" aria-live="polite" className={`sr-only ${pointDetailClassName}`}>
           {activePointData && activePointLabel && <>
-            <time className="shrink-0" dateTime={new Date(activePointData.t).toISOString()}>{formatTimestamp(activePointData.t)}</time>
-            <span className="font-mono" style={{ color: activePointColor }}>{activePointLabel}: {formatValue(activePointData.value, activePointUnit)}{activePointData.sampleCount > 1 ? ` · average of ${activePointData.sampleCount} readings` : ''}{decreaseDetail}{balanceDetail}</span>
+            <time dateTime={new Date(activePointData.t).toISOString()}>{formatTimestamp(activePointData.t)}</time>
+            <span>{activePointLabel}: {formatValue(activePointData.value, activePointUnit)}{activePointData.sampleCount > 1 ? ` · average of ${activePointData.sampleCount} readings` : ''}{decreaseDetail ? ` · ${decreaseDetail}` : ''}{balanceDetail ? ` · ${balanceDetail}` : ''}</span>
           </>}
         </p>
-        {usable.length >= 2 || (hasSecondary && secondaryUsable.length > 0) ? <div className="w-full">
+        {usable.length >= 2 || (hasSecondary && secondaryUsable.length > 0) ? <div ref={chartPlot} className="relative w-full">
           <svg
             viewBox="0 0 520 190"
             role="img"
@@ -346,12 +386,34 @@ export function MetricHistoryChart({
             <text x={PLOT_LEFT} y="179" fill="var(--c-muted)" fontSize="10">{formatTimestamp(minT)}</text>
             <text x={plotRight} y="179" textAnchor="end" fill="var(--c-muted)" fontSize="10">{formatTimestamp(maxT)}</text>
           </svg>
+          {activePointData && activePointLabel && <div
+            ref={pointTooltip}
+            role="tooltip"
+            aria-hidden="true"
+            className="pointer-events-none absolute z-10 flex flex-col rounded-lg border border-line bg-surface px-3 py-2 text-center font-mono text-[13.8px] text-ink shadow-md"
+            style={{
+              left: pointTooltipPosition?.left ?? 0,
+              top: pointTooltipPosition?.top ?? 0,
+              maxWidth: 'calc(100% - 16px)',
+              visibility: pointTooltipPosition ? 'visible' : 'hidden',
+            }}
+          >
+            <strong style={{ color: activePointColor }}>
+              {activePointLabel}: {formatValue(activePointData.value, activePointUnit)}
+            </strong>
+            <time className="whitespace-nowrap text-[12.65px] text-muted">{formatTimestamp(activePointData.t)}</time>
+            {decreaseDetail && <span className="max-w-full text-[13.8px] leading-tight">{decreaseDetail}</span>}
+            {balanceDetail && <span className="max-w-full text-[13.8px] leading-tight">{balanceDetail}</span>}
+            </div>}
         </div> : interactionPoints.length === 1 ? <div className="rounded bg-surface2 px-3 py-3 text-sm text-ink2">
           <p>Only one successful reading is available.</p>
           <p className="mt-1 font-mono">{formatTimestamp(interactionPoints[0]!.t)} · {interactionPoints[0]!.series === 'secondary' && secondaryLabel ? `${secondaryLabel}: ` : ''}{formatValue(interactionPoints[0]!.value, interactionPoints[0]!.series === 'secondary' ? 'usd' : unit)}</p>
           {interactionPoints[0]!.series === 'primary'
             && interactionPoints[0]!.peakBalance != null
+            && Number.isFinite(interactionPoints[0]!.peakBalance)
             && interactionPoints[0]!.troughBalance != null
+            && Number.isFinite(interactionPoints[0]!.troughBalance)
+            && interactionPoints[0]!.peakBalance > interactionPoints[0]!.troughBalance
             && <p className="mt-1 font-mono">T100 balance: {balanceFormatter.format(interactionPoints[0]!.peakBalance)} → {balanceFormatter.format(interactionPoints[0]!.troughBalance)}</p>}
         </div> : <p className="rounded bg-surface2 px-3 py-3 text-sm text-ink2">{emptyMessage}</p>}
         <p className="mt-2 text-xs text-muted">{updatedAt != null && Number.isFinite(updatedAt) ? `Metric refreshed ${formatTimestamp(updatedAt)}.` : 'Refresh time unavailable.'}</p>

@@ -21,6 +21,18 @@ test('history under the cap is sorted, unchanged in value, and leaves input unto
   assert.deepEqual(history, original);
 });
 
+test('chart preparation preserves T100 balance drawdown details', () => {
+  const history = [
+    { t: 1, value: 1.67, peakBalance: 167, troughBalance: 100 },
+    { t: 2, value: 1.33, peakBalance: 133, troughBalance: 100 },
+  ];
+
+  assert.deepEqual(
+    aggregateHistoryPoints(history, 256).map(({ peakBalance, troughBalance }) => [peakBalance, troughBalance]),
+    [[167, 100], [133, 100]],
+  );
+});
+
 test('history at the cap keeps every observation', () => {
   const history = Array.from({ length: MAX_CHART_POINTS }, (_, t) => ({ t, value: t * 2 }));
   const result = aggregateHistoryPoints(history);

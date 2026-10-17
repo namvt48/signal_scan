@@ -113,8 +113,8 @@ function DashboardShell() {
   // Token detail page DISABLED — state kept out so no detail query can be triggered.
   // const [selectedToken, setSelectedToken] = useState<{ chain: string; ca: string } | null>(null);
   const [tab, setTab] = useState<Tab>('dashboard');
-  // Dashboard/Rated tables stay MOUNTED once visited (inactive one is display:none),
-  // so switching tabs does not remount and refetch (~3s /api/signals).
+  // Keep visited tables mounted to preserve sort/filter state. SignalTable
+  // pauses inactive polling and reuses fresh rows when a tab is reactivated.
   const [visited, setVisited] = useState<Set<Tab>>(() => new Set<Tab>(['dashboard']));
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Bumped on every threshold save so SignalTable refetches immediately instead
@@ -180,6 +180,7 @@ function DashboardShell() {
             <SignalTable
               key={viewVersion}
               refreshKey={settingsVersion}
+              active={tab === 'dashboard'}
               onTierChange={() => setSettingsVersion((v) => v + 1)}
             />
           </div>
@@ -189,6 +190,7 @@ function DashboardShell() {
             <SignalTable
               key={`rated-${viewVersion}`}
               mode="rated"
+              active={tab === 'rated'}
               refreshKey={settingsVersion}
               onTierChange={() => setSettingsVersion((v) => v + 1)}
             />
@@ -208,7 +210,7 @@ function DashboardShell() {
         )}
       </main>
       {settingsOpen && (
-        <SettingsPanel onClose={() => setSettingsOpen(false)} onSaved={() => setSettingsVersion((v) => v + 1)} />
+        <SettingsPanel fomo={SHOW_FOMO} onClose={() => setSettingsOpen(false)} onSaved={() => setSettingsVersion((v) => v + 1)} />
       )}
     </div>
   );

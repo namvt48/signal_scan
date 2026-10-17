@@ -146,6 +146,7 @@ test('assembleSignals: trackedWallets = watch-buy members only, per-wallet 24h s
   assert.equal(ct01.sells, 1);
   assert.equal(ct01.lastTs, NOW - 800);
   assert.equal(ct01.balUsd, 1e7 * 0.001);
+  assert.equal(ct01.holdingPct, 1);
   // Token total = Σ rows (contract: the FE's rows always add up to the token figure).
   assert.equal(sig.trackedInflow, sig.trackedWallets.reduce((sum, w) => sum + w.inflow, 0));
 });
@@ -240,6 +241,23 @@ test('trackedWallets: an UNPRICED holding emits no balUsd (FE "—"), never a fa
   assert.ok(w);
   assert.ok(!('balUsd' in w), 'unpriced balUsd must be absent (FE renders —), never 0');
 });
+test('trackedWallets omit holding percentage when supply is zero or unavailable', () => {
+  const ca = 'caZeroSupply-balance-025';
+  const walletId = insertWallet({ address: 'wallet-addr-zero-supply', name: 'CTZS', tags: [], chain: 'sol', source: 'test' }).id;
+  insertTrackedCa({ address: ca, chain: 'sol', note: '', entryUsd: 60 });
+  upsertTokenInfo(token(ca, { supply: 0 }));
+  replaceWalletBalances(walletId, 'sol', [{ ca, amount: 20_000_000 }]);
+  insertTrades(walletId, [activity('txzs1', 'buy', 300, NOW - 300_000, ca)], 'watch');
+
+  let wallet = assembleSignals(NOW).find((signal) => signal.ca === ca)?.trackedWallets[0];
+  assert.ok(wallet);
+  assert.ok(!('holdingPct' in wallet), 'zero supply must not produce a share');
+
+  getDb().prepare('UPDATE token_state SET supply = NULL WHERE ca = ? AND chain = ?').run(ca, 'sol');
+  wallet = assembleSignals(NOW).find((signal) => signal.ca === ca)?.trackedWallets[0];
+  assert.ok(wallet);
+  assert.ok(!('holdingPct' in wallet), 'unknown supply must not produce a share');
+});
 
 test("trackedWallets and trackedInflow read only source='watch' trades", () => {
   const CA_S = 'caS-source-split-015';
@@ -278,7 +296,7 @@ test('trackedWalletStats: a watch buy OLDER than TRACKED_BY_WINDOW_MS still list
   assert.ok(sig);
   assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CTOLD']);
   // Zero 24h stats, but balUsd from the measured holding (5e6 × 0.002).
-  assert.deepEqual(sig.trackedWallets[0], { name: 'CTOLD', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 1e4 });
+  assert.deepEqual(sig.trackedWallets[0], { name: 'CTOLD', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 1e4, holdingPct: 0.5 });
   // The exported fn must agree with the assembled column.
   assert.deepEqual(trackedWalletStats(CA_Q, 'sol', NOW), sig.trackedWallets);
 });

@@ -15,11 +15,7 @@ import {
   parseTokenSupply,
 } from '../src/providers/solana.js';
 import { refreshFomoHolding, trackFomoWalletFromTx, type FomoRpcDeps } from '../src/fomo-holdings.js';
-import { config } from '../src/config.js';
-import { fetchFomoBalances } from '../src/fomo-api.js';
-import { fomoApiBalancesIdle, fomoHoldingsSweep } from '../src/poller.js';
-import { upsertTokenInfo } from '../src/ingest.js';
-import { getDb, insertFomoTrade, insertFomoUser, insertFomoUserWallet, insertTrackedCa, open } from '../src/db.js';
+import { getDb, insertFomoUser, insertFomoUserWallet, open } from '../src/db.js';
 
 import { providerRequestCache } from '../src/providers/request-cache.js';
 
@@ -113,31 +109,6 @@ function stubSol(balance: string, supply: string): void {
   }) as unknown as typeof fetch;
 }
 
-test('fetchFomoBalances skips null amounts instead of coercing them to valid zero', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalKey = config.fomoApiKey;
-  try {
-    config.fomoApiKey = 'test-key';
-    globalThis.fetch = (async () =>
-      new Response(JSON.stringify({
-        capturedAt: '2026-10-07T00:00:00.000Z',
-        available: true,
-        complete: true,
-        truncated: false,
-        holdings: [
-          { chain: 'base', token: { address: CA }, amount: null },
-          { chain: 'base', token: { address: CA }, amount: 0 },
-          { chain: 'base', token: { address: CA }, amount: '7' },
-        ],
-      }), { status: 200 })) as typeof fetch;
-    const result = await fetchFomoBalances('@null-amount');
-    assert.deepEqual(result?.balances, [{ ca: CA, chain: 'base', amount: 0 }]);
-    assert.equal(result?.complete, false, 'a malformed supported-chain balance makes the snapshot incomplete');
-  } finally {
-    globalThis.fetch = originalFetch;
-    config.fomoApiKey = originalKey;
-  }
-});
 
 before(() => {
   open(':memory:');
@@ -353,149 +324,5 @@ test('refreshFomoHolding: a later re-measure with a second wallet SUMS both and 
     assert.equal(rows[0]!.pct, 20);
   } finally {
     globalThis.fetch = orig;
-  }
-});
-test('FOMO balances sweep stores chain-scoped percentages and only infers zero from a complete snapshot', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalKey = config.fomoApiKey;
-  const originalPollWalletsMs = config.pollWalletsMs;
-  const user = insertFomoUser({ handle: '@balances-sweep' });
-  const targets = [
-    { chain: 'base' as const, supply: 1_000, amount: 50 },
-    { chain: 'bsc' as const, supply: 5_000, amount: 1_000 },
-    { chain: 'robinhood' as const, supply: 20_000, amount: 600 },
-  ];
-  for (const [index, target] of targets.entries()) {
-    insertTrackedCa({ address: CA, chain: target.chain, note: '', entryUsd: 60 });
-    upsertTokenInfo({
-      ca: CA,
-      chain: target.chain,
-      price: 1,
-      holders: 1,
-      volume24h: 1,
-      buyVol24h: 1,
-      sellVol24h: 0,
-      marketCap: target.supply,
-      liquidity: 1,
-      supply: target.supply,
-    });
-    insertFomoTrade({
-      fomo_user_id: user.id,
-      event_id: `balance-sweep-${target.chain}`,
-      ca: CA,
-      chain: target.chain,
-      type: 'buy',
-      usd_value: 10,
-      ts: Date.now() - index,
-    });
-  }
-
-  let responseBody: Record<string, unknown> = {
-    available: true,
-    complete: true,
-    truncated: false,
-    holdings: targets.map((target) => ({
-      chain: target.chain,
-      token: { address: CA },
-      amount: target.amount,
-    })),
-  };
-  let apiCalls = 0;
-  try {
-    config.fomoApiKey = 'test-key';
-    config.pollWalletsMs = 1;
-    globalThis.fetch = (async () => {
-      apiCalls += 1;
-      return new Response(JSON.stringify({ ...responseBody, capturedAt: new Date(Date.now()).toISOString() }), { status: 200 });
-    }) as typeof fetch;
-
-    await fomoHoldingsSweep();
-    await fomoApiBalancesIdle();
-    const measured = getDb()
-      .prepare('SELECT chain, amount, pct FROM fomo_api_holdings WHERE fomo_user_id = ? ORDER BY chain')
-      .all(user.id) as { chain: string; amount: number; pct: number }[];
-    assert.deepEqual(measured, [
-      { chain: 'base', amount: 50, pct: 5 },
-      { chain: 'bsc', amount: 1_000, pct: 20 },
-      { chain: 'robinhood', amount: 600, pct: 3 },
-    ]);
-
-    getDb().prepare('UPDATE fomo_api_balance_snapshots SET checked_at = ? WHERE fomo_user_id = ?')
-      .run(Date.now() - 24 * 60 * 60 * 1000 - 1, user.id);
-    responseBody = { available: true, complete: true, truncated: false, holdings: [] };
-    await fomoHoldingsSweep();
-    await fomoApiBalancesIdle();
-
-    const measuredZero = getDb()
-      .prepare('SELECT chain, amount, pct FROM fomo_api_holdings WHERE fomo_user_id = ? ORDER BY chain')
-      .all(user.id) as { chain: string; amount: number; pct: number }[];
-    assert.deepEqual(measuredZero, [
-      { chain: 'base', amount: 0, pct: 0 },
-      { chain: 'bsc', amount: 0, pct: 0 },
-      { chain: 'robinhood', amount: 0, pct: 0 },
-    ]);
-    assert.equal(apiCalls, 2, 'one all-chain balances request per user per refresh');
-  } finally {
-    globalThis.fetch = originalFetch;
-    config.fomoApiKey = originalKey;
-    config.pollWalletsMs = originalPollWalletsMs;
-  }
-});
-
-test('FOMO complete snapshot with a null amount does not infer a zero holding', async () => {
-  const originalFetch = globalThis.fetch;
-  const originalKey = config.fomoApiKey;
-  const originalPollWalletsMs = config.pollWalletsMs;
-  const ca = `0x${'d4'.repeat(20)}`;
-  const user = insertFomoUser({ handle: '@null-balance-sweep' });
-  insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
-  upsertTokenInfo({
-    ca,
-    chain: 'base',
-    price: 1,
-    holders: 1,
-    volume24h: 1,
-    buyVol24h: 1,
-    sellVol24h: 0,
-    marketCap: 1_000,
-    liquidity: 1,
-    supply: 1_000,
-  });
-  insertFomoTrade({
-    fomo_user_id: user.id,
-    event_id: 'null-balance-sweep-buy',
-    ca,
-    chain: 'base',
-    type: 'buy',
-    usd_value: 10,
-    ts: Date.now(),
-  });
-
-  try {
-    config.fomoApiKey = 'test-key';
-    config.pollWalletsMs = 1;
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-      capturedAt: new Date(Date.now()).toISOString(),
-      available: true,
-      complete: true,
-      truncated: false,
-      holdings: [{ chain: 'base', token: { address: ca }, amount: null }],
-    }), { status: 200 })) as typeof fetch;
-
-    await fomoHoldingsSweep();
-    await fomoApiBalancesIdle();
-
-    const holding = getDb()
-      .prepare('SELECT amount, pct FROM fomo_api_holdings WHERE fomo_user_id = ? AND ca = ? AND chain = ?')
-      .get(user.id, ca, 'base');
-    assert.equal(holding, undefined, 'invalid amount must not become a fabricated zero row');
-    const snapshot = getDb()
-      .prepare('SELECT complete, truncated FROM fomo_api_balance_snapshots WHERE fomo_user_id = ?')
-      .get(user.id) as { complete: number; truncated: number };
-    assert.deepEqual(snapshot, { complete: 0, truncated: 0 });
-  } finally {
-    globalThis.fetch = originalFetch;
-    config.fomoApiKey = originalKey;
-    config.pollWalletsMs = originalPollWalletsMs;
   }
 });

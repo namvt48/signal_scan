@@ -117,10 +117,16 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'GET', path: '/api/health', access: 'public' }, // monitors — ALWAYS public
   { method: 'GET', path: '/api/me', access: ALL_ROLES },
   { method: 'GET', path: '/api/signals', access: ALL_ROLES },
+  { method: 'GET', path: '/api/token-avatar/:chain/:ca', access: 'public' },
   { method: 'GET', path: '/api/settings', access: ALL_ROLES }, // the daemon reads it
   { method: 'PUT', path: '/api/settings', access: ADMIN_ONLY },
   { method: 'GET', path: '/api/telegram-alert-rules', access: ALL_ROLES },
   { method: 'PUT', path: '/api/telegram-alert-rules', access: ADMIN_ONLY },
+  { method: 'GET', path: '/api/fomo/telegram-alert-rules', access: ALL_ROLES },
+  { method: 'PUT', path: '/api/fomo/telegram-alert-rules', access: ADMIN_ONLY },
+  { method: 'GET', path: '/api/periodic-scan-settings', access: ALL_ROLES },
+  { method: 'PUT', path: '/api/periodic-scan-settings', access: ADMIN_ONLY },
+  { method: 'GET', path: '/api/monitor/periodic-scan', access: MONITOR_ONLY },
   { method: 'GET', path: '/api/wallets', access: ALL_ROLES }, // the daemon reads it
   { method: 'POST', path: '/api/wallets', access: ADMIN_ONLY },
   { method: 'PATCH', path: '/api/wallets/:id', access: ADMIN_ONLY },

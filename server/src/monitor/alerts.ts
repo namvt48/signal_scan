@@ -2,6 +2,7 @@ import { CHAINS } from '../shared/chain.js';
 import type { AlertMetricObservation, AlertMetricSnapshot, AlertTrackedMetadata } from '../alert-feed.js';
 import { validatedIconUrl } from '../providers/dexscreener.js';
 import { DEFAULT_TELEGRAM_ALERT_RULES, type TelegramAlertRules } from '../telegram-alert-settings.js';
+import { isSuppressedTelegramAlert } from './alert-policy.js';
 import type { MonitorConfig } from './config.js';
 import { MonitorStore } from './store.js';
 import { TelegramBot, TelegramSendError } from './telegram.js';
@@ -27,7 +28,7 @@ function nullableNumber(value: unknown): value is number | null {
 function parseTrackedGroup(raw: unknown): AlertTrackedMetadata['wallets'] | null {
   const namesRaw = field(raw, 'names');
   const total = field(raw, 'total');
-  if (!Array.isArray(namesRaw) || namesRaw.length > 3 ||
+  if (!Array.isArray(namesRaw) ||
       typeof total !== 'number' || !Number.isSafeInteger(total) || total < namesRaw.length) return null;
   const names: string[] = [];
   for (const name of namesRaw) {
@@ -73,8 +74,8 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
     const name = field(trackerBuyerRaw, 'name');
     const address = field(trackerBuyerRaw, 'address');
     if (typeof name !== 'string' || name.length > 128 ||
-        typeof address !== 'string' || address.length < 1 || address.length > 128) return null;
-    trackerBuyer = { name, address };
+        (address !== undefined && (typeof address !== 'string' || address.length < 1 || address.length > 128))) return null;
+    trackerBuyer = typeof address === 'string' ? { name, address } : { name };
   }
   const iconUrlRaw = field(snapshotRaw, 'iconUrl');
   const iconUrl = typeof iconUrlRaw === 'string' && iconUrlRaw.length <= 2048
@@ -134,7 +135,10 @@ function parseRules(raw: unknown): TelegramAlertRules | null {
 }
 
 export class MonitorAlerts {
-  private rules: TelegramAlertRules = { ...DEFAULT_TELEGRAM_ALERT_RULES };
+  private readonly rules: Record<Source, TelegramAlertRules> = {
+    A: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+    B: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+  };
   constructor(
     private readonly store: MonitorStore,
     private readonly config: MonitorConfig,
@@ -170,8 +174,8 @@ export class MonitorAlerts {
         observations.push(observation);
         previousId = observation.id;
       }
-      if (source === 'A') this.rules = parseRules(field(body, 'telegramAlertRules')) ?? this.rules;
-      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules);
+      this.rules[source] = parseRules(field(body, 'telegramAlertRules')) ?? this.rules[source];
+      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules[source]);
       await this.acknowledgeSource(baseUrl, committedCursor);
     } catch (error) {
       console.error(`[monitor] alert feed ${source} failed: ${responseKind(error)}`);
@@ -194,9 +198,21 @@ export class MonitorAlerts {
   private async sendPending(): Promise<void> {
     if (!this.bot.configured) return;
     for (const pending of this.store.pendingTelegramAlerts(this.now(), OUTBOX_BATCH_SIZE)) {
+      if (isSuppressedTelegramAlert(pending.payload, pending.alertId)) {
+        this.store.markTelegramAlertSuppressed(pending.alertId);
+        continue;
+      }
       if (!this.store.markTelegramAlertSending(pending.alertId)) continue;
       try {
-        await this.bot.send(pending.payload);
+        await this.bot.send(pending.payload, {
+          sentParts: pending.sentParts,
+          deliveryMode: pending.deliveryMode,
+          onPartSent: (sentParts, deliveryMode) => {
+            if (!this.store.markTelegramAlertPartSent(pending.alertId, sentParts, deliveryMode)) {
+              throw new Error('telegram_alert_progress_conflict');
+            }
+          },
+        });
         this.store.markTelegramAlertSent(pending.alertId, this.now());
       } catch (error) {
         const kind = responseKind(error);

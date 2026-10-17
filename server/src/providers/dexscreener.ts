@@ -25,11 +25,11 @@ export const DEXSCREENER_MAX_ADDRESSES = 30;
 
 /**
  * Hosts an icon URL may live on — exact match or subdomain. The URL lands in a
- * browser `<img src>`, so this allowlist is the trust boundary: anything the
- * third-party response carries that is not https on one of these hosts is
- * treated as "no icon" and NEVER stored.
+ * browser `<img src>`, so this allowlist is the trust boundary: anything from
+ * DexScreener or GMGN that is not https on one of these hosts is treated as
+ * "no icon" and NEVER stored.
  */
-export const ICON_HOST_ALLOWLIST: readonly string[] = ['cdn.dexscreener.com'];
+export const ICON_HOST_ALLOWLIST: readonly string[] = ['cdn.dexscreener.com', 'gmgn.ai'];
 
 interface DexBaseToken {
   address?: string;

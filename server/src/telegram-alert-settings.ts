@@ -35,10 +35,10 @@ function validRuleValue(key: keyof TelegramAlertRules, value: unknown): value is
 }
 
 
-export function getTelegramAlertRules(): TelegramAlertRules {
-  const rules = { ...DEFAULT_TELEGRAM_ALERT_RULES };
+function readRules(prefix: string, fallback: TelegramAlertRules = DEFAULT_TELEGRAM_ALERT_RULES): TelegramAlertRules {
+  const rules = { ...fallback };
   for (const key of RULE_KEYS) {
-    const raw = getSetting(`telegramAlert.${key}`);
+    const raw = getSetting(`${prefix}.${key}`);
     if (raw === undefined) continue;
     const value = Number(raw);
     if (validRuleValue(key, value)) rules[key] = value;
@@ -50,8 +50,12 @@ export function getTelegramAlertRules(): TelegramAlertRules {
   return rules;
 }
 
-export function updateTelegramAlertRules(patch: Record<string, unknown>): TelegramAlertRules | { error: string } {
-  const next = getTelegramAlertRules();
+function updateRules(
+  prefix: string,
+  patch: Record<string, unknown>,
+  fallback: TelegramAlertRules = DEFAULT_TELEGRAM_ALERT_RULES,
+): TelegramAlertRules | { error: string } {
+  const next = readRules(prefix, fallback);
   for (const key of RULE_KEYS) {
     const value = patch[key];
     if (value === undefined) continue;
@@ -68,7 +72,23 @@ export function updateTelegramAlertRules(patch: Record<string, unknown>): Telegr
     return { error: 'minMcK must be less than or equal to maxMcK when both are enabled' };
   }
   for (const key of RULE_KEYS) {
-    if (patch[key] !== undefined) setSetting(`telegramAlert.${key}`, String(next[key]));
+    if (patch[key] !== undefined) setSetting(`${prefix}.${key}`, String(next[key]));
   }
-  return getTelegramAlertRules();
+  return readRules(prefix, fallback);
+}
+
+export function getTelegramAlertRules(): TelegramAlertRules {
+  return readRules('telegramAlert');
+}
+
+export function updateTelegramAlertRules(patch: Record<string, unknown>): TelegramAlertRules | { error: string } {
+  return updateRules('telegramAlert', patch);
+}
+
+export function getFomoTelegramAlertRules(): TelegramAlertRules {
+  return readRules('fomoTelegramAlert', getTelegramAlertRules());
+}
+
+export function updateFomoTelegramAlertRules(patch: Record<string, unknown>): TelegramAlertRules | { error: string } {
+  return updateRules('fomoTelegramAlert', patch, getTelegramAlertRules());
 }

@@ -121,6 +121,7 @@ test('member with no trade in the 24h window keeps its zero-stat row + balUsd (L
     sells: 1,
     lastTs: NOW - 1_800_000,
     balUsd: 1,
+    holdingPct: (1000 / 1e9) * 100,
   });
   // Member with NO window trade: zero stats, lastTs 0, balUsd still present.
   assert.deepStrictEqual(rows[1], {
@@ -131,10 +132,11 @@ test('member with no trade in the 24h window keeps its zero-stat row + balUsd (L
     sells: 0,
     lastTs: 0,
     balUsd: 0.5,
+    holdingPct: (500 / 1e9) * 100,
   });
   // CA2: the 8d-old watch buy makes W1 an ever-bought member -> zero-stat row
   // with balUsd (2000 tokens × 0.001), NOT an absent entry.
   assert.deepStrictEqual(trackedWalletStatsByCa(NOW).get(`sol:${CA2}`) ?? [], [
-    { name: 'A1', clan: 'x', tags: ['Unicon'], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 2 },
+    { name: 'A1', clan: 'x', tags: ['Unicon'], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 2, holdingPct: (2000 / 1e9) * 100 },
   ]);
 });

@@ -1,14 +1,12 @@
-"""Logic THUẦN cho watcher EVM: topic padding, decode log Transfer ERC-20,
-allowlist DEX router, classify buy/sell, chia chunk block-range, dựng body
-trade/event. KHÔNG IO — mọi hàm unit-test offline được. IO (WS/RPC) ở
-`watchers/evm/feed.py`. T8, plan evm-base-bsc (D7).
+"""Pure EVM watcher logic: decode ERC-20 Transfer logs, net wallet balance changes,
+classify swap endpoints, split block ranges, and build trade/event bodies. No IO;
+RPC and websocket access lives in `watchers/evm/feed.py`.
 
 Router and quote addresses are verified against official deployment documentation;
 Robinhood sources are cited beside its mappings. Do not add unverified addresses.
 EVM addresses are case-insensitive, so map keys are lowercase.
 """
 
-WITHDRAWAL_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
 WRAPPED_NATIVE = {
     "base": "0x4200000000000000000000000000000000000006",
     "bsc": "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
@@ -25,8 +23,8 @@ EXPLORER_TX = {
     "robinhood": "https://robinhoodchain.blockscout.com/tx/",
 }
 
-# Allowlist DEX router per chain (D7). Swap outside the allowlist is ignored.
-# Robinhood deployments (chain 4663) verified by official Uniswap docs:
+# Known DEX router labels for emitted logs. Unknown routers are classified from
+# paired net wallet-token movements rather than rejected by this mapping.
 # https://developers.uniswap.org/docs/protocols/v3/deployments/v3-robinhood-chain-deployments
 ROUTERS = {
     "base": {
@@ -67,7 +65,7 @@ QUOTE_TOKENS = {
 }
 
 # Native legs are reconstructed from transaction value or wrapped-native
-# Withdrawal events only for routers in the allowlist above.
+# Withdrawal events, then included in the same net-endpoint calculation.
 # ---------- topic / address ----------
 
 
@@ -135,25 +133,86 @@ def decode_transfer_log(log):
         "value": value,
     }
 
-def decode_withdrawal_log(log, chain, wallet):
-    """Decode only Withdrawal events from this chain's wrapped native token."""
-    if not isinstance(log, dict):
-        return None
-    topics = log.get("topics") or []
-    if (
-        str(log.get("address") or "").lower() != WRAPPED_NATIVE.get(chain)
-        or len(topics) < 2
-        or str(topics[0]).lower() != WITHDRAWAL_TOPIC
-        or topic_to_address(topics[1]) != wallet.lower()
-    ):
-        return None
-    data = log.get("data") or ""
-    try:
-        if len(data) != 66 or not data.startswith("0x"):
-            return None
-        return int(data, 16)
-    except ValueError:
-        return None
+
+def decode_call_trace(trace, chain, tx, block):
+    """Decode successful native-value moves and standard ERC-20 transfer calls."""
+    if not isinstance(trace, dict):
+        return []
+    out = []
+    pending = [trace]
+    while pending:
+        frame = pending.pop()
+        if not isinstance(frame, dict) or frame.get("error"):
+            continue
+        kind = str(frame.get("type") or "").upper()
+        sender = str(frame.get("from") or "").lower()
+        recipient = str(frame.get("to") or "").lower()
+        calldata = str(frame.get("input") or "").lower()
+        if (
+            kind == "CALL"
+            and len(recipient) == 42
+            and recipient.startswith("0x")
+            and len(calldata) >= 10
+        ):
+            selector = calldata[:10]
+            payload = calldata[10:]
+            words = [payload[i : i + 64] for i in range(0, len(payload), 64)]
+
+            def address_at(index):
+                word = words[index]
+                if len(word) != 64 or word[:24] != "0" * 24:
+                    raise ValueError("invalid ABI address")
+                return "0x" + word[-40:]
+
+            try:
+                if selector == "0xa9059cbb" and len(payload) == 128:
+                    source, destination, amount = sender, address_at(0), int(words[1], 16)
+                elif selector == "0x23b872dd" and len(payload) == 192:
+                    source, destination, amount = (
+                        address_at(0),
+                        address_at(1),
+                        int(words[2], 16),
+                    )
+                else:
+                    source = destination = ""
+                    amount = 0
+                result = str(frame.get("output") or "").lower()
+                if result.startswith("0x") and len(result) == 66 and int(result, 16) == 0:
+                    amount = 0
+                if source and destination and amount:
+                    out.append(
+                        {
+                            "tx": tx,
+                            "block": block,
+                            "ca": recipient,
+                            "from": source,
+                            "to": destination,
+                            "value": amount,
+                        }
+                    )
+            except (IndexError, ValueError):
+                pass
+
+        if kind in {"CALL", "CREATE", "SELFDESTRUCT"}:
+            try:
+                native_amount = int(str(frame.get("value") or "0x0"), 16)
+            except ValueError:
+                native_amount = 0
+            if native_amount and len(sender) == 42 and len(recipient) == 42:
+                out.append(
+                    {
+                        "tx": tx,
+                        "block": block,
+                        "ca": WRAPPED_NATIVE[chain],
+                        "from": sender,
+                        "to": recipient,
+                        "value": native_amount,
+                    }
+                )
+        children = frame.get("calls")
+        if isinstance(children, list):
+            pending.extend(reversed(children))
+    return out
 
 
 # ---------- router / chunk ----------
@@ -181,62 +240,88 @@ def chunk_ranges(start: int, end: int, span: int):
 # ---------- classify ----------
 
 
-def _sum_side(transfers, wallet, field):
-    """{token_ca: tổng value} của các transfer mà `wallet` đứng phía `field`
-    ('from' = gửi đi, 'to' = nhận về)."""
-    out: dict[str, int] = {}
-    for t in transfers:
-        if t[field] == wallet:
-            out[t["ca"]] = out.get(t["ca"], 0) + t["value"]
-    return out
+def _net_side(transfers, wallet):
+    """Return exact per-token balance deltas for one wallet in the receipt."""
+    net: dict[str, int] = {}
+    for transfer in transfers:
+        ca = transfer["ca"].lower()
+        if transfer["from"] == wallet:
+            net[ca] = net.get(ca, 0) - transfer["value"]
+        if transfer["to"] == wallet:
+            net[ca] = net.get(ca, 0) + transfer["value"]
+    return {ca: raw for ca, raw in net.items() if raw}
 
 
-def classify_swap(chain, wallet, tx):
-    """1 tx (qua router allowlist) → ĐÚNG 1 event swap cho `wallet`, hoặc None.
+def classify_swaps(chain, wallet, tx):
+    """Collapse transfer logs to the wallet's net input/output token endpoints.
 
-    `tx` = {"to": addr đích của tx, "transfers": [decode_transfer_log…],
-            "decimals_of": callable(ca)->int}. Luật (D7):
-      - tx.to KHÔNG phải router allowlist ⇒ None (không phải swap qua router).
-      - BUY  = ví NHẬN token ngoài quote (multi-hop token→token: cạnh nhận thắng —
-               ví mở vị thế mới, khớp mục đích signal table);
-      - SELL = không có cạnh nhận non-quote nhưng ví GỬI token ngoài quote;
-      - token nhiều chân (route tách) ⇒ lấy chân value raw lớn nhất; qty scale
-        theo decimals; quote leg (nếu có) lấy tổng quote gửi/nhận.
+    Every returned event is one observed token balance change. Intermediate
+    route legs that cancel at the wallet are omitted; split transfers aggregate
+    by token contract. ERC-20 sides must pair with an opposite quote or token
+    movement, so a plain token send is not reported as a swap.
     """
-    router = router_name(chain, tx.get("to"))
-    if router is None:
-        return None
     wallet = wallet.lower()
     transfers = tx.get("transfers") or []
+    net = _net_side(transfers, wallet)
     quotes = QUOTE_TOKENS.get(chain, {})
-    sent, got = _sum_side(transfers, wallet, "from"), _sum_side(transfers, wallet, "to")
-    got_nq = {c: v for c, v in got.items() if c not in quotes and v > 0}
-    sent_nq = {c: v for c, v in sent.items() if c not in quotes and v > 0}
-    if got_nq:
-        side, legs, quote_legs = "BUY", got_nq, sent
-    elif sent_nq:
-        side, legs, quote_legs = "SELL", sent_nq, got
-    else:
-        return None  # chỉ toàn quote↔quote hoặc ví không chuyển gì — không phải swap
-    ca = max(legs, key=lambda c: legs[c])
-    raw = legs[ca]
-    dec = tx.get("decimals_of")
-    raw_dec = dec(ca) if callable(dec) else 18
-    decimals = int(raw_dec) if isinstance(raw_dec, (int, float, str)) else 18
-    q_ca = max(quote_legs, key=lambda c: quote_legs[c]) if quote_legs else None
-    return {
-        "type": "SWAP",
-        "chain": chain,
-        "wallet": wallet,
-        "side": side,
-        "ca": ca,
-        "qty_raw": raw,
-        "qty": raw / 10**decimals,
-        "router": router,
-        "quote_sym": quotes.get(q_ca) if q_ca else None,
-        "quote_raw": quote_legs.get(q_ca) if q_ca else None,
-        "tx": transfers[0]["tx"] if transfers else "",
-    }
+    assets = {ca: raw for ca, raw in net.items() if ca not in quotes}
+    if not assets:
+        return []
+
+    inputs = {ca: raw for ca, raw in net.items() if raw < 0}
+    outputs = {ca: raw for ca, raw in net.items() if raw > 0}
+    if not inputs or not outputs:
+        return []
+
+    decimals_of = tx.get("decimals_of")
+    if not callable(decimals_of):
+        return []
+
+    token_in_ca = next(iter(inputs)) if len(inputs) == 1 else None
+    token_out_ca = next(iter(outputs)) if len(outputs) == 1 else None
+    router_addr = tx.get("to")
+    router = router_name(chain, router_addr) or (
+        router_addr.lower() if isinstance(router_addr, str) else "unknown"
+    )
+    tx_hash = tx.get("tx") or (transfers[0].get("tx") if transfers else "")
+    events = []
+    for ca in sorted(assets):
+        raw = assets[ca]
+        try:
+            decimals = int(decimals_of(ca))
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if not 0 <= decimals <= 36:
+            return []
+        side = "BUY" if raw > 0 else "SELL"
+        opposite_quotes = {
+            quote_ca: quote_raw
+            for quote_ca, quote_raw in net.items()
+            if quote_ca in quotes and (quote_raw < 0 if side == "BUY" else quote_raw > 0)
+        }
+        quote_ca = next(iter(opposite_quotes)) if len(opposite_quotes) == 1 else None
+        if side == "BUY":
+            source_ca, destination_ca = token_in_ca, ca if token_out_ca == ca else None
+        else:
+            source_ca, destination_ca = ca if token_in_ca == ca else None, token_out_ca
+        events.append(
+            {
+                "type": "SWAP",
+                "chain": chain,
+                "wallet": wallet,
+                "side": side,
+                "ca": ca,
+                "qty_raw": abs(raw),
+                "qty": abs(raw) / 10**decimals,
+                "router": router,
+                "quote_sym": quotes.get(quote_ca) if quote_ca else None,
+                "quote_raw": abs(opposite_quotes[quote_ca]) if quote_ca else None,
+                "token_in_ca": source_ca,
+                "token_out_ca": destination_ca,
+                "tx": tx_hash,
+            }
+        )
+    return events
 
 
 # ---------- emit shape ----------

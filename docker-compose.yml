@@ -53,9 +53,13 @@ services:
         required: false
     environment:
       DB_PATH: /data/signal_scan.db
+      MARKET_DB_PATH: /market-data/market.db
+      SETUP_CACHE_FILE: /market-data/nansen-cache.json
       POLL_FLOWS_MS: "${POLL_FLOWS_MS:-10800000}"
+      POLL_SETUP_MS: "${POLL_SETUP_MS:-10800000}"
       SHOW_FOMO: ${SHOW_FOMO:-}
       MONITOR_API_TOKEN: ${MONITOR_API_TOKEN:-}
+      COHORT_LABELS_URL: "http://ct-wallet-alpha-engine:8081/api/pnl/cohort-labels"
       CRAWL_WS_ENDPOINT: ws://signal-scan-chrome-${INSTANCE:-a}:3000
       NANSEN_CRAWL: "on"
       # Setup queue is serviced independently; TTL/retry clocks gate requests per CA.
@@ -65,6 +69,7 @@ services:
       # Not committed — it carries proxy credentials. Editing it = restart the system.
       # DATA_DIR isolates a second instance's DB + proxy file from the first.
       - ./${DATA_DIR:-data}:/data
+      - signal-scan-market-data:/market-data
     depends_on:
       - chrome
     expose:
@@ -76,6 +81,7 @@ services:
       signal-scan-gateway:
         aliases:
           - "signal-scan-api-${INSTANCE:-a}"
+      signal-scan-cohort-labels: {}
     restart: unless-stopped
   web:
     build:
@@ -114,3 +120,10 @@ services:
 networks:
   signal-scan-gateway:
     external: true
+  signal-scan-cohort-labels:
+    external: true
+    name: signal-scan-cohort-labels
+volumes:
+  signal-scan-market-data:
+    external: true
+    name: signal-scan-market-data

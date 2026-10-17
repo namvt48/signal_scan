@@ -37,8 +37,11 @@ test('admin note saves exact text and clearing preserves other chain', async () 
   assert.equal((await put({ note: '' })).status, 200);
   assert.equal(findTrackedCa('note-ca', 'sol')?.user_note, '');
 });
-test('note validation rejects invalid payloads and unknown identities', async () => {
-  for (const body of [null, [], {}, { note: 42 }, { note: 'x', extra: true }, { note: 'x'.repeat(2001) }]) assert.equal((await put(body)).status, 400);
+test('note validation accepts image-sized notes and rejects invalid payloads and unknown identities', async () => {
+  for (const body of [null, [], {}, { note: 42 }, { note: 'x', extra: true }, { note: 'x'.repeat(1_300_001) }]) assert.equal((await put(body)).status, 400);
+  const imageSizedNote = 'x'.repeat(1_300_000);
+  assert.equal((await put({ note: imageSizedNote })).status, 200);
+  assert.equal(findTrackedCa('note-ca', 'sol')?.user_note, imageSizedNote);
   assert.equal((await put({ note: 'x' }, admin, 'invalid')).status, 400);
   assert.equal((await put({ note: 'x' }, admin, 'sol', 'missing')).status, 404);
 });

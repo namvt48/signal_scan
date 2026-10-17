@@ -18,10 +18,9 @@ import type { DoorConn, DoorHttpResponse } from '../src/crawl.js';
 import type { HourlyStatsRow, TgmFlowsRow, TokenFlowsClient } from '../src/providers/nansen.js';
 import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } from '../src/providers/provider.js';
 import type { Chain } from '../src/shared/chain.js';
-
-const { open, insertTrackedCa, getTokenState } = await import('../src/db.js');
+const { open, insertTrackedCa, getTokenState, getMetricPollCache } = await import('../src/db.js');
 const { upsertTokenInfo, updateTokenAnalytics, updateTokenMetrics } = await import('../src/ingest.js');
-const { loadSetupCache, getSetupCacheEntry, putSetupCacheEntry } = await import('../src/setup-cache.js');
+const { loadSetupCache, getSetupCacheEntry, putSetupCacheEntry, getSetupRetry, recordSetupRetry } = await import('../src/setup-cache.js');
 const { DoorPool, setPoolForTest } = await import('../src/crawl.js');
 const { setPollerDeps, setupSweep } = await import('../src/poller.js');
 
@@ -204,4 +203,58 @@ test('setup spam guard: a CA whose setup keeps coming back EMPTY backs off after
 
   await setupSweep(provider);
   assert.equal(metricCalls.get(EMPTY), 1, 'empty CA must NOT be hammered on the next pass (backoff)');
+});
+test('Fresh retry uses the durable metric gate after consecutive failures', async () => {
+  open(':memory:');
+  loadSetupCache(join(mkdtempSync(join(tmpdir(), 'setup-retry-fresh-gate-')), 'nansen-cache.json'));
+  const initialNow = Date.now();
+  let now = initialNow;
+  const realNow = Date.now;
+  Date.now = () => now;
+  try {
+    await installFakeDoor();
+    const ca = 'CA-FRESH-METRIC-GATE';
+    insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
+    upsertTokenInfo(info(ca, initialNow));
+    putSetupCacheEntry({
+      ca, chain: CHAIN, taken_at: initialNow - DAY, window: '',
+      series: [], exchange: [], info_at: initialNow - DAY, series_at: initialNow,
+    });
+    recordSetupRetry(ca, CHAIN, 'series', 2, initialNow + 60_000);
+    recordSetupRetry(ca, CHAIN, 'lf', 3, initialNow + 120_000);
+    const calls = new Map<string, number>();
+    const base = countingProvider(initialNow, calls);
+    const provider: MarketDataProvider = {
+      ...base,
+      metric: async () => {
+        const count = (calls.get(ca) ?? 0) + 1;
+        calls.set(ca, count);
+        if (count < 3) throw new Error('temporary Fresh failure');
+        return { nansenFreshPct: 24.7 };
+      },
+    };
+    setPollerDeps(provider, null, installFakeFlows([], []));
+
+    await setupSweep(provider);
+    assert.equal(calls.get(ca), 1);
+    let gate = getMetricPollCache(ca, CHAIN, 'gini')!.next_allowed_at;
+    await setupSweep(provider);
+    assert.equal(calls.get(ca), 1, 'must remain blocked before metric gate');
+
+    now = gate;
+    await setupSweep(provider);
+    assert.equal(calls.get(ca), 2, 'second failure is retried at the metric gate');
+    gate = getMetricPollCache(ca, CHAIN, 'gini')!.next_allowed_at;
+    await setupSweep(provider);
+    assert.equal(calls.get(ca), 2, 'second failure remains blocked before its next gate');
+
+    now = gate;
+    await setupSweep(provider);
+    assert.equal(calls.get(ca), 3, 'third attempt is allowed at the durable metric gate');
+    assert.equal(getTokenState(ca, CHAIN)?.nansen_fresh_pct, 24.7);
+    assert.equal(getSetupRetry(ca, CHAIN, 'series')?.misses, 2, 'series retry state remains independent');
+    assert.equal(getSetupRetry(ca, CHAIN, 'lf')?.misses, 3, 'LF retry state remains independent');
+  } finally {
+    Date.now = realNow;
+  }
 });

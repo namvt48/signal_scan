@@ -104,6 +104,104 @@ def test_decode_rejects_junk():
     assert cl.decode_transfer_log("not a dict") is None
     assert cl.decode_transfer_log({}) is None
 
+def test_decode_call_trace_extracts_token_calls_and_ignores_reverted_frames():
+    def word(value):
+        return f"{value:064x}"
+
+    trace = {
+        "type": "CALL",
+        "from": WALLET,
+        "to": UNISWAP,
+        "value": "0x0",
+        "calls": [
+            {
+                "type": "CALL",
+                "from": UNISWAP,
+                "to": WETH,
+                "input": "0x23b872dd" + word(int(WALLET, 16)) + word(int(POOL, 16)) + word(5 * 10**17),
+                "value": "0x0",
+            },
+            {
+                "type": "CALL",
+                "from": POOL,
+                "to": TOKEN,
+                "input": "0xa9059cbb" + word(int(WALLET, 16)) + word(1000 * 10**6),
+                "value": "0x0",
+            },
+            {
+                "type": "CALL",
+                "from": POOL,
+                "to": TOKEN2,
+                "input": "0xa9059cbb" + word(int(WALLET, 16)) + word(9),
+                "value": "0x0",
+                "error": "execution reverted",
+            },
+        ],
+    }
+
+    assert cl.decode_call_trace(trace, "base", TX, 100) == [
+        xfer(WALLET, POOL, 5 * 10**17, ca=WETH),
+        xfer(POOL, WALLET, 1000 * 10**6),
+    ]
+def test_decode_call_trace_includes_native_router_output():
+    trace = {
+        "type": "CALL",
+        "from": POOL,
+        "to": UNISWAP,
+        "value": "0x0",
+        "calls": [
+            {
+                "type": "CALL",
+                "from": UNISWAP,
+                "to": WALLET,
+                "value": hex(2 * 10**18),
+                "input": "0x",
+            }
+        ],
+    }
+
+    assert cl.decode_call_trace(trace, "base", TX, 100) == [
+        xfer(UNISWAP, WALLET, 2 * 10**18, ca=WETH),
+    ]
+
+def test_call_trace_refund_reduces_native_quote_endpoint():
+    trace = {
+        "type": "CALL",
+        "from": WALLET,
+        "to": UNISWAP,
+        "value": hex(10**18),
+        "calls": [
+            {
+                "type": "CALL",
+                "from": UNISWAP,
+                "to": WALLET,
+                "value": hex(10**17),
+                "input": "0x",
+            },
+            {
+                "type": "CALL",
+                "from": POOL,
+                "to": TOKEN,
+                "input": "0xa9059cbb"
+                + f"{int(WALLET, 16):064x}"
+                + f"{1000 * 10**6:064x}",
+                "value": "0x0",
+            },
+        ],
+    }
+    transfers = cl.decode_call_trace(trace, "base", TX, 100)
+
+    events = cl.classify_swaps("base", WALLET, mktx(UNISWAP, transfers))
+
+    assert len(events) == 1
+    assert events[0]["side"] == "BUY" and events[0]["ca"] == TOKEN
+    assert events[0]["qty_raw"] == 1000 * 10**6
+    assert events[0]["quote_raw"] == 9 * 10**17
+
+
+
+
+
 
 # ---------- chunk_ranges ----------
 
@@ -147,47 +245,49 @@ def test_robinhood_chain_official_router_and_quotes():
     assert cl.router_name("robinhood", universal) == "uniswap-universal"
     assert cl.router_name("base", router) is None
     assert cl.QUOTE_TOKENS["robinhood"] == {weth: "WETH", usdg: "USDG"}
-    buy = cl.classify_swap(
+    buy_events = cl.classify_swaps(
         "robinhood", WALLET,
         mktx(router, [xfer(WALLET, POOL, 10**18, ca=weth),
                       xfer(POOL, WALLET, 10**6, ca=TOKEN)]),
     )
+    assert len(buy_events) == 1
+    buy = buy_events[0]
     assert buy["chain"] == "robinhood" and buy["side"] == "BUY"
     assert buy["quote_sym"] == "WETH"
-    sell = cl.classify_swap(
+    sell_events = cl.classify_swaps(
         "robinhood", WALLET,
         mktx(universal, [xfer(WALLET, POOL, 2 * 10**6, ca=TOKEN),
                          xfer(POOL, WALLET, 10**6, ca=usdg)]),
     )
+    assert len(sell_events) == 1
+    sell = sell_events[0]
     assert sell["side"] == "SELL" and sell["quote_sym"] == "USDG"
-
-
-# ---------- classify_swap ----------
-
-
 def test_buy_quote_for_token():
-    ev = cl.classify_swap(
+    events = cl.classify_swaps(
         "base",
         WALLET,
         mktx(
             UNISWAP,
             [
-                xfer(WALLET, POOL, 5 * 10**17, ca=WETH),  # gửi quote
-                xfer(POOL, WALLET, 1000 * 10**6, ca=TOKEN),  # nhận token
+                xfer(WALLET, POOL, 5 * 10**17, ca=WETH),
+                xfer(POOL, WALLET, 1000 * 10**6, ca=TOKEN),
             ],
         ),
     )
-    assert ev is not None
+    assert len(events) == 1
+    ev = events[0]
     assert ev["side"] == "BUY" and ev["ca"] == TOKEN
-    assert ev["qty"] == pytest.approx(1000.0)  # 6 decimals
+    assert ev["qty"] == pytest.approx(1000.0)
+    assert ev["qty_raw"] == 1000 * 10**6
     assert ev["quote_sym"] == "WETH" and ev["quote_raw"] == 5 * 10**17
     assert ev["router"] == "uniswap-v3" and ev["tx"] == TX
+    assert ev["token_in_ca"] == WETH and ev["token_out_ca"] == TOKEN
     assert ev["chain"] == "base" and ev["wallet"] == WALLET
     assert ev["type"] == "SWAP"
 
 
 def test_sell_token_for_quote():
-    ev = cl.classify_swap(
+    events = cl.classify_swaps(
         "base",
         WALLET,
         mktx(
@@ -198,105 +298,81 @@ def test_sell_token_for_quote():
             ],
         ),
     )
-    assert ev is not None
-    # nhận WETH + gửi TOKEN ⇒ cạnh GỬI non-quote thắng ⇒ SELL TOKEN
+    assert len(events) == 1
+    ev = events[0]
     assert ev["side"] == "SELL" and ev["ca"] == TOKEN
     assert ev["qty"] == pytest.approx(1000.0)
     assert ev["quote_sym"] == "WETH"
-
-
-def test_token_to_token_single_buy_event():
-    ev = cl.classify_swap(
+    assert ev["token_in_ca"] == TOKEN and ev["token_out_ca"] == WETH
+def test_route_intermediate_cancels_and_split_output_sums():
+    events = cl.classify_swaps(
         "base",
         WALLET,
         mktx(
-            UNISWAP,
+            UNKNOWN,
             [
-                xfer(WALLET, POOL, 10**18, ca=TOKEN),
-                xfer(POOL, WALLET, 7 * 10**18, ca=TOKEN2),
+                xfer(WALLET, POOL, 10**18, ca=WETH),
+                xfer(POOL, WALLET, 4 * 10**6, ca=TOKEN),
+                xfer(WALLET, POOL, 4 * 10**6, ca=TOKEN),
+                xfer(POOL, WALLET, 2 * 10**18, ca=TOKEN2),
+                xfer(POOL, WALLET, 3 * 10**18, ca=TOKEN2),
             ],
         ),
     )
-    assert ev is not None and ev["side"] == "BUY" and ev["ca"] == TOKEN2
-    assert ev["quote_sym"] is None  # không có chân quote
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["side"] == "BUY" and ev["ca"] == TOKEN2
+    assert ev["qty_raw"] == 5 * 10**18
+    assert ev["qty"] == pytest.approx(5.0)
+    assert ev["token_in_ca"] == WETH and ev["token_out_ca"] == TOKEN2
 
 
-def test_multi_leg_picks_largest_raw():
-    ev = cl.classify_swap(
+def test_token_to_token_emits_only_net_endpoints():
+    events = cl.classify_swaps(
+        "base",
+        WALLET,
+        mktx(
+            UNKNOWN,
+            [
+                xfer(WALLET, POOL, 5000 * 10**6, ca=TOKEN),
+                xfer(POOL, WALLET, 3 * 10**18, ca=TOKEN2),
+            ],
+        ),
+    )
+    assert [(ev["side"], ev["ca"]) for ev in events] == [
+        ("SELL", TOKEN),
+        ("BUY", TOKEN2),
+    ]
+    assert all(ev["token_in_ca"] == TOKEN for ev in events)
+    assert all(ev["token_out_ca"] == TOKEN2 for ev in events)
+
+
+def test_plain_transfer_skipped():
+    events = cl.classify_swaps(
+        "base", WALLET, mktx(FRIEND, [xfer(WALLET, FRIEND, 1000 * 10**6, ca=TOKEN)])
+    )
+    assert events == []
+# ---------- classify_swaps ---------- 
+
+
+def test_quote_only_or_empty_skipped():
+    assert cl.classify_swaps("base", WALLET, mktx(UNISWAP, [])) == []
+    events = cl.classify_swaps(
         "base",
         WALLET,
         mktx(
             UNISWAP,
             [
                 xfer(WALLET, POOL, 10**18, ca=WETH),
-                xfer(POOL, WALLET, 100 * 10**6, ca=TOKEN),  # route tách: 2 chân nhận
-                xfer(POOL, WALLET, 2 * 10**18, ca=TOKEN2),
+                xfer(POOL, WALLET, 2 * 10**9, ca="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             ],
         ),
     )
-    assert ev is not None
-    assert ev["side"] == "BUY" and ev["ca"] == TOKEN2  # raw 2e18 > 1e8
-
-
-def test_unknown_router_skipped():
-    assert (
-        cl.classify_swap(
-            "base",
-            WALLET,
-            mktx(
-                UNKNOWN,
-                [
-                    xfer(WALLET, POOL, 10**18, ca=WETH),
-                    xfer(POOL, WALLET, 1000 * 10**6, ca=TOKEN),
-                ],
-            ),
-        )
-        is None
-    )
-
-
-def test_plain_transfer_skipped():
-    # ví chuyển token cho bạn, không qua router ⇒ không event
-    assert (
-        cl.classify_swap(
-            "base",
-            WALLET,
-            mktx(
-                FRIEND,
-                [
-                    xfer(WALLET, FRIEND, 1000 * 10**6, ca=TOKEN),
-                ],
-            ),
-        )
-        is None
-    )
-
-
-def test_quote_only_or_empty_skipped():
-    assert cl.classify_swap("base", WALLET, mktx(UNISWAP, [])) is None
-    assert (
-        cl.classify_swap(
-            "base",
-            WALLET,
-            mktx(
-                UNISWAP,
-                [
-                    xfer(WALLET, POOL, 10**18, ca=WETH),  # chỉ quote↔quote
-                    xfer(
-                        POOL,
-                        WALLET,
-                        2 * 10**9,
-                        ca="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-                    ),
-                ],
-            ),
-        )
-        is None
-    )
+    assert events == []
 
 
 def test_wallet_case_insensitive():
-    ev = cl.classify_swap(
+    events = cl.classify_swaps(
         "base",
         WALLET.upper(),
         mktx(
@@ -307,22 +383,24 @@ def test_wallet_case_insensitive():
             ],
         ),
     )
-    assert ev is not None
-    assert ev["side"] == "BUY" and ev["wallet"] == WALLET
+    assert len(events) == 1
+    assert events[0]["side"] == "BUY" and events[0]["wallet"] == WALLET
 
 
-def test_missing_decimals_of_defaults_18():
-    ev = cl.classify_swap(
+
+def test_missing_decimals_does_not_emit_guessed_quantity():
+    events = cl.classify_swaps(
         "base",
         WALLET,
         {
             "to": UNISWAP,
-            "transfers": [xfer(POOL, WALLET, 3 * 10**18, ca=TOKEN)],
+            "transfers": [
+                xfer(WALLET, POOL, 10**18, ca=WETH),
+                xfer(POOL, WALLET, 3 * 10**18, ca=TOKEN),
+            ],
         },
     )
-    assert ev is not None
-    assert ev["qty"] == pytest.approx(3.0)
-
+    assert events == []
 
 # ---------- trade_body / fmt ----------
 

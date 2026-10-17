@@ -3,9 +3,12 @@ KHÔNG mạng thật: mọi JSON-RPC đi qua FakeEvm monkeypatch vào seam
 `config.http_json`. Chạy: python3 -m pytest scripts/test_evm_feed.py -q
 """
 
+import asyncio
 import json
 import os
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -14,6 +17,7 @@ from watchers.common import config
 from watchers.common import state as st_mod
 from watchers.evm import feed
 from watchers.evm import main as emain
+from watchers.evm.journal import Journal
 
 WALLET = "0x1111111111111111111111111111111111111111"
 POOL = "0x3333333333333333333333333333333333333333"
@@ -65,19 +69,30 @@ class FakeEvm:
         decimals=6,
         block_time=BLOCK_TIME,
         transactions=None,
+        traces=None,
+        blocks=None,
+        trace_filters=None,
         range_error_message="exceed maximum block range",
     ):
         self.latest = latest
         self.logs = logs or []
         self.receipts = receipts or {}
         self.transactions = transactions or {}
+        self.traces = traces or {}
+        self.blocks = blocks or {}
+        self.trace_filters = trace_filters or {}
         self.max_span = max_span
         self.range_error_message = range_error_message
         self.decimals = decimals
         self.block_time = block_time
         self.getlogs_calls: list[tuple[str, int, int]] = []
         self.receipt_calls: list[str] = []
+        self.transaction_calls: list[str] = []
+        self.trace_calls: list[str] = []
+        self.trace_filter_calls: list[dict] = []
+        self.block_calls: list[int] = []
         self.range_errors = 0
+
     def __call__(self, url, payload=None, timeout=20, headers=None):
         assert payload is not None
         chain = (
@@ -89,33 +104,50 @@ class FakeEvm:
             if "robinhood" in url
             else "?"
         )
-        m, p = payload["method"], payload["params"]
-        if m == "eth_blockNumber":
-            r = hex(self.latest)
-        elif m == "eth_getLogs":
-            q = p[0]
-            a, b = int(q["fromBlock"], 16), int(q["toBlock"], 16)
-            self.getlogs_calls.append((chain, a, b))
-            if self.max_span and b - a + 1 > self.max_span:
+        method, params = payload["method"], payload["params"]
+        if method == "eth_blockNumber":
+            result = hex(self.latest)
+        elif method == "eth_getLogs":
+            query = params[0]
+            start, end = int(query["fromBlock"], 16), int(query["toBlock"], 16)
+            self.getlogs_calls.append((chain, start, end))
+            if self.max_span and end - start + 1 > self.max_span:
                 self.range_errors += 1
                 return {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "error": {"code": -32000, "message": self.range_error_message},
                 }
-            r = [l for l in self.logs if a <= int(l["blockNumber"], 16) <= b]
-        elif m == "eth_getTransactionReceipt":
-            self.receipt_calls.append(p[0])
-            r = self.receipts.get(p[0])
-        elif m == "eth_getTransactionByHash":
-            r = self.transactions.get(p[0])
-        elif m == "eth_getBlockByNumber":
-            r = {"timestamp": hex(self.block_time)}
-        elif m == "eth_call":  # decimals()
-            r = hex(self.decimals)
+            result = [
+                log
+                for log in self.logs
+                if start <= int(log["blockNumber"], 16) <= end
+            ]
+        elif method == "eth_getTransactionReceipt":
+            self.receipt_calls.append(params[0])
+            result = self.receipts.get(params[0])
+        elif method == "eth_getTransactionByHash":
+            self.transaction_calls.append(params[0])
+            result = self.transactions.get(params[0])
+        elif method == "debug_traceTransaction":
+            self.trace_calls.append(params[0])
+            result = self.traces.get(params[0])
+        elif method == "trace_filter":
+            self.trace_filter_calls.append(params[0])
+            key = "from" if "fromAddress" in params[0] else "to"
+            result = self.trace_filters.get(key, [])
+        elif method == "eth_getBlockByNumber":
+            number = int(params[0], 16)
+            if params[1]:
+                self.block_calls.append(number)
+                result = self.blocks.get(number, {"transactions": []})
+            else:
+                result = {"timestamp": hex(self.block_time)}
+        elif method == "eth_call":  # decimals()
+            result = hex(self.decimals)
         else:
-            r = None
-        return {"jsonrpc": "2.0", "id": 1, "result": r}
+            result = None
+        return {"jsonrpc": "2.0", "id": 1, "result": result}
 
 
 @pytest.fixture(autouse=True)
@@ -125,6 +157,7 @@ def _isolate(monkeypatch, tmp_path):
     feed._decimals.clear()
     feed._block_ts.clear()
     feed._tracked.clear()
+    feed.rpc_health_reset()
     monkeypatch.setattr(st_mod, "STATE_PATH", str(tmp_path / "evm_state.json"))
     monkeypatch.setattr(st_mod, "HEARTBEAT", str(tmp_path / "hb_evm"))
     monkeypatch.setattr(feed.time, "sleep", lambda s: None)
@@ -145,6 +178,25 @@ def use_fake(monkeypatch, fake):
 
 
 # ---------- helpers thuần ----------
+
+
+def test_concurrent_state_saves_use_distinct_atomic_files(monkeypatch, tmp_path):
+    monkeypatch.setattr(st_mod, "STATE_PATH", str(tmp_path / "state.json"))
+    all_written = threading.Barrier(4)
+    original_dump = json.dump
+
+    def synchronized_dump(state, handle):
+        original_dump(state, handle)
+        all_written.wait(timeout=5)
+
+    monkeypatch.setattr(st_mod.json, "dump", synchronized_dump)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(st_mod.save_state, {"writer": i}) for i in range(4)]
+        for future in futures:
+            future.result(timeout=5)
+
+    saved = st_mod.load_state()
+    assert saved["writer"] in range(4)
 
 
 def test_confirmed():
@@ -228,7 +280,7 @@ def test_rpc_fails_over_to_second_configured_key_before_public(monkeypatch):
     monkeypatch.setattr(config, "http_json", primary_fails)
 
     assert feed.evm_rpc("base", "eth_blockNumber", []) == "0x123"
-    assert calls == [primary] * 3 + [secondary]
+    assert calls == [primary, secondary]
 
 
 
@@ -246,7 +298,7 @@ def test_rpc_falls_back_to_public_endpoint_after_primary_failures(monkeypatch):
     monkeypatch.setattr(config, "http_json", primary_then_public)
 
     assert feed.evm_rpc("base", "eth_blockNumber", []) == "0x123"
-    assert calls == ["https://alchemy.example/base"] * 3 + [feed.DEFAULT_RPC["base"]]
+    assert calls == ["https://alchemy.example/base", feed.DEFAULT_RPC["base"]]
 
 
 def test_mask_redacts_path_tokens_and_query_credentials():
@@ -279,6 +331,25 @@ def test_backfill_scans_persists_and_posts_trade(monkeypatch, trades):
     assert b["price"] == pytest.approx(1.0)
     assert b["ts"] == BLOCK_TIME * 1000
     assert fake.receipt_calls == [TX]  # 2 sub filter trùng log ⇒ dedup, receipt 1 lần
+
+def test_backfill_and_block_scan_coalesce_same_transaction(monkeypatch, trades):
+    tx = {"hash": TX, "from": WALLET, "to": UNISWAP, "value": "0x0"}
+    fake = FakeEvm(
+        latest=1000,
+        logs=[raw_log(WALLET, POOL, 10**17, ca=WETH, block=993)],
+        receipts={TX: swap_receipt()},
+        blocks={993: {"transactions": [tx]}},
+    )
+    use_fake(monkeypatch, fake)
+    state = {"evm": {"base": {"last_block": 992}}}
+
+    feed.backfill("base", [WALLET], state, {"conf": 8, "span": 500})
+
+    assert len(trades) == 1 and trades[0]["tx"] == TX
+    assert fake.receipt_calls == [TX]
+    assert fake.trace_calls == []
+
+
 
 
 def test_backfill_confirmation_gate(monkeypatch, trades):
@@ -341,6 +412,36 @@ def test_address_required_logs_error_skips_retries(monkeypatch):
         feed.get_logs("bsc", 2, 3, feed.cl.sub_topics([WALLET])[0])
     assert fake.range_errors == 1
 
+def test_evm_rpc_does_not_retry_permission_failures(monkeypatch):
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(args[1]["method"])
+        raise OSError("HTTP Error 403: Forbidden")
+
+    monkeypatch.setattr(feed, "rpc_urls", lambda chain: ["https://single-rpc.invalid"])
+    monkeypatch.setattr(config, "http_json", forbidden)
+
+    with pytest.raises(RuntimeError, match="authorization/permission"):
+        feed.evm_rpc("base", "eth_getTransactionReceipt", [TX])
+
+    assert calls == ["eth_getTransactionReceipt"]
+
+def test_evm_rpc_does_not_retry_rate_limited_provider(monkeypatch):
+    calls = []
+
+    def limited(*args, **kwargs):
+        calls.append(args[1]["method"])
+        raise OSError("HTTP 429: quota exceeded")
+
+    monkeypatch.setattr(feed, "rpc_urls", lambda chain: ["https://single-rpc.invalid"])
+    monkeypatch.setattr(config, "http_json", limited)
+
+    with pytest.raises(RuntimeError, match="capacity/rate limit"):
+        feed.evm_rpc("base", "eth_getTransactionReceipt", [TX])
+
+    assert calls == ["eth_getTransactionReceipt"]
+
 
 def test_bsc_fetches_transfer_directions_concurrently(monkeypatch, trades):
     fake = FakeEvm(latest=10)
@@ -396,29 +497,90 @@ def test_backfill_cold_start_at_tip(monkeypatch, trades):
     assert fake.getlogs_calls == [("base", 993, 993)] * 2  # đúng tip, 2 sub filter
 
 
-def test_non_router_and_reverted_tx_skipped(monkeypatch, trades):
-    receipts = {
-        TX: {
-            "status": "0x1",
-            "to": "0x8888888888888888888888888888888888888888",
-            "logs": swap_receipt()["logs"],
-        },  # không phải router allowlist
-    }
+def test_unknown_router_pair_detected_and_reverted_tx_skipped(monkeypatch, trades):
+    receipts = {TX: swap_receipt(to="0x8888888888888888888888888888888888888888")}
     fake = FakeEvm(
-        latest=1000, logs=[raw_log(WALLET, POOL, 10**6, block=995)], receipts=receipts
+        latest=1000,
+        logs=[raw_log(WALLET, POOL, 10**6, block=991)],
+        receipts=receipts,
     )
     use_fake(monkeypatch, fake)
     st = {"evm": {"base": {"last_block": 990}}}
     feed.backfill("base", [WALLET], st, {"conf": 8, "span": 500})
-    assert trades == [] and st["evm"]["base"]["last_block"] == 993
-
-    # tx revert (status 0x0) ⇒ không event dù logs có đủ shape swap
+    assert len(trades) == 1
+    assert trades[0]["side"] == "buy" and trades[0]["ca"] == TOKEN
+    assert fake.transaction_calls == []  # ERC-20 endpoints need receipt only
     feed._seen_tx.clear()
     receipts[TX] = dict(swap_receipt(), status="0x0")
     st = {"evm": {"base": {"last_block": 990}}}
     feed.backfill("base", [WALLET], st, {"conf": 8, "span": 500})
+    assert len(trades) == 1
+
+
+def test_token_to_token_watch_emits_both_wallet_endpoints(monkeypatch, trades):
+    tx_hash = "0x" + "cd" * 32
+    receipt = {
+        "status": "0x1",
+        "to": "0x8888888888888888888888888888888888888888",
+        "logs": [
+            raw_log(WALLET, POOL, 5000 * 10**6, ca=TOKEN, tx=tx_hash, idx=1),
+            raw_log(POOL, WALLET, 3 * 10**18, ca="0x5555555555555555555555555555555555555555", tx=tx_hash, idx=2),
+        ],
+    }
+    fake = FakeEvm(
+        latest=1000,
+        logs=[raw_log(WALLET, POOL, 5000 * 10**6, ca=TOKEN, tx=tx_hash, block=991)],
+        receipts={tx_hash: receipt},
+    )
+    use_fake(monkeypatch, fake)
+    feed.backfill(
+        "base",
+        [WALLET],
+        {"evm": {"base": {"last_block": 990}}},
+        {"conf": 8, "span": 500},
+    )
+
+    assert [(trade["side"], trade["ca"], trade["tx"]) for trade in trades] == [
+        ("sell", TOKEN, tx_hash),
+        ("buy", "0x5555555555555555555555555555555555555555", tx_hash),
+    ]
+    assert fake.transaction_calls == []
+
+
+def test_unavailable_decimals_does_not_advance_cursor(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=1000,
+        logs=[raw_log(WALLET, POOL, 10**6, block=991)],
+        receipts={TX: swap_receipt()},
+        decimals=37,
+    )
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 990}}}
+
+    with pytest.raises(RuntimeError, match="out-of-range decimals"):
+        feed.backfill("base", [WALLET], st, {"conf": 8, "span": 500})
+    assert st["evm"]["base"]["last_block"] == 990
     assert trades == []
 
+
+
+def test_receipt_failure_keeps_cursor_and_retries_same_tx(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=1000,
+        logs=[raw_log(WALLET, POOL, 10**6, block=991)],
+    )
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 990}}}
+
+    with pytest.raises(RuntimeError, match="missing transaction receipt"):
+        feed.backfill("base", [WALLET], st, {"conf": 8, "span": 500})
+    assert st["evm"]["base"]["last_block"] == 990
+    assert ("base", TX.lower()) not in feed._seen_tx
+
+    fake.receipts[TX] = swap_receipt()
+    feed.backfill("base", [WALLET], st, {"conf": 8, "span": 500})
+    assert len(trades) == 1 and trades[0]["ca"] == TOKEN
+    assert st["evm"]["base"]["last_block"] == 993
 
 def test_bsc_pancake_sell(monkeypatch, trades):
     receipt = {
@@ -557,6 +719,129 @@ def test_robinhood_rpc_defaults_and_explicit_wss(monkeypatch):
     assert feed.rpc_url("robinhood") == "https://rpc.example/rh"
     assert feed.wss_url("robinhood") == "wss://rpc.example/rh"
 
+
+def test_hybrid_feed_plan_uses_ws_and_polls_missing_chain(monkeypatch):
+    for name in (
+        "BASE_RPC_URL",
+        "BSC_RPC_URL",
+        "BASE_WSS_URL",
+        "BSC_WSS_URL",
+        "ROBINHOOD_WSS_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    per = {chain: [WALLET] for chain in ("base", "bsc", "robinhood")}
+
+    ws_chains, poll_chains = feed.hybrid_feed_plan(per)
+    assert set(ws_chains) == {"base", "bsc"}
+    assert set(poll_chains) == {"robinhood"}
+
+    monkeypatch.setenv("ROBINHOOD_WSS_URL", "wss://rpc.example/rh")
+    ws_chains, poll_chains = feed.hybrid_feed_plan(per)
+    assert set(ws_chains) == {"base", "bsc", "robinhood"}
+    assert poll_chains == {}
+
+
+def test_ws_subscription_keeps_logs_arriving_before_acks():
+    log = {
+        "topics": [feed.cl.TRANSFER_TOPIC],
+        "transactionHash": TX,
+        "logIndex": "0x1",
+    }
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+            self.messages = [
+                json.dumps({"params": {"result": log}}),
+                json.dumps({"id": 2, "result": "sub-2"}),
+                json.dumps({"id": 1, "result": "sub-1"}),
+            ]
+
+        async def send(self, message):
+            self.sent.append(json.loads(message))
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+    ws = FakeWs()
+    pending = asyncio.run(feed._subscribe_wallet_logs(ws, [WALLET]))
+    assert len(ws.sent) == 2
+    assert pending == {(TX, "0x1"): log}
+
+
+def test_pre_ack_wss_log_is_journaled_before_session_processing(tmp_path):
+    log = raw_log(WALLET, POOL, 1, block=995)
+    store = Journal(str(tmp_path / "pre-ack.sqlite"))
+    feed.configure_journal(store)
+    try:
+        asyncio.run(
+            feed._persist_pending_logs(
+                "base", {WALLET}, {(TX, log["logIndex"]): log}
+            )
+        )
+        assert [item["tx"] for item in store.pending_candidates("base")] == [TX]
+    finally:
+        feed.configure_journal(None)
+        store.close()
+def test_ws_head_confirms_log_into_durable_candidate_without_block_poll(monkeypatch, tmp_path):
+    log = raw_log(WALLET, POOL, 1, block=995)
+    store = Journal(str(tmp_path / "ws-journal.sqlite"))
+    feed.configure_journal(store)
+    try:
+        monkeypatch.setattr(
+            feed, "block_number", lambda chain: pytest.fail("unexpected block poll")
+        )
+        monkeypatch.setattr(feed, "_drain_candidates", lambda *args: [])
+
+        class FakeWs:
+            async def recv(self):
+                return json.dumps({"params": {"result": log}})
+
+        pending = asyncio.run(
+            feed._consume_ws_logs(
+                FakeWs(),
+                "base",
+                {WALLET},
+                {"conf": 6},
+                {},
+                {},
+                {"height": 1000, "head_updates": True},
+            )
+        )
+        assert pending == {}
+        assert [item["tx"] for item in store.pending_candidates("base")] == [TX]
+    finally:
+        feed.configure_journal(None)
+        store.close()
+
+
+def test_ws_processing_error_keeps_uncommitted_log(monkeypatch):
+    log = {
+        "topics": [feed.cl.TRANSFER_TOPIC],
+        "transactionHash": TX,
+        "logIndex": "0x1",
+        "blockNumber": "0x3e7",
+    }
+
+    class FakeWs:
+        async def recv(self):
+            return json.dumps({"params": {"result": log}})
+
+    monkeypatch.setattr(feed, "block_number", lambda chain: 1000)
+
+    def fail(*args):
+        raise RuntimeError("receipt unavailable")
+
+    monkeypatch.setattr(feed, "process_log", fail)
+    pending = {}
+    with pytest.raises(RuntimeError, match="receipt unavailable"):
+        asyncio.run(
+            feed._consume_ws_logs(FakeWs(), "base", {WALLET}, {"conf": 1}, pending)
+        )
+    assert pending == {(TX, "0x1"): log}
+
+
+
 def test_bsc_publicnode_http_default_and_override(monkeypatch):
     assert feed.rpc_url("bsc") == "https://bsc-rpc.publicnode.com"
     monkeypatch.setenv("BSC_RPC_URL", "https://rpc.example/bsc")
@@ -567,6 +852,27 @@ def test_bsc_publicnode_http_default_and_override(monkeypatch):
     assert fake.getlogs_calls == [("bsc", 10, 10)]
 
 
+def test_rpc_quota_failure_fails_over_without_retrying_same_endpoint(monkeypatch):
+    primary = "https://rpc.primary"
+    secondary = "https://rpc.secondary"
+    monkeypatch.setenv("BASE_RPC_URL", f"{primary},{secondary}")
+    calls = []
+
+    def rpc(url, payload=None, timeout=20, headers=None):
+        calls.append(url)
+        if url == primary:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"message": "Monthly capacity limit exceeded"},
+            }
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x2"}
+
+    monkeypatch.setattr(config, "http_json", rpc)
+    assert feed.evm_rpc("base", "eth_blockNumber", []) == "0x2"
+    assert calls == [primary, secondary]
+
+
 
 def test_selected_robinhood_wallet_refresh(monkeypatch):
     rows = [{"address": "0x" + "c3" * 20, "chain": "robinhood"},
@@ -575,15 +881,6 @@ def test_selected_robinhood_wallet_refresh(monkeypatch):
     per, src = emain.load_wallets("/no-file", ("robinhood",))
     assert src == "api" and per == {"robinhood": ["0x" + "c3" * 20]}
 
-def withdrawal_log(wallet, value, ca="0x0bd7d308f8e1639fab988df18a8011f41eacad73"):
-    return {
-        "address": ca,
-        "topics": [
-            "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65",
-            "0x" + "0" * 24 + wallet.lower()[2:],
-        ],
-        "data": "0x%064x" % value,
-    }
 
 
 def test_native_input_and_output_require_router_erc20_receipt(monkeypatch, trades):
@@ -597,12 +894,36 @@ def test_native_input_and_output_require_router_erc20_receipt(monkeypatch, trade
             TX: {"status": "0x1", "to": router, "logs": [incoming]},
             tx_sell: {
                 "status": "0x1", "to": router,
-                "logs": [outgoing, withdrawal_log(WALLET, 2 * 10**18)],
+                "logs": [outgoing],
             },
         },
         transactions={
             TX: {"from": WALLET, "value": hex(10**18)},
             tx_sell: {"from": WALLET, "value": "0x0"},
+        },
+        traces={
+            TX: {
+                "type": "CALL",
+                "from": WALLET,
+                "to": router,
+                "value": hex(10**18),
+                "calls": [],
+            },
+            tx_sell: {
+                "type": "CALL",
+                "from": WALLET,
+                "to": router,
+                "value": "0x0",
+                "calls": [
+                    {
+                        "type": "CALL",
+                        "from": router,
+                        "to": WALLET,
+                        "value": hex(2 * 10**18),
+                        "input": "0x",
+                    }
+                ],
+            },
         },
     )
     use_fake(monkeypatch, fake)
@@ -611,6 +932,248 @@ def test_native_input_and_output_require_router_erc20_receipt(monkeypatch, trade
     assert [trade["side"] for trade in trades] == ["buy", "sell"]
     assert all(trade["chain"] == "robinhood" for trade in trades)
     assert [trade["amountUsd"] for trade in trades] == pytest.approx([500, 200])
+    assert fake.transaction_calls == [TX, tx_sell]
+    assert fake.trace_calls == [TX, tx_sell]
+def test_process_tx_nets_native_refund_before_emitting_quote_raw(monkeypatch):
+    tx_hash = "0x" + "fd" * 32
+    router = "0x8876789976decbfcbbbe364623c63652db8c0904"
+    token_output = raw_log(POOL, WALLET, 1000 * 10**6, tx=tx_hash)
+    trace = {
+        "type": "CALL",
+        "from": WALLET,
+        "to": router,
+        "value": hex(10**18),
+        "calls": [
+            {
+                "type": "CALL",
+                "from": router,
+                "to": WALLET,
+                "value": hex(10**17),
+                "input": "0x",
+            }
+        ],
+    }
+    fake = FakeEvm(
+        receipts={tx_hash: {"status": "0x1", "to": router, "logs": [token_output]}},
+        transactions={tx_hash: {"from": WALLET, "to": router, "value": hex(10**18)}},
+        traces={tx_hash: trace},
+    )
+    use_fake(monkeypatch, fake)
+    events = []
+    monkeypatch.setattr(feed, "emit_swap", lambda event, ts: events.append(dict(event)) or event)
+
+    feed.process_log("robinhood", token_output, {WALLET})
+
+    assert len(events) == 1
+    assert events[0]["quote_raw"] == 9 * 10**17
+    assert events[0]["qty_raw"] == 1000 * 10**6
+    assert fake.trace_calls == [tx_hash]
+
+
+def test_router_native_output_uses_call_trace(monkeypatch, trades):
+    tx_sell = "0x" + "ef" * 32
+    router = "0x8876789976decbfcbbbe364623c63652db8c0904"
+    trace = {
+        "type": "CALL",
+        "from": WALLET,
+        "to": router,
+        "value": "0x0",
+        "calls": [
+            {
+                "type": "CALL",
+                "from": router,
+                "to": WALLET,
+                "value": hex(2 * 10**18),
+                "input": "0x",
+            }
+        ],
+    }
+    fake = FakeEvm(
+        receipts={
+            tx_sell: {
+                "status": "0x1",
+                "to": router,
+                "logs": [raw_log(WALLET, POOL, 200 * 10**6, tx=tx_sell)],
+            }
+        },
+        transactions={tx_sell: {"from": WALLET, "value": "0x0"}},
+        traces={tx_sell: trace},
+    )
+    use_fake(monkeypatch, fake)
+
+    feed.process_log(
+        "robinhood",
+        raw_log(WALLET, POOL, 200 * 10**6, tx=tx_sell),
+        {WALLET},
+    )
+
+    assert len(trades) == 1
+    assert trades[0]["side"] == "sell" and trades[0]["ca"] == TOKEN
+    assert trades[0]["amountUsd"] == pytest.approx(200)
+    assert fake.trace_calls == [tx_sell]
+
+
+def test_block_scan_discovers_tracked_sender_without_transfer_log(monkeypatch, trades):
+    tx_hash = "0x" + "fa" * 32
+    router = UNISWAP
+
+    def word(value):
+        return f"{value:064x}"
+
+    trace = {
+        "type": "CALL",
+        "from": WALLET,
+        "to": router,
+        "value": "0x0",
+        "calls": [
+            {
+                "type": "CALL",
+                "from": router,
+                "to": WETH,
+                "input": "0x23b872dd"
+                + word(int(WALLET, 16))
+                + word(int(POOL, 16))
+                + word(5 * 10**17),
+                "value": "0x0",
+            },
+            {
+                "type": "CALL",
+                "from": POOL,
+                "to": TOKEN,
+                "input": "0xa9059cbb"
+                + word(int(WALLET, 16))
+                + word(1000 * 10**6),
+                "value": "0x0",
+            },
+        ],
+    }
+    tx = {
+        "hash": tx_hash,
+        "from": WALLET,
+        "to": router,
+        "value": "0x0",
+    }
+    fake = FakeEvm(
+        latest=1000,
+        receipts={tx_hash: {"status": "0x1", "to": router, "logs": []}},
+        traces={tx_hash: trace},
+        blocks={993: {"transactions": [tx]}},
+    )
+    use_fake(monkeypatch, fake)
+    state = {"evm": {"base": {"last_block": 992}}}
+
+    feed.backfill("base", [WALLET], state, {"conf": 8, "span": 500})
+
+    assert [(trade["side"], trade["ca"], trade["tx"]) for trade in trades] == [
+        ("buy", TOKEN, tx_hash),
+    ]
+    assert fake.block_calls == [992, 993]
+    assert fake.transaction_calls == []
+    assert fake.trace_calls == [tx_hash]
+
+
+def test_trace_filter_finds_internal_wallet_call_without_wallet_transfer(monkeypatch, trades):
+    tx_hash = "0x" + "fc" * 32
+    router = UNISWAP
+
+    def word(value):
+        return f"{value:064x}"
+
+    trace = {
+        "type": "CALL",
+        "from": POOL,
+        "to": "0x6666666666666666666666666666666666666666",
+        "value": "0x0",
+        "calls": [
+            {
+                "type": "CALL",
+                "from": "0x6666666666666666666666666666666666666666",
+                "to": WALLET,
+                "value": "0x0",
+                "calls": [
+                    {
+                        "type": "CALL",
+                        "from": WALLET,
+                        "to": router,
+                        "value": "0x0",
+                        "calls": [
+                            {
+                                "type": "CALL",
+                                "from": router,
+                                "to": WETH,
+                                "input": "0x23b872dd"
+                                + word(int(WALLET, 16))
+                                + word(int(POOL, 16))
+                                + word(5 * 10**17),
+                                "value": "0x0",
+                            },
+                            {
+                                "type": "CALL",
+                                "from": POOL,
+                                "to": TOKEN,
+                                "input": "0xa9059cbb"
+                                + word(int(WALLET, 16))
+                                + word(1000 * 10**6),
+                                "value": "0x0",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    tx = {
+        "hash": tx_hash,
+        "from": POOL,
+        "to": "0x6666666666666666666666666666666666666666",
+        "value": "0x0",
+    }
+    fake = FakeEvm(
+        latest=1008,
+        receipts={tx_hash: {"status": "0x1", "to": tx["to"], "logs": []}},
+        traces={tx_hash: trace},
+        blocks={993: {"transactions": [tx]}},
+        trace_filters={
+            "from": [
+                {
+                    "transactionHash": tx_hash,
+                    "action": {"from": WALLET, "to": router},
+                }
+            ]
+        },
+    )
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("BASE_TRACE_INDEX_RPC_URL", "https://trace-index.test")
+    state = {"evm": {"base": {"last_block": 992}}}
+
+    feed.backfill("base", [WALLET], state, {"conf": 8, "span": 500})
+
+    assert [(trade["side"], trade["ca"], trade["tx"]) for trade in trades] == [
+        ("buy", TOKEN, tx_hash),
+    ]
+    assert len(fake.trace_filter_calls) == 2
+    assert fake.block_calls == [992, 993, 994, 995]
+    assert fake.trace_calls == [tx_hash]
+
+
+def test_unavailable_trace_does_not_advance_block_cursor(monkeypatch, trades):
+    tx_hash = "0x" + "fb" * 32
+    tx = {"hash": tx_hash, "from": WALLET, "to": UNISWAP, "value": "0x0"}
+    fake = FakeEvm(
+        latest=1000,
+        receipts={tx_hash: {"status": "0x1", "to": UNISWAP, "logs": []}},
+        blocks={993: {"transactions": [tx]}},
+    )
+    use_fake(monkeypatch, fake)
+    state = {"evm": {"base": {"last_block": 992}}}
+
+    with pytest.raises(RuntimeError, match="trace"):
+        feed.backfill("base", [WALLET], state, {"conf": 8, "span": 500})
+
+    assert state["evm"]["base"]["last_block"] == 993
+    assert state["evm"]["base"]["last_tx_block"] == 992
+
+
 def test_refresh_cfg_failsoft(monkeypatch):
     per = {"base": ["0xold"], "bsc": []}
 
@@ -622,6 +1185,141 @@ def test_refresh_cfg_failsoft(monkeypatch):
     emain.refresh_cfg(per)  # không raise
     assert per == {"base": ["0xold"], "bsc": []}  # API chết ⇒ giữ nguyên ví
 
+
+
+
+def test_main_once_migrates_journal_and_stops_delivery_worker(monkeypatch, tmp_path):
+    for obj, name in (
+        (config, "_api_url"),
+        (config, "_track"),
+        (config, "_cfg_cli_min_usd"),
+        (config, "_evm_ignore_api_min_usd"),
+        (config, "min_usd"),
+        (feed.emit, "_jsonl"),
+        (st_mod, "STATE_PATH"),
+        (st_mod, "HEARTBEAT"),
+        (emain, "HERE"),
+        (emain, "_wallets_path"),
+    ):
+        monkeypatch.setattr(obj, name, getattr(obj, name, None), raising=False)
+    monkeypatch.setattr(emain, "HERE", str(tmp_path))
+    state_path = tmp_path / "evm_watch_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "evm": {
+                    "base": {
+                        "last_block": 10,
+                        "last_tx_block": 8,
+                        "chunk_rpc": "https://secret.example/token",
+                    }
+                }
+            }
+        )
+    )
+    fake = FakeEvm(latest=1000, logs=[])
+
+    def request(url, payload=None, timeout=20, headers=None):
+        if url.endswith("/api/wallets"):
+            return [{"address": WALLET, "chain": "base"}]
+        return fake(url, payload, timeout, headers)
+
+    monkeypatch.setenv("BASE_RPC_URL", "https://mainnet.base.org")
+    monkeypatch.setattr(config, "http_json", request)
+    monkeypatch.setattr(sys, "argv", [
+        "watcher",
+        "--chains",
+        "base",
+        "--feed",
+        "poll",
+        "--once",
+        "--no-min-usd-gate",
+        "--api-url",
+        "http://api.test",
+    ])
+
+    emain.main()
+    assert feed._journal is None
+    assert fake.getlogs_calls
+    assert fake.block_calls == [9, 10, 11, 12]
+    assert feed._journal is None
+    store = Journal(str(tmp_path / "evm_watch_journal.sqlite3"))
+    try:
+        assert store.state("base")["last_block"] == 993
+        assert store.state("base")["last_tx_block"] == 12
+        assert "secret" not in (tmp_path / "evm_watch_journal.sqlite3").read_bytes().decode(
+            "latin1", errors="ignore"
+        )
+    finally:
+        store.close()
+
+def test_new_head_rewinds_unconfirmed_fork_and_pending_trade(monkeypatch, tmp_path):
+    store = Journal(str(tmp_path / "head-journal.sqlite"))
+    feed.configure_journal(store)
+    try:
+        store.save_state({"evm": {"base": {"last_block": 102, "last_tx_block": 102}}})
+        for height in range(100, 103):
+            store.record_header(
+                "base",
+                {
+                    "number": hex(height),
+                    "hash": f"canonical-{height}",
+                    "parentHash": f"canonical-{height - 1}",
+                },
+            )
+        store.enqueue(
+            {
+                "chain": "base",
+                "wallet": WALLET,
+                "ca": TOKEN,
+                "tx": TX,
+                "side": "BUY",
+            },
+            102,
+            "canonical-102",
+        )
+        rpc_calls = []
+
+        def canonical_header(chain, method, params):
+            rpc_calls.append((chain, method, params))
+            if params[0] == "0x65":
+                return {"hash": "canonical-101"}
+            if params[0] == "0x67":
+                return {"hash": "fork-103"}
+            raise AssertionError((chain, method, params))
+
+        monkeypatch.setattr(feed, "evm_rpc", canonical_header)
+        state = {"evm": {"base": {"last_block": 102, "last_tx_block": 102}}}
+        asyncio.run(
+            feed._handle_new_head(
+                "base",
+                {"number": "0x67", "hash": "fork-103", "parentHash": "fork-102"},
+                state,
+                {},
+            )
+        )
+        assert state["evm"]["base"]["last_block"] == 101
+        assert store.due(now=0) == []
+        assert store.headers("base")[-1]["hash"] == "fork-103"
+        assert rpc_calls == [
+            ("base", "eth_getBlockByNumber", ["0x65", False])
+        ]
+        rpc_calls.clear()
+        asyncio.run(
+            feed._handle_new_head(
+                "base",
+                {"number": "0x69", "hash": "fork-105", "parentHash": "fork-104"},
+                state,
+                {},
+            )
+        )
+        assert rpc_calls == [
+            ("base", "eth_getBlockByNumber", ["0x67", False])
+        ]
+        assert store.headers("base")[-1]["hash"] == "fork-105"
+    finally:
+        feed.configure_journal(None)
+        store.close()
 
 def test_price_pairs_matches_evm_address_case_insensitively():
     from watchers.common import price as price_mod
@@ -640,3 +1338,30 @@ def test_price_pairs_matches_evm_address_case_insensitively():
         }
     ]
     assert price_mod._price_from_pairs(pairs, from_log) == ("DEGEN", 0.0011)
+
+
+def test_wss_handshake_failures_use_increasing_backoff(monkeypatch):
+    backoffs = []
+    endpoint = "wss://provider.invalid"
+
+    async def fail_session(*args):
+        raise OSError("HTTP 429 quota exceeded")
+
+    async def stop_after_second_failure(
+        chain, wallets, st, opts, failed_endpoint, exc, backoff
+    ):
+        backoffs.append(backoff)
+        if len(backoffs) == 2:
+            raise asyncio.CancelledError
+        return backoff * 2
+
+    monkeypatch.setattr(feed, "wss_urls", lambda chain: [endpoint])
+    monkeypatch.setattr(feed, "wss_url", lambda chain: endpoint)
+    monkeypatch.setattr(feed.rpc, "ready_urls", lambda urls, method: [endpoint])
+    monkeypatch.setattr(feed, "_run_ws_session", fail_session)
+    monkeypatch.setattr(feed, "_recover_ws_disconnect", stop_after_second_failure)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(feed._ws_chain_loop("base", [WALLET], {}, {}, {}, None))
+
+    assert backoffs == [2, 4]

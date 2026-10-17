@@ -7,7 +7,9 @@ import { config } from '../src/config.js';
 import {
   cacheKey,
   getSetupCacheEntry,
+  getSetupRetry,
   loadSetupCache,
+  mergeSetupCacheFiles,
   pruneSetupCache,
   putSetupCacheEntry,
   type SetupCacheEntry,
@@ -237,4 +239,36 @@ test('marker-only entry: empty payload + both markers — put accepted, reload k
   const before = getSetupCacheEntry('caMarkerOnly', 'sol');
   putSetupCacheEntry({ ...markerOnly, t100_pct: Number.NaN });
   assert.deepEqual(getSetupCacheEntry('caMarkerOnly', 'sol'), before, 'a NaN field must not round-trip');
+});
+test('legacy cache merge unions A/B keys and keeps the newest series plus retry deadlines', () => {
+  const destination = tmpFile();
+  const sourceA = tmpFile();
+  const sourceB = tmpFile();
+  const current = sampleEntry('shared', 1_000);
+  const fromA = sampleEntry('a-only', 2_000);
+  const sharedA = { ...sampleEntry('shared', 3_000), t100_multiple: 3 };
+  const fromB = sampleEntry('b-only', 4_000);
+  const sharedB = { ...sampleEntry('shared', 5_000), t100_multiple: 5 };
+  writeFileSync(destination, JSON.stringify({
+    version: 2,
+    entries: [current],
+    retries: { 'sol:shared:series': { misses: 1, nextAt: 10_000 } },
+  }));
+  writeFileSync(sourceA, JSON.stringify({
+    version: 2,
+    entries: [fromA, sharedA],
+    retries: { 'sol:shared:series': { misses: 2, nextAt: 20_000 } },
+  }));
+  writeFileSync(sourceB, JSON.stringify({
+    version: 2,
+    entries: [fromB, sharedB],
+    retries: { 'sol:shared:series': { misses: 3, nextAt: 15_000 } },
+  }));
+
+  assert.equal(mergeSetupCacheFiles([sourceA, sourceB], destination), 3);
+  const merged = loadSetupCache(destination);
+  assert.deepEqual([...merged.keys()].sort(), ['sol:a-only', 'sol:b-only', 'sol:shared']);
+  assert.equal(merged.get('sol:shared')?.t100_multiple, 5);
+  assert.equal(merged.get('sol:shared')?.taken_at, 5_000);
+  assert.deepEqual(getSetupRetry('shared', 'sol', 'series'), { misses: 2, nextAt: 20_000 });
 });

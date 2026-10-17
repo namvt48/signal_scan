@@ -3,27 +3,26 @@
 
 import { config, gatewayClientFromConfig } from './config.js';
 import { log } from './log.js';
-import { listTrackedCas, open, seedIfEmpty } from './db.js';
+import { listTrackedCas, open, seedIfEmpty, sharedAlertMetricImportCursor } from './db.js';
 import { MockProvider } from './providers/mock.js';
 import { GmgnMarketProvider } from './providers/gmgn.js';
 import { CompositeProvider } from './providers/composite.js';
 import { NansenApiClient, NansenMarketProvider, doorEndpointFor } from './providers/nansen.js';
-import { GW_NANSEN_DOOR_PATH } from './gateway-client.js';
+import { GW_MARKET_ALERT_ACK_PATH, GW_MARKET_SUBSCRIPTIONS_PATH, GW_NANSEN_DOOR_PATH } from './gateway-client.js';
 import type { MarketDataProvider } from './providers/provider.js';
 import { startPoller } from './poller.js';
 import { cacheKey, loadSetupCache, pruneSetupCache } from './setup-cache.js';
 import { createApp } from './api.js';
 import { cohortLabelIndex } from './cohort-labels.js';
 
-open(config.dbPath);
-seedIfEmpty();
+open(config.dbPath, config.marketDbPath);
+if (config.marketDbPath === '') seedIfEmpty();
 
-// Setup file cache (plan setup-fill-on-add §4): load ONCE at startup before any
-// sweep can consult or write it, then drop entries whose CA left the queue
-// (pruneSetupCache's empty-set guard keeps a just-reset DB from wiping the file).
-const setupCache = loadSetupCache();
-const setupPruned = pruneSetupCache(Date.now(), new Set(listTrackedCas().map((r) => cacheKey(r.address, r.chain))));
-log.info(`[setup-cache] loaded ${setupCache.size} entries from ${config.setupCacheFile} (pruned ${setupPruned})`);
+if (config.marketDbPath === '') {
+  const setupCache = loadSetupCache();
+  const setupPruned = pruneSetupCache(Date.now(), new Set(listTrackedCas().map((r) => cacheKey(r.address, r.chain))));
+  log.info(`[setup-cache] loaded ${setupCache.size} entries from ${config.setupCacheFile} (pruned ${setupPruned})`);
+}
 
 // Provider egress (todo 14). The gateway client is built from config IFF
 // `GATEWAY_URL` is set (non-empty) — REGARDLESS of NANSEN_API_KEY / GMGN_API_KEY,
@@ -64,7 +63,29 @@ function buildProvider(): MarketDataProvider {
 
 const provider = buildProvider();
 
-startPoller(provider, nansenApi);
+if (config.marketDbPath === '') {
+  startPoller(
+    provider,
+    nansenApi,
+    undefined,
+    'all',
+    config.mode !== 'mock' && gateway !== null ? gmgnApi : undefined,
+  );
+} else {
+  if (gateway === null) throw new Error('MARKET_DB_PATH requires GATEWAY_URL');
+  startPoller(provider, nansenApi, undefined, 'wallets');
+  const syncMarketTargets = async (): Promise<void> => {
+    await gateway.call(GW_MARKET_SUBSCRIPTIONS_PATH, {
+      tokens: listTrackedCas().map(({ address, chain }) => ({ ca: address, chain })),
+    });
+    await gateway.call(GW_MARKET_ALERT_ACK_PATH, { throughId: sharedAlertMetricImportCursor() });
+  };
+  const syncTimer = setInterval(() => {
+    void syncMarketTargets().catch((error: unknown) => log.warn('[market-data] subscription sync failed', error));
+  }, 30_000);
+  syncTimer.unref();
+  void syncMarketTargets().catch((error: unknown) => log.warn('[market-data] initial subscription sync failed', error));
+}
 cohortLabelIndex.start(
   (error) => log.warn('[cohort-labels] refresh failed', error),
   (wallets) => log.info(`[cohort-labels] refreshed ${wallets} wallet labels`),

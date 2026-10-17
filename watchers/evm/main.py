@@ -12,12 +12,13 @@ nhau; import module này không được đổi path của Sol (test khoá).
 import argparse
 import os
 import sys
+import threading
 
 from watchers.common import config, emit
 from watchers.common import state as st_mod
 from watchers.common.config import HERE, _mask
 from watchers.evm import classify as cl
-from watchers.evm import feed
+from watchers.evm import feed, journal as journal_mod
 
 _wallets_path = ""  # set trong main() — refresh_cfg dùng lại
 
@@ -79,9 +80,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--feed",
-        choices=["ws", "poll"],
+        choices=["ws", "hybrid", "poll"],
         default="ws",
-        help="ws = eth_subscribe logs/ví (mặc định); poll = eth_getLogs chunked",
+        help="ws = log/head subscriptions; hybrid = reconnect + HTTP reconciliation, poll chains without WSS",
     )
     ap.add_argument(
         "--chains",
@@ -155,30 +156,50 @@ def main() -> None:
             f"không có ví EVM nào (source={src}): {args.wallets} hay {config._api_url}/api/wallets"
         )
 
-    st = st_mod.load_state()
-    counts = " ".join(f"{c}={len(per[c])}" for c in chains)
-    print(
-        f"# evm watch {counts} ví (source={src})"
-        f" | feed={args.feed} | conf={args.confirmations} | min ${config.min_usd}",
-        flush=True,
-    )
-    endpoints = " ".join(f"rpc_{c}={_mask(feed.rpc_url(c))}" for c in chains)
-    print(f"# {endpoints}", flush=True)
-    opts = {
-        "conf": args.confirmations,
-        "span": args.chunk,
-        "once": args.once,
-        "sleep": args.poll_sleep,
-        "refresh": refresh_cfg,
-    }
+    store = journal_mod.Journal(os.path.join(HERE, "evm_watch_journal.sqlite3"))
     try:
-        if args.feed == "ws" and not args.once:
-            feed.run_ws_feed(per, st, opts)
-        else:
-            feed.run_poll_feed(per, st, opts)
-    except KeyboardInterrupt:
-        st_mod.save_state(st)
-        print("\n# stopped")
+        st = store.load_state(st_mod.load_state())
+        st_mod.save_state(st)  # rewrite legacy cursor JSON without stored RPC URLs
+        feed.configure_journal(store)
+        counts = " ".join(f"{c}={len(per[c])}" for c in chains)
+        print(
+            f"# evm watch {counts} ví (source={src})"
+            f" | feed={args.feed} | conf={args.confirmations} | min ${config.min_usd}",
+            flush=True,
+        )
+        endpoints = " ".join(f"rpc_{c}={_mask(feed.rpc_url(c))}" for c in chains)
+        print(f"# {endpoints}", flush=True)
+        opts = {
+            "conf": args.confirmations,
+            "span": args.chunk,
+            "once": args.once,
+            "sleep": args.poll_sleep,
+            "refresh": refresh_cfg,
+        }
+        stop_delivery = threading.Event()
+        delivery_worker = threading.Thread(
+            target=feed.delivery.run,
+            args=(stop_delivery,),
+            name="evm-trade-outbox",
+            daemon=True,
+        )
+        delivery_worker.start()
+        try:
+            if args.feed == "ws" and not args.once:
+                feed.run_ws_feed(per, st, opts)
+            elif args.feed == "hybrid" and not args.once:
+                feed.run_hybrid_feed(per, st, opts)
+            else:
+                feed.run_poll_feed(per, st, opts)
+        except KeyboardInterrupt:
+            feed.save_state(st)
+            print("\n# stopped")
+        finally:
+            stop_delivery.set()
+            delivery_worker.join(timeout=6)
+    finally:
+        feed.configure_journal(None)
+        store.close()
 
 
 if __name__ == "__main__":

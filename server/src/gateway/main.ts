@@ -9,6 +9,16 @@ import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { config, DEFAULT_GATEWAY_PORT } from '../config.js';
 import { log } from '../log.js';
+import { listTrackedCas, open, expireMarketSubscriptions } from '../db.js';
+import { GatewayClient } from '../gateway-client.js';
+import { CompositeProvider } from '../providers/composite.js';
+import { GmgnMarketProvider } from '../providers/gmgn.js';
+import { NansenApiClient, NansenMarketProvider } from '../providers/nansen.js';
+import type { MarketDataProvider } from '../providers/provider.js';
+import { startPoller, kickCAs } from '../poller.js';
+import { mergeSetupCacheFiles } from '../setup-cache.js';
+import { migrateLegacyMarketDatabases } from '../market-data-migration.js';
+import { browserPostJson } from './door.js';
 import { createGatewayApp } from './app.js';
 
 export { DEFAULT_GATEWAY_PORT };
@@ -60,6 +70,31 @@ export function parsePort(raw: string | undefined): number {
   return n;
 }
 
+
+function startSharedMarketPoller(): void {
+  process.env.GATEWAY_URL = `http://127.0.0.1:${config.gatewayPort}`;
+  process.env.GATEWAY_CALLER_TOKEN = config.gatewayTokenA;
+  const gatewayClient = new GatewayClient({
+    baseUrl: `http://127.0.0.1:${config.gatewayPort}`,
+    callerToken: config.gatewayTokenA,
+  });
+  const nansenApi = new NansenApiClient(config.nansenApiKey, gatewayClient);
+  const nansen = new NansenMarketProvider(
+    (url, body) => browserPostJson(url, body, { caller: 'a' }),
+    nansenApi,
+    listTrackedCas,
+  );
+  const gmgnApi = new GmgnMarketProvider(config.gmgnApiKey, gatewayClient);
+  let provider: MarketDataProvider = nansen;
+  if (config.mode === 'gmgn') {
+    provider = new CompositeProvider(gmgnApi, nansen);
+  }
+  startPoller(provider, nansenApi, nansenApi, 'market', gmgnApi);
+  const expiryTimer = setInterval(() => {
+    expireMarketSubscriptions();
+  }, 30_000);
+  expiryTimer.unref();
+}
 function main(): void {
   const missing = missingGatewayEnv(config);
   if (missing.length > 0) {
@@ -74,11 +109,22 @@ function main(): void {
     log.error('[gateway] bad config', e);
     process.exit(1);
   }
+  open(config.dbPath);
+  migrateLegacyMarketDatabases([
+    { id: 'a', path: process.env.MARKET_LEGACY_A_DB_PATH ?? '/legacy-a/signal_scan.db' },
+    { id: 'b', path: process.env.MARKET_LEGACY_B_DB_PATH ?? '/legacy-b/signal_scan.db' },
+  ]);
+  mergeSetupCacheFiles(
+    [process.env.MARKET_LEGACY_A_CACHE_PATH ?? '/legacy-a/nansen-cache.json',
+      process.env.MARKET_LEGACY_B_CACHE_PATH ?? '/legacy-b/nansen-cache.json'],
+    config.setupCacheFile,
+  );
 
-  const server = createServer(createGatewayApp());
+  const server = createServer(createGatewayApp({ onMarketTargetsAdded: kickCAs }));
 
   server.listen(port, () => {
     log.info(`[gateway] listening on :${port}`);
+    startSharedMarketPoller();
   });
 
   const shutdown = (signal: string): void => {

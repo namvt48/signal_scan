@@ -1,5 +1,7 @@
-import { validatedIconUrl } from '../providers/dexscreener.js';
+import { renderCaIdenticon } from '../token-avatar.js';
+import type { Chain } from '../shared/chain.js';
 import type { AlertTrackedMetadata } from '../alert-feed.js';
+import type { PeriodicScanItem } from '../periodic-scan.js';
 export type TelegramAlert = {
   alertId: string;
   chain: 'sol' | 'base' | 'bsc' | 'robinhood';
@@ -12,7 +14,7 @@ export type TelegramAlert = {
     previous: number;
     current: number;
     responseAt: number;
-    buyer?: { name: string; address: string };
+    buyer?: { name: string; address?: string };
   };
   nansen: { freshPct?: number; t100Multiple?: number; lf?: number };
   trackedHoldingPct?: number;
@@ -97,18 +99,51 @@ function numberText(value: number): string {
 function trackerBuyerText(buyer: TelegramAlert['trigger']['buyer']): string {
   if (buyer === undefined) return 'Unknown wallet (address unavailable)';
   const name = buyer.name.trim();
+  if (buyer.address === undefined) return `FOMO user ${name || 'unknown'}`;
   return name && name !== buyer.address ? `${name} (${buyer.address})` : buyer.address;
 }
-function timestampText(value: number): string {
-  if (!Number.isFinite(value)) return 'chưa có';
-  const localTime = new Date(value + 7 * 60 * 60 * 1000);
-  return Number.isNaN(localTime.getTime()) ? 'chưa có' : localTime.toISOString().slice(0, 19).replace('T', ' ');
+
+function trackedNamesLines(label: string, group: AlertTrackedMetadata['wallets']): string[] {
+  if (group.names.length === 0) return [`${label}: none`];
+  const lines: string[] = [];
+  let current = `${label}: `;
+  let currentCount = 0;
+  for (const name of group.names) {
+    const escaped = escapeHtml(name);
+    const separator = currentCount === 0 ? '' : ', ';
+    const candidate = `${current}${separator}${escaped}`;
+    if (visibleTextLength(candidate) > 3_000) {
+      lines.push(current);
+      current = `${label} (cont.): ${escaped}`;
+      currentCount = 1;
+    } else {
+      current = candidate;
+      currentCount += 1;
+    }
+  }
+  lines.push(current);
+  return lines;
 }
 
-function trackedNamesText(group: AlertTrackedMetadata['wallets']): string {
-  const names = group.names.map(escapeHtml).join(', ') || 'none';
-  const more = Math.max(0, group.total - group.names.length);
-  return more === 0 ? names : `${names} +${more} more`;
+function splitTelegramText(text: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let currentLength = 0;
+  for (const line of text.split('\n')) {
+    const lineLength = visibleTextLength(line);
+    if (lineLength > 4_000) throw new TelegramSendError('Telegram alert contains an oversized line');
+    const separatorLength = current.length === 0 ? 0 : 1;
+    if (currentLength + separatorLength + lineLength > 4_000) {
+      parts.push(current);
+      current = line;
+      currentLength = lineLength;
+    } else {
+      current = current.length === 0 ? line : `${current}\n${line}`;
+      currentLength += separatorLength + lineLength;
+    }
+  }
+  if (current.length > 0) parts.push(current);
+  return parts;
 }
 
 function visibleTextLength(html: string): number {
@@ -122,7 +157,8 @@ function visibleTextLength(html: string): number {
 }
 
 export function formatTelegramAlert(alert: TelegramAlert): string {
-  const ticker = alert.symbol?.trim().slice(0, 128) || `${alert.ca.slice(0, 6)}…${alert.ca.slice(-4)}`;
+  const rawTicker = alert.symbol?.trim().slice(0, 128) || `${alert.ca.slice(0, 6)}…${alert.ca.slice(-4)}`;
+  const ticker = rawTicker.startsWith('$') ? rawTicker : `$${rawTicker}`;
   const url = `https://gmgn.ai/${alert.chain}/token/${encodeURIComponent(alert.ca)}`;
   const triggerText = alert.trigger.metric === 'fresh'
     ? alert.trigger.previous > 0
@@ -137,19 +173,68 @@ export function formatTelegramAlert(alert: TelegramAlert): string {
     ? []
     : [
       `Tracked in: ${alert.tracked.count}`,
-      `Tracked by: ${trackedNamesText(alert.tracked.wallets)}`,
-      ...(alert.source === 'B' ? [`FOMO users: ${trackedNamesText(alert.tracked.fomoUsers)}`] : []),
+      ...trackedNamesLines('Tracked by', alert.tracked.wallets),
     ];
-  return [
-    `<a href="${escapeHtml(url)}">${escapeHtml(ticker)}</a>`,
-    `MC: ${marketCapText(alert.marketCap)}`,
-    `<b>${escapeHtml(triggerText)}</b>`,
+  const fomoLines = alert.source === 'B' && alert.tracked !== undefined
+    ? trackedNamesLines('FOMO users', alert.tracked.fomoUsers)
+    : [];
+  const metricLines = [
     `Nansen: Top100 ${metricValue(alert.nansen.t100Multiple, dashboardNumber)} | Low Float ${metricValue(alert.nansen.lf, dashboardCompact)} | Fresh ${metricValue(alert.nansen.freshPct, dashboardNumber, '%')}`,
     `Tracker holding: ${value(alert.trackedHoldingPct, '%')}`,
     ...trackedLines,
-    `Twitter: ${xHandle ? `<a href="https://x.com/${xHandle}">@${escapeHtml(xHandle)}</a>` : 'unavailable'} | <a href="${escapeHtml(xSearchUrl)}">CA search on X</a>`,
-    `Time: ${timestampText(alert.trigger.responseAt)}`,
-  ].join('\n');
+  ];
+  const twitterLine = `Twitter: ${xHandle ? `<a href="https://x.com/${xHandle}">@${escapeHtml(xHandle)}</a>` : 'unavailable'} | <a href="${escapeHtml(xSearchUrl)}">CA search on X</a>`;
+  return [
+    `${escapeHtml(ticker)}\nMC: ${marketCapText(alert.marketCap)}`,
+    `CA: <a href="${escapeHtml(url)}">Gmgn</a>`,
+    `<b>👌 ${escapeHtml(triggerText)}</b>`,
+    metricLines.join('\n'),
+    ...(fomoLines.length > 0 ? [fomoLines.join('\n')] : []),
+    '——',
+    twitterLine,
+  ].join('\n\n');
+}
+
+export interface PeriodicScanReportEntry {
+  source: 'A' | 'B';
+  signal: PeriodicScanItem;
+}
+
+export interface TelegramThreadIds {
+  alerts?: number;
+}
+
+export function formatPeriodicScanAlert(signal: PeriodicScanItem): string {
+  const rawTicker = signal.symbol?.trim().slice(0, 128) || `${signal.ca.slice(0, 6)}…${signal.ca.slice(-4)}`;
+  const ticker = rawTicker.startsWith('$') ? rawTicker : `$${rawTicker}`;
+  const xHandle = signal.xHandle && /^[A-Za-z0-9_]{1,15}$/.test(signal.xHandle) ? signal.xHandle : undefined;
+  const xSearchUrl = `https://x.com/search?q=${encodeURIComponent(signal.ca)}`;
+  const gmgnUrl = `https://gmgn.ai/${signal.chain}/token/${encodeURIComponent(signal.ca)}`;
+  return [
+    `${escapeHtml(ticker)}\nMC: ${marketCapText(signal.marketCap)}`,
+    `CA: <a href="${escapeHtml(gmgnUrl)}">Gmgn</a>`,
+    [
+      `Nansen: Top100 ${metricValue(signal.nansen.t100?.multiple, dashboardNumber)} | Low Float ${metricValue(signal.nansen.lf, dashboardCompact)} | Fresh Wallet ${metricValue(signal.nansen.rawFresh ?? signal.nansen.fresh, dashboardNumber, '%')}`,
+      `24h volume: ${marketCapText(signal.volume24h)}`,
+      `Tracker holding: ${value(signal.trackedHolding, '%')}`,
+      `Twitter: ${xHandle ? `<a href="https://x.com/${xHandle}">@${escapeHtml(xHandle)}</a>` : 'unavailable'} | <a href="${escapeHtml(xSearchUrl)}">CA search on X</a>`,
+    ].join('\n'),
+  ].join('\n\n');
+}
+
+function periodicScanSlotLabel(slot: string): string {
+  return slot.replace('T', ' ').replace('+07:00', ' UTC+7');
+}
+
+function formatPeriodicScanHeader(
+  entries: readonly PeriodicScanReportEntry[],
+  slot: string,
+  intervalHours: readonly number[],
+): string {
+  const sources = [...new Set(entries.map(({ source }) => source))].join('+');
+  const intervals = [...new Set(intervalHours)].sort((left, right) => left - right);
+  const cadence = intervals.length === 0 ? '' : ` · ${intervals.map((hours) => `${hours}h`).join('/')}`;
+  return `Periodic scan · Dashboard ${sources} · ${periodicScanSlotLabel(slot)}${cadence} · ${entries.length} CA`;
 }
 
 
@@ -158,62 +243,185 @@ export class TelegramBot {
 
   constructor(
     private readonly token: string,
-    private readonly chatId: string,
+    private readonly alertChatId: string,
     private readonly fetcher: Fetcher = fetch,
-    private readonly renderAvatar?: (symbol?: string) => Promise<Uint8Array>,
+    private readonly renderAvatar?: (symbol?: string, ca?: string, chain?: Chain, source?: 'A' | 'B') => Promise<Uint8Array>,
+    private readonly threads: TelegramThreadIds = {},
+    private readonly periodicChatId: string = '',
   ) {
-    this.configured = token.trim().length > 0 && chatId.trim().length > 0;
+    this.configured = token.trim().length > 0 && alertChatId.trim().length > 0;
   }
 
-  async send(alert: TelegramAlert): Promise<void> {
+  async send(
+    alert: TelegramAlert,
+    progress: {
+      sentParts?: number;
+      deliveryMode?: 'photo' | 'text';
+      onPartSent?: (sentParts: number, deliveryMode: 'photo' | 'text') => void;
+    } = {},
+  ): Promise<void> {
     if (!this.configured) throw new TelegramSendError('Telegram is not configured');
     const text = formatTelegramAlert(alert);
-    const textLength = visibleTextLength(text);
-    if (textLength > 4096) throw new TelegramSendError('Telegram alert exceeds the message limit');
-    const photo = validatedIconUrl(alert.iconUrl);
-    let avatar: Uint8Array | undefined;
-    if (!photo && textLength <= 1024 && this.renderAvatar) {
-      try {
-        avatar = await this.renderAvatar(alert.symbol);
-      } catch (error) {
-        const kind = error instanceof Error ? error.name : 'UnknownError';
-        console.warn(`[monitor] Telegram avatar render failed: ${kind}; falling back to text`);
-      }
+    const sentParts = progress.sentParts ?? 0;
+    const deliveryMode = progress.deliveryMode ?? 'photo';
+    const paragraphs = text.split('\n\n');
+    const photoCaption = visibleTextLength(text) <= 1024 ? text : paragraphs[0]!;
+    const remainder = visibleTextLength(text) <= 1024 ? '' : paragraphs.slice(1).join('\n\n');
+    const photoParts = remainder === '' ? [] : splitTelegramText(remainder);
+    const textParts = splitTelegramText(text);
+    const maximumParts = deliveryMode === 'photo' ? photoParts.length + 1 : textParts.length;
+    if (!Number.isSafeInteger(sentParts) || sentParts < 0 || sentParts > maximumParts) {
+      throw new TelegramSendError('Telegram alert delivery progress is invalid');
     }
-    if ((photo || avatar) && textLength <= 1024) {
+
+    if (deliveryMode === 'photo' && sentParts === 0) {
+      let avatar: Uint8Array;
+      try {
+        avatar = this.renderAvatar
+          ? await this.renderAvatar(alert.symbol, alert.ca, alert.chain, alert.source)
+          : await renderCaIdenticon(alert.chain, alert.ca);
+      } catch {
+        avatar = await renderCaIdenticon(alert.chain, alert.ca);
+      }
+      if (avatar.byteLength === 0) throw new TelegramSendError('Token avatar is empty');
       try {
         await this.request('sendPhoto', {
-          chat_id: this.chatId,
-          ...(photo ? { photo } : {}),
-          caption: text,
+          chat_id: this.alertChatId,
+          photo: 'attach://photo',
+          caption: photoCaption,
           parse_mode: 'HTML',
-        }, avatar);
-        return;
+        }, { fieldName: 'photo', bytes: avatar, filename: 'token-avatar.jpg', mediaType: 'image/jpeg' }, this.threads.alerts);
+        progress.onPartSent?.(1, 'photo');
       } catch (error) {
         if (!(error instanceof TelegramSendError) || !error.mediaRejected) throw error;
+        return this.sendTextParts(textParts, 0, progress.onPartSent);
       }
+      return this.sendTextParts(photoParts, 1, progress.onPartSent, 'photo');
     }
-    await this.request('sendMessage', {
-      chat_id: this.chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-    });
+
+    if (deliveryMode === 'photo') {
+      return this.sendTextParts(photoParts, sentParts, progress.onPartSent, 'photo');
+    }
+    return this.sendTextParts(textParts, sentParts, progress.onPartSent, 'text');
+  }
+
+  private async sendTextParts(
+    parts: readonly string[],
+    sentParts: number,
+    onPartSent?: (sentParts: number, deliveryMode: 'photo' | 'text') => void,
+    deliveryMode: 'photo' | 'text' = 'text',
+  ): Promise<void> {
+    for (let index = Math.max(0, sentParts - (deliveryMode === 'photo' ? 1 : 0)); index < parts.length; index += 1) {
+      const completedParts = deliveryMode === 'photo' ? index + 2 : index + 1;
+      const partText = parts.length === 1 ? parts[index]! : `Part ${completedParts}/${parts.length + (deliveryMode === 'photo' ? 1 : 0)}\n${parts[index]!}`;
+      await this.request('sendMessage', {
+        chat_id: this.alertChatId,
+        text: partText,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }, undefined, this.threads.alerts);
+      onPartSent?.(completedParts, deliveryMode);
+    }
+  }
+
+  async sendPeriodicScanReport(
+    entries: readonly PeriodicScanReportEntry[],
+    slot: string,
+    intervalHours: readonly number[] = [],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    if (!this.token.trim() || !this.periodicChatId.trim()) {
+      throw new TelegramSendError('Periodic scan Telegram channel is not configured');
+    }
+    const slotLabel = periodicScanSlotLabel(slot);
+    const prepared = await Promise.all(entries.map(async ({ source, signal }, index) => {
+      let bytes: Uint8Array;
+      try {
+        bytes = this.renderAvatar
+          ? await this.renderAvatar(signal.symbol, signal.ca, signal.chain, source)
+          : await renderCaIdenticon(signal.chain, signal.ca);
+      } catch {
+        bytes = await renderCaIdenticon(signal.chain, signal.ca);
+      }
+      if (bytes.byteLength === 0) throw new TelegramSendError('Periodic scan token avatar is empty');
+      const upload = {
+        fieldName: `periodic_avatar_${index}`,
+        bytes,
+        filename: `periodic-scan-avatar-${index}.jpg`,
+        mediaType: 'image/jpeg',
+      };
+      const caption = `Dashboard ${source} · ${slotLabel}\n\n${formatPeriodicScanAlert(signal)}`;
+      if (visibleTextLength(caption) > 1024) {
+        throw new TelegramSendError('Periodic scan item exceeds Telegram photo caption limit');
+      }
+      return { upload, caption };
+    }));
+
+    const header = formatPeriodicScanHeader(entries, slot, intervalHours);
+    let headerSent = false;
+    try {
+      await this.request('sendMessage', {
+        chat_id: this.periodicChatId,
+        text: header,
+        disable_web_page_preview: true,
+      });
+      headerSent = true;
+
+      for (let offset = 0; offset < prepared.length; offset += 10) {
+        const group = prepared.slice(offset, offset + 10);
+        if (group.length === 1) {
+          const item = group[0]!;
+          await this.request('sendPhoto', {
+            chat_id: this.periodicChatId,
+            photo: `attach://${item.upload.fieldName}`,
+            caption: item.caption,
+            parse_mode: 'HTML',
+          }, item.upload);
+          continue;
+        }
+        const media = group.map((item) => ({
+          type: 'photo',
+          media: `attach://${item.upload.fieldName}`,
+          caption: item.caption,
+          parse_mode: 'HTML',
+        }));
+        const uploads = group.map((item) => item.upload);
+        await this.request('sendMediaGroup', {
+          chat_id: this.periodicChatId,
+          media: JSON.stringify(media),
+        }, uploads, undefined, group.length);
+      }
+    } catch (error) {
+      if (!headerSent) throw error;
+      throw new TelegramSendError(
+        error instanceof Error ? error.message : 'Periodic scan report delivery failed',
+        undefined,
+        false,
+        'unknown',
+        false,
+      );
+    }
   }
 
   private async request(
-    method: 'sendPhoto' | 'sendMessage',
+    method: 'sendPhoto' | 'sendMessage' | 'sendMediaGroup',
     body: Record<string, unknown>,
-    photoBytes?: Uint8Array,
+    upload?: TelegramUpload | readonly TelegramUpload[],
+    threadId?: number,
+    expectedResultCount?: number,
   ): Promise<void> {
+    const payload = threadId === undefined ? body : { ...body, message_thread_id: threadId };
+    const uploads: readonly TelegramUpload[] = upload === undefined
+      ? []
+      : Array.isArray(upload) ? upload : [upload as TelegramUpload];
     let response: Response;
     try {
-      const init: RequestInit = photoBytes
-        ? { method: 'POST', body: multipartBody(body, photoBytes), signal: AbortSignal.timeout(10_000) }
+      const init: RequestInit = upload !== undefined
+        ? { method: 'POST', body: multipartBody(payload, uploads), signal: AbortSignal.timeout(10_000) }
         : {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
+          body: JSON.stringify(payload),
           signal: AbortSignal.timeout(10_000),
         };
       response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, init);
@@ -225,6 +433,7 @@ export class TelegramBot {
       error_code?: number;
       description?: string;
       parameters?: { retry_after?: number };
+      result?: unknown;
     };
     try {
       result = await response.json() as typeof result;
@@ -248,12 +457,28 @@ export class TelegramBot {
         definitelyRejected && response.status === 429,
       );
     }
+    if (expectedResultCount !== undefined &&
+        (!Array.isArray(result.result) || result.result.length !== expectedResultCount)) {
+      throw new TelegramSendError('Telegram returned an invalid media-group receipt', undefined, false, 'unknown');
+    }
   }
 }
 
-function multipartBody(body: Record<string, unknown>, photoBytes: Uint8Array): FormData {
+interface TelegramUpload {
+  fieldName: string;
+  bytes: Uint8Array;
+  filename: string;
+  mediaType: string;
+}
+
+function multipartBody(body: Record<string, unknown>, uploads: readonly TelegramUpload[]): FormData {
   const form = new FormData();
-  for (const [key, value] of Object.entries(body)) form.append(key, String(value));
-  form.append('photo', new Blob([photoBytes], { type: 'image/jpeg' }), 'token-avatar.jpg');
+  for (const [key, value] of Object.entries(body)) {
+    if (uploads.some((upload) => upload.fieldName === key && value === `attach://${key}`)) continue;
+    form.append(key, String(value));
+  }
+  for (const upload of uploads) {
+    form.append(upload.fieldName, new Blob([upload.bytes], { type: upload.mediaType }), upload.filename);
+  }
   return form;
 }

@@ -348,7 +348,42 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
         attemptedAtMs: now,
         error: null,
       }];
-      return jsonResponse({ rpcUsage, heliusUsage });
+      const isA = url.startsWith('http://api-a');
+      const fomoApiUsage = {
+        sampledAtMs: now,
+        windowMs: 300_000,
+        upstream: { apiStatus: 'operational', liveDataStatus: isA ? 'degraded' : 'operational', checkedAtMs: now },
+        endpoints: [{
+          endpoint: 'positions',
+          operations: isA ? 5 : 2,
+          attemptedOperations: isA ? 4 : 2,
+          attempts: isA ? 6 : 2,
+          attemptFailures: isA ? 2 : 0,
+          successes: isA ? 2 : 2,
+          noData: isA ? 1 : 0,
+          incomplete: 0,
+          failures: isA ? 1 : 0,
+          deferred: isA ? 1 : 0,
+          creditsCost: isA ? 3 : 1,
+          lastOutcome: isA ? 'http_error' : 'success',
+          lastOutcomeAtMs: now,
+        }, {
+          endpoint: 'swaps',
+          operations: 1,
+          attemptedOperations: 1,
+          attempts: 1,
+          attemptFailures: 0,
+          successes: 1,
+          noData: 0,
+          incomplete: 0,
+          failures: 0,
+          deferred: 0,
+          creditsCost: 1,
+          lastOutcome: 'success',
+          lastOutcomeAtMs: now,
+        }],
+      };
+      return jsonResponse({ rpcUsage, heliusUsage, fomoApiUsage });
     }
     if (url === 'http://gateway/monitor/metrics') {
       return jsonResponse({
@@ -372,6 +407,13 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
     assert.equal(snapshot.credits.find((item) => item.provider === 'FOMO')?.status, 'low');
     assert.equal(snapshot.credits.find((item) => item.provider === 'FOMO')?.used, 95);
     const nansen = snapshot.credits.filter((item) => item.provider === 'Nansen');
+    assert.equal(snapshot.fomoApi.length, 4);
+    const fomoPositionsA = snapshot.fomoApi.find((sample) => sample.instance === 'A' && sample.endpoint === 'positions');
+    assert.equal(fomoPositionsA?.operations, 5);
+    assert.equal(fomoPositionsA?.attemptFailures, 2);
+    assert.equal(fomoPositionsA?.upstreamLiveDataStatus, 'degraded');
+    const staleFomoApi = store.snapshot(now + 181_000, configuration.sampleIntervalMs * 3).fomoApi;
+    assert.equal(staleFomoApi.every((sample) => sample.stale && sample.upstreamApiStatus === 'unknown'), true);
     assert.equal(nansen.length, 1);
     assert.equal(nansen[0]?.key, 'shared-daily');
     assert.equal(nansen[0]?.used, 52);

@@ -1,0 +1,75 @@
+{
+  "scope": "FOMO GMGN sample cleanup and EVM endpoint validation",
+  "rpc_policy": "Public read-only endpoints only; 10 JSON-RPC methods per batch, 2 seconds between batches; 388 single-leg candidate queries; no configured quota-exhausted endpoints used.",
+  "trace_probe_results": {
+    "base": "HTTP 401 for debug_traceTransaction",
+    "robinhood": "HTTP 200, method debug_traceTransaction unavailable",
+    "bsc": "Earlier probe returned missing trie node"
+  },
+  "chains": {
+    "bsc": {
+      "gmgn_rows": 2187,
+      "wallet_tx_groups": 1900,
+      "duplicate_groups": 176,
+      "duplicate_group_statuses": {
+        "native_output_requires_trace": 22,
+        "verified_native_input_pair": 39,
+        "verified_single_asset_direction": 40,
+        "ambiguous_multi_asset_deltas": 2,
+        "verified_two_token_endpoints": 66,
+        "single_quote_delta_unresolved": 2,
+        "no_direct_wallet_token_delta": 5
+      },
+      "endpoint_verified_groups": 105,
+      "unresolved_duplicate_groups": 71,
+      "duplicate_receipt_failures": 0,
+      "clean_file": "/home/namvt/Desktop/dev-space/signal_scan/reports/gmgn_fomo_bsc_tx_groups_clean_20261012.jsonl"
+    },
+    "robinhood": {
+      "gmgn_rows": 2754,
+      "wallet_tx_groups": 2076,
+      "duplicate_groups": 243,
+      "duplicate_group_statuses": {
+        "verified_native_input_pair": 34,
+        "verified_single_asset_direction": 87,
+        "verified_two_token_endpoints": 122
+      },
+      "endpoint_verified_groups": 156,
+      "unresolved_duplicate_groups": 87,
+      "duplicate_receipt_failures": 0,
+      "clean_file": "/home/namvt/Desktop/dev-space/signal_scan/reports/gmgn_fomo_robinhood_tx_groups_clean_20261012.jsonl"
+    },
+    "base": {
+      "gmgn_rows": 2268,
+      "wallet_tx_groups": 1581,
+      "duplicate_groups": 282,
+      "duplicate_group_statuses": {
+        "verified_native_input_pair": 72,
+        "native_output_requires_trace": 52,
+        "verified_single_asset_direction": 42,
+        "single_quote_delta_unresolved": 6,
+        "verified_two_token_endpoints": 105,
+        "no_direct_wallet_token_delta": 4,
+        "ambiguous_multi_asset_deltas": 1
+      },
+      "endpoint_verified_groups": 177,
+      "unresolved_duplicate_groups": 105,
+      "duplicate_receipt_failures": 0,
+      "clean_file": "/home/namvt/Desktop/dev-space/signal_scan/reports/gmgn_fomo_base_tx_groups_clean_20261012.jsonl"
+    }
+  },
+  "totals": {
+    "gmgn_rows": 7209,
+    "wallet_tx_groups": 5557,
+    "duplicate_groups": 701,
+    "endpoint_verified_duplicate_groups": 438,
+    "unresolved_duplicate_groups": 263,
+    "direct_two_token_pair_replay_mismatches": 0,
+    "direct_two_token_pairs_replayed": 293
+  },
+  "limitations": [
+    "263 of 701 duplicate transactions remain unresolved without per-transaction native-value tracing: either wallet receives no direct output leg, withdrawal logs name a router rather than the wallet, only quote delta exists, no direct wallet token delta, or multiple same-sign assets are ambiguous.",
+    "No public endpoint tested supports usable historical debug_traceTransaction for all three chains; configured RPC quota is exhausted. Do not claim complete exact detection for those 263 transactions.",
+    "3 direct endpoint events disagree with GMGN token candidates; chain transfer deltas are treated as the source of truth."
+  ]
+}

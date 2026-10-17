@@ -1,6 +1,6 @@
 // F2 fix regression (plan setup-fill-on-add): the setupSweep file-cache prune must
 // read the tracked-CA set FRESH at prune time. The sweep is paced across ~0.8 ×
-// POLL_SETUP_MS (~9.6h in prod), so a CA added mid-sweep (POST /api/tracked-cas →
+// POLL_SETUP_MS (~2.4h in prod), so a CA added mid-sweep (POST /api/tracked-cas →
 // kickCAs → early kick → refreshSeries → putSetupCacheEntry) writes a legitimate
 // fresh entry whose key is absent from the sweep-start snapshot — pruning against
 // that stale snapshot deletes it, voiding the wipe-resilience guarantee.

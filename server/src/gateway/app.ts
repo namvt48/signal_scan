@@ -8,6 +8,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { config } from '../config.js';
 import { matchServiceToken } from '../auth.js';
 import { limiters } from '../ratelimit/index.js';
+import type { LimiterSnapshot } from '../ratelimit/types.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type Caller, type CallerTokens } from './auth.js';
 import { poolStatsOrNull, browserPostJson } from './door.js';
@@ -44,7 +45,8 @@ import {
 } from './nansen.js';
 import { GatewayCache, type CacheStats, type Preflight } from './cache.js';
 import { CreditAccountant, type CreditSnapshot } from './credit.js';
-import type { LimiterSnapshot } from '../ratelimit/types.js';
+import { CHAINS, EVM_ADDRESS, canonicalCa, isSolanaAddress, type Chain } from '../shared/chain.js';
+import { acknowledgeMarketAlertDelivery, replaceMarketSubscriptions, type CaTarget, type MarketAlertCaller } from '../db.js';
 
 /**
  * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
@@ -111,6 +113,8 @@ export interface GatewayAppDeps {
    * accountant also wraps the credit upstream to charge the REAL per-call cost.
    */
   credits?: CreditAccountant;
+  /** Immediate poll hook for newly subscribed shared tokens. */
+  onMarketTargetsAdded?: (targets: readonly CaTarget[]) => void;
 }
 
 /** The raw-payload proxy route (todo 3). Provider routes (7/8/9) reuse the
@@ -246,6 +250,65 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       next();
     });
   };
+
+  app.post('/v1/market/subscriptions', parseJson, (req: Request, res: Response) => {
+    const caller = req.caller;
+    if (caller !== 'a' && caller !== 'b') {
+      send(res, denial(403, 'market_subscriptions_forbidden'));
+      return;
+    }
+    const body: unknown = req.body;
+    if (body === null || typeof body !== 'object' || !('tokens' in body)) {
+      send(res, denial(400, 'bad_request'));
+      return;
+    }
+    const raw = (body as { tokens?: unknown }).tokens;
+    if (!Array.isArray(raw) || raw.length > 10_000) {
+      send(res, denial(400, 'bad_request'));
+      return;
+    }
+    const targets: CaTarget[] = [];
+    for (const item of raw) {
+      if (item === null || typeof item !== 'object') {
+        send(res, denial(400, 'bad_request'));
+        return;
+      }
+      const { ca, chain } = item as { ca?: unknown; chain?: unknown };
+      if (typeof ca !== 'string' || typeof chain !== 'string' || !CHAINS.includes(chain as Chain)) {
+        send(res, denial(400, 'bad_request'));
+        return;
+      }
+      if (chain === 'sol' ? !isSolanaAddress(ca) : !EVM_ADDRESS.test(ca)) {
+        send(res, denial(400, 'bad_request'));
+        return;
+      }
+      targets.push({ address: canonicalCa(ca, chain as Chain), chain: chain as Chain });
+    }
+    const added = replaceMarketSubscriptions(caller, targets);
+    deps.onMarketTargetsAdded?.(added);
+    res.json({ status: 200, body: JSON.stringify({ ok: true, added }), headers: {} });
+  });
+
+  app.post('/v1/market/alerts/ack', parseJson, (req: Request, res: Response) => {
+    const caller = req.caller;
+    if (caller !== 'a' && caller !== 'b') {
+      send(res, denial(403, 'market_alert_ack_forbidden'));
+      return;
+    }
+    const body: unknown = req.body;
+    const throughId = typeof body === 'object' && body !== null && !Array.isArray(body)
+      ? Reflect.get(body, 'throughId')
+      : undefined;
+    if (typeof throughId !== 'number' || !Number.isSafeInteger(throughId) || throughId < 0) {
+      send(res, denial(400, 'bad_request'));
+      return;
+    }
+    if (!acknowledgeMarketAlertDelivery(caller as MarketAlertCaller, throughId)) {
+      send(res, denial(409, 'market_alert_ack_out_of_range'));
+      return;
+    }
+    res.json({ status: 200, body: '{}', headers: {} });
+  });
 
   if (deps.upstream !== undefined) {
     const upstream = deps.upstream;
