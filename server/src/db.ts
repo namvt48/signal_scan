@@ -144,6 +144,23 @@ CREATE TABLE IF NOT EXISTS tracked_cas (
   entry_usd REAL,
   UNIQUE(address, chain)
 );
+CREATE TABLE IF NOT EXISTS market_subscriptions (
+  caller TEXT NOT NULL CHECK(caller IN ('a', 'b')),
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (caller, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_market_subscriptions_expiry ON market_subscriptions(expires_at);
+CREATE TABLE IF NOT EXISTS market_alert_delivery_cursors (
+  caller TEXT PRIMARY KEY CHECK(caller IN ('a', 'b')),
+  acknowledged_id INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO market_alert_delivery_cursors (caller, acknowledged_id) VALUES ('a', 0), ('b', 0);
+CREATE TABLE IF NOT EXISTS market_legacy_imports (
+  source TEXT PRIMARY KEY,
+  imported_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS token_state (
   ca TEXT,
   chain TEXT,
@@ -205,6 +222,11 @@ CREATE TABLE IF NOT EXISTS alert_metric_feed_state (
   acknowledged_id INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO alert_metric_feed_state (singleton, acknowledged_id) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS shared_alert_metric_import_state (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  imported_id INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO shared_alert_metric_import_state (singleton, imported_id) VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS holder_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ca TEXT,
@@ -391,6 +413,13 @@ CREATE TABLE IF NOT EXISTS fomo_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_fomo_positions_ca_chain ON fomo_positions(ca, chain);
 
+-- Last successful user-level positions refresh; enforces the on-alert cooldown across
+-- restarts, including users whose response contained no positions.
+CREATE TABLE IF NOT EXISTS fomo_position_snapshots (
+  fomo_user_id TEXT PRIMARY KEY REFERENCES fomo_users(id) ON DELETE CASCADE,
+  checked_at INTEGER NOT NULL
+);
+
 -- Zero-holding tracking: records when a wallet (instance A) or FOMO user (instance B)
 -- first hit 0% holding of a CA. After 24h at zero holding, the member is removed from Tracked by / FOMO by.
 CREATE TABLE IF NOT EXISTS zero_holdings (
@@ -406,7 +435,9 @@ CREATE INDEX IF NOT EXISTS idx_zero_holdings_lookup ON zero_holdings(member_type
 
 let instance: Database.Database | null = null;
 
-export function open(path: string): void {
+let sharedMarketAttached = false;
+export function open(path: string, sharedMarketPath = ''): void {
+  sharedMarketAttached = sharedMarketPath !== '';
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   instance = new Database(path);
   instance.pragma('journal_mode = WAL');
@@ -416,6 +447,30 @@ export function open(path: string): void {
   // (delete wallet -> trades/balances cleaned) depend on this.
   instance.pragma('foreign_keys = ON');
   instance.exec(SCHEMA);
+  instance.exec(`
+    CREATE TABLE IF NOT EXISTS token_avatar_cache (
+      chain TEXT NOT NULL,
+      ca TEXT NOT NULL,
+      source_url TEXT,
+      attempt_url TEXT,
+      retry_at INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0,
+      image BLOB NOT NULL,
+      PRIMARY KEY (chain, ca)
+    );
+  `);
+  instance.exec(`
+    CREATE TABLE IF NOT EXISTS fomo_api_request_state (
+      fomo_user_id TEXT NOT NULL,
+      endpoint TEXT NOT NULL CHECK(endpoint IN ('positions', 'swaps')),
+      last_attempt_at INTEGER NOT NULL,
+      next_eligible_at INTEGER NOT NULL,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_outcome TEXT NOT NULL,
+      PRIMARY KEY (fomo_user_id, endpoint),
+      FOREIGN KEY (fomo_user_id) REFERENCES fomo_users(id) ON DELETE CASCADE
+    );
+  `);
   const alertTable = instance.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_metric_observations'",
   ).get() as { sql: string } | undefined;
@@ -632,6 +687,15 @@ export function open(path: string): void {
   // cadence phase is stable across both.
   if (getSetting('systemDeployAt') === undefined) setSetting('systemDeployAt', String(Date.now()));
   if (config.showFomo) backfillFomoEvmWalletGroups(instance);
+  if (sharedMarketPath !== '') {
+    instance.prepare('ATTACH DATABASE ? AS market_data').run(sharedMarketPath);
+    instance.exec(`
+      CREATE TEMP VIEW token_state AS SELECT * FROM market_data.token_state;
+      CREATE TEMP VIEW metric_poll_cache AS SELECT * FROM market_data.metric_poll_cache;
+      CREATE TEMP VIEW holder_snapshots AS SELECT * FROM market_data.holder_snapshots;
+      CREATE TEMP VIEW nansen_series AS SELECT * FROM market_data.nansen_series;
+    `);
+  }
 }
 function backfillFomoEvmWalletGroups(db: Database.Database): void {
   const rows = db
@@ -948,6 +1012,69 @@ export interface CaTarget {
   chain: Chain;
 }
 
+/** Replace one instance's active CA subscription snapshot in the gateway database. */
+export function replaceMarketSubscriptions(
+  caller: 'a' | 'b',
+  targets: readonly CaTarget[],
+  now = Date.now(),
+  ttlMs = 90_000,
+): CaTarget[] {
+  const db = getDb();
+  const clean = [...new Map(targets.map((target) => {
+    const address = canonicalCa(target.address, target.chain);
+    return [`${target.chain}:${address}`, { address, chain: target.chain }] as const;
+  })).values()];
+  const replace = db.transaction(() => {
+    db.prepare('DELETE FROM market_subscriptions WHERE expires_at <= ?').run(now);
+    db.prepare('DELETE FROM market_subscriptions WHERE caller = ?').run(caller);
+    const insert = db.prepare(
+      'INSERT INTO market_subscriptions (caller, ca, chain, expires_at) VALUES (?, ?, ?, ?)',
+    );
+    for (const target of clean) insert.run(caller, target.address, target.chain, now + ttlMs);
+    return reconcileMarketTrackedCas(now);
+  });
+  return replace();
+}
+
+/** Expire disconnected callers and return newly active tokens for an early poll. */
+export function expireMarketSubscriptions(now = Date.now()): CaTarget[] {
+  const db = getDb();
+  return db.transaction(() => {
+    db.prepare('DELETE FROM market_subscriptions WHERE expires_at <= ?').run(now);
+    return reconcileMarketTrackedCas(now);
+  })();
+}
+
+function reconcileMarketTrackedCas(now: number): CaTarget[] {
+  const db = getDb();
+  const desired = db.prepare(
+    'SELECT DISTINCT ca AS address, chain FROM market_subscriptions WHERE expires_at > ?',
+  ).all(now) as CaTarget[];
+  const current = db.prepare(
+    "SELECT address, chain FROM tracked_cas WHERE note = 'shared-market'",
+  ).all() as CaTarget[];
+  const currentKeys = new Set(current.map((target) => `${target.chain}:${target.address}`));
+  const desiredKeys = new Set(desired.map((target) => `${target.chain}:${target.address}`));
+  const added: CaTarget[] = [];
+  const insert = db.prepare(
+    `INSERT INTO tracked_cas (id, address, chain, note, added_at, status)
+     VALUES (?, ?, ?, 'shared-market', ?, 'queued')
+     ON CONFLICT(address, chain) DO UPDATE SET status = 'queued'`,
+  );
+  for (const target of desired) {
+    const key = `${target.chain}:${target.address}`;
+    if (!currentKeys.has(key)) {
+      insert.run(randomUUID(), target.address, target.chain, new Date(now).toISOString());
+      added.push(target);
+    }
+  }
+  const remove = db.prepare("DELETE FROM tracked_cas WHERE address = ? AND chain = ? AND note = 'shared-market'");
+  for (const target of current) {
+    if (!desiredKeys.has(`${target.chain}:${target.address}`)) remove.run(target.address, target.chain);
+  }
+  return added;
+}
+
 /**
  * Tracked CAs whose essential core never landed. `supply` is the write-once LF
  * denominator, so NULL means the essential pass has not reached the CA yet — it
@@ -988,22 +1115,19 @@ export function listCaTargetsMissingSymbol(withinMs: number): CaTarget[] {
 }
 
 /**
- * Tracked CAs with no icon yet — the DexScreener sweep's target set. Same shape
- * as listCaTargetsMissingSymbol, but the window is generous instead of
- * credit-driven: one keyless batch call covers ≤30 CAs, so a mint that never
- * resolves (no DEX pair → no icon) costs a re-ask, not credits.
+ * Active tracked CAs without an icon. Eligibility never expires: missing logos
+ * may become available upstream later, and metric_poll_cache controls retry cadence.
  */
-export function listCaTargetsMissingIcon(withinMs: number): CaTarget[] {
-  const since = new Date(Date.now() - withinMs).toISOString();
+export function listCaTargetsMissingIcon(): CaTarget[] {
   return getDb()
     .prepare(
       `SELECT t.address AS address, t.chain AS chain
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.chain = t.chain AND s.ca = t.address
-        WHERE t.status != 'inactive' AND s.icon_url IS NULL AND t.added_at >= ?
+        WHERE t.status != 'inactive' AND (s.icon_url IS NULL OR trim(s.icon_url) = '')
         ORDER BY t.added_at DESC`,
     )
-    .all(since) as CaTarget[];
+    .all() as CaTarget[];
 }
 
 export function findTrackedCa(address: string, chain: Chain, includeInactive = false): TrackedCaRow | undefined {
@@ -1130,10 +1254,13 @@ const FOMO_ACTIVE = `EXISTS (SELECT 1 FROM fomo_trades f
  */
 function sweepOrphanedCaData(): void {
   const db = getDb();
-  db.prepare(
-    `DELETE FROM token_state WHERE NOT EXISTS (
-       SELECT 1 FROM tracked_cas t WHERE t.address = token_state.ca AND t.chain = token_state.chain)`,
-  ).run();
+  if (!sharedMarketAttached) {
+    // In shared mode token_state is a gateway-owned TEMP VIEW, not an API-owned table.
+    db.prepare(
+      `DELETE FROM token_state WHERE NOT EXISTS (
+         SELECT 1 FROM tracked_cas t WHERE t.address = token_state.ca AND t.chain = token_state.chain)`,
+    ).run();
+  }
   // wallet_token_state IS chain-scoped (PK wallet_id, ca, chain) — match the same
   // (chain, ca) identity tracked_cas is unique on, otherwise a row for base:0xdup is
   // kept alive by an unrelated tracked CA that merely shares the address.
@@ -1340,10 +1467,7 @@ export function deleteTrackedCasByIds(ids: readonly string[]): number {
   db.transaction(() => {
     const del = db.prepare('DELETE FROM tracked_cas WHERE id = ?');
     for (const id of ids) deleted += del.run(id).changes;
-    db.prepare(
-      `DELETE FROM token_state WHERE NOT EXISTS (
-         SELECT 1 FROM tracked_cas t WHERE t.address = token_state.ca AND t.chain = token_state.chain)`,
-    ).run();
+    sweepOrphanedCaData();
   })();
   return deleted;
 }
@@ -1492,6 +1616,20 @@ export function getMetricPollCache(ca: string, chain: Chain, kind: string): Metr
     .get(canonicalCa(ca, chain), chain, kind) as MetricPollCacheRow | undefined;
 }
 
+/** Effective gate for a successful metric read under the current cadence.
+ * Shorter gini TTLs tighten old persisted gates; new reservations and failures
+ * retain their own next_allowed_at to preserve in-flight work and backoff. */
+export function metricPollNextAllowedAt(row: MetricPollCacheRow, intervalMs: number): number {
+  const hasUnreservedSuccess =
+    row.kind === 'gini' &&
+    row.failure_count === 0 &&
+    row.response_at !== null &&
+    row.last_attempt_at <= row.response_at;
+  return hasUnreservedSuccess
+    ? Math.min(row.next_allowed_at, row.response_at! + intervalMs)
+    : row.next_allowed_at;
+}
+
 /** Reserve a due query atomically before network I/O; repeated callers cannot burst. */
 export function reserveMetricPoll(
   ca: string,
@@ -1506,7 +1644,7 @@ export function reserveMetricPoll(
     const row = db
       .prepare('SELECT * FROM metric_poll_cache WHERE ca = ? AND chain = ? AND kind = ?')
       .get(canon, chain, kind) as MetricPollCacheRow | undefined;
-    if (row && now < row.next_allowed_at) return { claimed: false, row };
+    if (row && now < metricPollNextAllowedAt(row, intervalMs)) return { claimed: false, row };
     db.prepare(
       `INSERT INTO metric_poll_cache
          (ca, chain, kind, last_attempt_at, next_allowed_at, failure_count)
@@ -1561,7 +1699,7 @@ export function appendAlertMetricObservation(
   metric: AlertMetric,
   value: number,
   responseAt: number,
-  trackerBuyer?: { name: string; address: string },
+  trackerBuyer?: { name: string; address?: string },
 ): void {
   const canonical = canonicalCa(ca, chain);
   const state = db.prepare(`
@@ -1614,7 +1752,12 @@ export function appendAlertMetricObservation(
         ? (holdings.amount / state.supply) * 100
         : 0,
     ...(metric === 'trackerBuy' && trackerBuyer
-      ? { trackerBuyer: { name: trackerBuyer.name.slice(0, 128), address: trackerBuyer.address.slice(0, 128) } }
+      ? {
+        trackerBuyer: {
+          name: trackerBuyer.name.slice(0, 128),
+          ...(trackerBuyer.address === undefined ? {} : { address: trackerBuyer.address.slice(0, 128) }),
+        },
+      }
       : {}),
   };
   db.prepare(`
@@ -1646,6 +1789,81 @@ export function getAlertMetricObservations(afterId: number, limit: number): Aler
     responseAt: row.response_at,
     snapshot: JSON.parse(row.snapshot_json) as AlertMetricSnapshot,
   }));
+}
+
+/** Import shared Fresh/T100 events into this instance's independently acked feed. */
+export function importSharedAlertMetricObservations(limit = 500): number {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+    throw new Error('shared alert import limit must be an integer from 1 to 1000');
+  }
+  const db = getDb();
+  const attached = db.pragma('database_list') as { name: string }[];
+  if (!attached.some((database) => database.name === 'market_data')) return 0;
+  return db.transaction(() => {
+    const cursor = db.prepare(
+      'SELECT imported_id FROM shared_alert_metric_import_state WHERE singleton = 1',
+    ).get() as { imported_id: number };
+    const rows = db.prepare(`
+      SELECT id, ca, chain, metric, value, response_at
+      FROM market_data.alert_metric_observations
+      WHERE id > ? ORDER BY id LIMIT ?
+    `).all(cursor.imported_id, limit) as {
+      id: number;
+      ca: string;
+      chain: string;
+      metric: string;
+      value: number;
+      response_at: number;
+    }[];
+    const last = rows.at(-1);
+    if (last === undefined) return 0;
+    let imported = 0;
+    for (const row of rows) {
+      if ((row.metric !== 'fresh' && row.metric !== 't100') ||
+          !CHAINS.includes(row.chain as Chain) || !Number.isFinite(row.value)) continue;
+      appendAlertMetricObservation(
+        db, row.ca, row.chain as Chain, row.metric, row.value, row.response_at,
+      );
+      imported++;
+    }
+    db.prepare(
+      'UPDATE shared_alert_metric_import_state SET imported_id = ? WHERE singleton = 1',
+    ).run(last.id);
+    return imported;
+  })();
+}
+
+export function sharedAlertMetricImportCursor(): number {
+  return (getDb().prepare(
+    'SELECT imported_id FROM shared_alert_metric_import_state WHERE singleton = 1',
+  ).get() as { imported_id: number }).imported_id;
+}
+
+export type MarketAlertCaller = 'a' | 'b';
+
+/** Each dashboard has an independent source cursor; compact only after both import. */
+export function acknowledgeMarketAlertDelivery(caller: MarketAlertCaller, throughId: number): boolean {
+  if ((caller !== 'a' && caller !== 'b') || !Number.isSafeInteger(throughId) || throughId < 0) return false;
+  const db = getDb();
+  return db.transaction(() => {
+    const current = db.prepare(
+      'SELECT acknowledged_id FROM market_alert_delivery_cursors WHERE caller = ?',
+    ).get(caller) as { acknowledged_id: number } | undefined;
+    if (current === undefined || throughId < current.acknowledged_id) return false;
+    if (throughId === current.acknowledged_id) return true;
+    const highWatermark = db.prepare(
+      'SELECT COALESCE(MAX(id), 0) AS id FROM alert_metric_observations',
+    ).get() as { id: number };
+    if (throughId > highWatermark.id) return false;
+    db.prepare(
+      'UPDATE market_alert_delivery_cursors SET acknowledged_id = ? WHERE caller = ?',
+    ).run(throughId, caller);
+    const minimum = db.prepare(
+      'SELECT MIN(acknowledged_id) AS id FROM market_alert_delivery_cursors',
+    ).get() as { id: number };
+    db.prepare('DELETE FROM alert_metric_observations WHERE id <= ?').run(minimum.id);
+    return true;
+  })();
 }
 
 /** Ack only after Monitor has durably committed its cursor and outbox. */
@@ -2070,14 +2288,24 @@ export function getFomoTradeEnrichmentTarget(fomoUserId: string, eventId: string
 /** Fill only a still-unknown BUY amount; alert-provided tradeUsd stays authoritative. */
 export function updateFomoTradeUsd(fomoUserId: string, eventId: string, amount: number): boolean {
   if (!Number.isFinite(amount) || amount <= 0) return false;
-  const res = getDb()
-    .prepare(
+  const db = getDb();
+  return db.transaction(() => {
+    const res = db.prepare(
       `UPDATE fomo_trades
           SET trade_usd = ?
         WHERE fomo_user_id = ? AND event_id = ? AND type = 'buy' AND trade_usd IS NULL`,
-    )
-    .run(amount, fomoUserId, eventId);
-  return res.changes > 0;
+    ).run(amount, fomoUserId, eventId);
+    if (res.changes === 0) return false;
+    const trade = db.prepare(`
+      SELECT t.ca, t.chain, t.ts, u.handle
+      FROM fomo_trades t JOIN fomo_users u ON u.id = t.fomo_user_id
+      WHERE t.fomo_user_id = ? AND t.event_id = ?
+    `).get(fomoUserId, eventId) as { ca: string; chain: Chain; ts: number; handle: string };
+    appendAlertMetricObservation(db, trade.ca, trade.chain, 'trackerBuy', amount, trade.ts, {
+      name: trade.handle,
+    });
+    return true;
+  })();
 }
 
 // --- fomo wallet holdings ---------------------------------------------------
@@ -2137,77 +2365,7 @@ export function listFomoWalletsForUser(fomoUserId: string, chain: Chain): FomoUs
     .all(fomoUserId, chain) as FomoUserWalletRow[];
 }
 
-/** Distinct (user, CA, chain) the users have alerted on for actively tracked CAs. */
-export function listFomoAlertTargets(): { fomo_user_id: string; ca: string; chain: Chain }[] {
-  return getDb()
-    .prepare(
-      `SELECT DISTINCT t.fomo_user_id, t.ca, t.chain
-         FROM fomo_trades t
-         JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
-        WHERE c.status != 'inactive'`,
-    )
-    .all() as {
-      fomo_user_id: string;
-      ca: string;
-      chain: Chain;
-    }[];
-}
 
-export interface FomoApiBalanceRow {
-  fomo_user_id: string;
-  ca: string;
-  chain: Chain;
-  amount: number;
-  pct: number | null;
-  captured_at: number;
-}
-
-export interface FomoApiBalanceSnapshot {
-  fomo_user_id: string;
-  checked_at: number;
-  captured_at: number | null;
-  complete: boolean;
-  truncated: boolean;
-  available: boolean;
-}
-
-export function getFomoApiBalanceSnapshot(fomoUserId: string): FomoApiBalanceSnapshot | undefined {
-  const row = getDb().prepare('SELECT * FROM fomo_api_balance_snapshots WHERE fomo_user_id = ?').get(fomoUserId) as
-    | (Omit<FomoApiBalanceSnapshot, 'complete' | 'truncated' | 'available'> & {
-        complete: number;
-        truncated: number;
-        available: number;
-      })
-    | undefined;
-  return row === undefined ? undefined : {
-    ...row,
-    complete: row.complete !== 0,
-    truncated: row.truncated !== 0,
-    available: row.available !== 0,
-  };
-}
-
-export function upsertFomoApiBalanceSnapshot(input: FomoApiBalanceSnapshot): void {
-  getDb().prepare(
-    `INSERT INTO fomo_api_balance_snapshots
-       (fomo_user_id, checked_at, captured_at, complete, truncated, available)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(fomo_user_id) DO UPDATE SET checked_at=excluded.checked_at,
-       captured_at=COALESCE(excluded.captured_at, fomo_api_balance_snapshots.captured_at),
-       complete=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.complete ELSE excluded.complete END,
-       truncated=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.truncated ELSE excluded.truncated END,
-       available=CASE WHEN excluded.captured_at IS NULL THEN fomo_api_balance_snapshots.available ELSE excluded.available END`,
-  ).run(input.fomo_user_id, input.checked_at, input.captured_at, Number(input.complete), Number(input.truncated), Number(input.available));
-}
-
-export function upsertFomoApiBalance(input: FomoApiBalanceRow): void {
-  getDb().prepare(
-    `INSERT INTO fomo_api_holdings (fomo_user_id, ca, chain, amount, pct, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
-       amount=excluded.amount, pct=excluded.pct, captured_at=excluded.captured_at`,
-  ).run(input.fomo_user_id, canonicalCa(input.ca, input.chain), input.chain, input.amount, input.pct, input.captured_at);
-}
 
 export interface FomoHoldingInput {
   fomo_user_id: string;
@@ -2263,53 +2421,177 @@ export interface FomoPositionInput {
   fetched_at: number;
 }
 
-/** ONE row per (user, ca, chain) — a refresh overwrites. ca canonicalized. */
+/** Upsert one position; unknown API fields preserve the last known value. */
 export function upsertFomoPosition(input: FomoPositionInput): void {
-  getDb()
-    .prepare(
-      `INSERT INTO fomo_positions (fomo_user_id, ca, chain, trade_id, status, amount, cost_basis_usd,
-                                   avg_entry_price, price_usd, realized_pnl_usd, unrealized_pnl_usd, fetched_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
-         trade_id = excluded.trade_id, status = excluded.status, amount = excluded.amount,
-         cost_basis_usd = excluded.cost_basis_usd, avg_entry_price = excluded.avg_entry_price,
-         price_usd = excluded.price_usd, realized_pnl_usd = excluded.realized_pnl_usd,
-         unrealized_pnl_usd = excluded.unrealized_pnl_usd, fetched_at = excluded.fetched_at`,
-    )
-    .run(
-      input.fomo_user_id,
-      canonicalCa(input.ca, input.chain),
-      input.chain,
-      input.trade_id,
-      input.status,
-      input.amount,
-      input.cost_basis_usd,
-      input.avg_entry_price,
-      input.price_usd,
-      input.realized_pnl_usd,
-      input.unrealized_pnl_usd,
-      input.fetched_at,
-    );
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO fomo_positions (fomo_user_id, ca, chain, trade_id, status, amount, cost_basis_usd,
+                                 avg_entry_price, price_usd, realized_pnl_usd, unrealized_pnl_usd, fetched_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+       trade_id = COALESCE(excluded.trade_id, fomo_positions.trade_id),
+       status = COALESCE(excluded.status, fomo_positions.status),
+       amount = COALESCE(excluded.amount, fomo_positions.amount),
+       cost_basis_usd = COALESCE(excluded.cost_basis_usd, fomo_positions.cost_basis_usd),
+       avg_entry_price = COALESCE(excluded.avg_entry_price, fomo_positions.avg_entry_price),
+       price_usd = COALESCE(excluded.price_usd, fomo_positions.price_usd),
+       realized_pnl_usd = COALESCE(excluded.realized_pnl_usd, fomo_positions.realized_pnl_usd),
+       unrealized_pnl_usd = COALESCE(excluded.unrealized_pnl_usd, fomo_positions.unrealized_pnl_usd),
+       fetched_at = excluded.fetched_at
+     WHERE COALESCE(excluded.trade_id, fomo_positions.trade_id) IS NOT fomo_positions.trade_id
+        OR COALESCE(excluded.status, fomo_positions.status) IS NOT fomo_positions.status
+        OR COALESCE(excluded.amount, fomo_positions.amount) IS NOT fomo_positions.amount
+        OR COALESCE(excluded.cost_basis_usd, fomo_positions.cost_basis_usd) IS NOT fomo_positions.cost_basis_usd
+        OR COALESCE(excluded.avg_entry_price, fomo_positions.avg_entry_price) IS NOT fomo_positions.avg_entry_price
+        OR COALESCE(excluded.price_usd, fomo_positions.price_usd) IS NOT fomo_positions.price_usd
+        OR COALESCE(excluded.realized_pnl_usd, fomo_positions.realized_pnl_usd) IS NOT fomo_positions.realized_pnl_usd
+        OR COALESCE(excluded.unrealized_pnl_usd, fomo_positions.unrealized_pnl_usd) IS NOT fomo_positions.unrealized_pnl_usd`,
+  ).run(
+    input.fomo_user_id,
+    canonicalCa(input.ca, input.chain),
+    input.chain,
+    input.trade_id,
+    input.status,
+    input.amount,
+    input.cost_basis_usd,
+    input.avg_entry_price,
+    input.price_usd,
+    input.realized_pnl_usd,
+    input.unrealized_pnl_usd,
+    input.fetched_at,
+  );
   if (input.amount != null && input.amount > 0) {
     clearZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain);
   } else if ((input.amount != null && input.amount <= 0) || input.status === 'closed') {
     recordZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain, input.fetched_at);
   }
 }
-/** Distinct traders to refresh positions for: anyone with a trade on a CA still tracked. */
-export function listFomoPositionTargets(): { fomo_user_id: string; handle: string }[] {
-  return getDb()
-    .prepare(
-      `SELECT DISTINCT u.id AS fomo_user_id, u.handle AS handle
-         FROM fomo_users u
-         JOIN fomo_trades t ON t.fomo_user_id = u.id
-         JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
-        WHERE u.handle <> '' AND c.status != 'inactive'`,
-    )
-    .all() as { fomo_user_id: string; handle: string }[];
+
+export interface FomoPositionTarget {
+  ca: string;
+  chain: Chain;
 }
 
-// --- seed (mock mode only) -------------------------------------------------
+/** CAs the dashboard currently lists for one user, before the active-CAs filter. */
+export function listFomoPositionTargets(fomoUserId: string, now = Date.now()): FomoPositionTarget[] {
+  return getDb().prepare(
+    `SELECT DISTINCT targets.ca, targets.chain
+       FROM (
+         SELECT ca, chain FROM fomo_trades WHERE fomo_user_id = ? AND type = 'buy'
+         UNION
+         SELECT ca, chain FROM fomo_positions WHERE fomo_user_id = ? AND (cost_basis_usd > 0 OR amount > 0)
+       ) targets
+      WHERE NOT EXISTS (
+        SELECT 1 FROM zero_holdings zh
+         WHERE zh.member_type = 'fomo' AND zh.member_id = ?
+           AND zh.ca = targets.ca AND zh.chain = targets.chain
+           AND zh.zero_at <= ?
+      )`,
+  ).all(fomoUserId, fomoUserId, fomoUserId, now - 86_400_000) as FomoPositionTarget[];
+}
+
+/** Apply one complete per-user positions response to tracked dashboard pairs. */
+export function syncFomoPositionsSnapshot(
+  fomoUserId: string,
+  positions: readonly FomoPositionInput[],
+  checkedAt: number,
+): void {
+  const db = getDb();
+  const run = db.transaction(() => {
+    const dashboardCas = new Set(listTrackedCas().map((ca) => `${ca.chain}:${ca.address}`));
+    const incoming = new Map<string, FomoPositionInput>();
+    for (const position of positions) {
+      const ca = canonicalCa(position.ca, position.chain);
+      if (!dashboardCas.has(`${position.chain}:${ca}`)) continue;
+      incoming.set(`${position.chain}:${ca}`, { ...position, ca, fomo_user_id: fomoUserId });
+    }
+    const targets = new Map<string, FomoPositionTarget>();
+    for (const target of listFomoPositionTargets(fomoUserId, checkedAt)) {
+      const ca = canonicalCa(target.ca, target.chain);
+      if (dashboardCas.has(`${target.chain}:${ca}`)) targets.set(`${target.chain}:${ca}`, { ...target, ca });
+    }
+    for (const [key, position] of incoming) {
+      targets.set(key, { chain: position.chain, ca: position.ca });
+    }
+    for (const [key, target] of targets) {
+      const position = incoming.get(key);
+      upsertFomoPosition(position ?? {
+        fomo_user_id: fomoUserId,
+        ca: target.ca,
+        chain: target.chain,
+        trade_id: null,
+        status: 'closed',
+        amount: 0,
+        cost_basis_usd: null,
+        avg_entry_price: null,
+        price_usd: null,
+        realized_pnl_usd: null,
+        unrealized_pnl_usd: null,
+        fetched_at: checkedAt,
+      });
+    }
+    upsertFomoPositionSnapshot({ fomo_user_id: fomoUserId, checked_at: checkedAt });
+  });
+  run();
+}
+
+export interface FomoPositionSnapshot {
+  fomo_user_id: string;
+  checked_at: number;
+}
+
+export function upsertFomoPositionSnapshot(input: FomoPositionSnapshot): void {
+  getDb().prepare(
+    `INSERT INTO fomo_position_snapshots (fomo_user_id, checked_at)
+     VALUES (?, ?)
+     ON CONFLICT(fomo_user_id) DO UPDATE SET checked_at=excluded.checked_at`,
+  ).run(input.fomo_user_id, input.checked_at);
+}
+export function getFomoPositionSnapshot(fomoUserId: string): FomoPositionSnapshot | undefined {
+  return getDb()
+    .prepare('SELECT fomo_user_id, checked_at FROM fomo_position_snapshots WHERE fomo_user_id = ?')
+    .get(fomoUserId) as FomoPositionSnapshot | undefined;
+}
+
+export type FomoApiRequestEndpoint = 'positions' | 'swaps';
+export interface FomoApiRequestState {
+  fomo_user_id: string;
+  endpoint: FomoApiRequestEndpoint;
+  last_attempt_at: number;
+  next_eligible_at: number;
+  consecutive_failures: number;
+  last_outcome: string;
+}
+
+export function getFomoApiRequestState(
+  fomoUserId: string,
+  endpoint: FomoApiRequestEndpoint,
+): FomoApiRequestState | undefined {
+  return getDb()
+    .prepare('SELECT * FROM fomo_api_request_state WHERE fomo_user_id = ? AND endpoint = ?')
+    .get(fomoUserId, endpoint) as FomoApiRequestState | undefined;
+}
+
+export function saveFomoApiRequestState(input: FomoApiRequestState): void {
+  getDb().prepare(`
+    INSERT INTO fomo_api_request_state
+      (fomo_user_id, endpoint, last_attempt_at, next_eligible_at, consecutive_failures, last_outcome)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fomo_user_id, endpoint) DO UPDATE SET
+      last_attempt_at = excluded.last_attempt_at,
+      next_eligible_at = excluded.next_eligible_at,
+      consecutive_failures = excluded.consecutive_failures,
+      last_outcome = excluded.last_outcome
+  `).run(
+    input.fomo_user_id,
+    input.endpoint,
+    input.last_attempt_at,
+    input.next_eligible_at,
+    input.consecutive_failures,
+    input.last_outcome,
+  );
+}
+
 
 /** Mirrors frontend SEED_WALLETS (src/services/dataStore.ts): CT01..CT08. */
 const SEED_WALLETS: WalletInput[] = [

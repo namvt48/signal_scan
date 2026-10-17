@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import type { NansenThresholds, Settings, TelegramAlertRules } from '../types';
+import type { NansenThresholds, PeriodicScanSettings, Settings, TelegramAlertRules } from '../types';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors, setAllFactors as setAllFactorsFlag } from '../services/debugFlags';
-import { Button, Modal, TextField } from './ui';
+import { Button, Modal, Select, TextField } from './ui';
 import { SHOW_FOMO } from '../config';
 
 type ThresholdKey = keyof NansenThresholds;
@@ -92,7 +92,11 @@ function parse(d: Draft): { ok: true; values: NansenThresholds } | { ok: false; 
   return { ok: true, values };
 }
 
-export default function SettingsPanel({ onClose, onSaved }: { onClose: () => void; onSaved?: (settings: Settings) => void }) {
+export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
+  onClose: () => void;
+  onSaved?: (settings: Settings) => void;
+  fomo?: boolean;
+}) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const allFactors = useAllFactors();
@@ -103,6 +107,10 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
   const [telegramError, setTelegramError] = useState<string | null>(null);
   const [telegramSaved, setTelegramSaved] = useState(false);
   const [telegramSaving, setTelegramSaving] = useState(false);
+  const [scanDraft, setScanDraft] = useState<PeriodicScanSettings | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanSaved, setScanSaved] = useState(false);
+  const [scanSaving, setScanSaving] = useState(false);
 
   const renderField = (spec: FieldSpec) => {
     const grouped = spec.grouped === true;
@@ -158,13 +166,16 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
     }).catch((e: unknown) => {
       if (alive) setSignalError(e instanceof Error ? e.message : String(e));
     });
-    if (!SHOW_FOMO) {
-      dataStore.getTelegramAlertRules().then((rules) => {
-        if (alive) setTelegramDraft(rules);
-      }).catch((e: unknown) => {
-        if (alive) setTelegramError(e instanceof Error ? e.message : String(e));
-      });
-    }
+    (fomo ? dataStore.getFomoTelegramAlertRules() : dataStore.getTelegramAlertRules()).then((rules) => {
+      if (alive) setTelegramDraft(rules);
+    }).catch((e: unknown) => {
+      if (alive) setTelegramError(e instanceof Error ? e.message : String(e));
+    });
+    dataStore.getPeriodicScanSettings().then((scan) => {
+      if (alive) setScanDraft(scan);
+    }).catch((e: unknown) => {
+      if (alive) setScanError(e instanceof Error ? e.message : String(e));
+    });
     return () => {
       alive = false;
     };
@@ -210,13 +221,36 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
     setTelegramError(null);
     setTelegramSaved(false);
     try {
-      const next = await dataStore.updateTelegramAlertRules(telegramDraft);
+      const next = fomo
+        ? await dataStore.updateFomoTelegramAlertRules(telegramDraft)
+        : await dataStore.updateTelegramAlertRules(telegramDraft);
       setTelegramDraft(next);
       setTelegramSaved(true);
     } catch (err) {
       setTelegramError(err instanceof Error ? err.message : String(err));
     } finally {
       setTelegramSaving(false);
+    }
+  }
+  async function submitPeriodicScan(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!scanDraft) return;
+    if (![scanDraft.maxVolume24hUsd, scanDraft.maxLowFloatTokens].every((value) =>
+      Number.isFinite(value) && value >= 0)) {
+      setScanError('Scan thresholds must be finite numbers ≥ 0.');
+      setScanSaved(false);
+      return;
+    }
+    setScanSaving(true);
+    setScanError(null);
+    setScanSaved(false);
+    try {
+      setScanDraft(await dataStore.updatePeriodicScanSettings(scanDraft));
+      setScanSaved(true);
+    } catch (error) {
+      setScanError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setScanSaving(false);
     }
   }
 
@@ -227,7 +261,7 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
       wide
       className="max-h-[calc(100vh-2rem)] overflow-y-auto"
     >
-      <div className={`grid grid-cols-1 gap-4 ${SHOW_FOMO ? '' : 'lg:grid-cols-2'}`}>
+      <div className={`grid grid-cols-1 gap-4 ${fomo ? '' : 'lg:grid-cols-2'}`}>
         <section className="rounded-lg border border-line p-4" aria-labelledby="signal-thresholds-title">
           <h3 id="signal-thresholds-title" className="text-sm font-semibold text-ink">Signal thresholds</h3>
           {signalError && <p role="alert" className="mt-2 text-xs text-neg">{signalError}</p>}
@@ -284,46 +318,138 @@ export default function SettingsPanel({ onClose, onSaved }: { onClose: () => voi
           )}
         </section>
 
-        {!SHOW_FOMO && (
-          <section className="rounded-lg border border-line p-4" aria-labelledby="telegram-thresholds-title">
-            <h3 id="telegram-thresholds-title" className="text-sm font-semibold text-ink">Telegram alert thresholds</h3>
-            <p className="mt-1 text-xs text-muted">
-              Saved separately from signal thresholds. MC values are in K USD; -1 disables either bound. Tracker Buying is per-wallet BUY amount in USD; 0 disables it.
+        <section className="rounded-lg border border-line p-4" aria-labelledby="telegram-thresholds-title">
+          <h3 id="telegram-thresholds-title" className="text-sm font-semibold text-ink">
+            {fomo ? 'FOMO Telegram alert thresholds' : 'Telegram alert thresholds · Instance A'}
+          </h3>
+          {telegramError && <p role="alert" className="mt-2 text-xs text-neg">{telegramError}</p>}
+          {telegramSaved && (
+            <p role="status" className="mt-2 text-xs text-pos">
+              {fomo ? 'FOMO Telegram alert thresholds saved.' : 'Instance A Telegram alert thresholds saved.'}
             </p>
-            <p className="mt-1 text-xs text-muted">
-              FW alerts require current FW &gt;= Min FW and growth &gt; FW growth; the previous FW baseline may be below Min FW.
-            </p>
-            {telegramError && <p role="alert" className="mt-2 text-xs text-neg">{telegramError}</p>}
-            {telegramSaved && <p role="status" className="mt-2 text-xs text-pos">Telegram alert thresholds saved.</p>}
-            {!telegramDraft ? (
-              <p className="mt-3 text-xs text-muted">{telegramError ?? 'Loading Telegram thresholds…'}</p>
-            ) : (
-              <form onSubmit={(e) => void submitTelegramRules(e)} className="mt-3">
-                <div className="space-y-3">
+          )}
+          {!telegramDraft ? (
+            <p className="mt-3 text-xs text-muted">{telegramError ?? 'Loading Telegram thresholds…'}</p>
+          ) : (
+            <form onSubmit={(e) => void submitTelegramRules(e)} className="mt-3">
+              <div className="space-y-3">
+                <div>
+                  <p className="text-xs font-medium text-ink">Market cap filter · K USD</p>
+                  <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
+                  <div className="mt-2 grid grid-cols-2 gap-3">
+                    {renderTelegramField('minMcK', 'Min MC', -1)}
+                    {renderTelegramField('maxMcK', 'Max MC', -1)}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {renderTelegramField('fwGrowthPct', 'FW growth (%)')}
+                  {renderTelegramField('minFwPct', 'Min FW (%)', 0, 100)}
+                </div>
+                {renderTelegramField('t100GrowthPct', 'T100 growth (%)')}
+                {renderTelegramField('trackerBuyingK', 'Tracker Buying > (K USD)')}
+              </div>
+              <div className="mt-4 flex justify-end">
+                <Button type="submit" disabled={telegramSaving}>
+                  {telegramSaving ? 'Saving…' : fomo ? 'Save FOMO Telegram thresholds' : 'Save Telegram thresholds'}
+                </Button>
+              </div>
+            </form>
+          )}
+        </section>
+
+        <section className="rounded-lg border border-line p-4" aria-labelledby="periodic-scan-title">
+          <h3 id="periodic-scan-title" className="text-sm font-semibold text-ink">
+            Periodic Dashboard scan · Instance {fomo ? 'B' : 'A'}
+          </h3>
+          <p className="mt-1 text-xs text-muted">
+            Every {scanDraft?.intervalHours ?? 6} hours at {scanDraft ? Array.from(
+              { length: 24 / scanDraft.intervalHours },
+              (_, index) => `${String(index * scanDraft.intervalHours).padStart(2, '0')}:00`,
+            ).join(', ') : '00:00, 06:00, 12:00, 18:00'} UTC+7. Reports tokens only when both 24h volume and Low Float are below their limits.
+          </p>
+          {scanError && <p role="alert" className="mt-2 text-xs text-neg">{scanError}</p>}
+          {scanSaved && <p role="status" className="mt-2 text-xs text-pos">Periodic scan settings saved.</p>}
+          {!scanDraft ? (
+            <p className="mt-3 text-xs text-muted">{scanError ?? 'Loading periodic scan settings…'}</p>
+          ) : (
+            <form onSubmit={(e) => void submitPeriodicScan(e)} className="mt-3">
+              <div className="space-y-3">
+                <label htmlFor="periodic-scan-enabled" className="flex items-center gap-2 text-xs font-medium text-ink">
+                  <input
+                    id="periodic-scan-enabled"
+                    type="checkbox"
+                    checked={scanDraft.enabled}
+                    onChange={(e) => {
+                      setScanSaved(false);
+                      setScanDraft((draft) => draft ? { ...draft, enabled: e.target.checked } : draft);
+                    }}
+                    className="h-3.5 w-3.5 accent-accent"
+                  />
+                  Enable periodic Telegram report
+                </label>
+                <div>
+                  <label htmlFor="periodic-scan-interval" className="block text-xs font-medium text-ink">Scan every (hours)</label>
+                  <Select
+                    id="periodic-scan-interval"
+                    value={scanDraft.intervalHours}
+                    onChange={(e) => {
+                      setScanSaved(false);
+                      setScanDraft((draft) => draft ? { ...draft, intervalHours: Number(e.target.value) } : draft);
+                    }}
+                    className="mt-1.5 w-full"
+                  >
+                    {[1, 2, 3, 4, 6, 8, 12, 24].map((hours) => (
+                      <option key={hours} value={hours}>{hours}</option>
+                    ))}
+                  </Select>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div>
-                    <p className="text-xs font-medium text-ink">Market cap filter · K USD</p>
-                    <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
-                    <div className="mt-2 grid grid-cols-2 gap-3">
-                      {renderTelegramField('minMcK', 'Min MC', -1)}
-                      {renderTelegramField('maxMcK', 'Max MC', -1)}
-                    </div>
+                    <label htmlFor="periodic-scan-volume" className="block text-xs font-medium text-ink">24h volume below (USD)</label>
+                    <TextField
+                      id="periodic-scan-volume"
+                      type="text"
+                      inputMode="numeric"
+                      value={group(scanDraft.maxVolume24hUsd)}
+                      onChange={(e) => {
+                        setScanSaved(false);
+                        const value = regroup(e.target.value);
+                        setScanDraft((draft) => draft ? {
+                          ...draft,
+                          maxVolume24hUsd: value === '' ? Number.NaN : Number(value.replaceAll(',', '')),
+                        } : draft);
+                      }}
+                      className="mt-1.5"
+                    />
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    {renderTelegramField('fwGrowthPct', 'FW growth (%)')}
-                    {renderTelegramField('minFwPct', 'Min FW (%)', 0, 100)}
+                  <div>
+                    <label htmlFor="periodic-scan-low-float" className="block text-xs font-medium text-ink">Low Float below (tokens)</label>
+                    <TextField
+                      id="periodic-scan-low-float"
+                      type="text"
+                      inputMode="numeric"
+                      value={group(scanDraft.maxLowFloatTokens)}
+                      onChange={(e) => {
+                        setScanSaved(false);
+                        const value = regroup(e.target.value);
+                        setScanDraft((draft) => draft ? {
+                          ...draft,
+                          maxLowFloatTokens: value === '' ? Number.NaN : Number(value.replaceAll(',', '')),
+                        } : draft);
+                      }}
+                      className="mt-1.5"
+                    />
                   </div>
-                  {renderTelegramField('t100GrowthPct', 'T100 growth (%)')}
-                  {renderTelegramField('trackerBuyingK', 'Tracker Buying > (K USD)')}
                 </div>
-                <div className="mt-4 flex justify-end">
-                  <Button type="submit" disabled={telegramSaving}>
-                    {telegramSaving ? 'Saving…' : 'Save Telegram thresholds'}
-                  </Button>
-                </div>
-              </form>
-            )}
-          </section>
-        )}
+              </div>
+              <div className="mt-4 flex justify-end">
+                <Button type="submit" disabled={scanSaving}>
+                  {scanSaving ? 'Saving…' : 'Save periodic scan settings'}
+                </Button>
+              </div>
+            </form>
+          )}
+        </section>
       </div>
     </Modal>
   );

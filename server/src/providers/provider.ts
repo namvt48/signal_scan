@@ -81,7 +81,7 @@ export interface MetricPatch {
   liquidity?: number;
   deployedAt?: number;
   symbol?: string;
-  /** Token logo URL (DexScreener icon sweep) — validated https + host allowlist BEFORE storage. */
+  /** Token logo URL (DexScreener or GMGN) — validated https + host allowlist BEFORE storage. */
   iconUrl?: string;
   /** X (Twitter) handle from GMGN token/info (data.link.twitter_username), normalized to a bare
    * alnum/underscore handle — the FE builds https://x.com/<handle>, so junk is dropped, not stored. */

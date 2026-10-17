@@ -37,7 +37,7 @@ export interface SetupCacheEntry {
   t100_multiple?: number;
   anchor_at?: number;
   genesis_bal?: number;
-  /** Epoch ms we OBTAINED the gini/fresh% field — its own 6h TTL (isInfoFresh).
+  /** Epoch ms we OBTAINED the gini/fresh% field — its own 3h TTL (isInfoFresh).
    * Optional: absent at runtime means "never obtained" (stale); a legacy entry
    * gets it backfilled from `taken_at` once, at load time (parseEntry). */
   info_at?: number;
@@ -53,7 +53,7 @@ export interface SetupRetryState {
   misses: number;
   nextAt: number;
 }
-type SetupRetryField = 'info' | 'series' | 'lf';
+type SetupRetryField = 'series' | 'lf';
 let retries = new Map<string, SetupRetryState>();
 /** Entries strictly older than 7 × POLL_SETUP_MS are pruned (plan §4). */
 const PRUNE_AGE_FACTOR = 7;
@@ -196,6 +196,7 @@ export function loadSetupCache(file: string = config.setupCacheFile): Map<string
   const legacy = raw['version'] === LEGACY_FILE_VERSION;
   const items: unknown[] = raw['entries'];
   let skipped = 0;
+  let discardedFreshRetry = false;
   for (const item of items) {
     const e = parseEntry(item, legacy);
     if (e) entries.set(cacheKey(e.ca, e.chain), e);
@@ -206,13 +207,61 @@ export function loadSetupCache(file: string = config.setupCacheFile): Map<string
       const state = parseRetryState(value);
       const split = key.indexOf(':');
       const field = key.slice(key.lastIndexOf(':') + 1);
-      if (state && isChain(key.slice(0, split)) && key.lastIndexOf(':') > split + 1 &&
-        (field === 'info' || field === 'series' || field === 'lf')) retries.set(key, state);
+      if (state && isChain(key.slice(0, split)) && key.lastIndexOf(':') > split + 1 && field === 'info') {
+        discardedFreshRetry = true;
+      } else if (state && isChain(key.slice(0, split)) && key.lastIndexOf(':') > split + 1 &&
+        (field === 'series' || field === 'lf')) retries.set(key, state);
       else skipped += 1;
     }
   }
   if (skipped > 0) log.warn(`[setup-cache] skipped ${skipped} malformed entries/retries in ${file}`);
+  if (discardedFreshRetry) persist();
   return entries;
+}
+
+/** Merge legacy per-instance caches into the gateway-owned cache before cutover. */
+export function mergeSetupCacheFiles(sourceFiles: readonly string[], destination = config.setupCacheFile): number {
+  const mergedEntries = new Map<string, SetupCacheEntry>();
+  const mergedRetries = new Map<string, SetupRetryState>();
+  for (const file of [destination, ...sourceFiles]) {
+    const loadedEntries = loadSetupCache(file);
+    for (const entry of loadedEntries.values()) {
+      const key = cacheKey(entry.ca, entry.chain);
+      const current = mergedEntries.get(key);
+      if (current === undefined) {
+        mergedEntries.set(key, entry);
+      } else {
+        const currentSeriesAt = current.series_at ?? 0;
+        const entrySeriesAt = entry.series_at ?? 0;
+        const series = entrySeriesAt > currentSeriesAt ? entry : current;
+        mergedEntries.set(key, {
+          ...current,
+          taken_at: Math.max(current.taken_at, entry.taken_at),
+          info_at: Math.max(current.info_at ?? 0, entry.info_at ?? 0) || undefined,
+          series_at: Math.max(currentSeriesAt, entrySeriesAt) || undefined,
+          window: series.window,
+          ...(series.series_from === undefined ? {} : { series_from: series.series_from }),
+          series: series.series,
+          exchange: series.exchange,
+          ...(series.t100_pct === undefined ? {} : { t100_pct: series.t100_pct }),
+          ...(series.t100_multiple === undefined ? {} : { t100_multiple: series.t100_multiple }),
+          ...(series.anchor_at === undefined ? {} : { anchor_at: series.anchor_at }),
+          ...(series.genesis_bal === undefined ? {} : { genesis_bal: series.genesis_bal }),
+          ...(series.lf_rule === undefined ? {} : { lf_rule: series.lf_rule }),
+        });
+      }
+    }
+    for (const [key, state] of retries) {
+      const current = mergedRetries.get(key);
+      if (current === undefined || state.nextAt > current.nextAt) mergedRetries.set(key, state);
+    }
+  }
+  activeFile = destination;
+  entries = mergedEntries;
+  retries = mergedRetries;
+  loaded = true;
+  persist();
+  return entries.size;
 }
 export function getSetupRetry(ca: string, chain: Chain, field: SetupRetryField): SetupRetryState | undefined {
   ensureLoaded();

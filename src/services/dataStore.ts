@@ -1,4 +1,4 @@
-import { EVM_CHAINS, CHAINS, type Chain, type FomoUser, type NansenThresholds, type Settings, type SettingsPatch, type TelegramAlertRules, type Tier, type TokenSignal, type Wallet, type WalletScope } from '../types';
+import { EVM_CHAINS, CHAINS, type Chain, type FomoUser, type NansenThresholds, type PeriodicScanSettings, type Settings, type SettingsPatch, type TelegramAlertRules, type Tier, type TokenSignal, type Wallet, type WalletScope } from '../types';
 import { SHOW_FOMO } from '../config';
 import { restDataStore } from './restDataStore';
 
@@ -53,11 +53,15 @@ export interface DataStore {
   updateFomoUser(id: string, patch: Partial<Omit<FomoUser, 'id'>>): Promise<FomoUser>;
   deleteFomoUser(id: string): Promise<void>;
   importFomoUsers(rows: FomoImportRow[]): Promise<ImportResult>;
-  listSignals(allFactors?: boolean): Promise<TokenSignal[]>;
+  listSignals(allFactors?: boolean, signal?: AbortSignal): Promise<TokenSignal[]>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
   getTelegramAlertRules(): Promise<TelegramAlertRules>;
   updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules>;
+  getFomoTelegramAlertRules(): Promise<TelegramAlertRules>;
+  updateFomoTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules>;
+  getPeriodicScanSettings(): Promise<PeriodicScanSettings>;
+  updatePeriodicScanSettings(settings: PeriodicScanSettings): Promise<PeriodicScanSettings>;
   setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void>;
   setNote(ca: string, chain: Chain, note: string): Promise<void>;
 }
@@ -590,6 +594,8 @@ export const localDataStore: DataStore = {
     return SEED_SIGNALS.map((s) => ({ ...s, note: notes[`${s.chain}:${s.ca}`] ?? '', tier: tiers[`${s.chain}:${s.ca}`] ?? s.tier ?? null }));
   },
 
+
+
   async getSettings(): Promise<Settings> {
     return { values: readThresholds(), defaults: { ...DEFAULT_THRESHOLDS }, debug: readDebug() };
   },
@@ -625,6 +631,43 @@ export const localDataStore: DataStore = {
   async updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
     localStorage.setItem('signal_scan:telegram-alert-rules', JSON.stringify(rules));
     return rules;
+  },
+
+  async getFomoTelegramAlertRules(): Promise<TelegramAlertRules> {
+    const raw = localStorage.getItem('signal_scan:fomo-telegram-alert-rules');
+    if (!raw) return this.getTelegramAlertRules();
+    const values = JSON.parse(raw) as Partial<TelegramAlertRules>;
+    const minMcK = num(values.minMcK, -1);
+    const maxMcK = num(values.maxMcK, -1);
+    const validRange = minMcK < 0 || maxMcK < 0 || minMcK <= maxMcK;
+    return {
+      fwGrowthPct: num(values.fwGrowthPct, 30),
+      minFwPct: num(values.minFwPct, 15),
+      t100GrowthPct: num(values.t100GrowthPct, 30),
+      minMcK: validRange && (minMcK === -1 || minMcK >= 0) ? minMcK : -1,
+      maxMcK: validRange && (maxMcK === -1 || maxMcK >= 0) ? maxMcK : -1,
+      trackerBuyingK: num(values.trackerBuyingK, 0),
+    };
+  },
+
+  async updateFomoTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
+    localStorage.setItem('signal_scan:fomo-telegram-alert-rules', JSON.stringify(rules));
+    return rules;
+  },
+  async getPeriodicScanSettings(): Promise<PeriodicScanSettings> {
+    const raw = localStorage.getItem('signal_scan:periodic-scan');
+    const values = raw ? JSON.parse(raw) as Partial<PeriodicScanSettings> : {};
+    return {
+      enabled: typeof values.enabled === 'boolean' ? values.enabled : true,
+      intervalHours: [1, 2, 3, 4, 6, 8, 12, 24].includes(values.intervalHours ?? NaN) ? values.intervalHours! : 6,
+      maxVolume24hUsd: num(values.maxVolume24hUsd, 300_000),
+      maxLowFloatTokens: num(values.maxLowFloatTokens, 69_000_000),
+    };
+  },
+
+  async updatePeriodicScanSettings(settings: PeriodicScanSettings): Promise<PeriodicScanSettings> {
+    localStorage.setItem('signal_scan:periodic-scan', JSON.stringify(settings));
+    return settings;
   },
 
   async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {

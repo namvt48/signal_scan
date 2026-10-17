@@ -20,6 +20,8 @@ export const GW_NANSEN_CREDIT_PATH = '/v1/nansen/credit';
 export const GW_NANSEN_DOOR_PATH = '/v1/nansen/door';
 export const GW_GMGN_TOKEN_INFO_PATH = '/v1/gmgn/token-info';
 export const GW_DEXSCREENER_PATH = '/v1/dexscreener';
+export const GW_MARKET_SUBSCRIPTIONS_PATH = '/v1/market/subscriptions';
+export const GW_MARKET_ALERT_ACK_PATH = '/v1/market/alerts/ack';
 
 /** Header the gateway sets on a 503 gate denial (mirror of gateway/contract.ts GATED_HEADER). */
 const GATED_HEADER = 'x-gateway-gated-until';

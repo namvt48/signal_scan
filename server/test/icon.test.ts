@@ -54,6 +54,9 @@ test('validatedIconUrl: https + allowlisted host passes; everything else is unde
   assert.equal(validatedIconUrl('https://cdn.dexscreener.com/cms/images/x'), 'https://cdn.dexscreener.com/cms/images/x');
   // Subdomain of an allowlisted host is allowed (dot-anchored suffix match).
   assert.equal(validatedIconUrl('https://img.cdn.dexscreener.com/x'), 'https://img.cdn.dexscreener.com/x');
+  assert.equal(validatedIconUrl('https://gmgn.ai/external-res/logo.webp'), 'https://gmgn.ai/external-res/logo.webp');
+  assert.equal(validatedIconUrl('https://cdn.gmgn.ai/external-res/logo.webp'), 'https://cdn.gmgn.ai/external-res/logo.webp');
+  assert.equal(validatedIconUrl('https://gmgn.ai.evil.tld/logo.webp'), undefined, 'GMGN suffix-lookalikes must be rejected');
   assert.equal(validatedIconUrl('http://cdn.dexscreener.com/x'), undefined, 'non-https must be rejected');
   assert.equal(validatedIconUrl('https://evil.example.com/x.png'), undefined, 'off-allowlist host must be rejected');
   assert.equal(validatedIconUrl('https://cdn.dexscreener.com.evil.tld/x'), undefined, 'suffix-lookalike host must be rejected');
@@ -137,9 +140,9 @@ before(() => {
 });
 
 test('listCaTargetsMissingIcon: only icon-less tracked CAs, and the set empties once written', () => {
-  assert.deepEqual(listCaTargetsMissingIcon(WINDOW_MS).map((c) => c.address), ['caNoIcon']);
+  assert.deepEqual(listCaTargetsMissingIcon().map((c) => c.address), ['caNoIcon']);
   updateTokenMetrics('caNoIcon', 'sol', { iconUrl: 'https://cdn.dexscreener.com/cms/images/late' });
-  assert.deepEqual(listCaTargetsMissingIcon(WINDOW_MS), []);
+  assert.deepEqual(listCaTargetsMissingIcon(), []);
 });
 
 test('icon_url patch does not clobber sibling columns (per-endpoint write isolation)', () => {
@@ -153,19 +156,19 @@ test('icon_url patch does not clobber sibling columns (per-endpoint write isolat
   assert.equal(row.symbol, 'ICO');
 });
 
-test('listCaTargetsMissingIcon: a CA older than the window drops out even with icon_url NULL', () => {
+test('listCaTargetsMissingIcon: a CA older than the original window remains eligible for GMGN retry', () => {
   insertTrackedCa({ address: 'caAncient', chain: 'sol', note: '', entryUsd: 100 });
   const old = new Date(Date.now() - 2 * WINDOW_MS).toISOString();
   getDb().prepare('UPDATE tracked_cas SET added_at = ? WHERE address = ?').run(old, 'caAncient');
-  assert.deepEqual(listCaTargetsMissingIcon(WINDOW_MS), [], 'expired CA must not be retried forever');
+  assert.deepEqual(listCaTargetsMissingIcon().map((ca) => ca.address), ['caAncient']);
 });
 
-test('assembleSignals: iconUrl surfaces in the DTO when stored, absent when NULL', () => {
+test('assembleSignals: iconUrl always resolves to the CA-keyed avatar endpoint', () => {
   insertTrackedCa({ address: 'caDtoNoIcon', chain: 'sol', note: '', entryUsd: 100 });
   const sigs = assembleSignals();
   const withIcon = sigs.find((s) => s.ca === 'caIcon');
-  assert.equal(withIcon?.iconUrl, 'https://cdn.dexscreener.com/cms/images/refreshed');
+  assert.equal(withIcon?.iconUrl, '/api/token-avatar/sol/caIcon');
   const noIcon = sigs.find((s) => s.ca === 'caDtoNoIcon');
   assert.ok(noIcon, 'the icon-less CA must still be listed');
-  assert.equal('iconUrl' in (noIcon as object), false, 'NULL icon_url must omit the key, not emit null');
+  assert.equal(noIcon?.iconUrl, '/api/token-avatar/sol/caDtoNoIcon');
 });

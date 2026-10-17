@@ -1,11 +1,18 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getDb, insertTrackedCa, insertWallet, open } from '../src/db.js';
-import { kickWallet, kickWalletHoldingsFor, pacedFor, setPollerDeps, walletSweep } from '../src/poller.js';
+import { getDb, insertFomoTrade, insertFomoUser, insertTrackedCa, insertWallet, open, upsertFomoPosition } from '../src/db.js';
+import { fomoHoldingsIdle, fomoPositionCooldownRefreshIdle, kickFomoPositions, kickWallet, kickWalletHoldingsFor, pacedFor, setPollerDeps, walletSweep } from '../src/poller.js';
+import { config } from '../src/config.js';
 import { insertTrades, replaceWalletBalances, updateTokenMetrics } from '../src/ingest.js';
 import type { MarketDataProvider } from '../src/providers/provider.js';
 
 let walletId = '';
+
+function fomoHealthResponse(): Response {
+  return new Response(JSON.stringify({
+    components: { api: { status: 'operational' }, liveData: { status: 'operational' } },
+  }), { status: 200 });
+}
 
 before(() => {
   open(':memory:');
@@ -52,6 +59,40 @@ test('walletSweep: writes holdings for linked wallets only, never queries the re
     undefined,
     'unlinked wallet got a holdings row',
   );
+});
+
+test('walletSweep does not refresh FOMO balances or positions for previously alerted users', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldKey = config.fomoApiKey;
+  const user = insertFomoUser({ handle: 'event-only-sweep', name: 'Event only' });
+  insertTrackedCa({ address: 'FOMO-SWEEP-CA', chain: 'base', note: 'test' });
+  insertFomoTrade({
+    fomo_user_id: user.id,
+    event_id: 'fomo-sweep-existing-alert',
+    ca: 'FOMO-SWEEP-CA',
+    chain: 'base',
+    type: 'buy',
+    ts: Date.now(),
+  });
+  let fomoApiCalls = 0;
+  config.fomoApiKey = 'test-key';
+  globalThis.fetch = (async () => {
+    fomoApiCalls += 1;
+    throw new Error('walletSweep must not call FOMO API');
+  }) as typeof fetch;
+  try {
+    const provider: MarketDataProvider = {
+      name: 'nansen',
+      tokenInfo: async () => { throw new Error('unused'); },
+      metric: async () => ({}),
+      walletTokenHoldings: async () => [],
+    };
+    await walletSweep(provider);
+    assert.equal(fomoApiCalls, 0, 'scheduled native wallet sweep must not requery FOMO users');
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+  }
 });
 
 // The on-demand sibling caller: a user-triggered wallet kick writes the same
@@ -180,4 +221,247 @@ test("kickWalletHoldingsFor: reads only the CAs' linked wallets, coalesces per c
   assert.equal(calls.filter((a) => a === 'hold-addr').length, 1, 'a second kick for the same chain must coalesce');
   assert.equal(calls.filter((a) => a === 'idle-addr').length, 0, 'a wallet with no watch BUY link must not be queried');
   assert.equal(calls.filter((a) => a === 'hold-base').length, 1, 'the base kick fires exactly once');
+});
+
+test('FOMO alert batch refreshes every tracked user position from one response', async () => {
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-batch', user_id: 'stable-fomo-id', name: 'Positions batch' });
+  const caA = 'FOMO-BATCH-A';
+  const caB = 'FOMO-BATCH-B';
+  const caC = 'FOMO-BATCH-C';
+  const unrelatedCa = 'FOMO-BATCH-UNRELATED';
+  for (const address of [caA, caB, caC, unrelatedCa]) insertTrackedCa({ address, chain: 'sol', note: 'test' });
+  const tsA = Date.now() - 1_000;
+  const tsB = tsA + 100;
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'batch-buy-a', ca: caA, chain: 'sol', type: 'buy', ts: tsA });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'batch-buy-b', ca: caB, chain: 'sol', type: 'buy', ts: tsB });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'batch-buy-c', ca: caC, chain: 'sol', type: 'buy', ts: tsB });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo.test';
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    paths.push(path);
+    if (path.endsWith('/status')) return fomoHealthResponse();
+    if (path.endsWith('/positions')) {
+      return new Response(JSON.stringify({ trades: [
+        { chain: 'solana', token: { address: caA }, tradeId: 'position-a', status: 'open', amount: 11 },
+        { chain: 'solana', token: { address: caB }, tradeId: 'position-b', status: 'open', amount: 22 },
+      ] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ swaps: [
+      { chain: 'solana', at: tsA + 50, tradeIdOut: 'position-a', tokenIn: { address: 'USDC', usd: 25 }, tokenOut: { address: caA, usd: 25 } },
+      { chain: 'solana', at: tsB + 50, tradeIdOut: 'position-b', tokenIn: { address: 'USDC', usd: 31 }, tokenOut: { address: caB, usd: 31 } },
+    ] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    kickFomoPositions(user.id, user.handle, 'batch-buy-a', user.user_id ?? undefined);
+    kickFomoPositions(user.id, user.handle, 'batch-buy-b', user.user_id ?? undefined);
+    await fomoHoldingsIdle();
+    assert.equal(paths.filter((path) => path.endsWith('/positions')).length, 1);
+    assert.equal(paths.filter((path) => path.includes('/swaps?')).length, 1);
+    assert.equal(paths.some((path) => path.includes('/v2/users/stable-fomo-id/positions')), true);
+    assert.equal(getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('batch-buy-a')?.trade_usd, 25);
+    assert.equal(getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('batch-buy-b')?.trade_usd, 31);
+    assert.equal(getDb().prepare('SELECT amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caA)?.amount, 11);
+    assert.equal(getDb().prepare('SELECT amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caB)?.amount, 22);
+    assert.deepEqual(
+      getDb().prepare('SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caC),
+      { amount: 0, status: 'closed' },
+      'a previously tracked CA omitted from the complete positions page is recorded as no current holding',
+    );
+    assert.equal(getDb().prepare('SELECT 1 FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, unrelatedCa), undefined);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
+  }
+});
+test('FOMO unavailable positions preserves last good amount and persists alert-trigger backoff', async () => {
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-unavailable', name: 'Positions unavailable' });
+  const ca = 'FOMO-UNAVAILABLE-CA';
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  const previousFetchedAt = Date.now() - 10_000;
+  upsertFomoPosition({
+    fomo_user_id: user.id,
+    ca,
+    chain: 'sol',
+    trade_id: 'last-good',
+    status: 'open',
+    amount: 44,
+    cost_basis_usd: 10,
+    avg_entry_price: 0.2,
+    price_usd: 0.3,
+    realized_pnl_usd: 0,
+    unrealized_pnl_usd: 1,
+    fetched_at: previousFetchedAt,
+  });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo.test';
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    paths.push(String(input));
+    return new Response(JSON.stringify({ available: false, trades: [] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    kickFomoPositions(user.id, user.handle);
+    await fomoHoldingsIdle();
+    const row = getDb().prepare(
+      'SELECT amount, fetched_at FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+    ).get(user.id, ca, 'sol') as { amount: number; fetched_at: number };
+    assert.deepEqual(row, { amount: 44, fetched_at: previousFetchedAt });
+    assert.equal(getDb().prepare('SELECT 1 FROM fomo_position_snapshots WHERE fomo_user_id = ?').get(user.id), undefined);
+    const requestState = getDb().prepare(
+      'SELECT last_outcome, consecutive_failures, next_eligible_at FROM fomo_api_request_state WHERE fomo_user_id = ? AND endpoint = ?',
+    ).get(user.id, 'positions') as { last_outcome: string; consecutive_failures: number; next_eligible_at: number };
+    assert.equal(requestState.last_outcome, 'no_data');
+    assert.equal(requestState.consecutive_failures, 0);
+    assert.ok(requestState.next_eligible_at > Date.now());
+    kickFomoPositions(user.id, user.handle);
+    await fomoHoldingsIdle();
+    assert.equal(paths.filter((path) => path.endsWith('/positions')).length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
+  }
+});
+test('FOMO transient failures persist Retry-After backoff between alerts', async () => {
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-retry-after', name: 'Retry after' });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo-retry-after.test';
+  let paidAttempts = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    if (String(input).endsWith('/status')) return fomoHealthResponse();
+    paidAttempts++;
+    return new Response('temporarily unavailable', {
+      status: 503,
+      headers: { 'retry-after': '120' },
+    });
+  }) as typeof fetch;
+  try {
+    const startedAt = Date.now();
+    kickFomoPositions(user.id, user.handle);
+    await fomoHoldingsIdle();
+    const state = getDb().prepare(
+      'SELECT last_outcome, consecutive_failures, next_eligible_at FROM fomo_api_request_state WHERE fomo_user_id = ? AND endpoint = ?',
+    ).get(user.id, 'positions') as { last_outcome: string; consecutive_failures: number; next_eligible_at: number };
+    assert.equal(state.last_outcome, 'http_error');
+    assert.equal(state.consecutive_failures, 1);
+    assert.ok(state.next_eligible_at >= startedAt + 120_000);
+    kickFomoPositions(user.id, user.handle);
+    await fomoHoldingsIdle();
+    assert.equal(paidAttempts, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
+  }
+});
+test('FOMO alert in cooldown resolves BUY immediately and gets one trailing positions refresh', async () => {
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-cooldown', name: 'Positions cooldown' });
+  const ca = 'FOMO-COOLDOWN-CA';
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo.test';
+  const paths: string[] = [];
+  let positionCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    paths.push(path);
+    if (path.endsWith('/positions')) {
+      positionCalls++;
+      return new Response(JSON.stringify({ trades: [
+        { chain: 'solana', token: { address: ca }, tradeId: positionCalls === 1 ? 'old-position-id' : 'new-position-id', status: 'open', amount: positionCalls },
+      ] }), { status: 200 });
+    }
+    const ts = getDb().prepare('SELECT ts FROM fomo_trades WHERE event_id = ?').get('cooldown-buy')?.ts as number;
+    return new Response(JSON.stringify({ swaps: [
+      { chain: 'solana', at: ts + 50, tradeIdOut: 'new-position-id', tokenIn: { address: 'USDC', usd: 42 }, tokenOut: { address: ca, usd: 42 } },
+    ] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    kickFomoPositions(user.id, user.handle);
+    await fomoHoldingsIdle();
+    getDb().prepare('UPDATE fomo_position_snapshots SET checked_at = ? WHERE fomo_user_id = ?')
+      .run(Date.now() - 50_000, user.id);
+    const previousCheckedAt = getDb().prepare('SELECT checked_at FROM fomo_position_snapshots WHERE fomo_user_id = ?').get(user.id)?.checked_at as number;
+    const ts = Date.now();
+    insertFomoTrade({ fomo_user_id: user.id, event_id: 'cooldown-buy', ca, chain: 'sol', type: 'buy', ts });
+    kickFomoPositions(user.id, user.handle, 'cooldown-buy');
+    await fomoHoldingsIdle();
+    assert.equal(positionCalls, 1, 'the in-cooldown alert does not spend a positions request immediately');
+    assert.equal(paths.filter((path) => path.includes('/swaps?')).length, 1);
+    assert.equal(getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('cooldown-buy')?.trade_usd, 42);
+
+    await fomoPositionCooldownRefreshIdle();
+    assert.equal(positionCalls, 2, 'one trailing request runs after cooldown even with no later alerts');
+    assert.equal(getDb().prepare('SELECT amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, ca)?.amount, 2);
+    assert.ok((getDb().prepare('SELECT checked_at FROM fomo_position_snapshots WHERE fomo_user_id = ?').get(user.id)?.checked_at as number) > previousCheckedAt);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
+  }
+});
+test('FOMO alert batches for other users proceed while one user is blocked', async () => {
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const oldFetch = globalThis.fetch;
+  const blockedUser = insertFomoUser({ handle: 'blocked-user', name: 'Blocked user' });
+  const freeUser = insertFomoUser({ handle: 'free-user', name: 'Free user' });
+  const ca = 'FOMO-FREE-USER';
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  insertFomoTrade({ fomo_user_id: freeUser.id, event_id: 'free-user-buy', ca, chain: 'sol', type: 'buy', ts: Date.now() });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo.test';
+  let unblockFetch!: (response: Response) => void;
+  const blockedResponse = new Promise<Response>((resolve) => { unblockFetch = resolve; });
+  let notifyBlockedFetch!: () => void;
+  const blockedFetchStarted = new Promise<void>((resolve) => { notifyBlockedFetch = resolve; });
+  let notifyFreeSwaps!: () => void;
+  const freeSwapsStarted = new Promise<void>((resolve) => { notifyFreeSwaps = resolve; });
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    if (path.includes('/blocked-user/positions')) {
+      notifyBlockedFetch();
+      return blockedResponse;
+    }
+    if (path.includes('/free-user/positions')) return new Response(JSON.stringify({ trades: [] }), { status: 200 });
+    if (path.includes('/free-user/swaps')) {
+      notifyFreeSwaps();
+      return new Response(JSON.stringify({ swaps: [] }), { status: 200 });
+    }
+    throw new Error(`unexpected FOMO endpoint ${path}`);
+  }) as typeof fetch;
+  let idle: Promise<void> | undefined;
+  try {
+    kickFomoPositions(blockedUser.id, blockedUser.handle);
+    kickFomoPositions(freeUser.id, freeUser.handle, 'free-user-buy');
+    idle = fomoHoldingsIdle();
+    await blockedFetchStarted;
+    // Exercise the real five-second batch timer; this clock timeout only bounds a failed isolation assertion.
+    const unrelatedStarted = await Promise.race([
+      freeSwapsStarted.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+    ]);
+    assert.equal(unrelatedStarted, true, 'one slow user must not serialize another user batch');
+  } finally {
+    unblockFetch(new Response(JSON.stringify({ trades: [] }), { status: 200 }));
+    if (idle !== undefined) await idle;
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
+  }
 });

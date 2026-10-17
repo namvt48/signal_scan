@@ -4,7 +4,8 @@ import { dirname } from 'node:path';
 import type { AlertMetricObservation } from '../alert-feed.js';
 import { DEFAULT_TELEGRAM_ALERT_RULES, type TelegramAlertRules } from '../telegram-alert-settings.js';
 import type { TelegramAlert } from './telegram.js';
-import type { HistorySeries, MetricSample, MonitorSnapshot, ServiceSample } from './types.js';
+import { isSuppressedTelegramAlert } from './alert-policy.js';
+import type { FomoApiSample, HistorySeries, MetricSample, MonitorSnapshot, ServiceSample } from './types.js';
 
 
 interface MetricRow {
@@ -34,6 +35,10 @@ interface ServiceRow {
   ts: number;
 }
 
+interface FomoApiSampleRow extends FomoApiSample {
+  ts: number;
+}
+
 interface UsageRow {
   provider: string;
   metric_key: string;
@@ -45,6 +50,8 @@ interface UsageRow {
 interface PendingTelegramAlert {
   alertId: string;
   attempts: number;
+  sentParts: number;
+  deliveryMode: 'photo' | 'text';
   payload: TelegramAlert;
 }
 
@@ -103,6 +110,7 @@ export class MonitorStore {
         ca TEXT NOT NULL,
         metric TEXT NOT NULL,
         value REAL NOT NULL,
+        previous_value REAL,
         PRIMARY KEY (source, chain, ca, metric)
       );
       CREATE TABLE IF NOT EXISTS telegram_alert_outbox (
@@ -113,9 +121,38 @@ export class MonitorStore {
         attempts INTEGER NOT NULL DEFAULT 0,
         sent_at INTEGER,
         last_error TEXT,
-        delivery_state TEXT NOT NULL DEFAULT 'pending'
+        delivery_state TEXT NOT NULL DEFAULT 'pending',
+        sent_parts INTEGER NOT NULL DEFAULT 0,
+        delivery_mode TEXT NOT NULL DEFAULT 'photo'
       );
+      CREATE TABLE IF NOT EXISTS fomo_api_samples (
+        id INTEGER PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        instance TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        operations INTEGER NOT NULL,
+        attempted_operations INTEGER NOT NULL,
+        attempts INTEGER NOT NULL,
+        attempt_failures INTEGER NOT NULL,
+        successes INTEGER NOT NULL,
+        no_data INTEGER NOT NULL,
+        incomplete INTEGER NOT NULL,
+        failures INTEGER NOT NULL,
+        deferred INTEGER NOT NULL,
+        credits_cost REAL NOT NULL,
+        last_outcome TEXT,
+        last_outcome_at_ms INTEGER,
+        sampled_at_ms INTEGER NOT NULL,
+        upstream_api_status TEXT NOT NULL,
+        upstream_live_data_status TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS fomo_api_samples_key_time
+        ON fomo_api_samples(instance, endpoint, ts DESC, id DESC);
     `);
+    const baselineColumns = this.db.pragma('table_info(alert_baselines)') as { name: string }[];
+    if (!baselineColumns.some((column) => column.name === 'previous_value')) {
+      this.db.exec('ALTER TABLE alert_baselines ADD COLUMN previous_value REAL');
+    }
     const outboxColumns = this.db.pragma('table_info(telegram_alert_outbox)') as { name: string }[];
     if (!outboxColumns.some((column) => column.name === 'delivery_state')) {
       this.db.exec(`
@@ -129,6 +166,20 @@ export class MonitorStore {
         SET delivery_state = 'uncertain',
             last_error = COALESCE(last_error, 'delivery outcome predates single-attempt protection')
         WHERE sent_at IS NULL AND attempts > 0 AND delivery_state = 'pending';
+      `);
+    }
+    const currentOutboxColumns = this.db.pragma('table_info(telegram_alert_outbox)') as { name: string }[];
+    if (!currentOutboxColumns.some((column) => column.name === 'sent_parts')) {
+      this.db.exec(`
+        ALTER TABLE telegram_alert_outbox
+        ADD COLUMN sent_parts INTEGER NOT NULL DEFAULT 0
+      `);
+    }
+    const updatedOutboxColumns = this.db.pragma('table_info(telegram_alert_outbox)') as { name: string }[];
+    if (!updatedOutboxColumns.some((column) => column.name === 'delivery_mode')) {
+      this.db.exec(`
+        ALTER TABLE telegram_alert_outbox ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'photo';
+        UPDATE telegram_alert_outbox SET delivery_mode = 'text' WHERE sent_parts > 0;
       `);
     }
   }
@@ -204,7 +255,29 @@ export class MonitorStore {
     writeAll(services);
   }
 
-  snapshot(now = Date.now(), staleAfterMs = 300_000): Pick<MonitorSnapshot, 'services' | 'credits'> {
+  recordFomoApiSamples(samples: readonly FomoApiSample[], ts = Date.now()): void {
+    const insert = this.db.prepare(`
+      INSERT INTO fomo_api_samples (
+        ts, instance, endpoint, operations, attempted_operations, attempts, attempt_failures,
+        successes, no_data, incomplete, failures, deferred, credits_cost, last_outcome,
+        last_outcome_at_ms, sampled_at_ms, upstream_api_status, upstream_live_data_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const writeAll = this.db.transaction((rows: readonly FomoApiSample[]) => {
+      for (const sample of rows) {
+        insert.run(
+          ts, sample.instance, sample.endpoint, sample.operations, sample.attemptedOperations,
+          sample.attempts, sample.attemptFailures, sample.successes, sample.noData,
+          sample.incomplete, sample.failures, sample.deferred, sample.creditsCost,
+          sample.lastOutcome, sample.lastOutcomeAtMs, sample.sampledAtMs,
+          sample.upstreamApiStatus, sample.upstreamLiveDataStatus,
+        );
+      }
+    });
+    writeAll(samples);
+  }
+
+  snapshot(now = Date.now(), staleAfterMs = 300_000): Pick<MonitorSnapshot, 'services' | 'credits' | 'fomoApi'> {
     const serviceRows = this.db.prepare(`
       SELECT s.service_id AS id, s.name, s.scope, s.status, s.checked_at AS checked_at,
              s.latency_ms AS latency_ms, s.detail, s.ts
@@ -221,6 +294,22 @@ export class MonitorStore {
         ON latest.latest_id = m.id
       ORDER BY m.provider, m.label
     `).all() as MetricRow[];
+    const fomoApiRows = this.db.prepare(`
+      SELECT f.instance, f.endpoint, f.operations,
+             f.attempted_operations AS attemptedOperations,
+             f.attempts, f.attempt_failures AS attemptFailures,
+             f.successes, f.no_data AS noData, f.incomplete, f.failures, f.deferred,
+             f.credits_cost AS creditsCost, f.last_outcome AS lastOutcome,
+             f.last_outcome_at_ms AS lastOutcomeAtMs, f.sampled_at_ms AS sampledAtMs,
+             f.upstream_api_status AS upstreamApiStatus,
+             f.upstream_live_data_status AS upstreamLiveDataStatus, f.ts
+      FROM fomo_api_samples f
+      JOIN (
+        SELECT instance, endpoint, MAX(id) AS latest_id
+        FROM fomo_api_samples GROUP BY instance, endpoint
+      ) latest ON latest.latest_id = f.id
+      ORDER BY f.instance, f.endpoint
+    `).all() as FomoApiSampleRow[];
     const hasSharedNansen = metricRows.some((row) => row.provider === 'Nansen' && row.metric_key === 'shared-daily');
     const hasMergedSolana = metricRows.some((row) =>
       row.provider === 'Solana RPC' && row.metric_key.startsWith('solana-rpc-'),
@@ -252,9 +341,18 @@ export class MonitorStore {
         source: row.source,
         updatedAt: row.updated_at,
       })),
+      fomoApi: fomoApiRows.map((row) => {
+        const stale = row.ts + staleAfterMs < now;
+        const { ts: _ts, ...sample } = row;
+        return {
+          ...sample,
+          upstreamApiStatus: stale ? 'unknown' : sample.upstreamApiStatus,
+          upstreamLiveDataStatus: stale ? 'unknown' : sample.upstreamLiveDataStatus,
+          stale,
+        };
+      }),
     };
   }
-
   history(hours: number, now = Date.now()): { series: HistorySeries[] } {
     const since = now - hours * 3_600_000;
     const rows = this.db.prepare(`
@@ -366,12 +464,15 @@ export class MonitorStore {
     const transaction = this.db.transaction((rows: readonly AlertMetricObservation[]) => {
       let cursor = this.alertCursor(source);
       const previousValue = this.db.prepare(`
-        SELECT value FROM alert_baselines
+        SELECT value, previous_value FROM alert_baselines
         WHERE source = ? AND chain = ? AND ca = ? AND metric = ?
       `);
       const saveBaseline = this.db.prepare(`
-        INSERT INTO alert_baselines (source, chain, ca, metric, value) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(source, chain, ca, metric) DO UPDATE SET value = excluded.value
+        INSERT INTO alert_baselines (source, chain, ca, metric, value, previous_value)
+        VALUES (?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(source, chain, ca, metric) DO UPDATE SET
+          previous_value = alert_baselines.value,
+          value = excluded.value
       `);
       const enqueue = this.db.prepare(`
         INSERT OR IGNORE INTO telegram_alert_outbox
@@ -380,9 +481,9 @@ export class MonitorStore {
       `);
       for (const observation of rows) {
         if (observation.id <= cursor) continue;
-        const previous = observation.metric === 'trackerBuy' ? undefined :
+        const baseline = observation.metric === 'trackerBuy' ? undefined :
           previousValue.get(source, observation.chain, observation.ca, observation.metric) as
-            | { value: number }
+            | { value: number; previous_value: number | null }
             | undefined;
         const current = observation.value;
         const freshPctForAlert = observation.metric === 'fresh' ? current : observation.snapshot.freshPct;
@@ -391,18 +492,23 @@ export class MonitorStore {
           (marketCapK !== null && Number.isFinite(marketCapK) &&
             (rules.minMcK === -1 || marketCapK >= rules.minMcK) &&
             (rules.maxMcK === -1 || marketCapK <= rules.maxMcK));
+        const growthThreshold = observation.metric === 'fresh' ? rules.fwGrowthPct : rules.t100GrowthPct;
+        const freshAllowed = observation.metric !== 'fresh' ||
+          (freshPctForAlert !== null &&
+            Number.isFinite(freshPctForAlert) &&
+            freshPctForAlert >= rules.minFwPct);
+        const qualifyingBaseline = observation.metric === 'trackerBuy' || !freshAllowed
+          ? undefined
+          : [baseline?.value, baseline?.previous_value].find((candidate) =>
+            candidate !== undefined &&
+            candidate !== null &&
+            candidate > 0 &&
+            current > candidate * (1 + growthThreshold / 100));
         const shouldAlert = marketCapAllowed && (observation.metric === 'trackerBuy'
           ? rules.trackerBuyingK > 0 &&
             observation.snapshot.trackerBuyer !== undefined &&
             current > rules.trackerBuyingK * 1000
-          : previous !== undefined &&
-            previous.value > 0 &&
-            (observation.metric === 'fresh'
-              ? freshPctForAlert !== null &&
-                Number.isFinite(freshPctForAlert) &&
-                freshPctForAlert >= rules.minFwPct &&
-                current > previous.value * (1 + rules.fwGrowthPct / 100)
-              : current > previous.value * (1 + rules.t100GrowthPct / 100)));
+          : qualifyingBaseline !== undefined);
         if (shouldAlert) {
           const snapshot = observation.snapshot;
           const alert: TelegramAlert = {
@@ -414,7 +520,7 @@ export class MonitorStore {
             ...(snapshot.marketCapAt !== null ? { marketCapAt: snapshot.marketCapAt } : {}),
             trigger: {
               metric: observation.metric,
-              previous: previous?.value ?? 0,
+              previous: qualifyingBaseline ?? 0,
               current,
               responseAt: observation.responseAt,
               ...(observation.metric === 'trackerBuy' && observation.snapshot.trackerBuyer
@@ -432,7 +538,9 @@ export class MonitorStore {
             ...(snapshot.tracked ? { tracked: snapshot.tracked } : {}),
             source,
           };
-          enqueue.run(alert.alertId, JSON.stringify(alert), snapshot.capturedAt, snapshot.capturedAt);
+          if (!isSuppressedTelegramAlert(alert)) {
+            enqueue.run(alert.alertId, JSON.stringify(alert), snapshot.capturedAt, snapshot.capturedAt);
+          }
         }
         if (observation.metric !== 'trackerBuy') {
           // Advance even outside the MC range; otherwise entering range could replay old growth.
@@ -451,13 +559,21 @@ export class MonitorStore {
 
   pendingTelegramAlerts(now: number, limit: number): PendingTelegramAlert[] {
     const rows = this.db.prepare(`
-      SELECT alert_id, payload_json, attempts FROM telegram_alert_outbox
+      SELECT alert_id, payload_json, attempts, sent_parts, delivery_mode FROM telegram_alert_outbox
       WHERE sent_at IS NULL AND delivery_state = 'pending' AND next_attempt_at <= ?
       ORDER BY created_at, alert_id LIMIT ?
-    `).all(now, limit) as { alert_id: string; payload_json: string; attempts: number }[];
+    `).all(now, limit) as {
+      alert_id: string;
+      payload_json: string;
+      attempts: number;
+      sent_parts: number;
+      delivery_mode: 'photo' | 'text';
+    }[];
     return rows.map((row) => ({
       alertId: row.alert_id,
       attempts: row.attempts,
+      sentParts: row.sent_parts,
+      deliveryMode: row.delivery_mode,
       payload: JSON.parse(row.payload_json) as TelegramAlert,
     }));
   }
@@ -466,6 +582,21 @@ export class MonitorStore {
       UPDATE telegram_alert_outbox SET delivery_state = 'sending'
       WHERE alert_id = ? AND sent_at IS NULL AND delivery_state = 'pending'
     `).run(alertId);
+    return result.changes === 1;
+  }
+  markTelegramAlertSuppressed(alertId: string): void {
+    this.db.prepare(`
+      UPDATE telegram_alert_outbox
+      SET delivery_state = 'suppressed', last_error = 'source_b_sol_suppressed'
+      WHERE alert_id = ? AND sent_at IS NULL AND delivery_state = 'pending'
+    `).run(alertId);
+  }
+  markTelegramAlertPartSent(alertId: string, sentParts: number, deliveryMode: 'photo' | 'text'): boolean {
+    if (!Number.isSafeInteger(sentParts) || sentParts < 1) return false;
+    const result = this.db.prepare(`
+      UPDATE telegram_alert_outbox SET sent_parts = ?, delivery_mode = ?
+      WHERE alert_id = ? AND delivery_state = 'sending' AND sent_parts = ?
+    `).run(sentParts, deliveryMode, alertId, sentParts - 1);
     return result.changes === 1;
   }
 
@@ -505,6 +636,7 @@ export class MonitorStore {
   prune(now = Date.now()): void {
     if (now - this.lastPrunedAt < 3_600_000) return;
     this.db.prepare('DELETE FROM metric_samples WHERE ts < ?').run(now - 90 * 86_400_000);
+    this.db.prepare('DELETE FROM fomo_api_samples WHERE ts < ?').run(now - 14 * 86_400_000);
     this.db.prepare('DELETE FROM service_samples WHERE ts < ?').run(now - 14 * 86_400_000);
     this.lastPrunedAt = now;
   }

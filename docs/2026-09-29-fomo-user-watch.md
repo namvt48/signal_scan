@@ -419,6 +419,62 @@ chart axes and tooltips. API/storage timestamps remain epoch milliseconds or UTC
 machine timestamps; relative ages and time-window filters remain durations/epoch-based.
 
 
+## 14. FOMO Tracker Buying Telegram alerts
+
+Every new FOMO BUY with a known positive `trade_usd` adds one `trackerBuy` observation
+to the instance-B alert feed. The monitor uses the same `trackerBuyingK` rule fetched
+from instance A as for tracked-wallet buys, including the existing strict `>` amount
+comparison and market-cap bounds. The alert identifies the FOMO trader by handle;
+FOMO users are not represented as wallet addresses.
+
+If the feed does not include a usable `trade_usd`, no alert is created from the
+position's `usdValue`. When the FOMO swap enrichment later resolves that BUY's fill,
+it adds the observation then. SELLs never create Tracker Buying alerts. The existing
+`eventId` prevents duplicate observations on replay.
+
+The Telegram alert's `Tracked by` and `FOMO users` lines include every tracked wallet
+name and FOMO handle available for the token; they do not collapse identities into a
+`+N more` suffix. Long alerts are split into labeled parts within Telegram's message
+limit; confirmed successful parts are persisted so retries resume at the first unsent
+part.
+
+## 15. Direct Fomo web API scan
+
+**Status: investigation only.** The authenticated Fomo web UI makes requests directly to `prod-api.fomo.family`. The requests below were observed through the logged-in Brave UI or replayed as read-only GETs; schemas and page counts were retained, not user IDs, tokens, addresses, or record values. This does not establish an official or stable public API contract.
+
+### Observed data routes
+
+| Data | Route | Observed response |
+|---|---|---|
+| User holdings | `GET /v2/users/{userId}/balances` | `balances[]` entries nest `balance`, `tokenFilterResult`, `userToken`, `activeTrade`, and `valuation`; top-level fields include `otherPnl`, `otherPnlV2`, `livePerpPnl`, and `otherEquity`. The UI returned a non-empty response for a public profile; the signed-in account's own balance response was empty. |
+| Active and closed positions | `GET /trades?userId={userId}&orderBy=closedAt` | `activeTrades[]`, `closedTrades[]`, `hasNextPage`, and `closedCount`. Each trade nests `trade`, `swaps`, `transfers`, and may include `tokenMetadata` and a comment. A populated response had `hasNextPage=true`. |
+| Individual swaps | `GET /v2/users/{userId}/swaps` | `swaps[]` contains `id`, `networkId`, `inTokenAddress`, `outTokenAddress`, `humanUsdAmountIn`, `humanUsdAmountOut`, `createdAt`, `outTradeId`, `inNetworkId`, and `outNetworkId`; response includes `hasNextPage`. |
+| Swap history pagination | `GET /v2/users/{userId}/swaps?lastSwapIdV2={cursor}` | Scrolling the profile activity caused the UI to request this query key. The observed cursor replay returned another non-overlapping page. Cursor selection and termination still need validation; one replay is not proof of complete history. |
+| Trade detail | `GET /trades/{tradeId}` | Returns a nested `trade`, its `swaps`, and `transfers`. The UI requested this after opening a profile trade. |
+| PnL/equity snapshots | `GET /v2/userTokens/aggregatedSnapshot?userId={userId}&timestamp=...` | The UI returned rows with `snapshotId`, `pnl`, and `equity`. |
+| Token activity | `GET /feed/token?tokenAddress=...&networkId=...&threshold=...` | A read-only API probe returned `items[]` with `type`, `id`, `tradeId`, `createdAt`, `userId`, `usdAmount`, `marketCap`, `fdv`, and `price`, plus `hasNextPage`. This route was not captured from a token-detail UI flow; its UI filters and pagination remain unverified. |
+
+The Discover UI also requested `/v2/leaderboard`, `/watchlist`, `/v2/clans/leaderboard?window=...&limit=...`, `/tokenAllowList/detailed`, `/v1/perps/listed-perps`, and `/proxy/verifiedTokens`. These are discovery/profile data, not evidence that the alert websocket has been replaced.
+
+### Candidate mapping to this repository
+
+- `FomoPosition`: `activeTrades[].trade.tokenAddress` → `ca`; `activeTrades[].trade.id` → `tradeId`; the source collection (`activeTrades`/`closedTrades`) and `trade.closedAt` → `status`; `trade.humanTokenAmount` → `amount`; `trade.totalCostBasis` → `costBasisUsd`; `trade.avgEntryPrice` → `avgEntryPrice`; `trade.tokenMetadata.currentPrice` → `priceUsd`; `trade.realizedPnlUsd` and `trade.unrealizedPnlUsd` → the respective PnL fields.
+- `FomoSwap`: `createdAt` → `at`; `outTradeId` → `tradeIdOut`; `inTokenAddress`/`outTokenAddress` → the two token addresses; `humanUsdAmountIn`/`humanUsdAmountOut` → the two USD values.
+- `networkId`/`inNetworkId`/`outNetworkId` require an explicit mapping to this repository's `Chain` union. Unsupported networks must remain unsupported; cross-chain swaps cannot be represented as a single-chain `FomoSwap` without an explicit policy.
+- The observed profile data routes use a stable `userId` for balances/swaps and the `userId` query for trades/snapshots. The exact handle-to-`userId` resolver contract was not verified; do not assume a handle is interchangeable with `userId` on every route.
+- These REST routes are enrichment/portfolio reads. They do **not** prove equivalence to the existing large-trade alert websocket, whose captured alert contract and `eventId` dedupe are documented above. Do not remove the websocket ingestion based on this scan.
+- `FomoPosition` and `FomoSwap` are not wire-compatible with the direct API response; an adapter and pagination handling are required. FOMO user's wallet holding measurements in `server/src/fomo-holdings.ts` remain a separate chain-RPC path.
+
+### Completeness and security limits
+
+- `/trades` returned `hasNextPage=true`; the next-page parameter was not identified. `/feed/token` also returned `hasNextPage=true`; its UI filters and cursor have not been captured.
+- Swaps use `lastSwapIdV2` in the observed UI request, but the exact cursor algorithm and full-history termination behavior are not yet established.
+- The app API uses the logged-in session and sits behind Cloudflare. A browser-impersonating `curl_cffi` client succeeded; plain external probes were blocked. Do not assume an ordinary server HTTP client will work.
+- The tested `fomo-sapiens` helper is unofficial and persists auth material when its login/auth flow is used. Do not reuse that persistence model or copy browser tokens into the project. A supported server-side auth/refresh mechanism is still required for a production integration.
+- No code, API provider, websocket, or deployment was changed as part of this investigation.
+
+---
+
 ## Source index
 
 - `.omo/plans/fomo-user-watch.md` - the work plan and the pinned "Captured FOMO alert schema"

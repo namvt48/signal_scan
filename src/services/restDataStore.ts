@@ -2,7 +2,7 @@
 // deployments). Same contract as the localStorage implementation; components
 // cannot tell them apart.
 
-import type { Chain, FomoUser, Settings, SettingsPatch, TelegramAlertRules, Tier, TokenSignal, Wallet } from '../types';
+import type { Chain, FomoUser, PeriodicScanSettings, Settings, SettingsPatch, TelegramAlertRules, Tier, TokenSignal, Wallet } from '../types';
 import { byHandle, byName, type DataStore, type FomoImportRow, type ImportResult, type ImportRow, type WalletWriteInput, type WalletWritePatch } from './dataStore';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
@@ -95,9 +95,11 @@ export const restDataStore: DataStore = {
     return request<ImportResult>('/fomo-users/import', json('POST', { rows }));
   },
 
-  async listSignals(allFactors?: boolean): Promise<TokenSignal[]> {
-    return request<TokenSignal[]>(`/signals?allFactors=${allFactors ? '1' : '0'}`);
+  async listSignals(allFactors?: boolean, signal?: AbortSignal): Promise<TokenSignal[]> {
+    return request<TokenSignal[]>(`/signals?allFactors=${allFactors ? '1' : '0'}`, { signal });
   },
+
+
 
   async getSettings(): Promise<Settings> {
     return request<Settings>('/settings');
@@ -114,6 +116,21 @@ export const restDataStore: DataStore = {
   async updateTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
     return request<TelegramAlertRules>('/telegram-alert-rules', json('PUT', rules));
   },
+  async getFomoTelegramAlertRules(): Promise<TelegramAlertRules> {
+    return request<TelegramAlertRules>('/fomo/telegram-alert-rules');
+  },
+
+  async updateFomoTelegramAlertRules(rules: TelegramAlertRules): Promise<TelegramAlertRules> {
+    return request<TelegramAlertRules>('/fomo/telegram-alert-rules', json('PUT', rules));
+  },
+
+  async getPeriodicScanSettings(): Promise<PeriodicScanSettings> {
+    return request<PeriodicScanSettings>('/periodic-scan-settings');
+  },
+
+  async updatePeriodicScanSettings(settings: PeriodicScanSettings): Promise<PeriodicScanSettings> {
+    return request<PeriodicScanSettings>('/periodic-scan-settings', json('PUT', settings));
+  },
 
   async setTier(ca: string, chain: Chain, tier: Tier | null): Promise<void> {
     await request<void>('/tier', json('PUT', { ca, chain, tier }));
@@ -126,3 +143,4 @@ export const restDataStore: DataStore = {
     );
   },
 };
+

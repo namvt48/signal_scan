@@ -30,6 +30,7 @@ import { timed } from '../log.js';
 import { HttpError, type Priority } from '../ratelimit/types.js';
 import { gatewayClientFromEnv, GatewayClient, GW_GMGN_TOKEN_INFO_PATH } from '../gateway-client.js';
 import type { Chain } from '../shared/chain.js';
+import { validatedIconUrl } from './dexscreener.js';
 import type { AssetInfo } from './solana.js';
 import type { MetricKind, MetricPatch } from './provider.js';
 
@@ -57,6 +58,7 @@ interface GmgnPriceBlock {
 
 interface GmgnData {
   symbol?: string;
+  logo?: unknown;
   holder_count?: number;
   circulating_supply?: string;
   total_supply?: string;
@@ -101,6 +103,7 @@ export function parseTokenInfo(json: GmgnTokenInfoResponse): MetricPatch {
   // fails validation is omitted rather than written, so the FE's fallback search link still works.
   const rawHandle = typeof d.link?.twitter_username === 'string' ? d.link.twitter_username.trim().replace(/^@+/, '') : '';
   const xHandle = X_HANDLE_RE.test(rawHandle) ? rawHandle : '';
+  const logo = validatedIconUrl(d.logo);
   return {
     ...(price > 0 ? { price } : {}),
     ...(supply > 0 ? { supply } : {}),
@@ -114,6 +117,7 @@ export function parseTokenInfo(json: GmgnTokenInfoResponse): MetricPatch {
     ...(created > 0 ? { deployedAt: created * 1000 } : {}),
     ...(sym !== '' ? { symbol: sym } : {}),
     ...(xHandle !== '' ? { xHandle } : {}),
+    ...(logo !== undefined ? { iconUrl: logo } : {}),
   };
 }
 
@@ -128,7 +132,11 @@ export interface GmgnProvider {
   assetInfo(ca: string, chain: Chain): Promise<AssetInfo>;
 }
 
-export class GmgnMarketProvider implements GmgnProvider {
+export interface GmgnIconProvider {
+  tokenIcon(ca: string, chain: Chain): Promise<string | undefined>;
+}
+
+export class GmgnMarketProvider implements GmgnProvider, GmgnIconProvider {
   private readonly inFlight = new Map<string, Promise<MetricPatch>>();
 
   readonly name = 'gmgn';
@@ -148,6 +156,11 @@ export class GmgnMarketProvider implements GmgnProvider {
     if (kind === 'gini') return {};
     const priority: Priority = kind === 'volume' ? 2 : 1;
     return this.fetchTokenInfo(ca, chain, priority);
+  }
+
+  /** Token/info logo for the shared icon backfill; a missing logo is retried by its durable sweep. */
+  async tokenIcon(ca: string, chain: Chain): Promise<string | undefined> {
+    return (await this.fetchTokenInfo(ca, chain, 2)).iconUrl;
   }
 
   /** Symbol/supply/price floor with no browser door — lets the ticker backfill run while Nansen CF-blocks. */

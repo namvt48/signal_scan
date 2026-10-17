@@ -1,0 +1,8 @@
+# The database is mounted as a host volume; keep multi-GB data and secrets out of builds.
+data/
+.env
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]

@@ -5,6 +5,7 @@ Tách từ scripts/wallet_watch.py (T7) — dời nguyên văn.
 
 import json
 import os
+import tempfile
 
 from watchers.common.config import HERE
 
@@ -38,7 +39,18 @@ def load_state():
 
 
 def save_state(st) -> None:
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(st, f)
-    os.replace(tmp, STATE_PATH)
+    directory = os.path.dirname(os.path.abspath(STATE_PATH))
+    fd, tmp = tempfile.mkstemp(
+        prefix=os.path.basename(STATE_PATH) + ".",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE_PATH)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass

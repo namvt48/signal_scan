@@ -6,11 +6,8 @@ import {
   deleteFomoUser,
   findFomoUserWallet,
   getDb,
-  insertFomoTrade,
-  insertTrackedCa,
   insertFomoUser,
   insertFomoUserWallet,
-  listFomoAlertTargets,
   listFomoWalletsForUser,
   open,
   upsertFomoHolding,
@@ -81,18 +78,6 @@ test('upsertFomoHolding: ONE row per (user, ca, chain) — a re-measure overwrit
   assert.equal(evmRow.wallet, EVM_WALLET_LC, 'wallet canonicalized');
 });
 
-test('listFomoAlertTargets: DISTINCT (user, ca, chain) from fomo_trades', () => {
-  const user = insertFomoUser({ handle: '@targets', name: 'Targets' });
-  insertTrackedCa({ address: 'CaA', chain: 'sol', note: 'fomo' });
-  insertTrackedCa({ address: 'CaB', chain: 'sol', note: 'fomo' });
-  insertFomoTrade({ fomo_user_id: user.id, event_id: 't1', ca: 'CaA', chain: 'sol', type: 'buy', ts: 1 });
-  insertFomoTrade({ fomo_user_id: user.id, event_id: 't2', ca: 'CaA', chain: 'sol', type: 'sell', ts: 2 });
-  insertFomoTrade({ fomo_user_id: user.id, event_id: 't3', ca: 'CaB', chain: 'sol', type: 'buy', ts: 3 });
-
-  const targets = listFomoAlertTargets().filter((t) => t.fomo_user_id === user.id);
-  assert.equal(targets.length, 2, 'CaA collapsed to one target');
-  assert.deepEqual(new Set(targets.map((t) => t.ca)), new Set(['CaA', 'CaB']));
-});
 
 test('deleteFomoUser: cascades to fomo_user_wallets AND fomo_holdings', () => {
   const user = insertFomoUser({ handle: '@cascade', name: 'Cascade' });

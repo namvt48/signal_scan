@@ -25,10 +25,35 @@ export interface MetricSample {
   updatedAt: string | null;
 }
 
+export type FomoApiEndpoint = 'positions' | 'swaps';
+export type FomoApiHealthStatus = 'operational' | 'degraded' | 'down' | 'unknown';
+
+export interface FomoApiSample {
+  instance: 'A' | 'B';
+  endpoint: FomoApiEndpoint;
+  operations: number;
+  attemptedOperations: number;
+  attempts: number;
+  attemptFailures: number;
+  successes: number;
+  noData: number;
+  incomplete: number;
+  failures: number;
+  deferred: number;
+  creditsCost: number;
+  lastOutcome: string | null;
+  lastOutcomeAtMs: number | null;
+  sampledAtMs: number;
+  upstreamApiStatus: FomoApiHealthStatus;
+  upstreamLiveDataStatus: FomoApiHealthStatus;
+  stale: boolean;
+}
+
 export interface MonitorSnapshot {
   generatedAt: string;
   services: ServiceSample[];
   credits: MetricSample[];
+  fomoApi: FomoApiSample[];
   notifications: { discordConfigured: boolean; lastDeliveryAt: string | null; lastError: string | null };
 }
 

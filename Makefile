@@ -44,6 +44,7 @@ HOST      ?= root@167.86.101.228
 GATEWAY_DIR := /root/signal_scan
 SERVER    := 167.86.101.228
 POLL_FLOWS_MS ?= 10800000
+POLL_SETUP_MS ?= 10800000
 
 # Instance selector: `make deploy INSTANCE=b` = second parallel deployment with its
 # own dir/port/DB. Default `a` = primary deployment.
@@ -81,7 +82,7 @@ endif
 LEGACY_CONTAINER := signal_scan
 
 # Passed to every docker compose call so the two instances stay isolated.
-COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS)
+COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS) POLL_SETUP_MS=$(POLL_SETUP_MS)
 
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
@@ -91,7 +92,27 @@ SSH       := ssh -o BatchMode=yes -o ConnectTimeout=10 $(HOST)
 SCP       := scp -o BatchMode=yes -o ConnectTimeout=10
 RSYNC_SSH := ssh -o BatchMode=yes -o ConnectTimeout=10
 
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy routing-smoke fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply watchers-up
+FOMO_RELEASE_FILES := \
+	server/src/alert-feed.ts \
+	server/src/api.ts \
+	server/src/auth.ts \
+	server/src/config.ts \
+	server/src/db.ts \
+	server/src/fomo-api.ts \
+	server/src/poller.ts \
+	server/src/setup-cache.ts \
+	server/src/signals.ts \
+	server/src/telegram-alert-settings.ts \
+	server/src/monitor/alert-policy.ts \
+	server/src/monitor/alerts.ts \
+	server/src/monitor/collector.ts \
+	server/src/monitor/store.ts \
+	server/src/monitor/telegram.ts \
+	server/src/monitor/types.ts \
+	server/public/monitor.html
+
+# Keep Telegram presentation deploy isolated from alert-state and API changes.
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up
 
 routing-smoke:
 	$(SSH) 'bash -s' < scripts/test_instance_routing.sh
@@ -102,6 +123,29 @@ deploy:
 	$(SCP) -r $(FILES) $(HOST):$(REMOTE_DIR)/
 	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src $(HOST):$(REMOTE_DIR)/
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose build && echo '== deploy OK — instance=$(INSTANCE) port=$(PORT) dir=$(REMOTE_DIR)'"
+
+# Deploy only the Fresh retry gate fix to instance A; never sync/rebuild web or B.
+fresh-retry-deploy:
+	@test "$(INSTANCE)" = a || { echo 'fresh-retry-deploy is restricted to INSTANCE=a'; exit 1; }
+	$(SCP) server/src/poller.ts server/src/setup-cache.ts $(HOST):$(REMOTE_DIR)/server/src/
+	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build api && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api; else $(COMPOSE_ENV) docker compose build api && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api; fi"
+	sleep 3
+	$(SSH) "curl -fsS http://127.0.0.1:8124/api/health >/dev/null && echo 'instance A API health OK'"
+
+# Deploy only the FOMO API and alert/telemetry backend files listed above.
+fomo-api-deploy:
+	@test "$(INSTANCE)" = a -o "$(INSTANCE)" = b || { echo 'fomo-api-deploy supports INSTANCE=a|b'; exit 1; }
+	rsync -azcR -e "$(RSYNC_SSH)" $(FOMO_RELEASE_FILES) $(HOST):$(REMOTE_DIR)/
+	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build api && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build api && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api; fi"
+	sleep 3
+	$(SSH) "curl -fsS http://127.0.0.1:$(PORT)/api/health >/dev/null && echo 'instance $(INSTANCE) API health OK'"
+
+# Apply the monitor's B/Solana suppression before restarting either API.
+fomo-release-deploy:
+	@$(MAKE) monitor-alerts-deploy
+	@$(MAKE) fomo-api-deploy INSTANCE=a
+	@$(MAKE) fomo-api-deploy INSTANCE=b
+
 
 fomo-evm-watch-deploy:
 	$(SSH) "set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -m 0750 /opt/fomo-wallet-watch/watchers/common /opt/fomo-wallet-watch/watchers/evm /opt/fomo-wallet-watch/data /root/signal-scan-monitor/heartbeats"
@@ -126,10 +170,18 @@ fomo-rpc-apply:
 watchers-up:
 	$(SSH) "set -eu; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; test -f /etc/cron.d/wallet-watch-watchdog; systemctl daemon-reload; systemctl enable --now wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service; systemctl is-active wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service"
 
+# Bring up the staged cohort-label source privately; source/data are migrated once from 250.
+cohort-labels-api-up:
+	$(SSH) "set -eu; test -f /opt/ct-wallet-alpha-engine/data/wallet_portfolio_pnl.sqlite3; docker network inspect signal-scan-cohort-labels >/dev/null 2>&1 || docker network create signal-scan-cohort-labels; touch /opt/ct-wallet-alpha-engine/.env; chmod 600 /opt/ct-wallet-alpha-engine/.env"
+	$(SCP) deploy/ct-wallet-alpha-engine.override.yml $(HOST):/opt/ct-wallet-alpha-engine/docker-compose.override.yml
+	$(SCP) deploy/ct-wallet-alpha-engine.dockerignore $(HOST):/opt/ct-wallet-alpha-engine/.dockerignore
+	$(SSH) "set -eu; cd /opt/ct-wallet-alpha-engine; docker compose config --quiet; docker compose build ct-wallet; docker compose up -d; timeout 60s sh -c 'until curl -fsS http://127.0.0.1:8081/api/health >/dev/null 2>&1; do sleep 1; done'; curl -fsS --max-time 30 http://127.0.0.1:8081/api/pnl/cohort-labels | jq -e '.schema == \"canonical_cohort_label_index_v1\" and .total_wallets > 0' >/dev/null; echo 'cohort API ready'"
+
 # The gateway net is external: Compose will NOT create it, so every `up` (a, b, local)
 # must ensure it exists first or `docker compose up` refuses to start.
 up:
 	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "docker network inspect signal-scan-cohort-labels >/dev/null 2>&1 || docker network create signal-scan-cohort-labels"
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d; else $(COMPOSE_ENV) docker compose up -d; fi"
 	sleep 2
 	@$(MAKE) status
@@ -146,10 +198,17 @@ restart:
 gateway-deploy:
 	@$(MAKE) deploy INSTANCE=a
 	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
 	$(SSH) "cd $(GATEWAY_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d gateway; else docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d gateway; fi"
+
+# Quiesce the legacy tables, force-import only public rows, then restart the gateway
+# so it merges the final A/B setup caches before resuming its single market poller.
+market-data-reconcile:
+	$(SSH) 'bash -s' < scripts/reconcile_market_data.sh
 
 gateway-up:
 	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d; else docker compose -f docker-compose.gateway.yml up -d; fi"
 
 gateway-down:
@@ -161,18 +220,18 @@ gateway-log:
 # ---------- public host monitor ----------
 
 monitor-deploy:
-	$(SSH) 'set -eu; dir=/root/signal-scan-monitor; envfile=$$dir/monitor.env; install -d -m 700 "$$dir"; if [ ! -f "$$envfile" ]; then umask 077; token=$$(openssl rand -hex 32); printf "MONITOR_API_TOKEN=%s\\nDISCORD_BOT_TOKEN=\\nDISCORD_CHANNEL_ID=\\nTELEGRAM_BOT_TOKEN=\\nTELEGRAM_CHAT_ID=\\n" "$$token" > "$$envfile"; fi; chmod 600 "$$envfile"; grep -q "^MONITOR_API_TOKEN=." "$$envfile"; install -d -m 0750 "$$dir/data" "$$dir/usage" "$$dir/heartbeats"; test -f /opt/fomo-watch/fomo_heartbeat; test -f /opt/wallet-watch/heartbeat; test -f /opt/fomo-watch/watchers/fomo/feed.py; test -f /opt/wallet-watch/watchers/common/state.py'
+	$(SSH) 'set -eu; dir=/root/signal-scan-monitor; envfile=$$dir/monitor.env; install -d -m 700 "$$dir"; if [ ! -f "$$envfile" ]; then umask 077; token=$$(openssl rand -hex 32); printf "MONITOR_API_TOKEN=%s\\nDISCORD_BOT_TOKEN=\\nDISCORD_CHANNEL_ID=\\nTELEGRAM_BOT_TOKEN=\\nTELEGRAM_CHAT_ID=\\nTELEGRAM_ALERT_THREAD_ID=\\nTELEGRAM_PERIODIC_CHAT_ID=\\n" "$$token" > "$$envfile"; fi; chmod 600 "$$envfile"; grep -q "^MONITOR_API_TOKEN=." "$$envfile"; install -d -m 0750 "$$dir/data" "$$dir/usage" "$$dir/heartbeats"; test -f /opt/fomo-watch/fomo_heartbeat; test -f /opt/wallet-watch/heartbeat; test -f /opt/fomo-watch/watchers/fomo/feed.py; test -f /opt/wallet-watch/watchers/common/state.py'
 	$(SCP) watchers/fomo/feed.py $(HOST):/opt/fomo-watch/watchers/fomo/feed.py
 	$(SCP) watchers/common/state.py $(HOST):/opt/wallet-watch/watchers/common/state.py
 	$(SSH) "systemctl restart fomo-watch.service wallet-watch.service"
 	@$(MAKE) deploy INSTANCE=a
 	@$(MAKE) deploy INSTANCE=b
 	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
+	$(SSH) "cd /root/signal_scan && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d"
 	@$(MAKE) up INSTANCE=a
 	@$(MAKE) up INSTANCE=b
 	@$(MAKE) routing-smoke
-	$(SSH) "cd /root/signal_scan && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d"
-	$(SSH) "cd /root/signal_scan && docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml up -d --build"
 	$(SCP) monitor.caddy $(HOST):/root/signal-scan-monitor/monitor.caddy
 	$(SSH) "set -eu; backup_dir=\$$(mktemp -d /root/signal-scan-monitor/caddy-backup.XXXXXX); cp -a /etc/caddy/Caddyfile \"\$$backup_dir/Caddyfile\"; if [ -f /etc/caddy/monitor.caddy ]; then cp -a /etc/caddy/monitor.caddy \"\$$backup_dir/monitor.caddy\"; else touch \"\$$backup_dir/no-monitor-snippet\"; fi; install -m 0644 /root/signal-scan-monitor/monitor.caddy /etc/caddy/monitor.caddy; if ! grep -Fqx 'import /etc/caddy/monitor.caddy' /etc/caddy/Caddyfile; then printf '\\nimport /etc/caddy/monitor.caddy\\n' >> /etc/caddy/Caddyfile; fi; if ! caddy validate --config /etc/caddy/Caddyfile; then cp -a \"\$$backup_dir/Caddyfile\" /etc/caddy/Caddyfile; if [ -f \"\$$backup_dir/monitor.caddy\" ]; then cp -a \"\$$backup_dir/monitor.caddy\" /etc/caddy/monitor.caddy; else rm -f /etc/caddy/monitor.caddy; fi; exit 1; fi; ufw allow 8443/tcp; systemctl reload caddy"
 	$(SSH) "set -eu; health_status=\$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8126/healthz); dashboard_status=\$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8126/); api_status=\$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8126/api/snapshot); history_status=\$$(curl -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8126/api/history?hours=24'); printf 'internal health=%s dashboard=%s snapshot=%s history=%s\\n' \"\$$health_status\" \"\$$dashboard_status\" \"\$$api_status\" \"\$$history_status\"; test \"\$$health_status\" = 200; test \"\$$dashboard_status\" = 200; test \"\$$api_status\" = 200; test \"\$$history_status\" = 200"
@@ -184,11 +243,25 @@ monitor-restart:
 monitor-alerts-deploy:
 	$(SCP) server/src/monitor/store.ts $(HOST):/root/signal_scan/server/src/monitor/store.ts
 	$(SCP) server/src/monitor/telegram.ts $(HOST):/root/signal_scan/server/src/monitor/telegram.ts
-	$(SCP) server/src/monitor/avatar.ts $(HOST):/root/signal_scan/server/src/monitor/avatar.ts
+	$(SCP) server/src/token-avatar.ts $(HOST):/root/signal_scan/server/src/token-avatar.ts
 	$(SCP) server/src/monitor/main.ts $(HOST):/root/signal_scan/server/src/monitor/main.ts
 	$(SCP) server/src/monitor/alerts.ts $(HOST):/root/signal_scan/server/src/monitor/alerts.ts
 	$(SCP) server/src/telegram-alert-settings.ts $(HOST):/root/signal_scan/server/src/telegram-alert-settings.ts
+	$(SCP) server/src/alert-feed.ts $(HOST):/root/signal_scan/server/src/alert-feed.ts
+	$(SCP) server/src/monitor/alert-policy.ts $(HOST):/root/signal_scan/server/src/monitor/alert-policy.ts
+	$(SCP) server/src/monitor/collector.ts $(HOST):/root/signal_scan/server/src/monitor/collector.ts
+	$(SCP) server/src/monitor/types.ts $(HOST):/root/signal_scan/server/src/monitor/types.ts
+	$(SCP) server/public/monitor.html $(HOST):/root/signal_scan/server/public/monitor.html
 	$(SSH) 'cd /root/signal_scan && docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml build monitor && docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml up -d --force-recreate monitor && for attempt in $$(seq 1 30); do curl -fsS http://127.0.0.1:8126/healthz >/dev/null 2>&1 && { echo monitor-health-ok; exit 0; }; sleep 1; done; echo monitor-health-failed; docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml ps; exit 1'
+
+# Deploy only the Telegram alert formatter; preserve monitor state and APIs.
+monitor-telegram-format-deploy:
+	$(SCP) server/src/monitor/telegram.ts $(HOST):/root/signal_scan/server/src/monitor/telegram.ts
+	$(SSH) 'set -eu; cd /root/signal_scan; docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml config --quiet; docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml build monitor; docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml up -d --force-recreate monitor; for attempt in $$(seq 1 30); do curl -fsS http://127.0.0.1:8126/healthz >/dev/null 2>&1 && { echo monitor-health-ok; exit 0; }; sleep 1; done; echo monitor-health-failed; docker compose --env-file /root/signal-scan-monitor/monitor.env -p signal_scan_monitor -f docker-compose.monitor.yml ps; exit 1'
+# Deploy separate periodic-channel routing; never fall back to the live-alert destination.
+monitor-periodic-report-deploy:
+	rsync -azcR -e "$(RSYNC_SSH)" server/src/monitor/telegram.ts server/src/monitor/periodic-scan.ts server/src/monitor/config.ts server/src/monitor/main.ts docker-compose.monitor.yml $(HOST):/root/signal_scan/
+	$(SSH) 'set -eu; cd /root/signal_scan; envfile=/root/signal-scan-monitor/monitor.env; test -f "$$envfile"; docker compose --env-file "$$envfile" -p signal_scan_monitor -f docker-compose.monitor.yml config --format json | python3 -c "import json,sys; e=json.load(sys.stdin)[\"services\"][\"monitor\"][\"environment\"]; missing=[key for key in (\"TELEGRAM_BOT_TOKEN\",\"TELEGRAM_CHAT_ID\") if not e.get(key)]; periodic=(e.get(\"TELEGRAM_PERIODIC_CHAT_ID\") or \"\").strip(); alert=(e.get(\"TELEGRAM_CHAT_ID\") or \"\").strip(); assert not missing, \"Missing Telegram alert config: \" + \", \".join(missing); assert not periodic or periodic != alert, \"TELEGRAM_PERIODIC_CHAT_ID must differ from TELEGRAM_CHAT_ID\"; print(\"periodic Telegram reports disabled until a separate channel is configured\" if not periodic else \"periodic Telegram channel configured\")"; docker compose --env-file "$$envfile" -p signal_scan_monitor -f docker-compose.monitor.yml config --quiet; docker compose --env-file "$$envfile" -p signal_scan_monitor -f docker-compose.monitor.yml build monitor; docker compose --env-file "$$envfile" -p signal_scan_monitor -f docker-compose.monitor.yml up -d --force-recreate monitor; for attempt in $$(seq 1 30); do curl -fsS http://127.0.0.1:8126/healthz >/dev/null 2>&1 && { echo monitor-health-ok; exit 0; }; sleep 1; done; echo monitor-health-failed; docker compose --env-file "$$envfile" -p signal_scan_monitor -f docker-compose.monitor.yml ps; exit 1'
 
 logs:
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose logs -f web"

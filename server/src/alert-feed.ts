@@ -22,8 +22,8 @@ export interface AlertMetricSnapshot {
   t100Multiple: number | null;
   lf: number | null;
   trackedHoldingPct: number | null;
-  /** Snapshot of the tracked wallet that made a priced BUY; absent on legacy and other metric rows. */
-  trackerBuyer?: { name: string; address: string };
+  /** Snapshot of the buyer for trackerBuy: wallet address for tracked wallets, handle-only for FOMO users. */
+  trackerBuyer?: { name: string; address?: string };
   /** Dashboard token decoration and tracked-user counts captured with the alert feed response. */
   iconUrl?: string;
   xHandle?: string;

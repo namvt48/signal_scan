@@ -1,6 +1,6 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getDb, insertFomoTrade, insertFomoUser, insertTrackedCa, insertWallet, listTrackedCas, open, upsertFomoPosition } from '../src/db.js';
+import { getDb, insertFomoTrade, insertFomoUser, insertTrackedCa, insertWallet, listTrackedCas, open, syncFomoPositionsSnapshot, upsertFomoPosition } from '../src/db.js';
 import { insertTrades, upsertTokenInfo } from '../src/ingest.js';
 import { assembleSignals, fomoUserStats, fomoUserStatsByCa } from '../src/signals.js';
 import type { TokenInfo } from '../src/providers/provider.js';
@@ -255,6 +255,7 @@ test('assembleSignals: fomoUsers populated; FOMO trades leak nothing into the tr
   assert.ok(empty);
   assert.deepStrictEqual(empty.fomoUsers, []);
 });
+
 
 test('fomoUserStats: buyUsd sums trade_usd — a buy usd_value is a POSITION, so summing it inflates by the buy count', () => {
   const [z] = fomoUserStats(CA_Z, 'sol', NOW);
@@ -552,6 +553,75 @@ test('fresh FOMO API balance beats position and RPC measurements in both aggrega
   const omittedByNewPartialSnapshot = fomoUserStats(ca, 'base', NOW);
   assert.equal(omittedByNewPartialSnapshot[0]?.holdingAmount, 0, 'a prior API row omitted by a newer partial snapshot is not current');
   assert.deepEqual(fomoUserStatsByCa(NOW).get(`base:${ca}`), omittedByNewPartialSnapshot);
+});
+test('FOMO positions retain token amounts across unchanged snapshots and revalue Bal at live price', () => {
+  const ca = 'fomo-position-live-price-023';
+  const user = insertFomoUser({ handle: '@position-live-price' });
+  insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
+  upsertTokenInfo(token(ca, 'base'));
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'position-live-price-buy', ca, chain: 'base', type: 'buy', ts: NOW });
+
+  const position = (amount: number, fetched_at: number) => ({
+    fomo_user_id: user.id,
+    ca,
+    chain: 'base' as const,
+    trade_id: 'position-live-price-id',
+    status: 'open',
+    amount,
+    cost_basis_usd: 50,
+    avg_entry_price: 0.5,
+    price_usd: 0.5,
+    realized_pnl_usd: 0,
+    unrealized_pnl_usd: 0,
+    fetched_at,
+  });
+
+  syncFomoPositionsSnapshot(user.id, [position(100, NOW)], NOW);
+  getDb().prepare('UPDATE token_state SET price = ? WHERE ca = ? AND chain = ?').run(0.001, ca, 'base');
+  assert.equal(fomoUserStats(ca, 'base', NOW)[0]?.balUsd, 0.1);
+
+  getDb().prepare('UPDATE token_state SET price = ? WHERE ca = ? AND chain = ?').run(0.002, ca, 'base');
+  assert.equal(fomoUserStats(ca, 'base', NOW)[0]?.balUsd, 0.2, 'market price changes revalue the stored token amount');
+
+  syncFomoPositionsSnapshot(user.id, [position(100, NOW + 1_000)], NOW + 1_000);
+  const unchanged = getDb().prepare(
+    'SELECT amount, fetched_at FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+  ).get(user.id, ca, 'base') as { amount: number; fetched_at: number };
+  assert.deepEqual(unchanged, { amount: 100, fetched_at: NOW }, 'unchanged positions do not rewrite the stored position');
+  assert.equal(fomoUserStats(ca, 'base', NOW + 1_000)[0]?.balUsd, 0.2, 'snapshot check time keeps the unchanged amount fresh');
+
+  syncFomoPositionsSnapshot(user.id, [position(150, NOW + 2_000)], NOW + 2_000);
+  const changed = getDb().prepare(
+    'SELECT amount, fetched_at FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+  ).get(user.id, ca, 'base') as { amount: number; fetched_at: number };
+  assert.deepEqual(changed, { amount: 150, fetched_at: NOW + 2_000 });
+  assert.equal(fomoUserStatsByCa(NOW + 2_000).get(`base:${ca}`)?.[0]?.balUsd, 0.3);
+});
+
+test('positive position amount keeps a FOMO user visible when cost basis is absent', () => {
+  const ca = 'fomo-position-no-cost-basis-024';
+  const user = insertFomoUser({ handle: '@position-no-cost-basis' });
+  insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
+  upsertTokenInfo(token(ca, 'base'));
+  syncFomoPositionsSnapshot(user.id, [{
+    fomo_user_id: user.id,
+    ca,
+    chain: 'base',
+    trade_id: null,
+    status: 'open',
+    amount: 12,
+    cost_basis_usd: null,
+    avg_entry_price: null,
+    price_usd: 0.001,
+    realized_pnl_usd: null,
+    unrealized_pnl_usd: null,
+    fetched_at: NOW,
+  }], NOW);
+
+  const direct = fomoUserStats(ca, 'base', NOW);
+  assert.equal(direct[0]?.holdingAmount, 12);
+  assert.equal(direct[0]?.balUsd, 0.012);
+  assert.deepEqual(fomoUserStatsByCa(NOW).get(`base:${ca}`), direct);
 });
 
 test('FOMO Bal is chain-scoped and preserves unknown versus measured zero', () => {

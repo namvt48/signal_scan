@@ -8,6 +8,7 @@ import {
   deleteFomoUser,
   findFomoUserByHandle,
   findFomoUserByUserId,
+  getAlertMetricObservations,
   getDb,
   importFomoUsers,
   insertFomoTrade,
@@ -45,8 +46,8 @@ test('(b) insertFomoTrade: event_id is idempotent (ON CONFLICT DO NOTHING)', () 
   assert.equal(countTrades('event_id = ?', 'evt-1'), 1, 'exactly one row exists');
 });
 
-test('updateFomoTradeUsd fills only an unresolved BUY belonging to the user', () => {
-  const user = insertFomoUser({ handle: '@fill-update' });
+test('updateFomoTradeUsd appends one tracker-buy observation only when resolving an unknown BUY fill', () => {
+  const user = insertFomoUser({ handle: 'midcurver', name: 'Midcurver' });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-null', ca: 'CaFill', chain: 'sol', type: 'buy', ts: 10 });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-known', ca: 'CaFill', chain: 'sol', type: 'buy', trade_usd: 12, ts: 11 });
   insertFomoTrade({ fomo_user_id: user.id, event_id: 'fill-sell', ca: 'CaFill', chain: 'sol', type: 'sell', ts: 12 });
@@ -58,6 +59,10 @@ test('updateFomoTradeUsd fills only an unresolved BUY belonging to the user', ()
   assert.equal(updateFomoTradeUsd('another-user', 'fill-null', 1), false);
   assert.equal((getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('fill-null') as { trade_usd: number }).trade_usd, 9950.06);
   assert.equal((getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('fill-known') as { trade_usd: number }).trade_usd, 12);
+  const observations = getAlertMetricObservations(0, 1000).filter((row) => row.ca === 'CaFill' && row.metric === 'trackerBuy');
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]?.value, 9950.06);
+  assert.deepEqual(observations[0]?.snapshot.trackerBuyer, { name: 'midcurver' });
 });
 
 // insertFomoTrade canonicalizes ca (reuses canonicalCa) so ${chain}:${ca} keys line up.

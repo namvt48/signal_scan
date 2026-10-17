@@ -81,10 +81,14 @@ test('GET /api/health is explicitly public in the policy table', () => {
   assert.equal(health.access, 'public');
 });
 
-test('no other route is public', () => {
-  for (const e of ROUTE_POLICY) {
-    if (e.path === '/api/health') continue;
-    assert.notEqual(e.access, 'public', `${key(e.method, e.path)} must require a role`);
+test('only health and CA avatar delivery are public', () => {
+  for (const entry of ROUTE_POLICY) {
+    const publicAvatar = entry.method === 'GET' && entry.path === '/api/token-avatar/:chain/:ca';
+    if (entry.path === '/api/health' || publicAvatar) {
+      assert.equal(entry.access, 'public');
+      continue;
+    }
+    assert.notEqual(entry.access, 'public', `${key(entry.method, entry.path)} must require a role`);
   }
 });
 

@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { MagnifyingGlass, XLogo } from '@phosphor-icons/react';
 import { dataStore } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
@@ -7,6 +7,7 @@ import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, formatTimestamp, pct, shortAddr, usd } from '../lib/format';
 import { freshPercentageInRange, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
+import { compareFomoUserActivity } from '../lib/fomoSort';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
 import { T100Chart } from './T100Chart';
@@ -57,6 +58,7 @@ const FOMO_COLS: readonly string[] = SHOW_CLAN
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
+const INLINE_ACTIVITY_LIMIT = 5;
 /** Keep ticker text readable beside its note button in both deployment variants. */
 const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
 
@@ -65,10 +67,24 @@ const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
  * count includes both matched FOMO users and native wallets that traded this CA;
  * their names remain separate in the breakdown so identities are not conflated.
  */
-const rowInflow = (s: TokenSignal): number | null => (SHOW_FOMO ? sumKnownUsd(s.fomoUsers.map((u) => u.buyUsd)) : s.trackedInflow);
-const rowHolding = (s: TokenSignal): number | undefined => (SHOW_FOMO ? sumKnownPercentages(s.fomoUsers.map((u) => u.holdingPct)) : s.trackedHolding);
-const rowHoldingPartial = (s: TokenSignal): boolean => SHOW_FOMO && s.fomoUsers.some((user) => user.holdingPct === undefined);
-const rowTrackedIn = (s: TokenSignal): number => (SHOW_FOMO ? s.fomoUsers.length + s.trackedWallets.length : s.trackedWallets.length);
+const rowInflow = (s: TokenSignal): number | null => (SHOW_FOMO
+  ? sumKnownUsd(s.fomoUsers.map((u) => u.buyUsd))
+  : s.trackedInflow);
+const rowHolding = (s: TokenSignal): number | undefined => (SHOW_FOMO
+  ? sumKnownPercentages(s.fomoUsers.map((u) => u.holdingPct))
+  : s.trackedHolding);
+const rowHoldingPartial = (s: TokenSignal): boolean => SHOW_FOMO
+  && s.fomoUsers.some((user) => user.holdingPct === undefined);
+const rowTrackedIn = (s: TokenSignal): number =>
+  SHOW_FOMO ? s.fomoUsers.length + s.trackedWallets.length : s.trackedWallets.length;
+
+function walletBalanceLabel(wallet: { balUsd?: number; holdingPct?: number }): string {
+  const balance = wallet.balUsd !== undefined ? usd(wallet.balUsd) : '—';
+  const share = wallet.holdingPct !== undefined && Number.isFinite(wallet.holdingPct)
+    ? ` (${pct(wallet.holdingPct)})`
+    : '';
+  return `${balance}${share}`;
+}
 
 /**
  * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
@@ -137,7 +153,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
               )}
             </td>
             <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2">
-              <span className={trackedUsdClass(w.balUsd)}>{w.balUsd !== undefined ? usd(w.balUsd) : '—'}</span>
+              <span className={trackedUsdClass(w.balUsd)}>{walletBalanceLabel(w)}</span>
             </td>
             <td className="py-1 pr-2 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{w.buys}</span>
@@ -161,8 +177,9 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
  * separately, never a net figure. Newest trade first; long handles truncate; numerics
  * right-aligned mono like the wallet rows.
  */
-function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: boolean }) {
-  const rows = [...users].sort((a, b) => b.lastTs - a.lastTs);
+function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head?: boolean; limit?: number }) {
+  const sortedRows = [...users].sort((a, b) => b.lastTs - a.lastTs);
+  const rows = limit === undefined ? sortedRows : sortedRows.slice(0, limit);
   return (
     <table className="w-full table-fixed border-collapse">
       <colgroup>
@@ -202,8 +219,8 @@ function FomoTable({ users, head = false }: { users: FomoUserStat[]; head?: bool
                 )}
               </td>
             )}
-            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current held token balance in USD">
-              <span className={trackedUsdClass(u.balUsd)}>{u.balUsd !== undefined ? usd(u.balUsd) : '—'}</span>
+            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current held token balance in USD; parenthesized percentage is supply share">
+              <span className={trackedUsdClass(u.balUsd)}>{walletBalanceLabel(u)}</span>
             </td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{u.buys}</span>
@@ -295,7 +312,7 @@ function Hero({ count }: { count: number }) {
           it becomes <span className="text-neg">price</span>
         </h1>
         <p className="mt-4 max-w-[440px] text-[14.5px] leading-[1.5] text-ink2">
-          Top <b className="font-bold text-ink">{count} tokens</b> ranked by {SHOW_FOMO ? 'latest FOMO or native-wallet trade' : 'latest tracked wallet activity'}.
+          Top <b className="font-bold text-ink">{count} tokens</b> ranked by {SHOW_FOMO ? 'latest FOMO-user trade in the 24h stats window' : 'latest tracked wallet activity'}.
         </p>
       </div>
       <div className="relative flex h-[220px] items-center justify-center">
@@ -567,10 +584,12 @@ function SignalHead({
 export default function SignalTable({
   refreshKey,
   mode = 'dashboard',
+  active = true,
   onTierChange: notifyTierChange,
 }: {
   refreshKey?: number;
   mode?: 'dashboard' | 'rated';
+  active?: boolean;
   /** Called after a tier PUT settles so a sibling (kept-alive, possibly hidden) table refetches. */
   onTierChange?: () => void;
 }) {
@@ -578,6 +597,9 @@ export default function SignalTable({
   const [error, setError] = useState<string | null>(null);
   const [walletsPopup, setWalletsPopup] = useState<TokenSignal | null>(null);
   const [fomoPopup, setFomoPopup] = useState<TokenSignal | null>(null);
+  const lastSignalsAt = useRef(0);
+  const queryKeyRef = useRef<string | null>(null);
+  const refreshKeyRef = useRef<number | undefined>(undefined);
   const allFactors = useAllFactors();
   // Tier edits are admin-only (server also enforces); viewers see a read-only badge.
   const { role } = useAuth();
@@ -595,47 +617,99 @@ export default function SignalTable({
   const [holdingMax, setHoldingMax] = useState('');
   const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(RATED_TIERS));
 
+  const openActivity = (signal: TokenSignal, target: 'wallets' | 'fomo') => {
+    setWalletsPopup(target === 'wallets' ? signal : null);
+    setFomoPopup(target === 'fomo' ? signal : null);
+  };
+  const closeActivity = () => {
+    setWalletsPopup(null);
+    setFomoPopup(null);
+  };
+
   useEffect(() => {
+    if (!active) return;
     let alive = true;
+    let loading = false;
+    let settingsLoaded = false;
+    let controller: AbortController | null = null;
     const load = (first: boolean) => {
+      if (document.visibilityState !== 'visible' || loading) return;
+      loading = true;
+      controller = new AbortController();
       dataStore
-        .listSignals(mode === 'rated' ? true : allFactors)
+        .listSignals(mode === 'rated' ? true : allFactors, controller.signal)
         .then((rows) => {
-          if (alive) setSignals(rows);
+          if (alive) {
+            setSignals(rows);
+            lastSignalsAt.current = Date.now();
+          }
         })
         .catch((e: unknown) => {
-          if (alive && first) setError(e instanceof Error ? e.message : String(e));
-        });
-      dataStore
-        .getSettings()
-        .then((s) => {
-          if (alive) setThresholds(s.values);
+          if (alive && first && !(e instanceof DOMException && e.name === 'AbortError')) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
         })
-        .catch(() => {
-          /* display toggle only — a read failure keeps the last value */
+        .finally(() => {
+          loading = false;
         });
+      if (first || !settingsLoaded) {
+        settingsLoaded = true;
+        dataStore
+          .getSettings()
+          .then((s) => {
+            if (alive) setThresholds(s.values);
+          })
+          .catch(() => {
+            /* display toggle only — a read failure keeps the last value */
+          });
+      }
     };
-    load(true);
-    // Server sweeps on its own cadence; 30s poll picks changed rows up without a reload.
+    const queryKey = `${mode}:${mode === 'rated' || allFactors ? '1' : '0'}`;
+    const forceRefresh = queryKeyRef.current !== queryKey || refreshKeyRef.current !== refreshKey;
+    queryKeyRef.current = queryKey;
+    refreshKeyRef.current = refreshKey;
+    if (forceRefresh || !signals || Date.now() - lastSignalsAt.current >= 30_000) load(true);
     const id = setInterval(() => load(false), 30_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') load(!settingsLoaded);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       alive = false;
+      controller?.abort();
       clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [refreshKey, allFactors, mode]);
+  }, [active, refreshKey, allFactors, mode]);
 
   if (error) return <ErrorState message={error} onRetry={() => window.location.reload()} />;
 
   if (!signals) {
+    const loadingSummaryCells: StatCell[] = mode === 'rated'
+      ? [
+          { label: 'Tiered so far', value: '—' },
+          { label: 'S-tier (S+/S)', value: '—' },
+          { label: 'A-tier (A+/A)', value: '—' },
+          { label: 'B-tier (B+/B)', value: '—' },
+        ]
+      : [
+          { label: 'Tokens tracked', value: '—' },
+          { label: 'Active signal', value: '—', variant: 'hi' },
+          { label: 'Watch signal', value: '—', variant: 'watch' },
+          { label: '24H volume, combined', value: '—' },
+        ];
     return (
-      <TableShell>
-        <table className={`table-fixed w-full ${TABLE_MIN_W} border-collapse text-left`}>
-          <thead>
-            <SignalHead allFactors={allFactors} />
-          </thead>
-          <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
-        </table>
-      </TableShell>
+      <div className="w-full">
+        <StatRow cells={loadingSummaryCells} />
+        <TableShell>
+          <table className={`table-fixed w-full ${TABLE_MIN_W} border-collapse text-left`}>
+            <thead>
+              <SignalHead allFactors={allFactors} />
+            </thead>
+            <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
+          </table>
+        </TableShell>
+      </div>
     );
   }
 
@@ -676,14 +750,38 @@ export default function SignalTable({
   if (mode === 'rated') {
     if (ratedAll.length === 0) {
       return (
-        <div className="frame frame-empty">
-          <div className="empty-title">No tokens have been tiered yet.</div>
-          <div className="empty-sub">Go to the Dashboard tab, set a Tier (S+, S, A+, A, B+, B) for a few tokens, then come back here.</div>
+        <div className="w-full">
+          <RatedHero />
+          <StatRow
+            cells={[
+              { label: 'Tiered so far', value: '0' },
+              { label: 'S-tier (S+/S)', value: '0' },
+              { label: 'A-tier (A+/A)', value: '0' },
+              { label: 'B-tier (B+/B)', value: '0' },
+            ]}
+          />
+          <div className="frame frame-empty">
+            <div className="empty-title">No tokens have been tiered yet.</div>
+            <div className="empty-sub">Go to the Dashboard tab, set a Tier (S+, S, A+, A, B+, B) for a few tokens, then come back here.</div>
+          </div>
         </div>
       );
     }
   } else if (base.length === 0) {
-    return <EmptyState title="No signals yet" hint="Signals will appear once the alpha engine starts streaming tokens." />;
+    return (
+      <div className="w-full">
+        <Hero count={0} />
+        <StatRow
+          cells={[
+            { label: 'Tokens tracked', value: String(signals.length) },
+            { label: 'Active signal', value: String(passing.length), variant: 'hi' },
+            { label: 'Watch signal', value: String(signals.length - passing.length), variant: 'watch' },
+            { label: '24H volume, combined', value: usd(0) },
+          ]}
+        />
+        <EmptyState title="No signals yet" hint="Signals will appear once the alpha engine starts streaming tokens." />
+      </div>
+    );
   }
 
   const sortVal = (s: TokenSignal, key: SortKey): number | null | undefined =>
@@ -713,9 +811,9 @@ export default function SignalTable({
     const ap = a.tier === 'P' ? 1 : 0;
     const bp = b.tier === 'P' ? 1 : 0;
     if (ap !== bp) return ap - bp;
-    // Default FOMO order includes buys and sells from social users and native wallets.
+    // Default FOMO order uses the latest FOMO-user trade in the same 24h window as Age.
     if (!sort) return SHOW_FOMO
-      ? (b.fomoActivityAt ?? 0) - (a.fomoActivityAt ?? 0)
+      ? compareFomoUserActivity(a, b)
       : b.trackedActivityAt - a.trackedActivityAt;
     const av = sortVal(a, sort.key);
     const bv = sortVal(b, sort.key);
@@ -751,7 +849,7 @@ export default function SignalTable({
   const onTierChange = (row: TokenSignal, tier: Tier | null) => {
     setTierError(null);
     const prev = row.tier;
-    setSignals((cur) => (tier === 'P' ? cur?.filter((r) => r.id !== row.id) ?? cur : cur?.map((r) => (r.id === row.id ? { ...r, tier } : r)) ?? cur));
+    setSignals((cur) => cur?.map((r) => (r.id === row.id ? { ...r, tier } : r)) ?? cur);
     dataStore
       .setTier(row.ca, row.chain, tier)
       .then(() => notifyTierChange?.())
@@ -792,7 +890,7 @@ export default function SignalTable({
               : `${ratedAll.length}/${signals.length} tokens tiered`
             : sort
               ? `sorted by ${SORT_LABEL[sort.key]}, ${sort.dir === 'asc' ? 'ascending' : 'descending'}`
-              : SHOW_FOMO ? 'sorted by latest FOMO or native-wallet trade' : 'sorted by tracked activity'}
+              : SHOW_FOMO ? 'sorted by latest FOMO-user trade (24h)' : 'sorted by tracked activity'}
         </span>
       </div>
       {tierError && <p className="px-1 pb-2 text-[12px] font-semibold text-neg">Tier update failed: {tierError}</p>}
@@ -907,6 +1005,10 @@ export default function SignalTable({
                     const inflow = rowInflow(s);
                     const holding = rowHolding(s);
                     const holdingPartial = rowHoldingPartial(s);
+                    const trackedWalletCount = s.trackedWallets.length;
+                    const fomoUserCount = s.fomoUsers.length;
+                    const hiddenActivityCount = Math.max(0, fomoUserCount - INLINE_ACTIVITY_LIMIT)
+                      + Math.max(0, trackedWalletCount - INLINE_ACTIVITY_LIMIT);
                     const isPass = s.tier === 'P';
                     return (
                       <tr
@@ -964,43 +1066,43 @@ export default function SignalTable({
                         <Td className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'}`}>
                           {SHOW_FOMO ? (
                             <div className="min-w-0 space-y-1.5">
-                              {s.fomoUsers.length > 0 && (
+                              {fomoUserCount > 0 && (
                                 <section>
                                   <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">FOMO users</div>
-                                  <FomoTable users={s.fomoUsers.slice(0, 3)} />
+                                  <FomoTable users={s.fomoUsers} limit={INLINE_ACTIVITY_LIMIT} />
                                 </section>
                               )}
-                              {s.trackedWallets.length > 0 && (
-                                <section className={s.fomoUsers.length > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
+                              {trackedWalletCount > 0 && (
+                                <section className={fomoUserCount > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
                                   <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">Native wallets</div>
-                                  <WalletTable wallets={s.trackedWallets.slice(0, 3)} />
+                                  <WalletTable wallets={s.trackedWallets.slice(0, INLINE_ACTIVITY_LIMIT)} />
                                 </section>
                               )}
-                              {s.fomoUsers.length === 0 && s.trackedWallets.length === 0 && <Pill active={false}>none</Pill>}
-                              {(s.fomoUsers.length > 3 || s.trackedWallets.length > 3) && (
+                              {fomoUserCount === 0 && trackedWalletCount === 0 && <Pill active={false}>none</Pill>}
+                              {hiddenActivityCount > 0 && (
                                 <button
                                   type="button"
-                                  onClick={() => setFomoPopup(s)}
+                                  onClick={() => void openActivity(s, 'fomo')}
                                   className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
                                   title="Xem toàn bộ FOMO users và native wallets đã trade token này"
                                 >
-                                  View all — {s.fomoUsers.length} users · {s.trackedWallets.length} wallets
+                                  +{hiddenActivityCount} more
                                 </button>
                               )}
                             </div>
-                          ) : s.trackedWallets.length === 0 ? (
+                          ) : trackedWalletCount === 0 ? (
                             <Pill active={false}>none</Pill>
                           ) : (
                             <div className="min-w-0">
-                              <WalletTable wallets={s.trackedWallets.slice(0, 3)} />
-                              {s.trackedWallets.length > 3 && (
+                              <WalletTable wallets={s.trackedWallets.slice(0, INLINE_ACTIVITY_LIMIT)} />
+                              {trackedWalletCount > INLINE_ACTIVITY_LIMIT && (
                                 <button
                                   type="button"
-                                  onClick={() => setWalletsPopup(s)}
+                                  onClick={() => void openActivity(s, 'wallets')}
                                   className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
                                   title="Xem toàn bộ wallet đang track token này"
                                 >
-                                  +{s.trackedWallets.length - 3} more
+                                  +{trackedWalletCount - INLINE_ACTIVITY_LIMIT} more
                                 </button>
                               )}
                             </div>
@@ -1031,6 +1133,7 @@ export default function SignalTable({
                             ca={s.ca}
                             symbol={s.symbol}
                             holders={s.holders}
+                            marketCapHistory={s.marketCapHistory}
                             history={s.holdersHistory}
                             updatedAt={s.holdersHistory?.at(-1)?.t ?? s.dataUpdatedAt?.holders}
                             valueClassName={holderCountClass(s.holders)}
@@ -1073,18 +1176,20 @@ export default function SignalTable({
       {walletsPopup && (
         <Modal
           title={`Tracked by — ${walletsPopup.symbol ?? walletsPopup.ca} (${walletsPopup.trackedWallets.length} wallets)`}
-          onClose={() => setWalletsPopup(null)}
+          onClose={closeActivity}
           className="trade-breakdown-modal"
         >
           <div className="trade-breakdown-content overflow-auto">
-            <WalletTable wallets={walletsPopup.trackedWallets} head />
+            {walletsPopup.trackedWallets.length > 0
+              ? <WalletTable wallets={walletsPopup.trackedWallets} head />
+              : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
           </div>
         </Modal>
       )}
       {SHOW_FOMO && fomoPopup && (
         <Modal
           title={`FOMO by — ${fomoPopup.symbol ?? fomoPopup.ca} (${fomoPopup.fomoUsers.length} users · ${fomoPopup.trackedWallets.length} native wallets)`}
-          onClose={() => setFomoPopup(null)}
+          onClose={closeActivity}
           className="trade-breakdown-modal"
         >
           <div className="trade-breakdown-content space-y-4 overflow-auto">
@@ -1095,11 +1200,15 @@ export default function SignalTable({
             </p>
             <section>
               <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">FOMO users</h3>
-              {fomoPopup.fomoUsers.length > 0 ? <FomoTable users={fomoPopup.fomoUsers} head /> : <p className="text-xs text-muted">No FOMO users traded this CA.</p>}
+              {fomoPopup.fomoUsers.length > 0
+                ? <FomoTable users={fomoPopup.fomoUsers} head />
+                : <p className="text-xs text-muted">No FOMO users traded this CA.</p>}
             </section>
             <section className="border-t border-line pt-3">
               <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">Native wallets</h3>
-              {fomoPopup.trackedWallets.length > 0 ? <WalletTable wallets={fomoPopup.trackedWallets} head /> : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
+              {fomoPopup.trackedWallets.length > 0
+                ? <WalletTable wallets={fomoPopup.trackedWallets} head />
+                : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
             </section>
           </div>
         </Modal>

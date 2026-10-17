@@ -2,8 +2,8 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { insertTrackedCa, open } from '../src/db.js';
-import { updateTokenMetrics } from '../src/ingest.js';
+import { insertTrackedCa, insertWallet, open } from '../src/db.js';
+import { insertTrades, updateTokenMetrics } from '../src/ingest.js';
 import { getDebugAllFactors, thresholdDefaults, updateThresholds } from '../src/settings.js';
 import type { TokenSignal } from '../src/signals.js';
 import { createApp } from '../src/api.js';
@@ -11,6 +11,7 @@ import { createApp } from '../src/api.js';
 const CA_FAIL = 'allf-fail-fresh-001';
 const CA_PASS = 'allf-pass-fresh-002';
 const CA_CHEAP = 'allf-below-minusd-003';
+const CA_ACTIVITY = 'signal-activity-list-details-004';
 // AUTH CONTRACT v1: GET /api/signals accepts the service role (via createApp
 // deps — static imports snapshot config before env in the body could apply).
 const SERVICE_TOKEN = 'signals-allfactors-service-token';
@@ -43,6 +44,25 @@ before(async () => {
   insertTrackedCa({ address: CA_PASS, chain: 'sol', note: '', entryUsd: 60 });
   // entryUsd 10 < minUsd default 50 → the display gate drops this row unless allFactors=1.
   insertTrackedCa({ address: CA_CHEAP, chain: 'sol', note: '', entryUsd: 10 });
+  insertTrackedCa({ address: CA_ACTIVITY, chain: 'sol', note: '', entryUsd: 60 });
+  for (let index = 0; index < 5; index += 1) {
+    const wallet = insertWallet({
+      address: `activity-wallet-${index}`,
+      name: `activity-wallet-${index}`,
+      tags: [],
+      chain: 'sol',
+      source: 'test',
+    });
+    insertTrades(wallet.id, [{
+      tx: `activity-tx-${index}`,
+      ts: Date.now() - index,
+      side: 'buy',
+      ca: CA_ACTIVITY,
+      chain: 'sol',
+      amountUsd: 100,
+      price: 1,
+    }], 'watch');
+  }
   // fresh 1% < freshMinPct default 10 → value exists but FAILS the gate.
   updateTokenMetrics(CA_FAIL, 'sol', { nansenFreshPct: 1 });
   updateTokenMetrics(CA_PASS, 'sol', { nansenFreshPct: 50 });
@@ -79,4 +99,14 @@ test('(d) the flag is per-request: the very next request without it is unaffecte
   assert.ok(on.some((r) => r.ca === CA_CHEAP));
   assertHidden(await getSignals(''));
   assert.equal(getDebugAllFactors(), false, 'the query param must never write the server-side setting');
+});
+
+test('GET /api/signals preserves every tracked-wallet and FOMO row', async () => {
+  const row = (await getSignals('?allFactors=1')).find((signal) => signal.ca === CA_ACTIVITY);
+  assert.ok(row);
+  assert.deepEqual(
+    row.trackedWallets.map((wallet) => wallet.name),
+    Array.from({ length: 5 }, (_, index) => `activity-wallet-${index}`),
+  );
+  assert.deepEqual(row.fomoUsers, []);
 });

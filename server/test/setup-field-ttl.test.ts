@@ -1,6 +1,6 @@
 // Fix D regression (2026-09-29): per-field crawl TTL. The marker means "we actually
 // OBTAINED this field's data at T", not "we made a call at T" — empty data must not
-// stamp. gini/fresh% keeps the 6h clock (POLL_SETUP_MS); the T100 series now uses a
+// stamp. gini/fresh% uses the 3h clock (POLL_SETUP_MS); the T100 series also uses a
 // 3h clock (POLL_FLOWS_MS). Absence at runtime ⇒ never obtained ⇒ stale; legacy
 // entries (no marker) are backfilled from taken_at ONCE at load, not at read time.
 // Env BEFORE the src imports (node:test = one process per file): the crawl gate is
@@ -21,7 +21,7 @@ import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } f
 import type { Chain } from '../src/shared/chain.js';
 import type { SetupCacheEntry } from '../src/setup-cache.js';
 
-const { getTokenState, open, insertTrackedCa } = await import('../src/db.js');
+const { getTokenState, open, insertTrackedCa, reserveMetricPoll, saveMetricPollResponse } = await import('../src/db.js');
 const { upsertTokenInfo, updateTokenAnalytics } = await import('../src/ingest.js');
 const {
   getSetupCacheEntry,
@@ -158,8 +158,9 @@ function tempCache(): string {
 
 test('isInfoFresh / isSeriesFresh: TTL boundaries — no marker means never obtained', () => {
   const now = Date.now();
-  const INFO = config.pollSetupMs; // 6h
+  const INFO = config.pollSetupMs; // 3h
   const SERIES = config.pollFlowsMs; // 3h
+  assert.equal(INFO, 3 * HOUR, 'Fresh% defaults to a 3h refresh/cache TTL');
   assert.equal(SERIES, 3 * HOUR, 'Top100 flow series defaults to a 3h refresh/cache TTL');
 
   assert.equal(isInfoFresh(entryFor('a', { info_at: now - (INFO - 1) }), now), true);
@@ -198,7 +199,7 @@ test('gini pass with NO nansenFreshPct does not stamp info_at — the CA keeps r
   assert.equal(metricCalls.get(ca), 2, 'still-owed gini is re-asked on the next pass');
 });
 
-test('gini pass WITH nansenFreshPct stamps info_at — the CA then sits on the 6h clock', async () => {
+test('gini pass WITH nansenFreshPct stamps info_at — the CA then sits on the 3h clock', async () => {
   const ca = 'CA-TTL-GINI-OK';
   open(':memory:');
   loadSetupCache(tempCache());
@@ -216,7 +217,7 @@ test('gini pass WITH nansenFreshPct stamps info_at — the CA then sits on the 6
   assert.equal(typeof getSetupCacheEntry(ca, CHAIN)?.info_at, 'number', 'real gini data stamps info_at');
 
   await atClock(now + 61_000, () => setupSweep(provider));
-  assert.equal(metricCalls.get(ca), 1, 'a stamped gini (61s < 6h) is NOT re-asked');
+  assert.equal(metricCalls.get(ca), 1, 'a stamped gini (61s < 3h) is NOT re-asked');
 });
 
 test('refreshSeries: fresh series with no info_at applies from cache and invents no gini stamp', async () => {
@@ -268,7 +269,7 @@ test('legacy on-disk entry (no markers) is backfilled from taken_at at load — 
   assert.equal(isSeriesFresh(e!, now), true);
 });
 
-test('needsSetup: info_at 7h old re-asks gini even though series_at is fresh', async () => {
+test('needsSetup: info_at 4h old re-asks gini even though series_at is fresh', async () => {
   const ca = 'CA-TTL-INFO-OLD';
   open(':memory:');
   loadSetupCache(tempCache());
@@ -279,11 +280,15 @@ test('needsSetup: info_at 7h old re-asks gini even though series_at is fresh', a
   setPollerDeps(provider, null, installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now)));
   insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
   upsertTokenInfo(info(ca, now));
-  putSetupCacheEntry(entryFor(ca, { taken_at: now - 7 * HOUR, info_at: now - 7 * HOUR, series_at: now - HOUR }));
+  putSetupCacheEntry(entryFor(ca, { taken_at: now - 4 * HOUR, info_at: now - 4 * HOUR, series_at: now - HOUR }));
+  const oldReadAt = now - 4 * HOUR;
+  reserveMetricPoll(ca, CHAIN, 'gini', oldReadAt, 6 * HOUR);
+  saveMetricPollResponse(ca, CHAIN, 'gini', oldReadAt, oldReadAt + 6 * HOUR, { nansenFreshPct: 20 });
+
 
   await setupSweep(provider);
 
-  assert.equal(metricCalls.get(ca), 1, 'gini 7h old (> 6h TTL) must be re-asked');
+  assert.equal(metricCalls.get(ca), 1, 'gini 4h old (> 3h TTL) must be re-asked');
   assert.equal(seriesCalls, 0, 'series 1h old (< 3h TTL) applies from cache — no flows fetch');
 });
 

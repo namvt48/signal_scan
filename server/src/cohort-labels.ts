@@ -1,4 +1,5 @@
-const COHORT_LABELS_URL = 'http://194.163.187.250/api/pnl/cohort-labels';
+const COHORT_LABELS_URL =
+  process.env.COHORT_LABELS_URL || 'http://ct-wallet-alpha-engine:8081/api/pnl/cohort-labels';
 const COHORT_REFRESH_MS = 60 * 60 * 1000;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 

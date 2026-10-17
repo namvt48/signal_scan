@@ -46,6 +46,12 @@ test('parseTokenInfo: the six columns from one live MINI row (strings coerced)',
   assert.ok(Math.abs((p.marketCap ?? 0) - 0.0026489706 * 999949659.050811) < 1e-3, `mc=${p.marketCap}`);
 });
 
+test('parseTokenInfo: GMGN logo maps to the shared icon field only for the GMGN host', () => {
+  const logo = 'https://gmgn.ai/external-res/abc_v2.webp';
+  assert.equal(parseTokenInfo({ code: 0, data: { logo } }).iconUrl, logo);
+  assert.equal('iconUrl' in parseTokenInfo({ code: 0, data: { logo: 'https://evil.example/logo.png' } }), false);
+});
+
 test('parseTokenInfo: zero/absent readings are OMITTED so they cannot clobber a good value', () => {
   const p = parseTokenInfo({ code: 0, data: { symbol: 'X', price: { price: '0' } } });
   assert.equal('price' in p, false);
@@ -110,6 +116,15 @@ test('GmgnMarketProvider: concurrent essential and volume for one CA share one u
 
   await gmgn.metric('ca', 'sol', 'essential');
   assert.equal(calls, 2, 'completed requests are not cached; next call gets a fresh gateway request');
+});
+
+test('GmgnMarketProvider.tokenIcon: fetches and validates the GMGN token/info logo', async () => {
+  const logo = 'https://gmgn.ai/external-res/abc_v2.webp';
+  const gateway = {
+    call: async () => ({ status: 200, body: JSON.stringify({ code: 0, data: { logo } }), headers: {} }),
+  } as unknown as GatewayClient;
+  const gmgn = new GmgnMarketProvider('', gateway);
+  assert.equal(await gmgn.tokenIcon('ca', 'sol'), logo);
 });
 
 test('CompositeProvider: routes essential+volume to GMGN, gini to Nansen', async () => {

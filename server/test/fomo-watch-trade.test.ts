@@ -2,9 +2,18 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { getDb, deleteTrackedCa, findTrackedCa, insertFomoUser, listTrackedCas, open } from '../src/db.js';
+import {
+  getAlertMetricObservations,
+  getDb,
+  deleteTrackedCa,
+  findTrackedCa,
+  insertFomoUser,
+  listTrackedCas,
+  open,
+} from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { fomoHoldingsIdle } from '../src/poller.js';
+import { config } from '../src/config.js';
 import { TOTAL_SUPPLY_SELECTOR } from '../src/providers/evm.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
 
@@ -102,6 +111,7 @@ test('POST /api/fomo-watch/trades: reposting the SAME eventId is a 200 no-op', a
   assert.equal(rowCount(), 1);
 });
 
+
 test('POST /api/fomo-watch/trades: unknown handle/userId is 404 and inserts nothing', async () => {
   const res = await post(trade({ eventId: 'evt-fomo-404', trader: 'not-tracked', userId: 'not-tracked-id' }));
   assert.equal(res.status, 404);
@@ -116,11 +126,18 @@ test('POST /api/fomo-watch/trades: userId wins over trader; handle-only falls ba
   assert.equal(byUid.status, 200);
   assert.equal(rowOf('evt-fomo-uid')?.fomo_user_id, uidFirstId);
 
-  const body = trade({ eventId: 'evt-fomo-handle', trader: 'handle-only' });
-  delete body.userId;
+  const body = trade({
+    eventId: 'evt-fomo-handle',
+    trader: 'handle-only',
+    userId: 'handle-only-stable-id',
+  });
   const byHandle = await post(body);
   assert.equal(byHandle.status, 200);
   assert.equal(rowOf('evt-fomo-handle')?.fomo_user_id, handleOnlyId);
+  const storedUser = getDb().prepare('SELECT user_id FROM fomo_users WHERE id = ?').get(handleOnlyId) as
+    | { user_id: string | null }
+    | undefined;
+  assert.equal(storedUser?.user_id, 'handle-only-stable-id');
 });
 
 test('POST /api/fomo-watch/trades: 400 on a bad or unmapped chain', async () => {
@@ -164,6 +181,43 @@ test('POST /api/fomo-watch/trades: usdValue/price optional → NULL; a negative 
   const loss = await post(trade({ eventId: 'evt-fomo-loss', type: 'sell', usdValue: -120.5 }));
   assert.equal(loss.status, 200);
   assert.equal(rowOf('evt-fomo-loss')?.usd_value, -120.5);
+});
+
+test('POST /api/fomo-watch/trades: priced BUY adds one tracker-buy observation with FOMO identity', async () => {
+  const body = trade({
+    eventId: 'evt-fomo-tracker-buy',
+    tradeUsd: 24_865.82,
+    usdValue: 24_875,
+    chain: 'robinhood',
+    tokenAddress: '0x88ad8ddf1e3898412146a534538d418c6f8a9062',
+  });
+  const res = await post(body);
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+
+  const observations = getAlertMetricObservations(0, 1000).filter(
+    (row) => row.ca === body.tokenAddress && row.metric === 'trackerBuy' && row.responseAt === body.ts,
+  );
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0]?.value, 24_865.82);
+  assert.deepEqual(observations[0]?.snapshot.trackerBuyer, { name: HANDLE });
+
+  const replay = await post(body);
+  assert.equal(replay.json.inserted, 0);
+  assert.equal(getAlertMetricObservations(0, 1000).filter(
+    (row) => row.ca === body.tokenAddress && row.metric === 'trackerBuy' && row.responseAt === body.ts,
+  ).length, 1);
+});
+
+test('POST /api/fomo-watch/trades: FOMO SELL and unpriced BUY do not create tracker-buy observations', async () => {
+  const sell = await post(trade({ eventId: 'evt-fomo-tracker-sell', type: 'sell', tokenAddress: SELL_CA, tradeUsd: 40000 }));
+  const unpriced = await post(trade({ eventId: 'evt-fomo-tracker-unpriced', tokenAddress: BUY_CA }));
+  assert.equal(sell.status, 200);
+  assert.equal(unpriced.status, 200);
+  const observations = getAlertMetricObservations(0, 1000).filter(
+    (row) => row.metric === 'trackerBuy' && (row.ca === SELL_CA || row.ca === BUY_CA),
+  );
+  assert.deepEqual(observations, []);
 });
 
 test('POST /api/fomo-watch/trades: tradeUsd is stored as the real trade while usdValue stays the position size', async () => {
@@ -334,5 +388,44 @@ test('POST /api/fomo-watch/trades: a txHash opportunistically records the trader
     assert.equal(h?.pct, 25);
   } finally {
     globalThis.fetch = orig;
+  }
+});
+test('FOMO alert requests positions for missing token amount, skips swaps when tradeUsd exists, and ignores duplicate alerts', async () => {
+  const oldFetch = globalThis.fetch;
+  const oldKey = config.fomoApiKey;
+  const oldBase = config.fomoApiBase;
+  const upstreamPaths: string[] = [];
+  const body = trade({ eventId: 'evt-fomo-event-refresh', tradeUsd: 23 });
+  config.fomoApiKey = 'test-key';
+  config.fomoApiBase = 'https://fomo.test';
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === 'https://fomo.test/status') {
+      return new Response(JSON.stringify({
+        components: { api: { status: 'operational' }, liveData: { status: 'operational' } },
+      }), { status: 200 });
+    }
+    if (url.startsWith('https://fomo.test/')) {
+      upstreamPaths.push(new URL(url).pathname);
+      return new Response(JSON.stringify({ trades: [] }), { status: 200 });
+    }
+    return oldFetch(input, init);
+  }) as typeof fetch;
+  try {
+    const inserted = await post(body);
+    assert.equal(inserted.json.inserted, 1);
+    await fomoHoldingsIdle();
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/positions'],
+      'alert lacks token amount, but known tradeUsd avoids a swaps read');
+
+    const duplicate = await post(body);
+    assert.equal(duplicate.json.inserted, 0);
+    await fomoHoldingsIdle();
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/positions'],
+      'duplicate WS delivery must not create another API refresh');
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoApiKey = oldKey;
+    config.fomoApiBase = oldBase;
   }
 });

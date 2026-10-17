@@ -7,20 +7,53 @@ import { DiscordBot } from './discord.js';
 import { MonitorNotifications } from './notifications.js';
 import { MonitorAlerts } from './alerts.js';
 import { TelegramBot } from './telegram.js';
-import { DashboardAvatarRenderer } from './avatar.js';
+import { renderCaIdenticon } from '../token-avatar.js';
 import { MonitorStore } from './store.js';
+import { PeriodicScanRunner } from './periodic-scan.js';
+import type { Chain } from '../shared/chain.js';
+
+async function fetchTokenAvatar(
+  baseUrl: string,
+  token: string,
+  chain: Chain,
+  ca: string,
+): Promise<Uint8Array> {
+  const url = new URL(`/api/token-avatar/${chain}/${encodeURIComponent(ca)}`, baseUrl);
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(7_000),
+  });
+  const size = Number(response.headers.get('content-length') ?? 0);
+  if (!response.ok || response.headers.get('content-type') !== 'image/jpeg' || size > 2 * 1024 * 1024) {
+    throw new Error('token_avatar_unavailable');
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength === 0 || bytes.byteLength > 2 * 1024 * 1024) throw new Error('token_avatar_invalid');
+  return bytes;
+}
 
 function main(): void {
   const config = readMonitorConfig();
   const store = new MonitorStore(config.dbPath);
   const collector = new MonitorCollector(store, config);
   const notifications = new MonitorNotifications(store, new DiscordBot(config.discordBotToken, config.discordChannelId), config);
-  const avatarRenderer = new DashboardAvatarRenderer(config.webAUrl, config.chromeAUrl);
-  const alerts = new MonitorAlerts(
-    store,
-    config,
-    new TelegramBot(config.telegramBotToken, config.telegramChatId, fetch, (symbol) => avatarRenderer.render(symbol)),
+  const telegramBot = new TelegramBot(
+    config.telegramBotToken,
+    config.telegramChatId,
+    fetch,
+    async (symbol, ca, chain, source) => {
+      if (ca !== undefined && chain !== undefined && source !== undefined) {
+        return fetchTokenAvatar(source === 'A' ? config.apiAUrl : config.apiBUrl, config.apiToken, chain, ca);
+      }
+      return renderCaIdenticon(chain ?? 'sol', ca ?? symbol ?? '-');
+    },
+    {
+      ...(config.telegramAlertThreadId !== undefined ? { alerts: config.telegramAlertThreadId } : {}),
+    },
+    config.telegramPeriodicChatId,
   );
+  const alerts = new MonitorAlerts(store, config, telegramBot);
+  const periodicScan = new PeriodicScanRunner(store, config, telegramBot);
   const server = createServer(createMonitorApp({ config, store, notifications }));
   let collecting = false;
 
@@ -30,6 +63,7 @@ function main(): void {
     try {
       await collector.collect();
       await notifications.tick();
+      await periodicScan.tick();
       await alerts.tick();
     } catch (error) {
       const kind = error instanceof Error ? error.name : 'Error';

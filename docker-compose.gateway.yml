@@ -36,6 +36,9 @@ services:
         required: false
     environment:
       GATEWAY_PORT: "8130"
+      DB_PATH: /market-data/market.db
+      MODE: "${MARKET_DATA_MODE:-gmgn}"
+      NANSEN_CRAWL: "on"
       # MUST point at THIS project's browser (todo 4): copying a's ws://chrome:3000
       # would resolve nothing here.
       CRAWL_WS_ENDPOINT: ws://gateway-chrome:3000
@@ -45,6 +48,9 @@ services:
     volumes:
       - /root/signal-scan-gateway/proxies.txt:/data/proxies.txt:ro
       - /root/signal-scan-gateway/gateway.env:/run/gateway.env:ro
+      - signal-scan-market-data:/market-data
+      - /root/signal_scan/data:/legacy-a:ro
+      - /root/signal_scan_b/data-b:/legacy-b:ro
     ports:
       # Loopback ONLY — host watchers need it, the public internet must not see it.
       - "127.0.0.1:8130:8130"
@@ -79,3 +85,7 @@ networks:
   # project-scoped default net that a/b cannot resolve (see evidence failure demo).
   signal-scan-gateway:
     external: true
+volumes:
+  signal-scan-market-data:
+    external: true
+    name: signal-scan-market-data

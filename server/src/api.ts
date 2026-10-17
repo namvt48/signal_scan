@@ -12,11 +12,13 @@ import { limiters } from './ratelimit/index.js';
 import { providerRequestCache } from './providers/request-cache.js';
 import { snapshotRpcUsage } from './providers/rpc-usage.js';
 import { HeliusUsagePoller } from './providers/helius-usage.js';
+import { getFomoApiUsageSnapshot } from './fomo-api.js';
 import { solanaRpcEndpoints } from './providers/solana.js';
 import {
   acknowledgeAlertMetricObservations,
   appendAlertMetricObservation,
   getAlertMetricObservations,
+  importSharedAlertMetricObservations,
   deleteFomoUser,
   deleteTier,
   deleteTrackedCa,
@@ -35,6 +37,7 @@ import {
   insertEvmWalletGroup,
   isChain,
   isPassTier,
+  getTokenState,
   listFomoUsers,
   listTrackedCas,
   listWallets,
@@ -55,12 +58,19 @@ import {
   insertWallet,
   updateWallet,
 } from './db.js';
-import { getTelegramAlertRules, updateTelegramAlertRules } from './telegram-alert-settings.js';
+import {
+  getFomoTelegramAlertRules,
+  getTelegramAlertRules,
+  updateFomoTelegramAlertRules,
+  updateTelegramAlertRules,
+} from './telegram-alert-settings.js';
 // Token detail page DISABLED — its 2 endpoints below are commented out too.
 // import { buildTokenDetail } from './detail.js';
 // import { balanceSeries } from './crawl.js';
 import { log } from './log.js';
-import { assembleSignals } from './signals.js';
+import { assembleSignals, type TokenSignal } from './signals.js';
+import { createSignalResponseCache } from './signal-response-cache.js';
+import { tokenAvatarBytes, validAvatarIdentity } from './token-avatar.js';
 import {
   getDebugAllFactors,
   getThresholds,
@@ -75,6 +85,8 @@ import {
 import { insertTrades } from './ingest.js';
 import { kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
 import { cohortLabelIndex } from './cohort-labels.js';
+import { getPeriodicScanSettings, updatePeriodicScanSettings } from './periodic-scan-settings.js';
+import { selectPeriodicScanSignals, toPeriodicScanItem } from './periodic-scan.js';
 
 interface WalletJson {
   id: string;
@@ -602,7 +614,18 @@ function enqueueTrackedCa(input: {
 
 export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '2mb' }));
+  const signalResponseCache = createSignalResponseCache<TokenSignal[]>();
+  app.use((req, res, next) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+      next();
+      return;
+    }
+    res.once('finish', () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) signalResponseCache.invalidate();
+    });
+    next();
+  });
 
   app.use((req, res, next) => {
     const t0 = Date.now();
@@ -632,6 +655,23 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       providerCache: providerRequestCache.stats(),
     });
   });
+  app.get('/api/token-avatar/:chain/:ca', async (req, res) => {
+    const { chain, ca } = req.params;
+    if (!validAvatarIdentity(chain, ca)) {
+      res.status(400).json({ error: 'invalid token identity' });
+      return;
+    }
+    try {
+      const token = getTokenState(ca, chain);
+      const image = await tokenAvatarBytes(getDb(), chain, ca, token?.icon_url);
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.end(image);
+    } catch {
+      res.status(503).json({ error: 'token avatar unavailable' });
+    }
+  });
   const heliusUsagePoller = new HeliusUsagePoller();
   const monitorToken = authDeps?.monitorToken ?? config.monitorApiToken;
   app.get('/api/monitor/metrics', (req, res) => {
@@ -644,6 +684,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.json({
       rpcUsage: snapshotRpcUsage(),
       heliusUsage: heliusUsagePoller.snapshot(solanaRpcEndpoints(), config.heliusProjectIds),
+      fomoApiUsage: getFomoApiUsageSnapshot(),
     });
   });
 
@@ -661,6 +702,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: 'afterId must be >= 0 and limit must be 1..200' });
       return;
     }
+    importSharedAlertMetricObservations();
     const sourceObservations = getAlertMetricObservations(afterId, limit);
     const signals = sourceObservations.length > 0 ? assembleSignals(Date.now(), true) : [];
     const signalsByCa = new Map(signals.map((signal) => [`${signal.chain}\0${signal.ca}`, signal]));
@@ -669,10 +711,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       if (!signal) return observation;
       const wallets = signal.trackedWallets;
       const fomoUsers = config.showFomo ? signal.fomoUsers : [];
-      const walletNames = wallets
-        .map((wallet) => wallet.name.trim().slice(0, 128))
-        .slice(0, 3);
-      const fomoHandles = fomoUsers.map((user) => user.handle.slice(0, 128)).slice(0, 3);
+      const walletNames = wallets.map((wallet) => wallet.name.trim().slice(0, 128));
+      const fomoHandles = fomoUsers.map((user) => user.handle.slice(0, 128));
       return {
         ...observation,
         snapshot: {
@@ -691,7 +731,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.json({
       observations,
       nextId: observations[observations.length - 1]?.id ?? afterId,
-      ...(config.showFomo ? {} : { telegramAlertRules: getTelegramAlertRules() }),
+      telegramAlertRules: config.showFomo ? getFomoTelegramAlertRules() : getTelegramAlertRules(),
     });
 
   });
@@ -728,7 +768,29 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   // the persisted server setting is only the default when the param is absent.
   app.get('/api/signals', (req, res) => {
     const af = req.query.allFactors;
-    res.json(assembleSignals(Date.now(), af === undefined ? getDebugAllFactors() : af === '1'));
+    const allFactors = af === undefined ? getDebugAllFactors() : af === '1';
+    res.json(signalResponseCache.get(allFactors, () => assembleSignals(Date.now(), allFactors)));
+  });
+  app.get('/api/periodic-scan-settings', (_req, res) => {
+    res.json(getPeriodicScanSettings());
+  });
+
+  app.put('/api/periodic-scan-settings', (req, res) => {
+    const result = updatePeriodicScanSettings(req.body);
+    if ('error' in result) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json(result);
+  });
+
+  app.get('/api/monitor/periodic-scan', (_req, res) => {
+    const settings = getPeriodicScanSettings();
+    const signals = settings.enabled
+      ? selectPeriodicScanSignals(assembleSignals(Date.now(), true), settings).map(toPeriodicScanItem)
+      : [];
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ settings, signals });
   });
 
   // Nansen factor thresholds + the allFactors debug flag — runtime-adjustable gates behind the X/3 score above.
@@ -781,6 +843,41 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     const result = updateTelegramAlertRules(patch);
+    if ('error' in result) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json(result);
+  });
+  app.get('/api/fomo/telegram-alert-rules', (_req, res) => {
+    if (!config.showFomo) {
+      res.status(404).json({ error: 'FOMO Telegram alert rules are available on instance B only' });
+      return;
+    }
+    res.json(getFomoTelegramAlertRules());
+  });
+
+  app.put('/api/fomo/telegram-alert-rules', (req, res) => {
+    if (!config.showFomo) {
+      res.status(404).json({ error: 'FOMO Telegram alert rules are available on instance B only' });
+      return;
+    }
+    const body: unknown = req.body;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      res.status(400).json({ error: 'body must be a JSON object' });
+      return;
+    }
+    const values = body as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    const ruleKeys = ['fwGrowthPct', 'minFwPct', 't100GrowthPct', 'minMcK', 'maxMcK', 'trackerBuyingK'] as const;
+    for (const key of ruleKeys) {
+      if (values[key] !== undefined) patch[key] = values[key];
+    }
+    if (Object.keys(values).some((key) => !(ruleKeys as readonly string[]).includes(key))) {
+      res.status(400).json({ error: 'unknown Telegram alert rule' });
+      return;
+    }
+    const result = updateFomoTelegramAlertRules(patch);
     if ('error' in result) {
       res.status(400).json({ error: result.error });
       return;
@@ -1009,8 +1106,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     const b = body as Record<string, unknown>;
-    if (Object.keys(b).some((key) => key !== 'note') || typeof b.note !== 'string' || b.note.length > 2000) {
-      res.status(400).json({ error: 'note must be a string up to 2000 characters' });
+    if (Object.keys(b).some((key) => key !== 'note') || typeof b.note !== 'string' || b.note.length > 1_300_000) {
+      res.status(400).json({ error: 'note must be a string up to 1300000 characters' });
       return;
     }
     const row = setTrackedCaNote(req.params.ca, req.params.chain, b.note);
@@ -1139,6 +1236,11 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       token: parsed.token ?? null,
       ts: parsed.ts,
     });
+    if (created && parsed.type === 'buy' && parsed.tradeUsd !== undefined && parsed.tradeUsd > 0) {
+      appendAlertMetricObservation(getDb(), parsed.ca, parsed.chain, 'trackerBuy', parsed.tradeUsd, parsed.ts, {
+        name: user.handle,
+      });
+    }
     // A watched user's BUY pulls the CA into the tracked queue EXACTLY like a
     // wallet-watch buy (user 2026-09-30): same enqueueTrackedCa gate, the buy's
     // usdValue is the entry size, so a KNOWN sub-minUsd buy is skipped and an
@@ -1159,7 +1261,11 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       kickFomoHoldings(user.id, parsed.chain, parsed.ca, parsed.txHash);
     }
     if (created) {
-      kickFomoPositions(user.id, user.handle, parsed.eventId);
+      const fomoApiUserId = user.user_id ?? parsed.userId;
+      if (parsed.userId !== undefined && user.user_id === null) {
+        updateFomoUser(user.id, { user_id: parsed.userId });
+      }
+      kickFomoPositions(user.id, user.handle, parsed.eventId, fomoApiUserId);
     }
     res.json({ inserted: created ? 1 : 0 });
   });

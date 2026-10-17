@@ -14,35 +14,36 @@ import {
   getTokenState,
   getMetricPollCache,
   listMetricPollCache,
+  metricPollNextAllowedAt,
   reserveMetricPoll,
   saveMetricPollResponse,
   failMetricPoll,
   listCaScoreGateCandidates,
   listCaTargetsMissingEssential,
   listCaTargetsMissingSymbol,
+  listCaTargetsMissingIcon,
+  getFomoApiRequestState,
+  saveFomoApiRequestState,
   getFomoTradeEnrichmentTarget,
-  listFomoAlertTargets,
-  listFomoPositionTargets,
+  getFomoPositionSnapshot,
   listTrackedCas,
-  getFomoApiBalanceSnapshot,
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
   updateFomoTradeUsd,
-  upsertFomoApiBalance,
-  upsertFomoApiBalanceSnapshot,
-  upsertFomoPosition,
+  syncFomoPositionsSnapshot,
   upsertNansenSeries,
   watchedCasForWallet,
   type CaScoreGateRow,
   type CaTarget,
+  type FomoApiRequestEndpoint,
   type MetricPollReservation,
   type TokenStateRow,
   type WalletRow,
 } from './db.js';
-import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo, clearCurrentMarketQuote, recomputeMarketCap } from './ingest.js';
-import { fetchFomoBalances, fetchFomoPositions, fetchFomoSwaps, matchFomoBuySwap } from './fomo-api.js';
-import type { FomoPosition } from './fomo-api.js';
+import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, updateTokenIconIfMissing, upsertTokenInfo, clearCurrentMarketQuote, recomputeMarketCap } from './ingest.js';
+import { fetchFomoPositions, fetchFomoSwaps, matchFomoBuySwaps, recordFomoApiDeferred } from './fomo-api.js';
+import type { FomoApiOutcome, FomoPosition, FomoSwap } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
@@ -61,11 +62,12 @@ import {
 import { type NansenApiClient, type BalanceRange, type StatWindow, type TgmFlowsRow, type TokenFlowsClient } from './providers/nansen.js';
 import { exchangeAnchorLf, RUNG_SPAN_DAYS, seriesReachesStart, t100Mdd } from './snapshot.js';
 import { nansenScore } from './signals.js';
-import { fomoRpcDeps, refreshFomoHolding, trackFomoWalletFromTx, type FomoRpcDeps } from './fomo-holdings.js';
+import { trackFomoWalletFromTx } from './fomo-holdings.js';
 import { getThresholds } from './settings.js';
 import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo } from './providers/provider.js';
+import type { GmgnIconProvider } from './providers/gmgn.js';
 import { enqueueSetup } from './setup-queue.js';
-import { fetchTokenMeta, type DexTokenMeta } from './providers/dexscreener.js';
+import { fetchTokenMeta, validatedIconUrl, type DexTokenMeta } from './providers/dexscreener.js';
 import { GatewayTransportError } from './gateway-client.js';
 import { log } from './log.js';
 
@@ -534,6 +536,49 @@ async function dexMarketSweep(): Promise<void> {
   });
 }
 
+/** Retry missing icons through GMGN after the shared DexScreener metadata pass. */
+export async function gmgnIconSweep(provider: GmgnIconProvider): Promise<void> {
+  const intervalMs = config.pollIconMs;
+  const targets = orderedMetricTargets(listCaTargetsMissingIcon(), 'gmgnIcon').slice(0, 30);
+  if (targets.length === 0) return;
+  const reserved = targets.flatMap((target) => {
+    const reservation = reserveMetricPoll(target.address, target.chain, 'gmgnIcon', Date.now(), intervalMs);
+    return reservation.claimed ? [{ target, reservation }] : [];
+  });
+  if (reserved.length === 0) return;
+
+  await runGatewaySweep('gmgnIconSweep', async (summary) => {
+    await pacedFor(reserved, intervalMs, async ({ target, reservation }) => {
+      if (getTokenState(target.address, target.chain)?.icon_url?.trim()) return;
+      try {
+        const iconUrl = validatedIconUrl(await provider.tokenIcon(target.address, target.chain));
+        if (iconUrl === undefined) {
+          failMetricPoll(
+            target.address,
+            target.chain,
+            'gmgnIcon',
+            failureNextAllowedAt(reservation.row?.failure_count ?? 0, intervalMs, Date.now()),
+          );
+          return;
+        }
+        const responseAt = Date.now();
+        const stored = updateTokenIconIfMissing(target.address, target.chain, iconUrl, responseAt);
+        if (stored) {
+          saveMetricPollResponse(target.address, target.chain, 'gmgnIcon', responseAt, responseAt + intervalMs, { iconUrl });
+        }
+      } catch (error) {
+        failMetricPoll(
+          target.address,
+          target.chain,
+          'gmgnIcon',
+          failureNextAllowedAt(reservation.row?.failure_count ?? 0, intervalMs, Date.now()),
+        );
+        logProviderError(summary, error, 'gmgnIconSweep', target.address);
+      }
+    });
+  });
+}
+
 
 // --- official tgm/flows door (T100 + LF since 2026-09-23) ---------------------
 // Narrow TokenFlowsClient seam: setPollerDeps derives it from the NansenApiClient
@@ -655,7 +700,7 @@ function passThroughAnalytics(st: TokenStateRow): { t100Pct?: number; t100Multip
   };
 }
 
-type SetupField = 'info' | 'series' | 'lf';
+type SetupField = 'series' | 'lf';
 const SETUP_RETRY_MIN_MS = 60_000;
 const SETUP_RETRY_MAX_MS = 43_200_000;
 
@@ -677,7 +722,8 @@ function retryLater(ca: string, chain: Chain, field: SetupField): void {
 
 function owesInfo(ca: string, chain: Chain, now: number): boolean {
   const cached = getSetupCacheEntry(ca, chain);
-  return (!cached || !isInfoFresh(cached, now)) && retryReady(ca, chain, 'info', now);
+  const poll = getMetricPollCache(ca, chain, 'gini');
+  return (!cached || !isInfoFresh(cached, now)) && (!poll || now >= metricPollNextAllowedAt(poll, config.pollSetupMs));
 }
 
 function owesSeries(ca: string, chain: Chain, now: number): boolean {
@@ -758,10 +804,8 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
         }
         if (typeof fresh === 'number' && Number.isFinite(fresh) && result.responseAt !== null) {
           stampSetupCacheField(c.address, c.chain, 'info_at', result.responseAt);
-          clearSetupRetry(c.address, c.chain, 'info');
-        } else retryLater(c.address, c.chain, 'info');
+        }
       } catch (e) {
-        retryLater(c.address, c.chain, 'info');
         logProviderError(summary, e, 'setupSweep gini', c.address);
       }
     }
@@ -1094,6 +1138,8 @@ export async function walletSweep(provider: MarketDataProvider): Promise<void> {
   // floor stays TRACKED so it can surface the moment its cap crosses it. Deleting it
   // here (the old pruneOutOfBandCas) guaranteed churn — add → learn mc → delete → re-add.
   zeroScoreGate();
+  // FOMO social positions and holdings refresh only from incoming alert events.
+  // Native wallet holdings above retain their normal polling cadence.
   // No wallet `Tracked by` -> the row renders "tracked by none"; drop it (user 2026-09-25).
   // Mock skipped: seed CAs are demo rows with no watch trades.
   if (config.mode !== 'mock') {
@@ -1101,8 +1147,6 @@ export async function walletSweep(provider: MarketDataProvider): Promise<void> {
       log.warn(`[poller] prune tracked-by-none CA ${r.address} ${r.chain} (added ${r.added_at}) ${r.note}`);
     }
   }
-  await fomoHoldingsSweep();
-  await fomoPositionsSweep();
 }
 
 async function run(task: PollTask): Promise<void> {
@@ -1186,6 +1230,8 @@ interface PollerDeps {
 }
 
 let pollerDeps: PollerDeps | null = null;
+type PollerScope = 'all' | 'market' | 'wallets';
+let pollerScope: PollerScope = 'all';
 
 /** startPoller stores its provider deps here so api.ts can kick on-demand crawls.
  * `tokenFlows` is the narrow T100/LF seam — it defaults to `nansenApi` (prod,
@@ -1243,8 +1289,128 @@ export function kickWalletHoldingsFor(cas: readonly { address: string; chain: Ch
 
 // --- FOMO user holdings (credit-free RPC, fomo tables only) ------------------
 
-/** Serial drain so a burst of alerts resolves one after another; tests await it. */
+/** FOMO wallet RPC alerts serialize independently from API batches. */
 let fomoKickDrain: Promise<void> = Promise.resolve();
+const FOMO_ALERT_BATCH_MS = 5_000;
+const FOMO_POSITION_REFRESH_COOLDOWN_MS = 60 * 1000;
+interface FomoPositionAlertBatch {
+  handle: string;
+  apiUserId?: string;
+  eventIds: Set<string>;
+  done: Promise<void>;
+  finish: () => void;
+}
+const fomoPositionAlertBatches = new Map<string, FomoPositionAlertBatch>();
+// Keep unrelated FOMO users moving without creating an unbounded API burst.
+const FOMO_POSITION_BATCH_CONCURRENCY = 4;
+let activeFomoPositionBatches = 0;
+const fomoPositionSlotWaiters: (() => void)[] = [];
+const fomoPositionUserDrains = new Map<string, Promise<void>>();
+interface FomoPositionCooldownRefresh {
+  handle: string;
+  apiUserId?: string;
+  timer: NodeJS.Timeout;
+  done: Promise<void>;
+  finish: () => void;
+}
+const fomoPositionCooldownRefreshes = new Map<string, FomoPositionCooldownRefresh>();
+
+const FOMO_API_BACKOFF_BASE_MS = 60_000;
+const FOMO_API_BACKOFF_MAX_MS = 5 * 60_000;
+const FOMO_API_NO_DATA_BACKOFF_MS = 60_000;
+
+function saveFomoApiOutcome(
+  fomoUserId: string,
+  endpoint: FomoApiRequestEndpoint,
+  outcome: FomoApiOutcome,
+  retryAfterMs: number | null,
+  now: number,
+): void {
+  const previous = getFomoApiRequestState(fomoUserId, endpoint);
+  let consecutiveFailures = previous?.consecutive_failures ?? 0;
+  let delayMs = 0;
+  if (outcome === 'success') consecutiveFailures = 0;
+  else if (outcome === 'no_data' || outcome === 'incomplete') {
+    consecutiveFailures = 0;
+    delayMs = FOMO_API_NO_DATA_BACKOFF_MS;
+  } else if (outcome === 'upstream_down' || outcome === 'unconfigured') {
+    delayMs = FOMO_API_NO_DATA_BACKOFF_MS;
+  } else {
+    consecutiveFailures += 1;
+    delayMs = Math.min(FOMO_API_BACKOFF_MAX_MS, FOMO_API_BACKOFF_BASE_MS * 2 ** (consecutiveFailures - 1));
+  }
+  if (retryAfterMs !== null) delayMs = Math.max(delayMs, retryAfterMs);
+  saveFomoApiRequestState({
+    fomo_user_id: fomoUserId,
+    endpoint,
+    last_attempt_at: now,
+    next_eligible_at: now + delayMs,
+    consecutive_failures: consecutiveFailures,
+    last_outcome: outcome,
+  });
+}
+
+function scheduleFomoPositionCooldownRefresh(
+  fomoUserId: string,
+  handle: string,
+  apiUserId: string | undefined,
+  checkedAt: number,
+): void {
+  const existing = fomoPositionCooldownRefreshes.get(fomoUserId);
+  if (existing !== undefined) {
+    existing.handle = handle;
+    if (apiUserId !== undefined) existing.apiUserId = apiUserId;
+    return;
+  }
+  let finish!: () => void;
+  const done = new Promise<void>((resolve) => { finish = resolve; });
+  const pending: FomoPositionCooldownRefresh = {
+    handle,
+    ...(apiUserId !== undefined ? { apiUserId } : {}),
+    timer: setTimeout(() => {
+      if (fomoPositionCooldownRefreshes.get(fomoUserId) !== pending) return;
+      fomoPositionCooldownRefreshes.delete(fomoUserId);
+      const previous = fomoPositionUserDrains.get(fomoUserId) ?? Promise.resolve();
+      const drain = previous
+        .then(() => withFomoPositionSlot(async () => {
+          await refreshFomoPositions(fomoUserId, pending.handle, pending.apiUserId);
+        }))
+        .catch((e) => log.error('[poller] fomo cooldown refresh', e));
+      let settled!: Promise<void>;
+      settled = drain.finally(() => {
+        pending.finish();
+        if (fomoPositionUserDrains.get(fomoUserId) === settled) fomoPositionUserDrains.delete(fomoUserId);
+      });
+      fomoPositionUserDrains.set(fomoUserId, settled);
+    }, Math.max(1, checkedAt + FOMO_POSITION_REFRESH_COOLDOWN_MS - Date.now())),
+    done,
+    finish,
+  };
+  fomoPositionCooldownRefreshes.set(fomoUserId, pending);
+}
+
+function cancelFomoPositionCooldownRefresh(fomoUserId: string): void {
+  const pending = fomoPositionCooldownRefreshes.get(fomoUserId);
+  if (pending === undefined) return;
+  clearTimeout(pending.timer);
+  fomoPositionCooldownRefreshes.delete(fomoUserId);
+  pending.finish();
+}
+
+async function withFomoPositionSlot(run: () => Promise<void>): Promise<void> {
+  if (activeFomoPositionBatches >= FOMO_POSITION_BATCH_CONCURRENCY) {
+    await new Promise<void>((resolve) => fomoPositionSlotWaiters.push(resolve));
+  } else {
+    activeFomoPositionBatches++;
+  }
+  try {
+    await run();
+  } finally {
+    const next = fomoPositionSlotWaiters.shift();
+    if (next !== undefined) next();
+    else activeFomoPositionBatches--;
+  }
+}
 
 /** Resolve + measure ONE alert's wallet fire-and-forget — never blocks the API
  *  response, never rejects (trackFomoWalletFromTx swallows every failure). */
@@ -1253,158 +1419,52 @@ export function kickFomoHoldings(fomoUserId: string, chain: Chain, ca: string, t
   fomoKickDrain = fomoKickDrain.then(() => trackFomoWalletFromTx(fomoUserId, chain, ca, txHash));
 }
 
-/** Test/observability seam: resolves when every queued FOMO kick has finished. */
-export function fomoHoldingsIdle(): Promise<void> {
-  return fomoKickDrain;
-}
-
-/** Periodic re-measure of every alerted (user, ca, chain) so holding pct stays
- *  current. Rides the wallet cadence; one supply read per (chain, ca) per pass. */
-export async function fomoHoldingsSweep(): Promise<void> {
-  const targets = listFomoAlertTargets();
-  if (targets.length === 0) return;
-  const users = new Map<string, { handle: string; targets: { ca: string; chain: Chain }[] }>();
-  for (const t of listFomoPositionTargets()) {
-    const entry = users.get(t.fomo_user_id) ?? { handle: t.handle, targets: [] };
-    users.set(t.fomo_user_id, entry);
+/** Test/observability seam: resolves when queued FOMO holding and API kicks finish. */
+export async function fomoHoldingsIdle(): Promise<void> {
+  await fomoKickDrain;
+  while (true) {
+    const pendingBatches = [...fomoPositionAlertBatches.values()].map((batch) => batch.done);
+    const drains = [...fomoPositionUserDrains.values()];
+    await Promise.all([...drains, ...pendingBatches]);
+    if (pendingBatches.length === 0 && fomoPositionAlertBatches.size === 0 && fomoPositionUserDrains.size === 0) return;
   }
-  for (const t of targets) {
-    const entry = users.get(t.fomo_user_id);
-    if (entry !== undefined) entry.targets.push({ ca: t.ca, chain: t.chain });
+}
+/** Await delayed position refreshes; unlike fomoHoldingsIdle, this waits through cooldown timers. */
+export async function fomoPositionCooldownRefreshIdle(): Promise<void> {
+  while (true) {
+    const pending = [...fomoPositionCooldownRefreshes.values()].map((refresh) => refresh.done);
+    const drains = [...fomoPositionUserDrains.values()];
+    await Promise.all([...pending, ...drains]);
+    if (pending.length === 0 && fomoPositionCooldownRefreshes.size === 0 && fomoPositionUserDrains.size === 0) return;
   }
-  scheduleFomoBalanceSweep(users);
-  const deps = fomoRpcDeps();
-  const supplyCache = new Map<string, number | null>();
-  await pacedFor(targets, config.pollWalletsMs, async (t) => {
-    try {
-      await refreshFomoHolding(t.fomo_user_id, t.chain, t.ca, deps, supplyCache);
-    } catch (e) {
-      log.error('[poller] fomoHoldingsSweep', t.fomo_user_id, e);
-    }
-  });
 }
 
-const FOMO_BALANCE_REFRESH_MS = 24 * 60 * 60 * 1000;
-let fomoBalanceSweepInFlight = false;
-let fomoBalanceSweepDrain: Promise<void> = Promise.resolve();
 
-function scheduleFomoBalanceSweep(users: ReadonlyMap<string, { handle: string; targets: { ca: string; chain: Chain }[] }>): void {
-  if (fomoBalanceSweepInFlight || users.size === 0) return;
-  const now = Date.now();
-  const dueUsers = [...users.entries()].filter(([id]) => {
-    const previous = getFomoApiBalanceSnapshot(id);
-    return previous === undefined || now - previous.checked_at >= FOMO_BALANCE_REFRESH_MS;
-  });
-  if (dueUsers.length === 0) return;
-  fomoBalanceSweepInFlight = true;
-  fomoBalanceSweepDrain = (async () => {
-    try {
-      const deps = fomoRpcDeps();
-      const supplyCache = new Map<string, number | null>();
-      await pacedFor(dueUsers, 600_000, async ([id, user]) => {
-        try {
-          await refreshFomoBalances(id, user.handle, user.targets, deps, supplyCache);
-        } catch (e) {
-          log.error('[poller] fomo balance snapshot', user.handle, e);
-        }
-      });
-    } catch (e) {
-      log.error('[poller] fomo balance sweep', e);
-    } finally {
-      fomoBalanceSweepInFlight = false;
-    }
-  })();
-}
-
-/** Await the background all-chain balances sweep; used by deterministic module tests. */
-export function fomoApiBalancesIdle(): Promise<void> {
-  return fomoBalanceSweepDrain;
-}
-
-/** Refresh all tracked CA balances with one all-chain API snapshot per user/day. */
-async function refreshFomoBalances(
+/** Refresh ONE trader's positions from an alert; never called by a periodic sweep. */
+async function refreshFomoPositions(
   fomoUserId: string,
   handle: string,
-  targets: readonly { ca: string; chain: Chain }[],
-  deps: FomoRpcDeps,
-  supplyCache: Map<string, number | null>,
-): Promise<void> {
-  const previous = getFomoApiBalanceSnapshot(fomoUserId);
-  const checkedAt = Date.now();
-  if (previous !== undefined && checkedAt - previous.checked_at < FOMO_BALANCE_REFRESH_MS) return;
-  const snapshot = await fetchFomoBalances(handle);
-  if (snapshot === null) {
-    upsertFomoApiBalanceSnapshot({
-      fomo_user_id: fomoUserId, checked_at: checkedAt, captured_at: null,
-      complete: false, truncated: false, available: false,
-    });
-    return;
+  apiUserId: string | undefined,
+): Promise<FomoPosition[] | null> {
+  const now = Date.now();
+  const state = getFomoApiRequestState(fomoUserId, 'positions');
+  if (state !== undefined && state.next_eligible_at > now) {
+    recordFomoApiDeferred('positions', now);
+    return null;
   }
-
-  const byToken = new Map(snapshot.balances.map((b) => [`${b.chain}:${b.ca}`, b]));
-  const targetsByToken = new Set(targets.map((t) => `${t.chain}:${t.ca}`));
-  for (const b of snapshot.balances) {
-    let pct: number | null = null;
-    if (targetsByToken.has(`${b.chain}:${b.ca}`)) {
-      const key = `${b.chain}:${b.ca}`;
-      let supply = supplyCache.get(key);
-      if (supply === undefined) {
-        supply = getTokenState(b.ca, b.chain)?.supply ?? null;
-        if ((supply === null || supply <= 0) && (b.chain === 'base' || b.chain === 'bsc' || b.chain === 'robinhood')) {
-          try {
-            supply = await deps.evm.tokenSupply(b.ca, b.chain);
-          } catch (e) {
-            log.warn('[poller] fomo API token supply', b.chain, b.ca, e);
-            supply = null;
-          }
-        }
-        supplyCache.set(key, supply);
-      }
-      if (supply !== null && supply > 0) pct = (b.amount / supply) * 100;
-    }
-    upsertFomoApiBalance({
-      fomo_user_id: fomoUserId, ca: b.ca, chain: b.chain, amount: b.amount,
-      pct, captured_at: snapshot.capturedAt,
-    });
+  const previous = getFomoPositionSnapshot(fomoUserId);
+  if (previous !== undefined && now - previous.checked_at < FOMO_POSITION_REFRESH_COOLDOWN_MS) {
+    recordFomoApiDeferred('positions', now);
+    scheduleFomoPositionCooldownRefresh(fomoUserId, handle, apiUserId, previous.checked_at);
+    return null;
   }
-  if (snapshot.available && snapshot.complete && !snapshot.truncated) {
-    for (const target of targets) {
-      if (byToken.has(`${target.chain}:${target.ca}`)) continue;
-      const key = `${target.chain}:${target.ca}`;
-      let supply = supplyCache.get(key);
-      if (supply === undefined) {
-        supply = getTokenState(target.ca, target.chain)?.supply ?? null;
-        if ((supply === null || supply <= 0) && (target.chain === 'base' || target.chain === 'bsc' || target.chain === 'robinhood')) {
-          try {
-            supply = await deps.evm.tokenSupply(target.ca, target.chain);
-          } catch (e) {
-            log.warn('[poller] fomo API token supply', target.chain, target.ca, e);
-            supply = null;
-          }
-        }
-        supplyCache.set(key, supply);
-      }
-      upsertFomoApiBalance({
-        fomo_user_id: fomoUserId, ca: target.ca, chain: target.chain,
-        amount: 0, pct: supply !== null && supply > 0 ? 0 : null, captured_at: snapshot.capturedAt,
-      });
-    }
-  }
-  upsertFomoApiBalanceSnapshot({
-    fomo_user_id: fomoUserId, checked_at: checkedAt, captured_at: snapshot.capturedAt,
-    complete: snapshot.complete, truncated: snapshot.truncated, available: snapshot.available,
-  });
-}
-
-/** Refresh ONE trader's displayed positions from the FOMO API. Shared by the
- *  periodic sweep and the on-alert kick so both write identical rows. */
-async function refreshFomoPositions(fomoUserId: string, handle: string): Promise<FomoPosition[]> {
-  const tracked = new Set(listTrackedCas().map((c) => `${c.chain}:${c.address}`));
   const fetchedAt = Date.now();
-  const positions = await fetchFomoPositions(handle);
-  for (const p of positions) {
-    if (!tracked.has(`${p.chain}:${p.ca}`)) continue;
-    upsertFomoPosition({
+  const result = await fetchFomoPositions(apiUserId ?? handle);
+  saveFomoApiOutcome(fomoUserId, 'positions', result.outcome, result.retryAfterMs, Date.now());
+  if (result.outcome !== 'success' || result.value === null) return null;
+  syncFomoPositionsSnapshot(
+    fomoUserId,
+    result.value.map((p) => ({
       fomo_user_id: fomoUserId,
       ca: p.ca,
       chain: p.chain,
@@ -1417,65 +1477,103 @@ async function refreshFomoPositions(fomoUserId: string, handle: string): Promise
       realized_pnl_usd: p.realizedPnlUsd,
       unrealized_pnl_usd: p.unrealizedPnlUsd,
       fetched_at: fetchedAt,
-    });
+    })),
+    fetchedAt,
+  );
+  cancelFomoPositionCooldownRefresh(fomoUserId);
+  return result.value;
+}
+
+async function refreshFomoSwaps(fomoUserId: string, identity: string): Promise<FomoSwap[] | null> {
+  const now = Date.now();
+  const state = getFomoApiRequestState(fomoUserId, 'swaps');
+  if (state !== undefined && state.next_eligible_at > now) {
+    recordFomoApiDeferred('swaps', now);
+    return null;
   }
-  return positions;
+  const result = await fetchFomoSwaps(identity);
+  saveFomoApiOutcome(fomoUserId, 'swaps', result.outcome, result.retryAfterMs, Date.now());
+  return result.outcome === 'success' ? result.value : null;
 }
 
-/** On-alert refresh resolves a missing BUY fill from swaps, using the refreshed
- *  position ID when available and otherwise requiring one exact CA/time match. */
-export function kickFomoPositions(fomoUserId: string, handle: string, eventId?: string): void {
-  if (handle === '' || config.fomoApiKey === '') return;
-  fomoKickDrain = fomoKickDrain.then(async () => {
-    const positions = await refreshFomoPositions(fomoUserId, handle);
-    if (eventId === undefined) return;
+async function refreshFomoPositionAlertBatch(
+  fomoUserId: string,
+  batch: FomoPositionAlertBatch,
+): Promise<void> {
+  const identity = batch.apiUserId ?? batch.handle;
+  const positions = await refreshFomoPositions(fomoUserId, batch.handle, batch.apiUserId);
+  const targets: { eventId: string; ca: string; chain: Chain; ts: number; tradeId: string | null }[] = [];
+  for (const eventId of batch.eventIds) {
     const trade = getFomoTradeEnrichmentTarget(fomoUserId, eventId);
-    if (trade === undefined || trade.type !== 'buy' || trade.trade_usd !== null) return;
-    const position = positions.find((p) => p.ca === trade.ca && p.chain === trade.chain);
-    const swaps = await fetchFomoSwaps(handle);
-    if (swaps === null) return;
-    const amount = matchFomoBuySwap({
-      ca: trade.ca,
-      chain: trade.chain,
-      ts: trade.ts,
-      tradeId: position?.tradeId ?? null,
-    }, swaps);
-    if (amount !== null) updateFomoTradeUsd(fomoUserId, eventId, amount);
-  });
-}
-
-
-/** Periodic backstop for the kick: re-syncs every displayed (user, CA, chain) on
- *  the wallet cadence, paced over ~10 minutes so a pass stays well under the API's
- *  burst limit — a 60s pass for the same 39 traders earned 429/503 and shares the
- *  budget with the alert daemon (measured 2026-10-01). The on-alert kick is what
- *  keeps the dash current; this only catches what the kick missed. No-ops without
- *  a key; a CA no longer tracked is skipped. */
-export async function fomoPositionsSweep(): Promise<void> {
-  if (config.fomoApiKey === '') return;
-  const targets = listFomoPositionTargets();
+    if (trade === undefined || trade.type !== 'buy' || trade.trade_usd !== null) continue;
+    const position = positions?.find((p) => p.ca === trade.ca && p.chain === trade.chain);
+    targets.push({ eventId, ca: trade.ca, chain: trade.chain, ts: trade.ts, tradeId: position?.tradeId ?? null });
+  }
   if (targets.length === 0) return;
-  await pacedFor(targets, Math.min(config.pollWalletsMs, 600_000), async (t) => {
-    try {
-      await refreshFomoPositions(t.fomo_user_id, t.handle);
-    } catch (e) {
-      log.error('[poller] fomoPositionsSweep', t.handle, e);
-    }
-  });
+  const swaps = await refreshFomoSwaps(fomoUserId, identity);
+  if (swaps === null) return;
+  const amounts = matchFomoBuySwaps(targets, swaps);
+  for (let i = 0; i < targets.length; i++) {
+    const amount = amounts[i];
+    if (amount !== null && amount !== undefined) updateFomoTradeUsd(fomoUserId, targets[i]!.eventId, amount);
+  }
 }
+
+/** Coalesce one trader's alerts for five seconds into one positions/swaps API batch. */
+export function kickFomoPositions(
+  fomoUserId: string,
+  handle: string,
+  eventId?: string,
+  apiUserId?: string,
+): void {
+  if (handle === '' || config.fomoApiKey === '') return;
+  const existing = fomoPositionAlertBatches.get(fomoUserId);
+  if (existing !== undefined) {
+    existing.handle = handle;
+    if (apiUserId !== undefined) existing.apiUserId = apiUserId;
+    if (eventId !== undefined) existing.eventIds.add(eventId);
+    return;
+  }
+  let finish!: () => void;
+  const done = new Promise<void>((resolve) => { finish = resolve; });
+  const batch: FomoPositionAlertBatch = {
+    handle,
+    ...(apiUserId !== undefined ? { apiUserId } : {}),
+    eventIds: new Set(),
+    done,
+    finish,
+  };
+  if (eventId !== undefined) batch.eventIds.add(eventId);
+  fomoPositionAlertBatches.set(fomoUserId, batch);
+  setTimeout(() => {
+    const queued = fomoPositionAlertBatches.get(fomoUserId);
+    if (queued !== batch) return;
+    fomoPositionAlertBatches.delete(fomoUserId);
+    const previous = fomoPositionUserDrains.get(fomoUserId) ?? Promise.resolve();
+    const drain = previous
+      .then(() => withFomoPositionSlot(() => refreshFomoPositionAlertBatch(fomoUserId, batch)))
+      .catch((e) => log.error('[poller] fomo alert refresh', e));
+    let settled!: Promise<void>;
+    settled = drain.finally(() => {
+      batch.finish();
+      if (fomoPositionUserDrains.get(fomoUserId) === settled) fomoPositionUserDrains.delete(fomoUserId);
+    });
+    fomoPositionUserDrains.set(fomoUserId, settled);
+  }, FOMO_ALERT_BATCH_MS);
+}
+
 
 /** Add hook shares the periodic cache gates; wallet links still get their scoped refresh. */
 export function kickCAs(cas: readonly { address: string; chain: Chain }[]): void {
   if (!pollerDeps) return;
-  for (const c of cas) {
-    // T4 (plan setup-fill-on-add): the early setup pass rides kickToken's
-    // completion — upsertTokenInfo has CREATED the token_state row by then, and
-    // refreshSeries no-ops without it, so the chain IS the ordering guarantee.
-    void kickToken(pollerDeps.provider, c.address, c.chain).then(() => {
-      kickSetupEarly([c]);
-    });
+  if (pollerScope !== 'wallets') {
+    for (const c of cas) {
+      void kickToken(pollerDeps.provider, c.address, c.chain).then(() => {
+        kickSetupEarly([c]);
+      });
+    }
   }
-  kickWalletHoldingsFor(cas);
+  if (pollerScope !== 'market') kickWalletHoldingsFor(cas);
 }
 
 // Newly-added tokens enter the same queue as chart and background refreshes.
@@ -1591,7 +1689,6 @@ async function bootstrapTokenInfo(provider: MarketDataProvider, address: string,
         updateNansenHolders(address, chain, info.nansenStats);
         if (Number.isFinite(info.nansenStats.freshSupplyPct)) {
           stampSetupCacheField(address, chain, 'info_at', responseAt);
-          clearSetupRetry(address, chain, 'info');
         }
       }
       for (const kind of METRIC_KINDS) {
@@ -1648,7 +1745,6 @@ async function applyDueMetric(
   applyMetricPatch(address, chain, kind, result.patch);
   if (kind === 'gini' && typeof result.patch.nansenFreshPct === 'number' && result.responseAt !== null) {
     stampSetupCacheField(address, chain, 'info_at', result.responseAt);
-    clearSetupRetry(address, chain, 'info');
   }
 }
 
@@ -1728,6 +1824,7 @@ export function kickToken(provider: MarketDataProvider, address: string, chain: 
 
 /** Cache one CA's Nansen balance series (one full-series fetch, 3 sliced windows) now. */
 export function kickNansen(address: string, chain: Chain): void {
+  if (pollerScope === 'wallets') return;
   void (async () => {
     const { bal, ok } = await crawlBalanceSeries(address, chain);
     const st = getTokenState(address, chain);
@@ -1770,30 +1867,43 @@ export function nextPhaseDelayMs(anchorAt: number, now: number, intervalMs: numb
 }
 
 /** Starts the sweeps with staggered initial delays (20s apart, in this order). */
-export function startPoller(provider: MarketDataProvider, nansenApi: NansenApiClient | null, tokenFlows?: TokenFlowsClient | null): void {
+export function startPoller(
+  provider: MarketDataProvider,
+  nansenApi: NansenApiClient | null,
+  tokenFlows?: TokenFlowsClient | null,
+  scope: PollerScope = 'all',
+  gmgnIconProvider?: GmgnIconProvider,
+): void {
+  pollerScope = scope;
   setPollerDeps(provider, nansenApi, tokenFlows);
-  const tasks: PollTask[] = [
-    { name: 'essentialSweep', intervalMs: config.pollEssentialMs, fn: () => metricSweep(provider, 'essential', config.pollEssentialMs) },
-    {
-      name: 'essentialGapSweep',
-      intervalMs: config.pollEssentialGapMs,
-      // Too-new CAs are filtered out: a mint Nansen has not indexed yet gains
-      // The 30-minute MC cache gate prevents this faster gap sweep from querying early.
-      fn: () =>
-        metricSweep(
-          provider,
-          'essential',
-          config.pollEssentialGapMs,
-          listCaTargetsMissingEssential().filter((c) => !isTooNewToken(c.address, c.chain, Date.now())),
-        ),
-    },
-    { name: 'volumeSweep', intervalMs: config.pollVolumeMs, fn: () => metricSweep(provider, 'volume', config.pollVolumeMs) },
-    { name: 'flowsSweep', intervalMs: config.pollFlowsMs, fn: () => flowsSweep() },
-    { name: 'walletSweep', intervalMs: config.pollWalletsMs, fn: () => walletSweep(provider) },
-    { name: 'symbolBackfillSweep', intervalMs: config.pollSymbolBackfillMs, fn: () => symbolBackfillSweep(provider) },
-    { name: 'dexMarketSweep', intervalMs: config.pollIconMs, fn: () => dexMarketSweep() },
-  ];
-  if (config.crawlEnabled) {
+  const tasks: PollTask[] = [];
+  if (scope !== 'wallets') {
+    tasks.push(
+      { name: 'essentialSweep', intervalMs: config.pollEssentialMs, fn: () => metricSweep(provider, 'essential', config.pollEssentialMs) },
+      {
+        name: 'essentialGapSweep',
+        intervalMs: config.pollEssentialGapMs,
+        fn: () =>
+          metricSweep(
+            provider,
+            'essential',
+            config.pollEssentialGapMs,
+            listCaTargetsMissingEssential().filter((c) => !isTooNewToken(c.address, c.chain, Date.now())),
+          ),
+      },
+      { name: 'volumeSweep', intervalMs: config.pollVolumeMs, fn: () => metricSweep(provider, 'volume', config.pollVolumeMs) },
+      { name: 'flowsSweep', intervalMs: config.pollFlowsMs, fn: () => flowsSweep() },
+      { name: 'symbolBackfillSweep', intervalMs: config.pollSymbolBackfillMs, fn: () => symbolBackfillSweep(provider) },
+      { name: 'dexMarketSweep', intervalMs: config.pollIconMs, fn: () => dexMarketSweep() },
+    );
+    if (gmgnIconProvider) {
+      tasks.push({ name: 'gmgnIconSweep', intervalMs: config.pollIconMs, fn: () => gmgnIconSweep(gmgnIconProvider) });
+    }
+  }
+  if (scope !== 'market') {
+    tasks.push({ name: 'walletSweep', intervalMs: config.pollWalletsMs, fn: () => walletSweep(provider) });
+  }
+  if (scope !== 'wallets' && config.crawlEnabled) {
     // F1=(b) (plan setup-fill-on-add T5): the marks count from the SYSTEM deploy
     // anchor in settings (written once by db.open(), never overwritten), not from
     // process boot.

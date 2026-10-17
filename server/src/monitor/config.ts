@@ -24,6 +24,8 @@ export interface MonitorConfig {
   discordChannelId: string;
   telegramBotToken: string;
   telegramChatId: string;
+  telegramPeriodicChatId: string;
+  telegramAlertThreadId?: number;
 }
 
 function integer(raw: string | undefined, fallback: number, name: string, min: number, max: number): number {
@@ -41,6 +43,7 @@ function nonNegative(raw: string | undefined, fallback: number, name: string): n
   if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite number >= 0`);
   return value;
 }
+
 function percentage(raw: string | undefined, fallback: number, name: string): number {
   const value = nonNegative(raw, fallback, name);
   if (value > 100) throw new Error(`${name} must be <= 100`);
@@ -52,9 +55,25 @@ function required(raw: string | undefined, name: string): string {
   return raw;
 }
 
+function optionalThreadId(raw: string | undefined, name: string): number | undefined {
+  return raw === undefined || raw.trim() === ''
+    ? undefined
+    : integer(raw, 0, name, 1, Number.MAX_SAFE_INTEGER);
+}
+
 export function readMonitorConfig(env: NodeJS.ProcessEnv = process.env): MonitorConfig {
   const timezone = env.MONITOR_TIMEZONE?.trim() || 'Asia/Ho_Chi_Minh';
   new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(0);
+  const telegramChatId = env.TELEGRAM_CHAT_ID?.trim() || '';
+  const telegramPeriodicChatId = env.TELEGRAM_PERIODIC_CHAT_ID?.trim() || '';
+  const telegramAlertThreadId = optionalThreadId(env.TELEGRAM_ALERT_THREAD_ID, 'TELEGRAM_ALERT_THREAD_ID');
+  if (telegramAlertThreadId !== undefined && telegramChatId === '') {
+    throw new Error('TELEGRAM_CHAT_ID is required when Telegram alert topics are configured');
+  }
+  if (telegramPeriodicChatId !== '' && telegramPeriodicChatId.toLowerCase() === telegramChatId.toLowerCase()) {
+    throw new Error('TELEGRAM_PERIODIC_CHAT_ID must differ from TELEGRAM_CHAT_ID');
+  }
+
   return {
     apiToken: required(env.MONITOR_API_TOKEN, 'MONITOR_API_TOKEN'),
     port: integer(env.MONITOR_PORT, 8126, 'MONITOR_PORT', 1, 65535),
@@ -80,6 +99,8 @@ export function readMonitorConfig(env: NodeJS.ProcessEnv = process.env): Monitor
     discordBotToken: env.DISCORD_BOT_TOKEN?.trim() || '',
     discordChannelId: env.DISCORD_CHANNEL_ID?.trim() || '',
     telegramBotToken: env.TELEGRAM_BOT_TOKEN?.trim() || '',
-    telegramChatId: env.TELEGRAM_CHAT_ID?.trim() || '',
+    telegramChatId,
+    telegramPeriodicChatId,
+    ...(telegramAlertThreadId !== undefined ? { telegramAlertThreadId } : {}),
   };
 }

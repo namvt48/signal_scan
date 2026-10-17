@@ -81,6 +81,19 @@ test('metric poll reservation persists response and cadence across database reop
     open(':memory:');
   }
 });
+test('gini reservation honors a shortened cadence for an existing success', () => {
+  const now = 10_000;
+  const oldCadenceMs = 6 * 60 * 60_000;
+  const newCadenceMs = 3 * 60 * 60_000;
+  open(':memory:');
+  reserveMetricPoll('fresh-ca', 'sol', 'gini', now, oldCadenceMs);
+  saveMetricPollResponse('fresh-ca', 'sol', 'gini', now, now + oldCadenceMs, { nansenFreshPct: 12 });
+
+  assert.equal(reserveMetricPoll('fresh-ca', 'sol', 'gini', now + newCadenceMs - 1, newCadenceMs).claimed, false);
+  const shortened = reserveMetricPoll('fresh-ca', 'sol', 'gini', now + newCadenceMs, newCadenceMs);
+  assert.equal(shortened.claimed, true);
+  assert.equal(reserveMetricPoll('fresh-ca', 'sol', 'gini', now + newCadenceMs, newCadenceMs).claimed, false);
+});
 
 test('MC metric sweep enforces the 30-minute floor and retains the last success on failure', async () => {
   open(':memory:');

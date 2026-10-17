@@ -4,45 +4,43 @@ import { getBalanceChart, getTokenDetail } from '../services/tokenDetail';
 import { compact, formatTime, pct, usd } from '../lib/format';
 import { CopyButton, ErrorState, SkeletonRows, TableShell, Td, Th } from './ui';
 
+
 // Balance chart 24h — the green Nansen "Balance" series (top-100 total, tokens).
 // Curve drawn in SVG (viewBox % space, non-scaling stroke); labels/gridlines are
 // real HTML so text stays 11px at any width (SVG text would scale up).
 function BalanceChartSvg({ points }: { points: { t: number | string; total: number }[] }) {
-  const vals = points.map((p) => p.total);
+  const vals = points.map((point) => point.total);
   const max = Math.max(...vals);
   const min = Math.min(...vals);
   const pad = (max - min) * 0.1 || max * 0.05 || 1;
   const hi = max + pad;
   const lo = min - pad;
-  const yPct = (v: number) => (1 - (v - lo) / (hi - lo)) * 100;
-
-  const xs = points.map((_, i) => (i / Math.max(1, points.length - 1)) * 100);
+  const yPct = (value: number) => (1 - (value - lo) / (hi - lo)) * 100;
+  const xs = points.map((_, index) => (index / Math.max(1, points.length - 1)) * 100);
   let path = `M${xs[0]!.toFixed(2)},${yPct(vals[0]!).toFixed(2)}`;
-  for (let i = 1; i < points.length; i++) {
-    const mx = ((xs[i - 1]! + xs[i]!) / 2).toFixed(2);
-    path += ` C${mx},${yPct(vals[i - 1]!).toFixed(2)} ${mx},${yPct(vals[i]!).toFixed(2)} ${xs[i]!.toFixed(2)},${yPct(vals[i]!).toFixed(2)}`;
+  for (let index = 1; index < points.length; index += 1) {
+    const middle = ((xs[index - 1]! + xs[index]!) / 2).toFixed(2);
+    path += ` C${middle},${yPct(vals[index - 1]!).toFixed(2)} ${middle},${yPct(vals[index]!).toFixed(2)} ${xs[index]!.toFixed(2)},${yPct(vals[index]!).toFixed(2)}`;
   }
   const area = `${path} L100,100 L0,100 Z`;
-
   const fmtT = (t: number | string): string => {
-    const s = String(t);
-    return s.includes('T') ? s.slice(11, 16) : s.slice(5, 10);
+    const value = String(t);
+    return value.includes('T') ? value.slice(11, 16) : value.slice(5, 10);
   };
   const ticks = [hi, lo + (hi - lo) / 2, lo];
-
   return (
     <div className="flex gap-3">
       <div className="relative h-56 w-14 shrink-0 text-right font-mono text-[11px] text-muted">
-        {ticks.map((v) => (
-          <span key={v} className="absolute right-0 -translate-y-1/2" style={{ top: `${yPct(v)}%` }}>
-            {compact(v)}
+        {ticks.map((value) => (
+          <span key={value} className="absolute right-0 -translate-y-1/2" style={{ top: `${yPct(value)}%` }}>
+            {compact(value)}
           </span>
         ))}
       </div>
       <div className="min-w-0 flex-1">
         <div className="relative h-56">
-          {ticks.map((v) => (
-            <div key={v} className="absolute inset-x-0 border-t border-dashed border-line" style={{ top: `${yPct(v)}%` }} />
+          {ticks.map((value) => (
+            <div key={value} className="absolute inset-x-0 border-t border-dashed border-line" style={{ top: `${yPct(value)}%` }} />
           ))}
           <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Balance chart">
             <defs>
@@ -63,6 +61,8 @@ function BalanceChartSvg({ points }: { points: { t: number | string; total: numb
     </div>
   );
 }
+
+
 
 const METRIC_CARD = 'rounded-xl border border-line bg-surface p-4';
 

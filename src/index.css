@@ -249,10 +249,10 @@ body {
 .note-flag:focus-visible{ opacity:1; }
 .note-flag:hover{ background:var(--c-good-ink); color:var(--c-pos); border-color:rgba(62,125,82,0.45); }
 .note-flag:focus-visible{ outline:2px solid var(--c-pos); outline-offset:2px; }
-.note-flag.has-note{ opacity:1; width:42px; height:42px; border:none; border-radius:0; background:transparent; margin-left:4px; top:0; transition:transform .12s ease; }
-.note-flag.has-note:hover{ background:transparent; transform:scale(1.1); }
-.note-flag-mark{ position:relative; display:inline-flex; width:42px; height:42px; align-items:center; justify-content:center; color:#E5A900; }
-.note-flag-alert{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:15px; font-weight:900; line-height:1; }
+ .note-flag.has-note{ opacity:1; width:34px; height:34px; border:none; border-radius:0; background:transparent; margin-left:4px; top:0; transition:transform .12s ease; }
+ .note-flag.has-note:hover{ background:transparent; transform:scale(1.1); }
+ .note-flag-mark{ position:relative; display:inline-flex; width:21.6px; height:21.6px; align-items:center; justify-content:center; color:#E5A900; }
+ .note-flag-alert{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font-size:12px; font-weight:900; line-height:1; }
 
 /* Shared floating surface for the editor and saved-note tooltip. */
 .note-pop{
@@ -274,20 +274,21 @@ body {
 .note-editor.below::after{ top:-11px; }
 .note-editor.above::after{ bottom:-11px; }
 .note-pop-content{ box-sizing:border-box; max-height:inherit; overflow-y:auto; }
-.note-editor{ width:2080px; min-height:var(--editor-min-height,520px); padding:0; }
-.note-editor-content{ display:flex; min-height:var(--editor-min-height,520px); flex-direction:column; padding:44px 52px; }
+ .note-editor{ width:min(1080px,calc(100vw - 24px)); min-height:var(--editor-min-height,360px); padding:0; }
+ .note-editor-content{ display:flex; min-height:var(--editor-min-height,360px); flex-direction:column; padding:24px 28px; }
 .note-ed-head{ display:flex; align-items:center; gap:24px; margin-bottom:24px; }
-.note-ed-ico{ width:64px; height:64px; border-radius:14px; background:var(--c-good-ink); color:var(--c-pos); display:flex; align-items:center; justify-content:center; flex:none; }
-.note-ed-title{ overflow:hidden; font-size:21px; font-weight:800; color:var(--c-ink); text-overflow:ellipsis; white-space:nowrap; }
+ .note-ed-ico{ width:44px; height:44px; border-radius:12px; background:var(--c-good-ink); color:var(--c-pos); display:flex; align-items:center; justify-content:center; flex:none; }
+ .note-ed-title{ overflow:hidden; font-size:16px; font-weight:800; color:var(--c-ink); text-overflow:ellipsis; white-space:nowrap; }
 .note-ed-title span{ font-weight:600; color:var(--c-muted); }
-.note-editor .note-editor-textarea{
-  display:block; width:100%; box-sizing:border-box; min-height:480px; flex:1; resize:vertical;
-  font-family:"Plus Jakarta Sans",sans-serif; font-size:25px; line-height:1.55; color:var(--c-ink);
+ .note-editor .note-editor-textarea{
+  display:block; width:100%; box-sizing:border-box; min-height:300px; flex:1; resize:vertical;
+  font-family:"Plus Jakarta Sans",sans-serif; font-size:18px; line-height:1.5; color:var(--c-ink);
   padding:9px 11px; border-radius:10px; border:1px solid var(--c-line); background:#F7F9F6; outline:none;
+  white-space:pre-wrap; word-break:break-word; overflow-y:auto;
   transition:border-color .12s ease, background .12s ease;
 }
 .note-editor .note-editor-textarea:focus{ border-color:rgba(62,125,82,0.55); background:#fff; }
-.note-editor .note-editor-textarea::placeholder{ color:#A3AC9F; }
+.note-editor .note-editor-textarea:empty::before{ content:attr(data-placeholder); color:#A3AC9F; pointer-events:none; }
 .note-ed-foot{ display:flex; align-items:center; gap:6px; margin-top:10px; }
 .note-ed-hint{ flex:1; font-size:10px; color:#A3AC9F; }
 .note-ed-count{ font-size:10.5px; color:#A3AC9F; font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -301,16 +302,17 @@ body {
 .note-btn.primary{ background:var(--c-pos); color:#fff; }
 .note-btn.primary:hover{ background:#336a45; }
 .note-btn:disabled{ cursor:wait; opacity:.6; }
-.note-tip{ width:max-content; max-width:min(2080px,calc(100vw - 24px)); min-width:min(1200px,calc(100vw - 24px)); padding:0; pointer-events:auto; }
-.note-tip::after{ width:20px; height:20px; margin-left:-10px; }
-.note-tip.below::after{ top:-11px; }
-.note-tip.above::after{ bottom:-11px; }
-.note-tip-content{ padding:44px 52px 44px 60px; }
-.note-tip::before{ content:""; position:absolute; left:0; top:48px; bottom:48px; width:6px; border-radius:0 6px 6px 0; background:#F2B01E; }
-.note-tip-head{ font-size:21px; font-weight:700; color:var(--c-muted); margin-bottom:8px; }
-.note-tip-head b{ color:var(--c-ink); font-weight:800; }
-.note-tip-body{ font-size:25px; line-height:1.55; color:var(--c-ink); white-space:pre-wrap; word-break:break-word; }
-.note-tip-foot{ margin-top:16px; font-size:20px; color:#A3AC9F; }
+ .note-tip{ width:max-content; max-width:min(1080px,calc(100vw - 24px)); min-width:min(600px,calc(100vw - 24px)); padding:0; pointer-events:auto; }
+ .note-tip::after{ width:20px; height:20px; margin-left:-10px; }
+ .note-tip.below::after{ top:-11px; }
+ .note-tip.above::after{ bottom:-11px; }
+ .note-tip-content{ padding:24px 28px 24px 34px; }
+ .note-tip::before{ content:""; position:absolute; left:0; top:28px; bottom:28px; width:4px; border-radius:0 6px 6px 0; background:#F2B01E; }
+ .note-tip-head{ font-size:16px; font-weight:700; color:var(--c-muted); margin-bottom:8px; }
+ .note-tip-head b{ color:var(--c-ink); font-weight:800; }
+ .note-tip-body{ font-size:18px; line-height:1.5; color:var(--c-ink); white-space:pre-wrap; word-break:break-word; }
+ .note-tip-foot{ margin-top:10px; font-size:12px; color:#A3AC9F; }
+ .note-attachment{ display:inline-block; max-width:100%; max-height:240px; width:auto; object-fit:contain; vertical-align:middle; margin:0 .25em; }
 @media (max-width: 767px) {
   .note-tip-foot{ margin-top:16px; font-size:20px; }
   .note-tip { max-height: min(1440px, calc(100vh - 24px)); }

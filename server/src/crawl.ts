@@ -11,6 +11,7 @@
 // Import direction is one-way — crawl.ts imports from gateway/door.ts, never
 // the reverse — so there is no module cycle.
 
+import { config } from './config.js';
 import {
   hourlyStatsBody,
   NANSEN_HOURLY_STATS_URL,
@@ -120,26 +121,30 @@ export async function balanceSeries(
   chain: Chain,
   window: 'day' | 'week' | 'month',
 ): Promise<{ source: 'nansen' | 'snapshots'; points: BalancePoint[]; cachedAt?: number }> {
+  const atMs = (p: BalancePoint) => (typeof p.t === 'number' ? p.t : Date.parse(String(p.t)));
   let cachedAt = nansenSeriesCachedAt(ca, chain, window);
   let cached = getNansenSeries(ca, chain, window);
-  // FILE-cache fallback (plan setup-fill-on-add §4): a DB-table reset wipes
-  // nansen_series, but data/nansen-cache.json survives — replay a FRESH entry
-  // through the SAME window slicer the fetch path uses instead of degrading to
-  // internal snapshots or kicking a door refetch.
+  // A fresh file-cache entry survives a DB-table reset. API instances serve it
+  // directly; only the gateway may replay it into shared SQLite.
   if (cached.length <= 1) {
-    const e = getSetupCacheEntry(ca, chain);
-    // Fresh% stamps must never make an old chart look newly fetched.
-    if (e && e.series.length > 0 && e.series_at !== undefined && isSeriesFresh(e, Date.now())) {
-      cacheSeriesWindows(ca, chain, e.series, e.series_at);
-      log.info(`[setup-cache] replayed ${ca.slice(0, 8)} (${chain}) chart windows from the file cache`);
-      cachedAt = nansenSeriesCachedAt(ca, chain, window);
-      cached = getNansenSeries(ca, chain, window);
+    const entry = getSetupCacheEntry(ca, chain);
+    if (entry && entry.series.length > 0 && entry.series_at !== undefined && isSeriesFresh(entry, Date.now())) {
+      if (config.marketDbPath !== '') {
+        const since = Date.now() - (window === 'day' ? 86_400_000 : window === 'week' ? 7 * 86_400_000 : 30 * 86_400_000);
+        const points = entry.series.filter((point) => atMs(point) >= since).sort((a, b) => atMs(a) - atMs(b));
+        if (points.length > 1) return { source: 'nansen', points, cachedAt: entry.series_at };
+      } else {
+        cacheSeriesWindows(ca, chain, entry.series, entry.series_at);
+        log.info(`[setup-cache] replayed ${ca.slice(0, 8)} (${chain}) chart windows from the file cache`);
+        cachedAt = nansenSeriesCachedAt(ca, chain, window);
+        cached = getNansenSeries(ca, chain, window);
+      }
     }
   }
   // Stale top-up: serve the cache immediately but kick a background refresh so
   // the series converges toward Nansen live within one sweep interval.
   if (cachedAt !== undefined && Date.now() - cachedAt > 3_600_000) kickNansen(ca, chain);
-  const atMs = (p: BalancePoint) => (typeof p.t === 'number' ? p.t : Date.parse(String(p.t)));
+
   if (cached.length > 1) return { source: 'nansen', points: cached.sort((a, b) => atMs(a) - atMs(b)), cachedAt };
   const since = Date.now() - (window === 'day' ? 86_400_000 : window === 'week' ? 7 * 86_400_000 : 30 * 86_400_000);
   return { source: 'snapshots', points: snapshotSeries(ca, chain, since), cachedAt };

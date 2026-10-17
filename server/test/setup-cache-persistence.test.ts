@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -70,28 +70,48 @@ test('marker-only first-add entry stamps only the obtained field and preserves a
   assert.equal(getSetupCacheEntry('CACHE-ABSENT-MARKERS', CHAIN)?.series_at, undefined);
 });
 
-test('info, series and LF retry states persist independently and clear by field', () => {
+
+test('series and LF retry states persist independently and clear by field', () => {
   const file = cacheFile();
   loadSetupCache(file);
   const ca = 'CACHE-RETRY-INDEPENDENT';
-  const infoRetry = { misses: 2, nextAt: 10_000 };
   const seriesRetry = { misses: 3, nextAt: 20_000 };
   const lfRetry = { misses: 4, nextAt: 30_000 };
 
-  recordSetupRetry(ca, CHAIN, 'info', infoRetry.misses, infoRetry.nextAt);
   recordSetupRetry(ca, CHAIN, 'series', seriesRetry.misses, seriesRetry.nextAt);
   recordSetupRetry(ca, CHAIN, 'lf', lfRetry.misses, lfRetry.nextAt);
   loadSetupCache(file);
 
-  assert.deepEqual(getSetupRetry(ca, CHAIN, 'info'), infoRetry);
   assert.deepEqual(getSetupRetry(ca, CHAIN, 'series'), seriesRetry);
   assert.deepEqual(getSetupRetry(ca, CHAIN, 'lf'), lfRetry);
   clearSetupRetry(ca, CHAIN, 'series');
   assert.equal(getSetupRetry(ca, CHAIN, 'series'), undefined);
-  assert.deepEqual(getSetupRetry(ca, CHAIN, 'info'), infoRetry);
   assert.deepEqual(getSetupRetry(ca, CHAIN, 'lf'), lfRetry);
   loadSetupCache(file);
   assert.equal(getSetupRetry(ca, CHAIN, 'series'), undefined);
-  assert.deepEqual(getSetupRetry(ca, CHAIN, 'info'), infoRetry);
   assert.deepEqual(getSetupRetry(ca, CHAIN, 'lf'), lfRetry);
+});
+
+test('legacy Fresh retries are discarded while series and LF retry state survives', () => {
+  const file = cacheFile();
+  const ca = 'CACHE-LEGACY-RETRIES';
+  const fresh = { misses: 2, nextAt: 40_000 };
+  const series = { misses: 3, nextAt: 50_000 };
+  const lf = { misses: 4, nextAt: 60_000 };
+  writeFileSync(file, JSON.stringify({
+    version: 2,
+    entries: [bareEntry(ca, 10_000)],
+    retries: {
+      [`${CHAIN}:${ca}:info`]: fresh,
+      [`${CHAIN}:${ca}:series`]: series,
+      [`${CHAIN}:${ca}:lf`]: lf,
+    },
+  }));
+
+  loadSetupCache(file);
+
+  assert.equal(getSetupRetry(ca, CHAIN, 'series')?.nextAt, series.nextAt);
+  assert.equal(getSetupRetry(ca, CHAIN, 'lf')?.nextAt, lf.nextAt);
+  const persisted = JSON.parse(readFileSync(file, 'utf8')) as { retries: Record<string, unknown> };
+  assert.equal(persisted.retries[`${CHAIN}:${ca}:info`], undefined);
 });

@@ -230,6 +230,26 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch,
   if (patch.marketCap !== undefined) recordMarketCapSnapshot(ca, chain, sampledAt);
 }
 
+/** Fill a missing icon atomically; a concurrent valid provider write always wins. */
+export function updateTokenIconIfMissing(
+  ca: string,
+  chain: Chain,
+  iconUrl: string,
+  sampledAt = Date.now(),
+): boolean {
+  const canonical = canonicalCa(ca, chain);
+  const result = getDb()
+    .prepare(
+      `INSERT INTO token_state (ca, chain, icon_url, fetched_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(ca, chain) DO UPDATE SET
+         icon_url = excluded.icon_url,
+         fetched_at = excluded.fetched_at
+       WHERE token_state.icon_url IS NULL OR trim(token_state.icon_url) = ''`,
+    )
+    .run(canonical, chain, iconUrl, sampledAt);
+  return result.changes > 0;
+}
+
 /**
  * Fill-only write: a column is set ONLY while it is still NULL
  * (`COALESCE(token_state.col, excluded.col)`). Used by the NON-owning provider of a
