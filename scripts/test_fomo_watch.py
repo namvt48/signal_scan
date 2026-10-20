@@ -9,7 +9,7 @@ Fixtures dựng từ capture THẬT `.omo/evidence/fomo-user-watch/task-0-alert-
 (102 alert, schema đã pin trong plan). Cover đúng danh sách todo 10:
   1. welcome/heartbeat/ping → không emit, không raise.
   2. perp (tokenAddress null) + thesis → drop.
-  3. chain 'ethereum' → drop; solana/base/bsc/robinhood → map tương ứng.
+  3. chain 'ethereum'/solana → drop; base/bsc/robinhood → map tương ứng.
   4. trader không được watch → drop, không emit.
   5. trader khớp handle (row KHÔNG có userId) → CÓ emit (handle matching works).
   6. cùng eventId 2 lần → emit 1 lần (dedupe).
@@ -82,17 +82,18 @@ PONG = "pong"
 PERP = _first(_ALERTS, alertType="perp")  # tokenAddress null, chain hyperliquid/1337
 THESIS = _first(_ALERTS, alertType="thesis")
 ETH = _first(_ALERTS, chain="ethereum", alertType="buy")
-SOL_BUY = _first(_ALERTS, chain="solana", alertType="buy")
-# USD THẬT đã giao dịch (~17/102 alert có field này). steph_2441 là ca điển hình:
-# usdValue 61,206.56 (position SAU fill) trong khi chỉ mua 126.06 USD.
-SOL_BUY_TRADE = next(
+SOLANA_BUY = _first(_ALERTS, chain="solana", alertType="buy")
+BASE_BUY = _first(_ALERTS, chain="base", alertType="buy")
+# Use Base for ingestion-path tests: FOMO no longer forwards Solana alerts.
+SOL_BUY = BASE_BUY
+BASE_BUY_TRADE = next(
     dict(a)
     for a in _ALERTS
-    if a.get("trader") == "steph_2441"
-    and a.get("chain") == "solana"
+    if a.get("chain") == "robinhood"
     and a.get("alertType") == "buy"
     and a.get("tradeUsd") is not None
 )
+SOL_BUY_TRADE = BASE_BUY_TRADE
 BASE_SELL = _first(_ALERTS, chain="base", alertType="sell")
 BSC_SELL = _first(_ALERTS, chain="bsc", alertType="sell")
 ROBINHOOD_BUY = _first(_ALERTS, chain="robinhood", alertType="buy")
@@ -225,12 +226,13 @@ try:
 finally:
     restore()
 
-# ---------- (3) chain map: ethereum drop; solana/base/bsc/robinhood → map ----------
+# ---------- (3) chain map: ethereum/solana drop; base/bsc/robinhood → map ----------
 
 fh = reset(
     users=[
         {"handle": ETH["trader"], "source": "csv"},
-        {"handle": SOL_BUY["trader"], "source": "csv"},
+        {"handle": SOLANA_BUY["trader"], "source": "csv"},
+        {"handle": BASE_BUY["trader"], "source": "csv"},
         {"handle": BASE_SELL["trader"], "source": "csv"},
         {"handle": BSC_SELL["trader"], "source": "csv"},
         {"handle": ROBINHOOD_BUY["trader"], "source": "csv"},
@@ -238,8 +240,9 @@ fh = reset(
 )
 try:
     check(feed.alert_body(ETH) is None, "(3) chain 'ethereum' ⇒ drop")
+    check(feed.alert_body(SOLANA_BUY) is None, "(3) chain 'solana' ⇒ drop")
     for al, want in (
-        (SOL_BUY, "sol"),
+        (BASE_BUY, "base"),
         (BASE_SELL, "base"),
         (BSC_SELL, "bsc"),
         (ROBINHOOD_BUY, "robinhood"),
@@ -288,7 +291,7 @@ try:
     if fh.posted:
         p = fh.posted[0]
         check(p["eventId"] == SOL_BUY["eventId"], "(5) POST đúng eventId")
-        check(p["type"] == "buy" and p["chain"] == "sol", "(5) POST type/chain đúng")
+        check(p["type"] == "buy" and p["chain"] == "base", "(5) POST type/chain đúng")
         check(
             p["trader"] == SOL_BUY["trader"] and p["userId"] == SOL_BUY["userId"],
             "(5) POST kèm trader+userId của alert",

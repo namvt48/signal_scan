@@ -1,0 +1,16 @@
+services:
+  browser:
+    image: browserless/chrome:1.61-chrome-stable
+    environment:
+      CONNECTION_TIMEOUT: 1800000
+      MAX_CONCURRENT_SESSIONS: 2
+    ports:
+      - "127.0.0.1:31135:3000"
+    mem_limit: 2g
+    shm_size: 1g
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

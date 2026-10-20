@@ -511,6 +511,7 @@ def _swap_event(tx, wallet, sig, ts, sa, sb, pool, rank, net_map=None, tot_map=N
         "quote_mint": qm,
         "quote_sym": _dsym(qm),
         "quote_qty": qq,
+        "quote_qty_net": net_map.get(qm) if net_map else None,
         "quote_usd": qusd,
         "qty_net": qty_net,
         "unit_price": qq / qty if qty else 0.0,

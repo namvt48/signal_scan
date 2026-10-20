@@ -5,8 +5,9 @@ import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
 import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
-import { ago, compact, formatTimestamp, pct, shortAddr, usd } from '../lib/format';
-import { freshPercentageInRange, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
+import { ago, compact, formatTimestamp, pct, shortAddr, tokenAmount, usd } from '../lib/format';
+import { sortTrackedWalletsByBalance, type WalletBalanceSort } from '../lib/walletSort';
+import { freshDisplayValue, freshPercentageInRange, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
 import { compareFomoUserActivity } from '../lib/fomoSort';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
@@ -86,12 +87,27 @@ function walletBalanceLabel(wallet: { balUsd?: number; holdingPct?: number }): s
   return `${balance}${share}`;
 }
 
+function tokenBalanceTooltip(amount?: number): string | undefined {
+  const formatted = tokenAmount(amount);
+  return formatted === undefined ? undefined : `Current token balance: ${formatted}`;
+}
+
 /**
  * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
  * column labels — the inline cell relies on the "Tracked by" Th sub-line above,
  * so only the popup (a standalone table) renders them.
  */
-function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; head?: boolean }) {
+interface WalletTableProps {
+  wallets: TrackedWalletStat[];
+  head?: boolean;
+  balanceSort: WalletBalanceSort;
+  onBalanceSort: () => void;
+  limit?: number;
+}
+
+function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit }: WalletTableProps) {
+  const sortedWallets = sortTrackedWalletsByBalance(wallets, balanceSort);
+  const rows = limit === undefined ? sortedWallets : sortedWallets.slice(0, limit);
   return (
     <table className="w-full table-fixed border-collapse">
       <colgroup>
@@ -106,7 +122,11 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
             {SHOW_CLAN && <th className="pb-1 pr-2 text-left">Clan</th>}
             <th className="pb-1 pr-1 text-center">Rank</th>
             <th className="pb-1 pr-1 text-left">Group</th>
-            <th className="whitespace-nowrap pb-1 pr-1 text-right">Bal</th>
+            <th className="whitespace-nowrap pb-1 pr-1 text-right">
+              <button type="button" onClick={onBalanceSort} title="Sort tracked wallets by balance within this CA" className="group cursor-pointer select-none">
+                Bal <SortIcon dir={balanceSort} />
+              </button>
+            </th>
             <th className="pb-1 pr-2 text-right">TXs</th>
             <th className="pb-1 pr-2 text-right">Inflow</th>
             <th className="pb-1 pl-1 text-left">Age</th>
@@ -114,7 +134,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
         </thead>
       )}
       <tbody>
-        {wallets.map((w) => (
+        {rows.map((w) => (
           <tr key={w.name}>
             <td className="py-1 pr-2 text-[11px]">
               <span className="block truncate font-medium text-ink" title={w.name}>
@@ -153,7 +173,7 @@ function WalletTable({ wallets, head = false }: { wallets: TrackedWalletStat[]; 
               )}
             </td>
             <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2">
-              <span className={trackedUsdClass(w.balUsd)}>{walletBalanceLabel(w)}</span>
+              <span className={trackedUsdClass(w.balUsd)} title={tokenBalanceTooltip(w.holdingAmount)}>{walletBalanceLabel(w)}</span>
             </td>
             <td className="py-1 pr-2 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{w.buys}</span>
@@ -219,8 +239,8 @@ function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head
                 )}
               </td>
             )}
-            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current held token balance in USD; parenthesized percentage is supply share">
-              <span className={trackedUsdClass(u.balUsd)}>{walletBalanceLabel(u)}</span>
+            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title={tokenBalanceTooltip(u.holdingAmount) ?? 'Current held token balance in USD; parenthesized percentage is supply share'}>
+              <span className={trackedUsdClass(u.balUsd)} title={tokenBalanceTooltip(u.holdingAmount)}>{walletBalanceLabel(u)}</span>
             </td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
               <span className="font-semibold text-pos">{u.buys}</span>
@@ -430,6 +450,18 @@ const SORT_LABEL: Record<SortKey, string> = {
   mc: 'market cap',
 };
 
+interface SortIconProps {
+  dir: WalletBalanceSort;
+}
+
+function SortIcon({ dir }: SortIconProps) {
+  return (
+    <span className={`text-[11px] font-semibold ${dir === null ? 'text-muted' : 'text-pos'} group-hover:text-ink2`}>
+      {dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '↕'}
+    </span>
+  );
+}
+
 /** MC header hint: the band in force, or whichever single edge is armed. */
 function mcBand(t: NansenThresholds): string {
   if (t.minMc > 0 && t.maxMc > 0) return `${usd(t.minMc)}–${usd(t.maxMc)}`;
@@ -459,9 +491,7 @@ function SortTh({
       <button type="button" onClick={() => onSort?.(col)} title={`Sort by ${SORT_LABEL[col]}`} className="group block w-full cursor-pointer select-none">
         <span className="inline-flex items-center gap-1">
           {label}
-          <span className={`text-[11px] font-semibold ${dir === null ? 'text-muted' : 'text-pos'} group-hover:text-ink2`}>
-            {dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '↕'}
-          </span>
+          <SortIcon dir={dir} />
         </span>
         {subLabel}
       </button>
@@ -474,12 +504,16 @@ function SignalHead({
   sort = null,
   onSort,
   allFactors = false,
+  walletBalanceSort = null,
+  onWalletBalanceSort,
 }: {
   thresholds?: NansenThresholds | null;
   sort?: SortState;
   onSort?: (key: SortKey) => void;
   /* Debug-only: the STT column renders only while the allFactors flag is on. */
   allFactors?: boolean;
+  walletBalanceSort?: WalletBalanceSort;
+  onWalletBalanceSort?: () => void;
 }) {
   return (
     <tr>
@@ -533,7 +567,14 @@ function SignalHead({
               {SHOW_CLAN && <span className="text-left">Clan</span>}
               <span className="pr-1 text-center">Rank</span>
               <span className="pr-1 text-left">Group</span>
-              <span className="whitespace-nowrap pr-1 text-right">Bal</span>
+              <button
+                type="button"
+                onClick={onWalletBalanceSort}
+                title="Sort tracked wallet balances within each CA; CA order stays unchanged"
+                className="group cursor-pointer select-none whitespace-nowrap pr-1 text-right"
+              >
+                Bal <SortIcon dir={walletBalanceSort} />
+              </button>
               <span className="pr-2 text-right">TXs</span>
               <span className="pr-2 text-right">Inflow</span>
               <span className="pl-1 text-left">Age</span>
@@ -605,6 +646,7 @@ export default function SignalTable({
   const { role } = useAuth();
   const isAdmin = role === 'admin';
   const [thresholds, setThresholds] = useState<NansenThresholds | null>(null);
+  const [walletBalanceSort, setWalletBalanceSort] = useState<WalletBalanceSort>(null);
   const [sort, setSort] = useState<SortState>(null);
   const [tierError, setTierError] = useState<string | null>(null);
   const [nansenFilter, setNansenFilter] = useState<Set<NansenFactor>>(new Set());
@@ -626,6 +668,7 @@ export default function SignalTable({
     setFomoPopup(null);
   };
 
+  const toggleWalletBalanceSort = () => setWalletBalanceSort((current) => current === 'desc' ? 'asc' : 'desc');
   useEffect(() => {
     if (!active) return;
     let alive = true;
@@ -704,7 +747,7 @@ export default function SignalTable({
         <TableShell>
           <table className={`table-fixed w-full ${TABLE_MIN_W} border-collapse text-left`}>
             <thead>
-              <SignalHead allFactors={allFactors} />
+              <SignalHead allFactors={allFactors} walletBalanceSort={walletBalanceSort} />
             </thead>
             <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
           </table>
@@ -991,6 +1034,8 @@ export default function SignalTable({
                   sort={mode === 'rated' ? null : sort}
                   onSort={mode === 'rated' ? undefined : toggleSort}
                   allFactors={allFactors}
+                  walletBalanceSort={walletBalanceSort}
+                  onWalletBalanceSort={toggleWalletBalanceSort}
                 />
               </thead>
               <tbody className="[&>tr:last-child>td]:border-b-0">
@@ -1075,7 +1120,7 @@ export default function SignalTable({
                               {trackedWalletCount > 0 && (
                                 <section className={fomoUserCount > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
                                   <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">Native wallets</div>
-                                  <WalletTable wallets={s.trackedWallets.slice(0, INLINE_ACTIVITY_LIMIT)} />
+                                  <WalletTable wallets={s.trackedWallets} limit={INLINE_ACTIVITY_LIMIT} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
                                 </section>
                               )}
                               {fomoUserCount === 0 && trackedWalletCount === 0 && <Pill active={false}>none</Pill>}
@@ -1094,7 +1139,7 @@ export default function SignalTable({
                             <Pill active={false}>none</Pill>
                           ) : (
                             <div className="min-w-0">
-                              <WalletTable wallets={s.trackedWallets.slice(0, INLINE_ACTIVITY_LIMIT)} />
+                              <WalletTable wallets={s.trackedWallets} limit={INLINE_ACTIVITY_LIMIT} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
                               {trackedWalletCount > INLINE_ACTIVITY_LIMIT && (
                                 <button
                                   type="button"
@@ -1123,7 +1168,7 @@ export default function SignalTable({
                           <SetupValue value={s.nansen.lf !== undefined ? compact(s.nansen.lf) : '—'} pass={s.nansen.pass.lf} />
                         </Td>
                         <Td className={`w-20 ${NS_CELL} ${NS_END}`}>
-                          <FreshWalletChart ca={s.ca} symbol={s.symbol} fresh={s.nansen.fresh} pass={s.nansen.pass.fresh} history={s.nansen.freshHistory} marketCapHistory={s.marketCapHistory} updatedAt={s.dataUpdatedAt?.fresh ?? s.nansen.freshUpdatedAt} />
+                          <FreshWalletChart ca={s.ca} symbol={s.symbol} fresh={freshDisplayValue(s.nansen.rawFresh ?? s.nansen.fresh, thresholds?.freshMinPct ?? null, allFactors)} freshCurrent={s.nansen.freshCurrent} hasFreshTimestamp={(s.dataUpdatedAt?.fresh ?? s.nansen.freshUpdatedAt) !== undefined} pass={s.nansen.pass.fresh} history={s.nansen.freshHistory} marketCapHistory={s.marketCapHistory} updatedAt={s.dataUpdatedAt?.fresh ?? s.nansen.freshUpdatedAt} />
                         </Td>
                         <Td
                           className="w-20 text-center font-mono tabular-nums text-[13px] text-ink2"
@@ -1181,7 +1226,7 @@ export default function SignalTable({
         >
           <div className="trade-breakdown-content overflow-auto">
             {walletsPopup.trackedWallets.length > 0
-              ? <WalletTable wallets={walletsPopup.trackedWallets} head />
+              ? <WalletTable wallets={walletsPopup.trackedWallets} head balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
               : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
           </div>
         </Modal>
@@ -1207,7 +1252,7 @@ export default function SignalTable({
             <section className="border-t border-line pt-3">
               <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">Native wallets</h3>
               {fomoPopup.trackedWallets.length > 0
-                ? <WalletTable wallets={fomoPopup.trackedWallets} head />
+                ? <WalletTable wallets={fomoPopup.trackedWallets} head balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
                 : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
             </section>
           </div>

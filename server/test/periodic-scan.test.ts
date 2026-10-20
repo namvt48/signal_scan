@@ -19,7 +19,7 @@ function signal(overrides: Partial<TokenSignal> = {}): TokenSignal {
     symbol: 'DEMO',
     trackedWallets: [],
     fomoUsers: [],
-    nansen: { score: 0, pass: { fresh: false, t100: false, lf: false }, t100: { pct: 12, multiple: 1.12 }, lf: 68_000_000, fresh: 8, rawFresh: 8 },
+    nansen: { score: 0, pass: { fresh: false, t100: false, lf: false }, t100: { pct: 12, multiple: 1.12 }, lf: 68_000_000, fresh: 8, rawFresh: 8, freshCurrent: true, freshUpdatedAt: 0 },
     holders: 10,
     marketCap: 120_000,
     dataUpdatedAt: { volume24h: 1 },
@@ -102,7 +102,7 @@ test('periodic scan omits empty reports, blocks partial feeds, and does not retr
         settings: { enabled: true, intervalHours: 3 },
         signals: scenario === 'empty' ? [] : [{
           chain: 'sol', ca: 'CA1', symbol: 'DEMO', iconUrl: 'https://cdn.dexscreener.com/cms/images/token-icon.png',
-          volume24h: 299_000, trackedHolding: 1, nansen: { lf: 68_000_000 },
+          volume24h: 299_000, trackedHolding: 1, nansen: { lf: 68_000_000, freshCurrent: false, freshUpdatedAt: 0, rawFresh: 0 },
         }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     };
@@ -136,7 +136,7 @@ test('periodic scan formatter includes requested metrics and encoded links', () 
   const text = formatPeriodicScanAlert({
     chain: 'sol', ca: 'CA/&1', symbol: '<DEMO>', marketCap: 12_000,
     iconUrl: 'https://example.com/token.png', xHandle: 'demo_token',
-    nansen: { t100: { multiple: 1.12 }, lf: 68_000_000, rawFresh: 8 },
+    nansen: { t100: { multiple: 1.12 }, lf: 68_000_000, rawFresh: 8, freshCurrent: true },
     volume24h: 299_000, trackedHolding: 3.5,
   });
   assert.ok(text.includes('Nansen: Top100 1.12 | Low Float 68M | Fresh Wallet 8%'));
@@ -147,6 +147,23 @@ test('periodic scan formatter includes requested metrics and encoded links', () 
   assert.ok(text.includes('https://x.com/search?q=CA%2F%261'));
   assert.ok(text.includes('$&lt;DEMO&gt;\nMC: $12K\n\nCA:'));
   assert.ok(!text.startsWith('<a'));
+  const stale = formatPeriodicScanAlert({
+    chain: 'sol', ca: 'CA1',
+    nansen: { freshCurrent: false, freshUpdatedAt: 0, rawFresh: 0 },
+    volume24h: 0, trackedHolding: 0,
+  });
+  assert.equal(stale.includes('stale'), false);
+  assert.equal(stale.includes('updated'), false);
+  assert.ok(stale.includes('Fresh Wallet 0%'));
+  const unknownTime = formatPeriodicScanAlert({
+    chain: 'sol', ca: 'CA1',
+    nansen: { freshCurrent: false, fresh: 8 },
+    volume24h: 0, trackedHolding: 0,
+  });
+  assert.equal(unknownTime.includes('stale'), false);
+  assert.equal(unknownTime.includes('update time unknown'), false);
+  assert.ok(unknownTime.includes('Fresh Wallet 8%'));
+
 });
  
 
@@ -205,7 +222,7 @@ test('periodic scan sends a source/time header and captioned avatar album idempo
       signals: [{
         chain: 'sol', ca: 'CA1', symbol: 'DEMO', ...(url.includes('api-a')
           ? { iconUrl: 'https://cdn.dexscreener.com/cms/images/token-icon.png' } : {}),
-        marketCap: 120_000, nansen: { t100: { multiple: 1.12 }, lf: 68_000_000, rawFresh: 8 },
+        marketCap: 120_000, nansen: { t100: { multiple: 1.12 }, lf: 68_000_000, rawFresh: 8, freshCurrent: true, freshUpdatedAt: 0 },
         volume24h: url.includes('api-a') ? 299_000 : 298_000, trackedHolding: 3.5,
       }],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });

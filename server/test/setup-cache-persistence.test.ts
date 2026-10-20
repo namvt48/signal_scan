@@ -12,6 +12,7 @@ import {
   loadSetupCache,
   putSetupCacheEntry,
   recordSetupRetry,
+  refreshSetupCacheIfChanged,
   stampSetupCacheField,
 } from '../src/setup-cache.js';
 
@@ -114,4 +115,21 @@ test('legacy Fresh retries are discarded while series and LF retry state survive
   assert.equal(getSetupRetry(ca, CHAIN, 'lf')?.nextAt, lf.nextAt);
   const persisted = JSON.parse(readFileSync(file, 'utf8')) as { retries: Record<string, unknown> };
   assert.equal(persisted.retries[`${CHAIN}:${ca}:info`], undefined);
+});
+
+test('shared cache readers refresh after another process writes a newer snapshot', () => {
+  const file = cacheFile();
+  const initialAt = Date.now();
+  loadSetupCache(file);
+  putSetupCacheEntry({ ...bareEntry('CACHE-SHARED-UPDATE', initialAt), info_at: initialAt });
+
+  const updatedAt = initialAt + 1_000;
+  writeFileSync(file, JSON.stringify({
+    version: 2,
+    entries: [{ ...bareEntry('CACHE-SHARED-UPDATE', updatedAt), info_at: updatedAt, series_at: updatedAt }],
+  }));
+  refreshSetupCacheIfChanged();
+
+  assert.equal(getSetupCacheEntry('CACHE-SHARED-UPDATE', CHAIN)?.info_at, updatedAt);
+  assert.equal(getSetupCacheEntry('CACHE-SHARED-UPDATE', CHAIN)?.series_at, updatedAt);
 });

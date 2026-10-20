@@ -1,0 +1,29 @@
+[Unit]
+Description=Signal Scan private Nansen egress proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tinyproxy
+Group=tinyproxy
+ExecStart=/usr/bin/tinyproxy -d -c /etc/signal-scan-egress/tinyproxy.conf
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=signal-scan-egress
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

@@ -156,7 +156,6 @@ def _fomo_credit_loop(key: str) -> Any:
 
 WS_URL = "wss://api.fomoapi.io/ws/alerts"  # key ride query-string — KHÔNG log full URL
 _CHAIN = {
-    "solana": "sol",
     "base": "base",
     "bsc": "bsc",
     "robinhood": "robinhood",

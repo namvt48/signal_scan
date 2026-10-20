@@ -88,3 +88,27 @@ test('identical setup keys join one job and rejected work can be retried', async
   });
   assert.equal(attempts, 2, 'a rejection removes the in-flight key for a subsequent retry');
 });
+
+test('a timed-out setup job releases the serialized queue and fences late completion', async () => {
+  const started = deferred();
+  const release = deferred();
+  const order: string[] = [];
+  const first = enqueueSetup('QUEUE-TIMEOUT-FIRST', CHAIN, 0, async (signal) => {
+    started.resolve();
+    await release.promise;
+    if (!signal.aborted) order.push('late-first');
+  }, { timeoutMs: 20 });
+  await started.promise;
+  const second = enqueueSetup('QUEUE-TIMEOUT-SECOND', CHAIN, 0, async () => {
+    order.push('second');
+  }, { timeoutMs: 20 });
+
+  const deadline = Promise.withResolvers<'deadline'>();
+  const timer = setTimeout(() => deadline.resolve('deadline'), 50);
+  const result = await Promise.race([second.then(() => 'completed' as const), deadline.promise]);
+  clearTimeout(timer);
+  assert.equal(result, 'completed', 'next CA must run within the bounded deadline');
+  await assert.rejects(first, /timed out/i);
+  release.resolve();
+  assert.deepEqual(order, ['second'], 'late completion must not write after timeout');
+});

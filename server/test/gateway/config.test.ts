@@ -36,8 +36,9 @@ const TOUCHED = [
   'CACHE_TTL_DEXSCREENER_MS',
   'CRAWL_WS_ENDPOINT',
   'CRAWL_PROXY_FILE',
+  'CRAWL_FRESH_WALLET_WS_ENDPOINTS',
   'RL_DEXSCREENER_MAX',
-] as const;
+];
 
 async function withFreshConfig<T>(
   tag: string,
@@ -120,6 +121,7 @@ test('gateway config: defaults when env is unset', async () => {
     assert.equal(c.cacheTtlNansenMs, 30_000);
     assert.equal(c.cacheTtlDexscreenerMs, 30_000);
     assert.equal(c.crawlWsEndpoint, 'ws://chrome:3000');
+    assert.deepEqual(c.crawlFreshWalletWsEndpoints, []);
     assert.equal(c.crawlProxyFile, '');
   });
 });
@@ -142,6 +144,7 @@ test('gateway config: env overrides win', async () => {
       CACHE_TTL_DEXSCREENER_MS: '2500',
       CRAWL_WS_ENDPOINT: 'ws://gateway-chrome:3000',
       CRAWL_PROXY_FILE: '/data/proxies.txt',
+      CRAWL_FRESH_WALLET_WS_ENDPOINTS: 'ws://gateway-chrome:3000, ws://172.20.0.1:31135,ws://gateway-chrome:3000',
     },
     (c) => {
       assert.equal(c.gatewayPort, 9999);
@@ -158,6 +161,7 @@ test('gateway config: env overrides win', async () => {
       assert.equal(c.cacheTtlDexscreenerMs, 2500);
       assert.equal(c.crawlWsEndpoint, 'ws://gateway-chrome:3000');
       assert.equal(c.crawlProxyFile, '/data/proxies.txt');
+      assert.deepEqual(c.crawlFreshWalletWsEndpoints, ['ws://gateway-chrome:3000', 'ws://172.20.0.1:31135']);
     },
   );
 });

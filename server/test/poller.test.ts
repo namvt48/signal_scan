@@ -1,7 +1,7 @@
 import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getDb, insertFomoTrade, insertFomoUser, insertTrackedCa, insertWallet, open, upsertFomoPosition } from '../src/db.js';
-import { fomoHoldingsIdle, fomoPositionCooldownRefreshIdle, kickFomoPositions, kickWallet, kickWalletHoldingsFor, pacedFor, setPollerDeps, walletSweep } from '../src/poller.js';
+import { getDb, getMetricPollCache, insertFomoTrade, insertFomoUser, insertTrackedCa, insertWallet, open, upsertFomoPosition } from '../src/db.js';
+import { fomoHoldingsIdle, fomoPositionCooldownRefreshIdle, kickFomoPositions, kickWallet, kickWalletHoldingsFor, metricSweep, pacedFor, setPollerDeps, walletSweep } from '../src/poller.js';
 import { config } from '../src/config.js';
 import { insertTrades, replaceWalletBalances, updateTokenMetrics } from '../src/ingest.js';
 import type { MarketDataProvider } from '../src/providers/provider.js';
@@ -178,6 +178,56 @@ test('pacedFor: a slow request consumes its slot instead of adding the gap on to
   assert.ok(elapsed < 1200, `the gap was added on top of the request: got ${elapsed}ms, expected ~${3 * costMs}ms`);
 });
 
+
+test('metricSweep: a stuck Gini CA times out without blocking the next CA or persisting its late result', async () => {
+  const oldTimeout = config.giniMetricTimeoutMs;
+  config.giniMetricTimeoutMs = 50;
+  let resolveCa1!: (patch: { nansenFreshPct: number }) => void;
+  let notifyCa1Started!: () => void;
+  let notifyCa2Finished!: () => void;
+  let ca1Signal: AbortSignal | undefined;
+  const ca1Started = new Promise<void>((resolve) => { notifyCa1Started = resolve; });
+  const ca2Finished = new Promise<void>((resolve) => { notifyCa2Finished = resolve; });
+  const ca1Result = new Promise<{ nansenFreshPct: number }>((resolve) => { resolveCa1 = resolve; });
+  const provider: MarketDataProvider = {
+    name: 'nansen',
+    tokenInfo: async () => { throw new Error('unused'); },
+    metric: async (ca, _chain, kind, signal) => {
+      assert.equal(kind, 'gini');
+      if (ca === 'CA-GINI-1') {
+        ca1Signal = signal;
+        notifyCa1Started();
+        return ca1Result;
+      }
+      notifyCa2Finished();
+      return { nansenFreshPct: 22 };
+    },
+    walletTokenHoldings: async () => [],
+  };
+  const targets = [
+    { address: 'CA-GINI-1', chain: 'sol' as const },
+    { address: 'CA-GINI-2', chain: 'sol' as const },
+  ];
+  updateTokenMetrics('CA-GINI-1', 'sol', { nansenFreshPct: 11 });
+  let sweep: Promise<void> | undefined;
+  try {
+    sweep = metricSweep(provider, 'gini', 1, targets);
+    await ca1Started;
+    const ca2Completed = await Promise.race([
+      ca2Finished.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+    ]);
+    assert.equal(ca2Completed, true, 'a pending Gini provider call blocked the next CA');
+    assert.equal(ca1Signal?.aborted, true, 'the timed-out provider call was not aborted');
+  } finally {
+    resolveCa1({ nansenFreshPct: 99 });
+    if (sweep !== undefined) await sweep;
+    config.giniMetricTimeoutMs = oldTimeout;
+  }
+  assert.equal(getMetricPollCache('CA-GINI-2', 'sol', 'gini')?.response_json, '{"nansenFreshPct":22}');
+  assert.equal(getMetricPollCache('CA-GINI-1', 'sol', 'gini')?.response_json, null, 'late CA1 response was persisted');
+  assert.equal(getDb().prepare('SELECT nansen_fresh_pct FROM token_state WHERE ca = ? AND chain = ?').get('CA-GINI-1', 'sol')?.nansen_fresh_pct, 11, 'late CA1 result overwrote the last known metric');
+});
 // Fast CA→wallet attach (A): on insert, refresh holdings immediately so the linked
 // wallet's balance lands in ~1s instead of waiting out the 15m walletSweep. Only the
 // wallets the watch BUY already linked are read; coalesced per chain. Every chain

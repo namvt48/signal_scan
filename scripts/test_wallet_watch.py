@@ -374,7 +374,7 @@ assert tr["usd_pending"] and tr["quote_usd"] is None, tr
 assert ww.track_post_body(tr) is None, "type=RECEIVE KHÔNG vào queue CA"
 print("OK (d): ví chỉ NHẬN token mà không ký ⇒ event RECEIVE (log-only)")
 
-# ---------- §5.1/§5.4/§5.5 + §4.1 (2026-09-21): qty_net / per-hop POST / phantom ----------
+# ---------- §5.1/§5.4/§5.5 + §4.1 (2026-09-21): qty_net / per-hop CA tracking / phantom ----------
 
 CT_W = "5YRgrP3mjGzrzirYYN5HAQH19cTYREYwGxW6XRJQUzij"  # ví cặp CTRL (thật)
 CT_MINT_PHANTOM = "H74CYmXgMkYHYuSRsZt6RJb4NYp2u72Vw8BS5huApump"  # LMAO!
@@ -437,10 +437,11 @@ print(
     f"OK (ii): {mint_seen} mint qty_net == net ví; OK (iii): FLCW fee 3% → qty_net/qty=0.97"
 )
 
-# (iv) _handle_tx: POST theo TỪNG hop net>0 (Q5) + KHÔNG fallback khi có hop +
-#      dedupe theo (sig,wallet,mint,side,step) + ts_epoch_ms từ blockTime.
+# (iv) _handle_tx keeps every hop in track/log, aggregates wallet-trade USD by
+#      (CA, side) before the DB's unique (wallet, ca, tx, side) key.
 _posts: list[dict] = []
 _wrote: list[dict] = []
+_trade_posts: list[tuple[dict, float | None]] = []
 _tgt: list[int] = []
 _o_warm, _o_track, _o_watch, _o_jl, _o_tgt, _o_det = (
     ww._warm_prices,
@@ -452,7 +453,7 @@ _o_warm, _o_track, _o_watch, _o_jl, _o_tgt, _o_det = (
 )
 setattr(ww, "_warm_prices", lambda tx: None)
 setattr(ww, "track_event", _posts.append)
-setattr(ww, "watch_trade_event", lambda ev, bt=None: None)
+setattr(ww, "watch_trade_event", lambda ev, bt=None: _trade_posts.append((ev, bt)))
 setattr(ww, "jl_write", _wrote.append)
 setattr(ww, "_target_event", lambda *a, **k: (_tgt.append(1), None)[1])
 try:
@@ -481,20 +482,27 @@ try:
     tx_m, w_m, n_hop = hi
     st_m: dict = {"wallets": {}}
     ww._handle_tx(tx_m, "SIGmulti", [w_m], st_m)
+    real_groups = {
+        (e["mint"], e["side"])
+        for e in ww.detect_swaps(tx_m, w_m)
+        if e["type"] == "SWAP"
+        and ((e["side"] == "BUY" and (e.get("qty_net") or 0) > 0) or e["side"] == "SELL")
+    }
+    assert len(_trade_posts) == len(real_groups), (_trade_posts, real_groups)
     assert len(_posts) == n_hop, f"post phải ĐỦ {n_hop} hop, got {len(_posts)}"
-    assert not _tgt, "có hop net>0 ⇒ KHÔNG được dùng fallback _target_event"
     assert all("ts_epoch_ms" in e and e["ts_epoch_ms"] > 0 for e in _wrote), _wrote
     assert all(
         e["ts_epoch_ms"] == int((tx_m.get("blockTime") or 0) * 1000) for e in _wrote
     ), "ts_epoch_ms phải từ blockTime"
     _posts.clear()
+    _trade_posts.clear()
     ww._handle_tx(tx_m, "SIGmulti", [w_m], st_m)  # cùng sig ⇒ dedupe
-    assert not _posts, f"dedupe hỏng: post lại {len(_posts)} hop"
+    assert not _posts and not _trade_posts, f"dedupe hỏng: {_posts} {_trade_posts}"
 
     # §4.1 phantom CHƯA fix (xem (i)): hiện row phantom vẫn được post như mọi row khác.
 
-    # Nhiều hop: fixture không có ca này (SOLCAT 2P13YN7yqr là tx live, 3 hop) ⇒ stub
-    # detector để chứng minh KHÔNG gộp 1 CA/tx và lọc đúng SWAP + (BUY net>0 | SELL).
+    # Multiple hops for one CA stay individually logged/tracked but collapse
+    # to one sum-valued wallet-trade row under the server's unique transaction key.
     _base = {
         "ts": "09-21 10:00:00",
         "slot": 1,
@@ -514,6 +522,17 @@ try:
         "usd_pending": False,
         "type": "SWAP",
         "n_steps": 4,
+    }
+    _unknown_quote_hop = {
+        **_base,
+        "side": "BUY",
+        "mint": "Mint2",
+        "qty": 2.0,
+        "qty_net": 2.0,
+        "quote_usd": None,
+        "quote_sym": "",
+        "quote_qty": None,
+        "step": 4,
     }
     stub = [
         {
@@ -535,6 +554,17 @@ try:
         {
             **_base,
             "side": "BUY",
+            "mint": "Mint2",
+            "qty": 5.0,
+            "quote_qty": 0.25,
+            "quote_usd": 25.0,
+            "qty_net": 5.0,
+            "step": 3,
+        },
+        _unknown_quote_hop,
+        {
+            **_base,
+            "side": "BUY",
             "mint": "Mint3",
             "qty": 30.0,
             "qty_net": 30.0,
@@ -550,11 +580,19 @@ try:
         },
         {
             **_base,
+            "side": "BUY",
+            "mint": "Mint5",
+            "qty": 7.0,
+            "qty_net": 7.0,
+            "step": 4,
+        },
+        {
+            **_base,
             "side": "SELL",
             "mint": "Mint5",
             "qty": 50.0,
             "qty_net": -50.0,
-            "step": 4,
+            "step": 5,
         },
         {
             **_base,
@@ -566,20 +604,136 @@ try:
             "step": 1,
         },
     ]
+    _unknown_quote_original = dict(_unknown_quote_hop)
+    ww._aggregate_watch_hops(stub)
+    assert _unknown_quote_hop == _unknown_quote_original, "aggregation mutated source hop"
     setattr(
         ww,
         "detect_swaps",
         lambda tx, wallet, trace=None, with_transfers=False: list(stub),
     )
     _posts.clear(), _wrote.clear()
+    _trade_posts.clear()
     ww._handle_tx(tx_m, "SIGstub", [w_m], st_m)
-    assert [p["mint"] for p in _posts] == ["Mint1", "Mint2", "Mint3", "Mint5"], (
-        f"post = SWAP + (BUY net>0 hoặc SELL), không gộp 1 CA/tx: {_posts}"
-    )
-    assert len(_wrote) == 6, (
-        f"cả 6 event phải vào jsonl (kể cả SELL/RECEIVE): {len(_wrote)}"
-    )
+    assert [(p["mint"], p["side"]) for p in _posts] == [
+        ("Mint1", "BUY"), ("Mint2", "BUY"), ("Mint2", "BUY"),
+        ("Mint2", "BUY"), ("Mint3", "BUY"), ("Mint5", "BUY"),
+        ("Mint5", "SELL"),
+    ], _posts
+    grouped = {(e["mint"], e["side"]): e for e, _ in _trade_posts}
+    assert set(grouped) == {
+        ("Mint1", "BUY"), ("Mint2", "BUY"), ("Mint3", "BUY"),
+        ("Mint5", "BUY"), ("Mint5", "SELL")
+    }, grouped
+    assert grouped[("Mint2", "BUY")]["quote_usd"] == 125.0
+    assert grouped[("Mint2", "BUY")]["qty"] == 27.0
+    assert "quote_qty" not in grouped[("Mint2", "BUY")]
+    assert "unit_price" not in grouped[("Mint2", "BUY")]
+    assert grouped[("Mint5", "BUY")]["qty"] == 7.0
+    assert grouped[("Mint5", "SELL")]["qty"] == 50.0
+    assert len(_wrote) == 9, f"all 9 raw hops stay in JSONL, got {len(_wrote)}"
     assert not _tgt, "có hop ⇒ không fallback"
+    # A closed intermediate token route must carry its acquisition cost into the
+    # final token's BUY row, even when the intermediate BUY hops have no net qty.
+    route_base = {**_base, "sig": "SIGroute"}
+    route = [
+        {
+            **route_base,
+            "side": "BUY",
+            "mint": "MintInter",
+            "quote_mint": "USDC",
+            "quote_sym": "USDC",
+            "qty": 41051.542496648,
+            "qty_net": None,
+            "quote_qty": 2477.55,
+            "quote_usd": 2477.55,
+            "step": 1,
+        },
+        {
+            **route_base,
+            "side": "BUY",
+            "mint": "MintInter",
+            "quote_mint": "USDC",
+            "quote_sym": "USDC",
+            "qty": 3469.575667719,
+            "qty_net": None,
+            "quote_qty": 208.95,
+            "quote_usd": 208.95,
+            "step": 2,
+        },
+        {
+            **route_base,
+            "side": "SELL",
+            "mint": "MintInter",
+            "quote_mint": "MintFinal",
+            "quote_sym": "FINAL",
+            "qty": 44521.118164367,
+            "qty_net": None,
+            "quote_qty": 15904018.100078,
+            "quote_usd": 2349.023473381521,
+            "step": 3,
+        },
+        {
+            **route_base,
+            "side": "BUY",
+            "mint": "MintFinal",
+            "quote_mint": ww.WSOL,
+            "quote_sym": "SOL",
+            "qty": 1765325.358779,
+            "qty_net": 17492650.024268,
+            "quote_qty": 2.838481925,
+            "quote_usd": 298.948916341,
+            "step": 4,
+        },
+    ]
+    route[2]["quote_qty_net"] = 17492650.024268
+    route_rows = ww._aggregate_watch_hops(route)
+    assert not any(
+        e["mint"] == "MintInter" and e["side"] == "SELL" for e in route_rows
+    ), route_rows
+    route_with_final_sell = [
+        *route,
+        {
+            **route_base,
+            "side": "SELL",
+            "mint": "MintFinal",
+            "quote_mint": ww.WSOL,
+            "qty": 1_000_000.0,
+            "qty_net": -1_000_000.0,
+            "quote_qty": 1.0,
+            "quote_qty_net": 0.0,
+            "quote_usd": 160.0,
+            "step": 5,
+        },
+    ]
+    partial_rows = ww._aggregate_watch_hops(route_with_final_sell)
+    partial_buy = next(
+        e for e in partial_rows if e["mint"] == "MintFinal" and e["side"] == "BUY"
+    )
+    assert abs(partial_buy["quote_usd"] - 2985.448916341) < 1e-8, partial_buy
+    assert any(
+        e["mint"] == "MintFinal" and e["side"] == "SELL" for e in partial_rows
+    ), partial_rows
+    setattr(ww, "detect_events", lambda tx, wallet: list(route))
+    _trade_posts.clear()
+    ww._handle_tx(tx_m, "SIGroute", [w_m], st_m)
+    route_buys = [e for e, _ in _trade_posts if e["mint"] == "MintFinal" and e["side"] == "BUY"]
+    assert len(route_buys) == 1, route_buys
+    assert abs(route_buys[0]["quote_usd"] - 2985.448916341) < 1e-8, route_buys[0]
+    assert route_buys[0]["qty"] == 17492650.024268, route_buys[0]
+    # Route endpoint can exist only as the quote side of the final SELL.
+    route_only = route[:3]
+    setattr(ww, "detect_events", lambda tx, wallet: list(route_only))
+    _posts.clear()
+    _trade_posts.clear()
+    ww._handle_tx(tx_m, "SIGroute-only", [w_m], st_m)
+    quote_only_buys = [
+        e for e, _ in _trade_posts if e["mint"] == "MintFinal" and e["side"] == "BUY"
+    ]
+    assert len(quote_only_buys) == 1, quote_only_buys
+    assert abs(quote_only_buys[0]["quote_usd"] - 2686.5) < 1e-8, quote_only_buys[0]
+    assert quote_only_buys[0]["qty"] == 17492650.024268, quote_only_buys[0]
+    assert any(e["mint"] == "MintFinal" and e["side"] == "BUY" for e in _posts), _posts
 finally:
     setattr(ww, "_warm_prices", _o_warm)
     setattr(ww, "track_event", _o_track)
@@ -588,7 +742,7 @@ finally:
     setattr(ww, "_target_event", _o_tgt)
     setattr(ww, "detect_swaps", _o_det)
 print(
-    f"OK (iv): post đúng hop net>0 ({n_hop} real + 3/6 stub) + dedupe + ts_epoch_ms + không fallback"
+    "OK (iv): per-hop CA/log + per-(CA,side) wallet-trade aggregation + dedupe + fallback"
 )
 # (v) §7.3 rotate + gzip theo NGÀY UTC: file live `events.jsonl` GIỮ NGUYÊN TÊN
 #     (ruleA_real_regress.py đọc thẳng path đó) — bản cũ chỉ được nén sang
@@ -681,4 +835,4 @@ assert ww._use_gmgn() is False
 os.environ.pop("QUOTE_SOURCE", None)
 print("OK (w): _use_gmgn — mặc định DexScreener, GMGN chỉ khi bật tường minh")
 
-print("PASS: wallet_watch — qty_net / per-hop POST / rotate jsonl / phantom §4.1")
+print("PASS: wallet_watch — qty_net / per-hop CA/log, aggregated trade rows / rotate jsonl / phantom §4.1")

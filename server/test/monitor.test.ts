@@ -232,6 +232,81 @@ test('low-credit alerts deduplicate, then re-arm after the balance recovers', as
   }
 });
 
+test('provider incidents deduplicate across store restart and notify once on recovery', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'signal-scan-monitor-incidents-'));
+  const dbPath = join(directory, 'monitor.db');
+  const configuration = config({
+    MONITOR_DAILY_REPORT_HOUR: '23',
+    DISCORD_BOT_TOKEN: 'test-discord-token',
+    DISCORD_CHANNEL_ID: '12345678901234567',
+  });
+  const { bot, messages } = captureDiscord(configuration);
+  let now = Date.UTC(2026, 0, 2, 12);
+  const incident: ServiceSample = {
+    id: 'nansen-fw-freshness', name: 'Nansen FW successful data', scope: 'Nansen',
+    status: 'down', checkedAt: new Date(now).toISOString(), latencyMs: null, detail: 'All tracked CAs stale',
+  };
+  let store = new MonitorStore(dbPath);
+  try {
+    store.recordServices([incident], now);
+    await new MonitorNotifications(store, bot, configuration, () => now).tick();
+    assert.equal(messages.length, 1);
+    store.close();
+
+    store = new MonitorStore(dbPath);
+    await new MonitorNotifications(store, bot, configuration, () => now).tick();
+    assert.equal(messages.length, 1);
+
+    now += 60_000;
+    store.recordServices([{ ...incident, status: 'healthy', detail: 'All tracked CAs fresh' }], now);
+    await new MonitorNotifications(store, bot, configuration, () => now).tick();
+    await new MonitorNotifications(store, bot, configuration, () => now).tick();
+    assert.equal(messages.length, 2);
+    assert.match(messages[1] ?? '', /recovered/i);
+  } finally {
+    store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('server incidents, credit warnings and daily reports never fall back to Telegram', async () => {
+  const configuration = config({
+    MONITOR_DAILY_REPORT_HOUR: '8',
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+    TELEGRAM_CHAT_ID: '-1001234567890',
+  });
+  const store = new MonitorStore(':memory:');
+  const incident: ServiceSample = {
+    id: 'nansen-fw-freshness', name: 'Nansen FW successful data', scope: 'Nansen',
+    status: 'down', checkedAt: new Date(Date.UTC(2026, 0, 2, 12)).toISOString(),
+    latencyMs: null, detail: 'All tracked CAs stale',
+  };
+  const telegramMessages: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    const payload = JSON.parse(String(init?.body ?? '{}')) as { text?: unknown };
+    if (typeof payload.text === 'string') telegramMessages.push(payload.text);
+    return jsonResponse({ ok: true, result: { message_id: 1 } });
+  };
+  let now = Date.UTC(2026, 0, 2, 12);
+  try {
+    store.recordServices([incident], now);
+    store.recordMetrics([metric('FOMO', 'account', 95, 5, 100, 'low', 'credits', 10)], now);
+    await new MonitorNotifications(store, new DiscordBot('', ''), configuration, () => now).tick();
+
+    store.setNotificationState('provider:nansen-fw-freshness', 'incident', now, null);
+    now += 60_000;
+    store.recordServices([{ ...incident, status: 'healthy' }], now);
+    await new MonitorNotifications(store, new DiscordBot('', ''), configuration, () => now).tick();
+
+    assert.deepEqual(telegramMessages, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    store.close();
+  }
+});
+
+
 test('daily report uses observed per-provider deltas and persists once-per-day deduplication', async () => {
   const configuration = config({
     MONITOR_DAILY_REPORT_HOUR: '8',
@@ -309,6 +384,9 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
   let apiMetricScrapes = 0;
   let nansenBudget = 100;
   let nansenHalf = 50;
+  let trackedCaCount = 2;
+  let collectorNow = now;
+  let includeNansenFreshness = true;
   const fetcher: typeof fetch = async (input, init) => {
     const url = String(input);
     if (url.endsWith('/api/monitor/metrics')) {
@@ -391,16 +469,41 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
         gmgnKeys: [{ index: 0, served: 4, weight: 5 }],
       });
     }
-    if (url.endsWith('/api/health')) return jsonResponse({ healthy: true });
-    if (url === 'http://gateway/health') return jsonResponse({ ok: true });
+    if (url.endsWith('/api/health')) {
+      const isA = url.startsWith('http://api-a');
+      if (!includeNansenFreshness) return jsonResponse({ healthy: true });
+      return jsonResponse({
+        healthy: true,
+        nansen: {
+          trackedCaCount: trackedCaCount * (isA ? 2 : 1),
+          latestFwSuccessAt: now - 900_000,
+          latestT100SuccessAt: now - 900_000,
+          fwFreshCount: isA ? trackedCaCount * 2 : 0,
+          fwStaleCount: isA ? 0 : trackedCaCount,
+          fwUnknownCount: 0,
+          t100FreshCount: isA ? trackedCaCount * 2 : 0,
+          t100StaleCount: isA ? 0 : trackedCaCount,
+          t100UnknownCount: 0,
+        },
+      });
+    }
+    if (url === 'http://gateway/health') return jsonResponse({
+      ok: true,
+      doors: [{ state: 'retired' }],
+    });
     return new Response(null, { status: 200 });
   };
   try {
-    const collector = new MonitorCollector(store, configuration, fetcher, () => now);
+    const collector = new MonitorCollector(store, configuration, fetcher, () => collectorNow);
     await collector.collect();
     assert.equal(apiMetricScrapes, 2);
     const snapshot = store.snapshot(now, configuration.sampleIntervalMs * 3);
     const services = new Map(snapshot.services.map((service) => [service.id, service]));
+    assert.equal(services.get('gateway')?.status, 'healthy');
+    assert.equal(services.get('nansen-fw-a')?.status, 'healthy');
+    assert.equal(services.get('nansen-fw-b')?.status, 'down');
+    assert.equal(services.get('nansen-t100-a')?.status, 'healthy');
+    assert.equal(services.get('nansen-t100-b')?.status, 'down');
     assert.equal(services.get('api-a')?.status, 'healthy');
     assert.equal(services.get('fomo-watch')?.status, 'healthy');
     assert.equal(services.get('wallet-watch')?.status, 'healthy');
@@ -438,7 +541,14 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
 
     nansenBudget = 0;
     nansenHalf = 0;
+    trackedCaCount = 0;
     await collector.collect();
+    const idleServices = new Map(store.snapshot(now, configuration.sampleIntervalMs * 3).services.map((service) => [service.id, service]));
+    assert.equal(idleServices.get('nansen-browser')?.status, 'unknown');
+    assert.equal(idleServices.get('nansen-fw-a')?.status, 'unknown');
+    assert.equal(idleServices.get('nansen-fw-b')?.status, 'unknown');
+    assert.equal(idleServices.get('nansen-t100-a')?.status, 'unknown');
+    assert.equal(idleServices.get('nansen-t100-b')?.status, 'unknown');
     const unlimited = store.snapshot(now, configuration.sampleIntervalMs * 3).credits
       .find((item) => item.provider === 'Nansen');
     assert.equal(apiMetricScrapes, 4);
@@ -447,6 +557,15 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
     assert.equal(unlimited?.limit, null);
     assert.equal(unlimited?.status, 'unknown');
     assert.match(unlimited?.source ?? '', /unlimited/);
+    includeNansenFreshness = false;
+    collectorNow += 60_000;
+    await collector.collect();
+    const unavailableServices = new Map(store.snapshot(collectorNow, configuration.sampleIntervalMs * 3).services.map((service) => [service.id, service]));
+    assert.equal(unavailableServices.get('nansen-fw-a')?.status, 'degraded');
+    assert.equal(unavailableServices.get('nansen-fw-b')?.status, 'degraded');
+    assert.equal(unavailableServices.get('nansen-t100-a')?.status, 'degraded');
+    assert.equal(unavailableServices.get('nansen-t100-b')?.status, 'degraded');
+    assert.equal(unavailableServices.get('nansen-fw-a')?.detail, 'Freshness telemetry unavailable');
   } finally {
     store.close();
     await rm(directory, { recursive: true, force: true });

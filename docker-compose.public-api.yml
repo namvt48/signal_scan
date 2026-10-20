@@ -1,0 +1,22 @@
+services:
+  public-api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.public-api
+    env_file:
+      - path: server/public-api.env
+        required: false
+    environment:
+      PUBLIC_API_RUN: "1"
+      PUBLIC_API_PORT: "3010"
+      PUBLIC_API_INTERNAL_URL: "http://signal-scan-api-${INSTANCE:-a}:3001"
+    ports:
+      - "${PUBLIC_API_BIND:-127.0.0.1}:${PUBLIC_API_HOST_PORT:-3010}:3010"
+    networks:
+      signal-scan-gateway:
+        aliases:
+          - signal-scan-public-api
+    restart: unless-stopped
+networks:
+  signal-scan-gateway:
+    external: true

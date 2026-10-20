@@ -1,32 +1,28 @@
 // Nansen provider routes for the gateway (plan request-plane-gateway, todo 7).
 //
-// Nansen has TWO DISTINCT outbound seams and BOTH are proxied here:
+// Nansen has two outbound seams:
 //
-//   (i)  the CREDIT API — `POST https://api.nansen.ai<path>` with the
-//        gateway-held `apikey` header, governed by
-//        `limiters.run('nansen-credit', {priority})`. Covers every
-//        `NansenApiClient` method: `tokenFlows` (the LIVE chart path via
-//        `poller.ts` `crawlBalanceSeries → seriesAtRung`), `tokenInformation`,
-//        `dexTrades`, `currentBalance`.
-//   (ii) the FREE browser door — `POST https://app.nansen.ai/api/questions/<slug>`
-//        through the relocated DoorPool (`gateway/door.ts`), today injected as
-//        `providers/nansen.ts` `PostJson` (`browserPostJson`). The DoorPool owns
-//        per-path/per-door budgets and its bounded, caller-fair admission queue:
-//        essential/new-CA reads precede background volume; `nansen-door` stays
-//        unwired so there is no second quota (plan D8).
+//   (i)  CREDIT API — `POST https://api.nansen.ai<path>` with the gateway-held
+//        `apikey`, governed by `limiters.run('nansen-credit', {priority})`.
+//        This covers `NansenApiClient` methods such as token flows,
+//        token information, dex trades and current balance.
+//   (ii) FREE browser questions — `POST https://app.nansen.ai/api/questions/<slug>`.
+//        Essential/volume questions use the general DoorPool; Gini, which
+//        supplies Fresh Wallet data, uses its own direct Browserless pool.
+//        Each pool owns its budgets, quarantine and bounded admission queue.
+//        `nansen-door` stays unwired so there is no second quota (plan D8).
 //
-// Both seams return the RAW upstream payload inside the todo-3 envelope
-// `{status, body, headers}`; the gateway does NOT parse provider payloads.
-// Retries live INSIDE the limiter (nansen-credit fibo retry) — nothing here
-// retries.
+// Both seams return raw upstream payloads in the `{status, body, headers}`
+// envelope; the gateway does not parse provider payloads. Credit retries live
+// inside the limiter; browser-door retries live inside their DoorPool.
 //
-// DOOR RAW-BODY NOTE: the DoorPool's in-page transport JSON-parses the response
-// once (by contract), so the door route re-serializes that parsed value to the
-// raw string the envelope carries. This is byte-round-trip serialization, NOT
-// provider parsing — `parseEssentialData`/`parseGiniStats`/… stay in the provider.
+// DOOR RAW-BODY NOTE: in-page transport JSON-parses once, so the door route
+// re-serializes the parsed value for the envelope. Provider parsing
+// (`parseEssentialData`, `parseGiniStats`, etc.) stays in the provider.
 
 import { config } from '../config.js';
-import { browserPostJson, type DoorRequestOptions } from './door.js';
+import type { Classification } from './door.js';
+import { browserPostJson, freshWalletBrowserPostJson, type DoorRequestOptions } from './door.js';
 import type { Priority } from '../ratelimit/types.js';
 import {
   buildEnvelope,
@@ -199,7 +195,7 @@ export type DoorPost = (
   url: string,
   body: unknown,
   options?: DoorRequestOptions,
-) => Promise<{ status: number; json: unknown | null }>;
+) => Promise<{ status: number; json: unknown | null; classification?: Classification | 'unavailable' }>;
 
 export interface NansenDoorParams {
   endpoint: NansenDoorEndpoint;
@@ -225,17 +221,19 @@ export function parseNansenDoor(raw: unknown): NansenDoorParse {
 }
 
 export interface NansenDoorDeps {
-  /** Door transport; defaults to the relocated DoorPool's `browserPostJson`. */
+  /** Default transport override; production selects the pool by endpoint. */
   postJson?: DoorPost;
+  /** Optional override for the dedicated Fresh Wallet pool in tests/consumers. */
+  freshWalletPostJson?: DoorPost;
   /** Authenticated request owner; used for shared-quota fairness. */
   caller?: Caller;
 }
 
 /**
- * One free-door call: validate → DoorPool `postJson` → envelope. The DoorPool
- * owns routing/budgets/quarantine and never throws; its status rides the
- * envelope (HTTP 200 `{status, body, headers}`) so a 429/503 stays a distinct
- * upstream-ish status rather than being conflated with a gateway denial.
+ * One free-door call: validate → path-specific DoorPool `postJson` → envelope.
+ * Each pool owns routing/budgets/quarantine and never throws; its status rides
+ * the envelope (HTTP 200 `{status, body, headers}`) so a 429/503 stays distinct
+ * from a gateway denial.
  */
 export async function handleNansenDoor(
   rawBody: unknown,
@@ -247,14 +245,18 @@ export async function handleNansenDoor(
     parsed.value.endpoint === 'tgm-essential-data' ? 0
       : parsed.value.endpoint === 'tgm-volume-details' ? 2
         : 1;
-  const postJson = deps.postJson ?? browserPostJson;
-  const { status, json } = await postJson(
+  const postJson = parsed.value.endpoint === 'tgm-holders-gini-stats'
+    ? deps.freshWalletPostJson ?? deps.postJson ?? freshWalletBrowserPostJson
+    : deps.postJson ?? browserPostJson;
+  const { status, json, classification } = await postJson(
     NANSEN_DOOR_URLS[parsed.value.endpoint],
     parsed.value.body,
     { caller: deps.caller ?? 'internal', priority },
   );
+  const doorClass = classification ?? (status === 200 ? 'ok' : status === 403 ? 'real403' : status === 429 ? 'throttle' : status >= 500 ? '5xx' : 'transport');
+  const headers = { 'x-nansen-door-classification': doorClass };
   if (status !== 200 || json === null || json === undefined) {
-    return buildEnvelope(status, null, {});
+    return buildEnvelope(status, null, headers);
   }
-  return buildEnvelope(200, JSON.stringify(json), {});
+  return buildEnvelope(200, JSON.stringify(json), headers);
 }

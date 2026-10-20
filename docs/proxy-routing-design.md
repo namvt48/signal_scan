@@ -85,12 +85,18 @@ DoorConn 0  DoorConn 1  DoorConn 2  DoorConn N-1
   app.nansen.ai  (CF challenge ở page, path API ở in-page fetch)
 ```
 
+**Fresh Wallet route:** This diagram covers the general free-question pool.
+`tgm-holders-gini-stats` (the Fresh Wallet source in `NansenMarketProvider`)
+uses a separate DoorPool configured with direct Browserless WS endpoints; it
+does not inherit `CRAWL_PROXY_FILE`. The official Nansen credit API remains a
+direct `fetch` through its existing gateway limiter.
+
 **Vì sao pool nằm sau injection point `(url, body)`?** Chữ ký `browserPostJson(url, body): Promise<{status, json}>` là hợp đồng bất biến (`decisions.md` invariant; plan hard constraint #2). `poller.ts`, `providers/nansen.ts`, `api.ts`, `snapshot.ts`, FE và cả `index.ts` không phải sửa một dòng. Pool là lớp trong suốt: `browserPostJson` chỉ trở thành delegate lazy tới `DoorPool`, còn provider vẫn gọi y hệt.
 
 Định nghĩa door (D1):
 
-- Door = **1 WS connection** tới browserless (`CRAWL_WS_ENDPOINT`, default `ws://chrome:3000`, `config.ts:96`) + `--proxy-server=<proxy>` truyền qua query string + `page.authenticate({username, password})` khi proxy có credential.
-- browserless v1 spawn **1 browser / connection** ⇒ N doors nằm trong **cùng 1 container** `chrome` với N connection (không thêm service chrome). Đã chứng minh: `.probe/multi-proxy-probe.mjs`, `.probe/challenge-probe.mjs`.
+- General door = one Browserless WS connection + optional HTTP proxy (`--proxy-server` + `page.authenticate`), with its own cookie jar, `cf_clearance` and egress IP.
+- Fresh Wallet door = one direct Browserless WS endpoint from `CRAWL_FRESH_WALLET_WS_ENDPOINTS`; the connection has its own cookie jar and egress IP, with no HTTP proxy.
 
 ---
 
@@ -161,6 +167,9 @@ Lưu ý bug-fix bắt buộc (T3): bỏ nhánh passthrough `status !== 403` (`cr
 - Startup log (D8): `loaded N proxies → N doors` + kết quả từng door. `pool.start()` warmup song song, non-blocking; `index.ts` không sửa, không await.
 - Chỉ hỗ trợ HTTP proxy (`http://user:pass@host:port`). **SOCKS5 không dùng được** vì Chrome không auth được SOCKS5 (plan non-goals; `issues.md` gotcha).
 - Bảo mật: không log password, không đưa credential vào URL log; `.env.example` chỉ ghi tên biến + format, không giá trị thật (plan hard constraint #6). Observability (D10): log `[door <id>] <event> path=<p> status=<s> budget=<used>/<cap> outstanding=<n> state=<st>`; events `warmup-ok, warmup-fail, retired, throttled, re-warm, requery, skip, egress`. Không thêm endpoint mới.
+- `make nansen-egress-deploy` provisions a Browserless container on VPS 250 bound to `127.0.0.1:31135`, plus a separate source-restricted SSH tunnel from VPS 228 bound to the `signal-scan-gateway` bridge only.
+- The gateway env sets `CRAWL_FRESH_WALLET_WS_ENDPOINTS` to the existing VPS 228 Browserless plus the tunneled VPS 250 Browserless. Only `tgm-holders-gini-stats` uses this direct two-egress pool; the Nansen credit API and other free-question endpoints keep their existing routes.
+- The target leaves `/root/signal-scan-gateway/proxies.txt` unchanged. The previous HTTP CONNECT proxy experiment through VPS 250 returned 403 interstitials; Fresh Wallet traffic now uses Chrome hosted on VPS 250 itself, not that proxy. Deployment sends no Telegram alert and makes no Nansen query.
 
 ---
 
@@ -234,7 +243,7 @@ Quy trình:
 2. Tạo/sửa `./data/proxies.txt` trên server (nếu dùng door pool).
 3. Chạy `make restart` (`Makefile:61-63` = deploy + up).
 
-Task này **không** ssh, không deploy; runbook chỉ để owner thực thi.
+Fresh Wallet's two direct Browserless routes are deployed through `make nansen-egress-deploy`; no manual proxy-file change or Telegram alert is involved.
 
 **Cảnh báo bảo mật**: `NANSEN_API_KEY` đã lộ ra log trong một phiên trước **cần rotate** (`evidence/2026-09-21-vol-1h-column.md` §8 "Security note"). Tài liệu này chỉ nhắc **tên biến**, không chứa giá trị.
 

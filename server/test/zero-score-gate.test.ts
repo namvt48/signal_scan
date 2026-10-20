@@ -2,6 +2,7 @@ import { before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { findTrackedCa, getDb, getTokenState, insertTrackedCa, insertWallet, open, setTier } from '../src/db.js';
 import { insertTrades, replaceWalletBalances } from '../src/ingest.js';
+import { config } from '../src/config.js';
 import { zeroScoreGate } from '../src/poller.js';
 import { nansenScore } from '../src/signals.js';
 import { getThresholds, type NansenThresholds } from '../src/settings.js';
@@ -12,6 +13,7 @@ const ONE_PASS = 'caGate-onepass'; // full data, exactly 1/3 -> kept
 const HELD_DEAD = 'caGate-held-dead'; // full data 0/3, but a tracked wallet still HOLDS it
 const DUMPED_DEAD = 'caGate-dumped-dead'; // full data 0/3, wallet dumped -> back in scope
 const TIERED_DEAD = 'caGate-tiered-dead'; // full data 0/3 but user-rated -> never deleted
+const STALE = 'caGate-stale-fw';
 
 let th: NansenThresholds;
 let holderId: string;
@@ -26,20 +28,24 @@ function factorValues(): { failFresh: number; passFresh: number; failT100: numbe
   };
 }
 
-function insertState(ca: string, state: { symbol: string | null; fresh: number; t100: number; lf: number }): void {
+function insertState(
+  ca: string,
+  state: { symbol: string | null; fresh: number; t100: number; lf: number },
+  freshAt = Date.now(),
+): void {
   getDb()
     .prepare(
-      `INSERT INTO token_state (ca, chain, symbol, supply, price, nansen_fresh_pct, t100_multiple, genesis_bal, fetched_at)
-       VALUES (?, 'sol', ?, 1000000000, 0.000001, ?, ?, ?, ?)`,
+      `INSERT INTO token_state (ca, chain, symbol, supply, price, nansen_fresh_pct, fresh_updated_at, t100_multiple, genesis_bal, fetched_at)
+       VALUES (?, 'sol', ?, 1000000000, 0.000001, ?, ?, ?, ?, ?)`,
     )
-    .run(ca, state.symbol, state.fresh, state.t100, state.lf, Date.now());
+    .run(ca, state.symbol, state.fresh, freshAt, state.t100, state.lf, Date.now());
 }
 
 before(() => {
   open(':memory:');
   th = getThresholds();
   const v = factorValues();
-  for (const ca of [COMPLETE_DEAD, INCOMPLETE, ONE_PASS, HELD_DEAD, DUMPED_DEAD, TIERED_DEAD]) {
+  for (const ca of [COMPLETE_DEAD, INCOMPLETE, ONE_PASS, HELD_DEAD, DUMPED_DEAD, TIERED_DEAD, STALE]) {
     insertTrackedCa({ address: ca, chain: 'sol', note: 'gate test' });
   }
   // Given: one complete 0/3 row, one symbol-less 0/3 row, one complete 1/3 row.
@@ -52,6 +58,7 @@ before(() => {
   insertState(DUMPED_DEAD, { symbol: 'DUMP', fresh: v.failFresh, t100: v.failT100, lf: v.failLf });
   // The same 0/3 data as COMPLETE_DEAD, but a stored tier puts it out of the gate's scope.
   insertState(TIERED_DEAD, { symbol: 'TIER', fresh: v.failFresh, t100: v.failT100, lf: v.failLf });
+  insertState(STALE, { symbol: 'STALE', fresh: v.passFresh, t100: v.failT100, lf: v.failLf }, Date.now() - config.pollSetupMs - 1);
   setTier(TIERED_DEAD, 'sol', 'S+');
   holderId = insertWallet({ address: 'wallet-gate-holder', name: 'test_gate', tags: [], chain: 'sol', source: 'test' }).id;
   replaceWalletBalances(holderId, 'sol', [
@@ -89,6 +96,20 @@ test('zeroScoreGate: keeps a 0/3 CA whose data is incomplete (symbol NULL)', () 
   // Then: untouched — the sweeps are still filling it.
   assert.notEqual(findTrackedCa(INCOMPLETE, 'sol'), undefined);
   assert.notEqual(getTokenState(INCOMPLETE, 'sol'), undefined);
+});
+
+test('zeroScoreGate keeps an otherwise complete CA whose only high FW reading is stale', () => {
+  const s = nansenScore(getTokenState(STALE, 'sol'), th);
+  assert.equal(s.fresh, th.freshMinPct);
+  assert.equal(s.freshCurrent, false);
+  assert.equal(s.freshPass, false);
+  assert.equal(s.complete, false);
+  assert.equal(s.score, 0);
+
+  zeroScoreGate();
+
+  assert.notEqual(findTrackedCa(STALE, 'sol'), undefined);
+  assert.notEqual(getTokenState(STALE, 'sol'), undefined);
 });
 
 test('zeroScoreGate: keeps a complete CA with exactly one passing factor', () => {

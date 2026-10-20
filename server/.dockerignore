@@ -1,0 +1,7 @@
+.env
+.env.*
+node_modules
+dist
+public-api.env*
+public-api.env.example
+coverage

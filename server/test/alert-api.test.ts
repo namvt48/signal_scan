@@ -171,7 +171,7 @@ test('alert feed enriches A and B observations with dashboard token and tracked-
   try {
     await withApi(async (baseUrl) => {
       const ca = 'feed-meta-ca';
-      const chain = 'sol' as const;
+      const chain = 'base' as const;
       insertTrackedCa({ address: ca, chain, note: 'test', entryUsd: 100 });
       updateTokenMetrics(ca, chain, {
         iconUrl: 'https://cdn.dexscreener.com/cms/images/token-icon.png',
@@ -231,7 +231,7 @@ test('alert feed enriches A and B observations with dashboard token and tracked-
         wallets: { names: walletNames, total: 4 },
         fomoUsers: { names: [], total: 0 },
       });
-      assert.equal(aPage.observations[0]?.snapshot.iconUrl, '/api/token-avatar/sol/feed-meta-ca');
+      assert.equal(aPage.observations[0]?.snapshot.iconUrl, '/api/token-avatar/base/feed-meta-ca');
       assert.equal(aPage.observations[0]?.snapshot.xHandle, 'hyped_account');
 
       config.showFomo = true;
@@ -274,7 +274,10 @@ test('alert feed enriches A and B observations with dashboard token and tracked-
       } finally {
         store.close();
       }
-      assert.equal(telegramRequests.length, 1, 'source B Solana alerts are suppressed');
+      assert.equal(telegramRequests.length, 2, 'source A and supported FOMO EVM alerts are delivered');
+      assert.ok(telegramRequests.some(({ payload }) =>
+        typeof payload.caption === 'string'
+        && payload.caption.includes('FOMO users: @fomo_buyer, @fomo_four, @fomo_three, @fomo_two')));
       assert.ok(telegramRequests.every(({ method }) => method === 'sendPhoto'));
       const aCaption = telegramRequests.find(({ payload }) =>
         typeof payload.caption === 'string' && payload.caption.includes('Tracked in: 4'))?.payload.caption;

@@ -18,7 +18,7 @@ import type { RequestHandler, Response } from 'express';
 import { config } from './config.js';
 import { log } from './log.js';
 
-export type Role = 'admin' | 'viewer' | 'service' | 'monitor';
+export type Role = 'admin' | 'viewer' | 'service' | 'monitor' | 'export';
 
 export interface Principal {
   /** null for service/monitor tokens — they have no email identity. */
@@ -60,6 +60,8 @@ export interface AuthDeps {
   serviceToken?: string;
   /** Dedicated monitor token — authenticates the monitor-only role. */
   monitorToken?: string;
+  /** Private credential for the separately running read-only export service. */
+  publicExportToken?: string;
   /** DEV ONLY (temporary). Default: AUTH_DISABLED. True → every request gets
    * the admin principal, no token verified. Never set in a deployed env. */
   authDisabled?: boolean;
@@ -99,6 +101,7 @@ export function matchServiceToken(provided: string, expected: string): boolean {
 const ALL_ROLES: readonly Role[] = ['admin', 'viewer', 'service'];
 const ADMIN_ONLY: readonly Role[] = ['admin'];
 const ADMIN_SERVICE: readonly Role[] = ['admin', 'service'];
+const EXPORT_ONLY: readonly Role[] = ['export'];
 const MONITOR_ONLY: readonly Role[] = ['monitor'];
 
 /** 'public' = no auth at all. Otherwise: the roles allowed on the route. */
@@ -139,6 +142,7 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'PUT', path: '/api/tier', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/wallet-watch/trades', access: ADMIN_SERVICE }, // wallet_watch daemon
   { method: 'GET', path: '/api/monitor/metrics', access: MONITOR_ONLY },
+  { method: 'GET', path: '/api/internal/public-export', access: EXPORT_ONLY },
   { method: 'GET', path: '/api/monitor/alerts', access: MONITOR_ONLY },
   { method: 'POST', path: '/api/monitor/alerts/ack', access: MONITOR_ONLY },
   { method: 'GET', path: '/api/fomo-users', access: ALL_ROLES }, // the daemon reads it
@@ -214,10 +218,12 @@ async function authenticate(
   projectId: string,
   serviceToken: string,
   monitorToken: string,
+  publicExportToken: string,
   roles: ReadonlyMap<string, Role>,
 ): Promise<AuthOutcome> {
   if (matchServiceToken(token, serviceToken)) return { principal: { email: null, role: 'service' } };
   if (matchServiceToken(token, monitorToken)) return { principal: { email: null, role: 'monitor' } };
+  if (matchServiceToken(token, publicExportToken)) return { principal: { email: null, role: 'export' } };
   const email = await verifyIdTokenEmail(token, jwks, projectId);
   if (email === null) return { status: 401 };
   const role = roles.get(email.trim().toLowerCase());
@@ -247,6 +253,7 @@ export function createAuthMiddleware(deps: AuthDeps = {}): RequestHandler {
   const projectId = deps.firebaseProjectId ?? config.firebaseProjectId;
   const serviceToken = deps.serviceToken ?? config.serviceToken;
   const monitorToken = deps.monitorToken ?? config.monitorApiToken;
+  const publicExportToken = deps.publicExportToken ?? config.publicApiExportToken;
   const authDisabled = deps.authDisabled ?? config.authDisabled;
   return async (req, res, next) => {
     if (authDisabled) {
@@ -264,7 +271,7 @@ export function createAuthMiddleware(deps: AuthDeps = {}): RequestHandler {
       deny(res, 401);
       return;
     }
-    const outcome = await authenticate(token, jwks, projectId, serviceToken, monitorToken, roles);
+    const outcome = await authenticate(token, jwks, projectId, serviceToken, monitorToken, publicExportToken, roles);
     if ('status' in outcome) {
       deny(res, outcome.status);
       return;

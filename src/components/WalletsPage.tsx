@@ -18,13 +18,9 @@ type DisplayWallet = Omit<Wallet, 'chain'> & { chain: WalletScope };
 
 function displayWallets(rows: Wallet[]): DisplayWallet[] {
   if (!SHOW_FOMO) return rows;
-  const solana: DisplayWallet[] = [];
   const evmGroups = new Map<string, Wallet[]>();
   for (const wallet of rows) {
-    if (wallet.chain === 'sol') {
-      solana.push(wallet);
-      continue;
-    }
+    if (wallet.chain === 'sol') continue;
     const key = wallet.address.toLowerCase();
     evmGroups.set(key, [...(evmGroups.get(key) ?? []), wallet]);
   }
@@ -35,10 +31,10 @@ function displayWallets(rows: Wallet[]): DisplayWallet[] {
     if (!preferred) throw new Error('cannot display an empty EVM wallet group');
     return { ...preferred, chain: 'evm' as const };
   });
-  return [...solana, ...evm].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return evm.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
 
-const EMPTY_DRAFT: Draft = { address: '', name: '', chain: 'sol', source: '', clan: '' };
+const EMPTY_DRAFT: Draft = { address: '', name: '', chain: SHOW_FOMO ? 'evm' : 'sol', source: '', clan: '' };
 
 function toMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -116,7 +112,7 @@ function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | nu
               {(initial && SHOW_FOMO
                 ? [initial.chain]
                 : SHOW_FOMO
-                  ? ['sol', 'evm'] as WalletScope[]
+                  ? ['evm'] as WalletScope[]
                   : CHAINS
               ).map((chain) => (
                 <option key={chain} value={chain}>

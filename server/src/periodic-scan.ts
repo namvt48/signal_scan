@@ -10,6 +10,8 @@ export interface PeriodicScanItem {
   iconUrl?: string;
   xHandle?: string;
   nansen: {
+    freshCurrent: boolean;
+    freshUpdatedAt?: number;
     t100?: { multiple?: number };
     lf?: number;
     fresh?: number;
@@ -45,6 +47,8 @@ export function toPeriodicScanItem(signal: TokenSignal): PeriodicScanItem {
     ...(signal.iconUrl !== undefined ? { iconUrl: signal.iconUrl } : {}),
     ...(signal.xHandle !== undefined ? { xHandle: signal.xHandle } : {}),
     nansen: {
+      freshCurrent: signal.nansen.freshCurrent,
+      ...(signal.nansen.freshUpdatedAt !== undefined ? { freshUpdatedAt: signal.nansen.freshUpdatedAt } : {}),
       ...(signal.nansen.t100 !== undefined ? { t100: signal.nansen.t100 } : {}),
       ...(signal.nansen.lf !== undefined ? { lf: signal.nansen.lf } : {}),
       ...(signal.nansen.fresh !== undefined ? { fresh: signal.nansen.fresh } : {}),

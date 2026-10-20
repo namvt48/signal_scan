@@ -129,6 +129,48 @@ function parseRpcUsageMetric(raw: unknown): RpcUsageMetric | null {
   };
 }
 
+interface SetupFreshness {
+  trackedCaCount: number;
+  latestFwSuccessAt: number | null;
+  latestT100SuccessAt: number | null;
+  fwFreshCount: number | null | undefined;
+  fwStaleCount: number | null | undefined;
+  fwUnknownCount: number | null | undefined;
+  t100FreshCount: number | null | undefined;
+  t100StaleCount: number | null | undefined;
+  t100UnknownCount: number | null | undefined;
+}
+
+function setupFreshness(value: unknown): SetupFreshness | null {
+  const trackedCaCount = field(value, 'trackedCaCount');
+  const latestFwSuccessAt = field(value, 'latestFwSuccessAt');
+  const latestT100SuccessAt = field(value, 'latestT100SuccessAt');
+  const counts = ['fwFreshCount', 'fwStaleCount', 'fwUnknownCount', 't100FreshCount', 't100StaleCount', 't100UnknownCount']
+    .map((key) => field(value, key));
+  if (!finiteNonNegativeInteger(trackedCaCount) ||
+      (latestFwSuccessAt !== null && !finiteNonNegative(latestFwSuccessAt)) ||
+      (latestT100SuccessAt !== null && !finiteNonNegative(latestT100SuccessAt)) ||
+      counts.some((count) => count !== undefined && !finiteNonNegativeInteger(count))) return null;
+  return {
+    trackedCaCount, latestFwSuccessAt, latestT100SuccessAt,
+    fwFreshCount: counts[0] as number | null, fwStaleCount: counts[1] as number | null,
+    fwUnknownCount: counts[2] as number | null, t100FreshCount: counts[3] as number | null,
+    t100StaleCount: counts[4] as number | null, t100UnknownCount: counts[5] as number | null,
+  };
+}
+
+function nansenService(
+  id: string,
+  name: string,
+  status: ServiceSample['status'],
+  now: number,
+  detail: string,
+): ServiceSample {
+  return { id, name, scope: 'Nansen', status, checkedAt: new Date(now).toISOString(), latencyMs: null, detail };
+}
+
+
+
 
 export class MonitorCollector {
   constructor(
@@ -154,6 +196,7 @@ export class MonitorCollector {
       this.heartbeat('fomo-watch', 'FOMO watcher', this.config.fomoHeartbeatPath, 90_000, ts),
       this.heartbeat('wallet-watch', 'Wallet watcher', this.config.walletHeartbeatPath, 300_000, ts),
     ]);
+    services.push(...await this.nansenServices(ts));
 
     const telemetry = await Promise.all([
       this.fetchPrivateMetrics('api-a-telemetry', 'Instance A telemetry', `${this.config.apiAUrl}/api/monitor/metrics`),
@@ -567,6 +610,84 @@ export class MonitorCollector {
     return result;
   }
 
+  private async nansenServices(now: number): Promise<ServiceSample[]> {
+    const readJson = async (url: string): Promise<unknown> => {
+      try {
+        const response = await this.fetcher(url, { signal: AbortSignal.timeout(5_000) });
+        return response.ok ? await response.json() : null;
+      } catch {
+        return null;
+      }
+    };
+    const [apiA, apiB, gateway] = await Promise.all([
+      readJson(`${this.config.apiAUrl}/api/health`),
+      readJson(`${this.config.apiBUrl}/api/health`),
+      readJson(`${this.config.gatewayUrl}/health`),
+    ]);
+    const freshnessA = setupFreshness(field(apiA, 'nansen'));
+    const freshnessB = setupFreshness(field(apiB, 'nansen'));
+    const instances: Array<{ suffix: 'a' | 'b'; name: string; stats: SetupFreshness | null }> = [
+      { suffix: 'a', name: 'Instance A', stats: freshnessA },
+      { suffix: 'b', name: 'Instance B', stats: freshnessB },
+    ];
+    const active = instances.some(({ stats }) => (stats?.trackedCaCount ?? 0) > 0);
+    const result: ServiceSample[] = [];
+    if (active) {
+      const doors = field(gateway, 'doors');
+      const browserReady = field(field(gateway, 'nansen'), 'browserReady');
+      const usableDoor = Array.isArray(doors) && doors.some((door) => {
+        const state = field(door, 'state');
+        return state === 'healthy' || state === 'probation';
+      });
+      const browser = browserReady === true || (browserReady === undefined && usableDoor);
+      result.push(nansenService(
+        'nansen-browser', 'Nansen browser readiness', browser ? 'healthy' : 'degraded', now,
+        browser ? 'A usable browser door is ready' : 'No usable browser door is ready',
+      ));
+    } else {
+      result.push(nansenService('nansen-browser', 'Nansen browser readiness', 'unknown', now, 'No tracked CAs'));
+    }
+
+    for (const { suffix, name, stats } of instances) {
+      const metrics = [
+        {
+          id: `nansen-fw-${suffix}`,
+          name: `${name} Nansen FW successful data`,
+          latest: stats?.latestFwSuccessAt ?? null,
+          fresh: stats?.fwFreshCount ?? 0,
+          stale: stats?.fwStaleCount ?? 0,
+          unknown: stats?.fwUnknownCount ?? stats?.trackedCaCount ?? 0,
+        },
+        {
+          id: `nansen-t100-${suffix}`,
+          name: `${name} Nansen T100/LF successful data`,
+          latest: stats?.latestT100SuccessAt ?? null,
+          fresh: stats?.t100FreshCount ?? 0,
+          stale: stats?.t100StaleCount ?? 0,
+          unknown: stats?.t100UnknownCount ?? stats?.trackedCaCount ?? 0,
+        },
+      ];
+      const tracked = stats?.trackedCaCount ?? 0;
+      for (const metric of metrics) {
+        const fresh = stats === null || tracked === 0 ? 0 : metric.fresh;
+        const stale = stats === null || tracked === 0 ? 0 : metric.stale;
+        const unknown = stats === null || tracked === 0 ? 0 : metric.unknown;
+        const status = stats === null
+          ? 'degraded'
+          : tracked === 0
+            ? 'unknown'
+            : stale === tracked && unknown === 0
+              ? 'down'
+              : stale > 0 || unknown > 0 || fresh < tracked ? 'degraded' : 'healthy';
+        const detail = stats === null ? 'Freshness telemetry unavailable'
+          : tracked === 0 ? 'No tracked CAs'
+            : `${fresh}/${tracked} tracked CAs fresh; ${stale} stale, ${unknown} unknown` +
+              (metric.latest === null ? '' : `; latest successful update ${new Date(metric.latest).toISOString()}`);
+        result.push(nansenService(metric.id, metric.name, status, now, detail));
+      }
+    }
+    return result;
+  }
   private async readFomoUsage(now: number): Promise<{ service: ServiceSample; metrics: MetricSample[]; fomoApiSamples: FomoApiSample[] }> {
     try {
       const raw: unknown = JSON.parse(await readFile(this.config.fomoUsagePath, 'utf8'));

@@ -69,7 +69,7 @@ interface FakeDoor {
   responder: Responder;
   fetchCount: number;
   fetchTimes: number[]; // virtual timestamp of every fetch (proves waits/quarantines)
-  requestBodies: unknown[];
+  requestSignals: Array<AbortSignal | undefined>;
   invalidateCount: number;
   closeCount: number;
   outstanding: number;
@@ -83,13 +83,15 @@ function makeDoor(clock: Clock, requestBodies: unknown[]): FakeDoor {
     fetchCount: 0,
     fetchTimes: [],
     requestBodies,
+    requestSignals: [],
     invalidateCount: 0,
     closeCount: 0,
     outstanding: 0,
     holdNext: false,
     blocked: [],
     conn: {
-      fetch: async (_url, body, _timeoutMs) => {
+      fetch: async (_url, body, _timeoutMs, signal) => {
+        d.requestSignals.push(signal);
         d.fetchCount += 1;
         d.requestBodies.push(body);
         d.fetchTimes.push(clock.now());
@@ -132,6 +134,7 @@ interface Harness {
 function makeHarness(
   over: Partial<DoorPoolConfig> = {},
   sleep?: (clock: Clock, ms: number) => Promise<void>,
+  connectOverride?: (spec: DoorSpec, index: number) => Promise<DoorConn>,
 ): Harness {
   const clock = makeClock();
   const config: DoorPoolConfig = {
@@ -150,6 +153,7 @@ function makeHarness(
   for (let i = 0; i < Math.max(1, config.proxies.length); i++) doors.push(makeDoor(clock, requestBodies));
   const connectSpecs: DoorSpec[] = [];
   const logs: string[] = [];
+  let connectIndex = 0;
   const deps: DoorPoolDeps = {
     config,
     now: () => clock.now(),
@@ -159,6 +163,8 @@ function makeHarness(
     },
     connect: async (spec) => {
       connectSpecs.push(spec);
+      const index = connectIndex++;
+      if (connectOverride) return connectOverride(spec, index);
       // Re-warm reconnects map back to the SAME fake door (matched by proxy
       // url) so per-door counters accumulate across re-warms.
       const idx = spec.proxy == null ? 0 : Math.max(0, config.proxies.findIndex((p) => p.url === spec.proxy?.url));
@@ -204,6 +210,73 @@ async function primeSplit(h: Harness): Promise<{ first: FakeDoor; other: FakeDoo
   const otherIdx = 1 - firstIdx;
   return { first: h.doors[firstIdx]!, other: h.doors[otherIdx]!, otherIdx };
 }
+
+test('hung warmup expires and a broken-proxy door can be rearmed', async () => {
+  let releaseFirst!: (conn: DoorConn) => void;
+  let connects = 0;
+  let h!: Harness;
+  h = makeHarness(
+    { proxies: [px(1)], warmupTimeoutMs: 5 },
+    undefined,
+    async (_spec, index) => {
+      connects += 1;
+      if (index === 0) {
+        return new Promise<DoorConn>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return h.doors[0]!.conn;
+    },
+  );
+  h.pool.start();
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.equal(statOf(h, 0).state, 'retired', 'hung connect must expire instead of occupying warming forever');
+  assert.equal(statOf(h, 0).retiredReason, 'broken-proxy');
+  h.clock.advance(60_001);
+  const request = h.pool.postJson(nu('after-warm-timeout'), {});
+  await waitFor(() => connects >= 2, 'retry connect');
+  const late = makeDoor(h.clock, h.requestBodies);
+  releaseFirst(late.conn);
+  await tick();
+  assert.equal(late.closeCount, 1, 'late connection is closed rather than installed');
+  await request;
+});
+
+test('eligible retired door rearms beside a hung warming door', async () => {
+  let releaseHung!: (conn: DoorConn) => void;
+  let h!: Harness;
+  const attempts = [0, 0];
+  h = makeHarness(
+    { proxies: [px(1), px(2)], warmupTimeoutMs: 100 },
+    undefined,
+    async (spec) => {
+      const index = spec.proxy?.url === px(1).url ? 0 : 1;
+      attempts[index] += 1;
+      if (index === 0) {
+        return new Promise<DoorConn>((resolve) => {
+          releaseHung = resolve;
+        });
+      }
+      if (attempts[index] === 1) throw new Error('broken proxy');
+      return h.doors[index]!.conn;
+    },
+  );
+  h.pool.start();
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.equal(statOf(h, 0).state, 'warming', 'first connection remains hung');
+  assert.equal(statOf(h, 1).state, 'retired', 'second proxy is independently retired');
+  h.clock.advance(60_001);
+  const request = h.pool.postJson(nu('mixed-recovery'), {});
+  await waitFor(() => attempts[1] === 2, 'eligible retired proxy reconnect');
+  assert.equal((await request).status, 200);
+  await new Promise<void>((resolve) => setTimeout(resolve, 110));
+  assert.equal(statOf(h, 0).state, 'retired', 'hung connection attempt expires independently');
+  const late = makeDoor(h.clock, h.requestBodies);
+  releaseHung(late.conn);
+  await tick();
+  assert.equal(late.closeCount, 1, 'late expired connection is closed after another door served');
+});
+
 
 // ---------- group 1: parseProxyFile ----------
 
@@ -642,3 +715,61 @@ test('DoorPool: essential work dispatches before queued background volume at a s
     'urgent CA work uses the first slot without increasing either door quota',
   );
 });
+test('DoorPool: aborting an active browser request forwards its signal without transport penalty', async () => {
+  const h = makeHarness();
+  await startPool(h);
+  const d = h.doors[0]!;
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const originalFetch = d.conn.fetch;
+  d.conn.fetch = async (_url, body, _timeoutMs, signal) => {
+    receivedSignal = signal;
+    d.fetchCount += 1;
+    d.requestBodies.push(body);
+    d.fetchTimes.push(h.clock.now());
+    return new Promise<DoorHttpResponse>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  };
+  const before = statOf(h, 0);
+  try {
+    const request = h.pool.postJson(nu('active-abort'), {}, { signal: controller.signal });
+    await waitFor(() => d.fetchCount === 1, 'browser request dispatch');
+    controller.abort(new Error('cancelled'));
+    const settled = await Promise.race([request.then(() => 'resolved', () => 'rejected'), tick().then(() => 'pending')]);
+    assert.equal(receivedSignal, controller.signal, 'DoorConn receives the exact caller signal');
+    assert.equal(settled, 'rejected', 'abort rejects the active request promptly');
+    assert.equal(d.fetchCount, 1, 'cancellation does not retry the transport');
+    assert.equal(statOf(h, 0).state, before.state, 'cancellation does not penalize the door');
+    assert.equal(statOf(h, 0).requests, before.requests, 'cancellation does not mutate request accounting');
+  } finally {
+    controller.abort(new Error('test cleanup'));
+    d.conn.fetch = originalFetch;
+  }
+});
+
+test('DoorPool: aborting a queued path-quota acquisition removes it before quota opens', async () => {
+  let releaseSleep!: () => void;
+  const h = makeHarness(
+    { proxies: [], pathBudget: 1 },
+    (clock) => new Promise<void>((resolve) => {
+      releaseSleep = () => {
+        clock.advance(60_001);
+        resolve();
+      };
+    }),
+  );
+  await startPool(h);
+  const d = h.doors[0]!;
+  await h.pool.postJson(nu('queued-abort'), {});
+  const controller = new AbortController();
+  const request = h.pool.postJson(nu('queued-abort'), {}, { signal: controller.signal });
+  await waitFor(() => releaseSleep !== undefined, 'quota scheduler to wait');
+  controller.abort(new Error('cancelled while queued'));
+  const outcome = await Promise.race([request.then(() => 'resolved', () => 'rejected'), tick().then(() => 'pending')]);
+  releaseSleep();
+  await tick();
+  assert.equal(outcome, 'rejected', 'queued acquisition rejects promptly on abort');
+  assert.equal(d.fetchCount, 1, 'cancelled queued work is never dispatched when quota opens');
+});
+

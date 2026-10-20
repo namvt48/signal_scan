@@ -107,7 +107,7 @@ export interface MarketDataProvider {
   readonly name: string;
   tokenInfo(ca: string, chain: Chain): Promise<TokenInfo>;
   /** ONE endpoint per kind — the poller runs each kind on its own cadence. */
-  metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch>;
+  metric(ca: string, chain: Chain, kind: MetricKind, signal?: AbortSignal): Promise<MetricPatch>;
   /**
    * RPC-only floor for one mint: symbol/supply/price with NO browser door, so the
    * data still lands while Cloudflare or a sick Chrome sidecar blocks `metric`.

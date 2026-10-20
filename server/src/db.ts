@@ -98,6 +98,7 @@ export interface TokenStateRow {
   market_cap_history_json: string | null;
   fetched_at: number | null;
 }
+export type MetricPollRetryClass = 'legacy_probe' | 'transient' | 'permanent' | null;
 export interface MetricPollCacheRow {
   ca: string;
   chain: Chain;
@@ -107,6 +108,7 @@ export interface MetricPollCacheRow {
   next_allowed_at: number;
   failure_count: number;
   response_json: string | null;
+  retry_class: MetricPollRetryClass;
 }
 
 export interface MetricPollReservation {
@@ -204,6 +206,7 @@ CREATE TABLE IF NOT EXISTS metric_poll_cache (
   next_allowed_at INTEGER NOT NULL,
   failure_count INTEGER NOT NULL DEFAULT 0,
   response_json TEXT,
+  retry_class TEXT,
   PRIMARY KEY (ca, chain, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_metric_poll_due ON metric_poll_cache(kind, next_allowed_at);
@@ -447,6 +450,8 @@ export function open(path: string, sharedMarketPath = ''): void {
   // (delete wallet -> trades/balances cleaned) depend on this.
   instance.pragma('foreign_keys = ON');
   instance.exec(SCHEMA);
+  const metricPollCols = (instance.pragma('table_info(metric_poll_cache)') as { name: string }[]).map((c) => c.name);
+  if (!metricPollCols.includes('retry_class')) instance.exec('ALTER TABLE metric_poll_cache ADD COLUMN retry_class TEXT');
   instance.exec(`
     CREATE TABLE IF NOT EXISTS token_avatar_cache (
       chain TEXT NOT NULL,
@@ -669,6 +674,7 @@ export function open(path: string, sharedMarketPath = ''): void {
       throw new Error(`wallet chain migration: foreign_key_check found ${fkViolations.length} violation(s)`);
     }
   }
+  instance.exec('CREATE INDEX IF NOT EXISTS idx_wallet_token_state_chain_ca ON wallet_token_state(chain, ca)');
   // One-time LF re-resolve (user 2026-09-11): the LF rule became "the exchange
   // chart's LEFTMOST point", so every stored genesis_bal is stale — and stale is
   // self-locking, because refreshSeries only refetches while the column is NULL.
@@ -686,7 +692,11 @@ export function open(path: string, sharedMarketPath = ''): void {
   // never overwritten: settings survives restarts AND table resets, so the
   // cadence phase is stable across both.
   if (getSetting('systemDeployAt') === undefined) setSetting('systemDeployAt', String(Date.now()));
-  if (config.showFomo) backfillFomoEvmWalletGroups(instance);
+  if (config.showFomo) {
+    // Keep historical rows, but permanently stop them entering B's active CA queue.
+    instance.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE chain = 'sol' AND status != 'inactive'").run();
+    backfillFomoEvmWalletGroups(instance);
+  }
   if (sharedMarketPath !== '') {
     instance.prepare('ATTACH DATABASE ? AS market_data').run(sharedMarketPath);
     instance.exec(`
@@ -743,7 +753,10 @@ export interface WalletInput {
 }
 
 export function listWallets(): WalletRow[] {
-  return getDb().prepare('SELECT * FROM wallets ORDER BY name').all() as WalletRow[];
+  const sql = config.showFomo
+    ? "SELECT * FROM wallets WHERE chain != 'sol' ORDER BY name"
+    : 'SELECT * FROM wallets ORDER BY name';
+  return getDb().prepare(sql).all() as WalletRow[];
 }
 
 /**
@@ -940,6 +953,10 @@ export function importWallets(
   const run = db.transaction((items: readonly ImportCandidate[]) => {
     items.forEach((r, i) => {
       const address = r.address.trim();
+      if (config.showFomo && r.chain === 'sol') {
+        skipped.push({ row: i, reason: 'Solana wallets are disabled on FOMO instance' });
+        return;
+      }
       if (!address) {
         skipped.push({ row: i, reason: 'address is empty' });
         return;
@@ -1000,6 +1017,10 @@ export interface TrackedCaInput {
 }
 
 export function listTrackedCas(includeInactive = false): TrackedCaRow[] {
+  if (config.showFomo) {
+    const activeFilter = includeInactive ? '' : " AND status != 'inactive'";
+    return getDb().prepare(`SELECT * FROM tracked_cas WHERE chain != 'sol'${activeFilter} ORDER BY added_at DESC`).all() as TrackedCaRow[];
+  }
   if (includeInactive) {
     return getDb().prepare('SELECT * FROM tracked_cas ORDER BY added_at DESC').all() as TrackedCaRow[];
   }
@@ -1207,6 +1228,7 @@ export function reactivateTrackedCa(
   entryUsd?: number,
 ): TrackedCaRow | undefined {
   const db = getDb();
+  if (config.showFomo && chain === 'sol') return undefined;
   const canon = canonicalCa(address, chain);
   const now = new Date().toISOString();
   db.prepare(`
@@ -1616,17 +1638,26 @@ export function getMetricPollCache(ca: string, chain: Chain, kind: string): Metr
     .get(canonicalCa(ca, chain), chain, kind) as MetricPollCacheRow | undefined;
 }
 
-/** Effective gate for a successful metric read under the current cadence.
- * Shorter gini TTLs tighten old persisted gates; new reservations and failures
- * retain their own next_allowed_at to preserve in-flight work and backoff. */
+/** Retry interval shared by stale legacy FW gates and transient Door challenges. */
+export const METRIC_RECOVERY_RETRY_MS = 5 * 60_000;
+
+/** Effective gate for successful reads and recoverable FW failures.
+ * Legacy failures get one bounded probe so persisted exponential gates cannot
+ * strand CAs after deployment; classified permanent failures keep their backoff. */
 export function metricPollNextAllowedAt(row: MetricPollCacheRow, intervalMs: number): number {
   const hasUnreservedSuccess =
     row.kind === 'gini' &&
     row.failure_count === 0 &&
     row.response_at !== null &&
     row.last_attempt_at <= row.response_at;
-  return hasUnreservedSuccess
-    ? Math.min(row.next_allowed_at, row.response_at! + intervalMs)
+  if (hasUnreservedSuccess) return Math.min(row.next_allowed_at, row.response_at! + intervalMs);
+  const recoverableFailure =
+    row.kind === 'gini' &&
+    (row.retry_class === 'transient' ||
+      row.retry_class === 'legacy_probe' ||
+      (row.failure_count > 0 && row.retry_class === null));
+  return recoverableFailure
+    ? Math.min(row.next_allowed_at, row.last_attempt_at + METRIC_RECOVERY_RETRY_MS)
     : row.next_allowed_at;
 }
 
@@ -1647,11 +1678,18 @@ export function reserveMetricPoll(
     if (row && now < metricPollNextAllowedAt(row, intervalMs)) return { claimed: false, row };
     db.prepare(
       `INSERT INTO metric_poll_cache
-         (ca, chain, kind, last_attempt_at, next_allowed_at, failure_count)
-       VALUES (?, ?, ?, ?, ?, 0)
+         (ca, chain, kind, last_attempt_at, next_allowed_at, failure_count, retry_class)
+       VALUES (?, ?, ?, ?, ?, 0, NULL)
        ON CONFLICT(ca, chain, kind) DO UPDATE SET
          last_attempt_at = excluded.last_attempt_at,
-         next_allowed_at = excluded.next_allowed_at`,
+         next_allowed_at = excluded.next_allowed_at,
+         retry_class = CASE
+           WHEN metric_poll_cache.kind = 'gini'
+             AND metric_poll_cache.failure_count > 0
+             AND metric_poll_cache.retry_class IS NULL
+           THEN 'legacy_probe'
+           ELSE metric_poll_cache.retry_class
+         END`,
     ).run(canon, chain, kind, now, now + intervalMs);
     return { claimed: true, row };
   })();
@@ -1670,14 +1708,15 @@ export function saveMetricPollResponse(
   db.transaction(() => {
     db.prepare(
       `INSERT INTO metric_poll_cache
-         (ca, chain, kind, last_attempt_at, response_at, next_allowed_at, failure_count, response_json)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+         (ca, chain, kind, last_attempt_at, response_at, next_allowed_at, failure_count, response_json, retry_class)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL)
        ON CONFLICT(ca, chain, kind) DO UPDATE SET
          last_attempt_at = excluded.last_attempt_at,
          response_at = excluded.response_at,
          next_allowed_at = excluded.next_allowed_at,
          failure_count = 0,
-         response_json = excluded.response_json`,
+         response_json = excluded.response_json,
+         retry_class = NULL`,
     ).run(canonicalCa(ca, chain), chain, kind, responseAt, responseAt, nextAllowedAt, JSON.stringify(response));
     const fresh = kind === 'gini' ? freshValue(response) : undefined;
     if (fresh !== undefined) appendAlertMetricObservation(db, ca, chain, 'fresh', fresh, responseAt);
@@ -1766,6 +1805,10 @@ export function appendAlertMetricObservation(
   `).run(canonical, chain, metric, value, responseAt, JSON.stringify(snapshot));
 }
 
+export function getLatestAlertMetricObservationId(): number {
+  const row = getDb().prepare('SELECT COALESCE(MAX(id), 0) AS id FROM alert_metric_observations').get() as { id: number };
+  return row.id;
+}
 /** Ordered, durable metric observations consumed by the central Monitor. */
 export function getAlertMetricObservations(afterId: number, limit: number): AlertMetricObservation[] {
   const rows = getDb().prepare(`
@@ -1891,10 +1934,22 @@ export function failMetricPoll(
   chain: Chain,
   kind: string,
   nextAllowedAt: number,
+  retryClass: Exclude<MetricPollRetryClass, null | 'legacy_probe'> = 'permanent',
 ): void {
   getDb()
     .prepare(
-      `UPDATE metric_poll_cache SET next_allowed_at = ?, failure_count = failure_count + 1
+      `UPDATE metric_poll_cache
+       SET next_allowed_at = ?, failure_count = failure_count + 1, retry_class = ?
+       WHERE ca = ? AND chain = ? AND kind = ?`,
+    )
+    .run(nextAllowedAt, retryClass, canonicalCa(ca, chain), chain, kind);
+}
+
+/** Defer a transient failure without increasing the exponential backoff counter. */
+export function deferMetricPoll(ca: string, chain: Chain, kind: string, nextAllowedAt: number): void {
+  getDb()
+    .prepare(
+      `UPDATE metric_poll_cache SET next_allowed_at = ?, retry_class = 'transient'
        WHERE ca = ? AND chain = ? AND kind = ?`,
     )
     .run(nextAllowedAt, canonicalCa(ca, chain), chain, kind);
@@ -2612,6 +2667,7 @@ const SEED_WALLETS: WalletInput[] = [
  */
 export function seedIfEmpty(): void {
   if (config.mode !== 'mock') return;
+  if (config.showFomo) return;
   const db = getDb();
   const walletCount = (db.prepare('SELECT COUNT(*) AS n FROM wallets').get() as { n: number }).n;
   const caCount = (db.prepare('SELECT COUNT(*) AS n FROM tracked_cas').get() as { n: number }).n;

@@ -1,0 +1,22 @@
+[Unit]
+Description=Signal Scan Fresh Wallet Browserless tunnel to VPS 250
+After=network-online.target snap.docker.dockerd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/root/signal-scan-egress/fw-browser-tunnel.env
+ExecStart=/usr/bin/ssh -g -NT -i /root/signal-scan-egress/fw-browser_id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/signal-scan-egress/known_hosts -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L ${BIND_ADDRESS}:31135:127.0.0.1:31135 root@194.163.187.250
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+CapabilityBoundingSet=
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

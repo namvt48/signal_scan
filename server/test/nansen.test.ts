@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { extremesFromStats, fiboDelayMs, holdersGiniBody, hourlyStatsBody, NansenWebCrawler, parseGiniStats, type HourlyStatsRow, type PostJson } from '../src/providers/nansen.js';
 import { GatewayClient } from '../src/gateway-client.js';
 import { providerRequestCache } from '../src/providers/request-cache.js';
+import { NansenDoorError } from '../src/shared/nansen-door.js';
 
 beforeEach(() => providerRequestCache.clear());
 
@@ -80,6 +81,32 @@ import { hourlyStatsToPoints } from '../src/crawl.js';
 import { SolanaRpcClient } from '../src/providers/solana.js';
 import { EvmRpcClient, MULTICALL3_ADDRESS } from '../src/providers/evm.js';
 
+test('NansenMarketProvider preserves door class and signal; only challenge 403 is transient', async () => {
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const challenge = new NansenMarketProvider(async (_url, _body, signal) => {
+    receivedSignal = signal;
+    return { status: 403, json: null, classification: 'interstitial' };
+  }, null, () => []);
+  await assert.rejects(challenge.metric('ca', 'sol', 'volume', controller.signal), (error: unknown) => {
+    assert.ok(error instanceof NansenDoorError);
+    assert.equal(error.status, 403);
+    assert.equal(error.classification, 'interstitial');
+    assert.equal(error.transient, true);
+    return true;
+  });
+  assert.equal(receivedSignal, controller.signal);
+
+  const real403 = new NansenMarketProvider(async () => ({
+    status: 403, json: null, classification: 'real403',
+  }), null, () => []);
+  await assert.rejects(real403.metric('ca', 'sol', 'volume'), (error: unknown) => {
+    assert.ok(error instanceof NansenDoorError);
+    assert.equal(error.classification, 'real403');
+    assert.equal(error.transient, false);
+    return true;
+  });
+});
 test('essential-data body + parser: marketCap null derives price×circulatingSupply', () => {
   const b = essentialDataBody('caX', 'sol') as { parameters: Record<string, unknown> };
   assert.equal(b.parameters.chain, 'solana');

@@ -9,6 +9,7 @@ import { GmgnMarketProvider } from './providers/gmgn.js';
 import { CompositeProvider } from './providers/composite.js';
 import { NansenApiClient, NansenMarketProvider, doorEndpointFor } from './providers/nansen.js';
 import { GW_MARKET_ALERT_ACK_PATH, GW_MARKET_SUBSCRIPTIONS_PATH, GW_NANSEN_DOOR_PATH } from './gateway-client.js';
+import { parseDoorClassification, type DoorClassification } from './shared/nansen-door.js';
 import type { MarketDataProvider } from './providers/provider.js';
 import { startPoller } from './poller.js';
 import { cacheKey, loadSetupCache, pruneSetupCache } from './setup-cache.js';
@@ -46,12 +47,16 @@ const gmgnApi = new GmgnMarketProvider(config.gmgnApiKey, gateway ?? undefined);
 
 // The free app-questions door rides the gateway too: the api process never builds
 // a DoorPool, it POSTs the question to the gateway's door route.
-async function doorPostJson(url: string, body: unknown): Promise<{ status: number; json: unknown }> {
+async function doorPostJson(url: string, body: unknown, signal?: AbortSignal): Promise<{ status: number; json: unknown; classification: DoorClassification | null }> {
   const endpoint = doorEndpointFor(url);
   if (endpoint === null) throw new Error(`[index] unknown nansen door url ${url}`);
   if (gateway === null) throw new Error('[index] GATEWAY_URL unset: the nansen door requires the gateway');
-  const env = await gateway.call(GW_NANSEN_DOOR_PATH, { endpoint, body });
-  return { status: env.status, json: env.body === null ? null : (JSON.parse(env.body) as unknown) };
+  const env = await gateway.call(GW_NANSEN_DOOR_PATH, { endpoint, body }, signal);
+  return {
+    status: env.status,
+    json: env.body === null ? null : (JSON.parse(env.body) as unknown),
+    classification: parseDoorClassification(env.headers['x-nansen-door-classification']),
+  };
 }
 
 function buildProvider(): MarketDataProvider {

@@ -74,6 +74,8 @@ export const config = {
    * Setup and flows queues are serviced by the gateway limits, not spread
    * across these freshness intervals. */
   pollSetupMs: num('POLL_SETUP_MS', 10_800_000),
+  /** Bound one free Gini provider call so a stuck request cannot stall the metric queue. */
+  giniMetricTimeoutMs: posNum('GINI_METRIC_TIMEOUT_MS', 30_000),
   /** setupSweep scheduler cadence; independent of failed-field retry backoff. */
   pollSetupSweepMs: posNum('POLL_SETUP_SWEEP_MS', 300_000),
 
@@ -198,6 +200,10 @@ export const config = {
   showFomo: str('SHOW_FOMO', '') === 'on',
   /** Dedicated Bearer secret for the central Monitor service; empty disables it. */
   monitorApiToken: str('MONITOR_API_TOKEN', ''),
+  /** Private Bearer credential for the separately deployed public API export route. */
+  publicApiExportToken: str('PUBLIC_API_EXPORT_TOKEN', ''),
+  publicApiPort: num('PUBLIC_API_PORT', 3010),
+  publicApiInternalUrl: str('PUBLIC_API_INTERNAL_URL', ''),
   /** DEV ONLY (temporary): `AUTH_DISABLED=1` short-circuits the auth middleware
    * and grants every request the admin principal — no Bearer token needed. Set
    * it inline at process start; NEVER in a deployed env. Default '' = off. */
@@ -205,14 +211,21 @@ export const config = {
   // Mốc backfill lịch sử trades (ISO date) — 'từ lúc token được phát hiện'.
   nansenBackfillFrom: str('NANSEN_BACKFILL_FROM', '2026-08-01'),
   crawlWsEndpoint: str('CRAWL_WS_ENDPOINT', 'ws://chrome:3000'),
+  /** Direct Browserless endpoints reserved for the Fresh Wallet free question. */
+  crawlFreshWalletWsEndpoints: [...new Set(
+    str('CRAWL_FRESH_WALLET_WS_ENDPOINTS', '')
+      .split(',')
+      .map((endpoint) => endpoint.trim())
+      .filter(Boolean),
+  )],
   /** Browser circuit breaker: consecutive THROWN transport failures before the
    * door fast-fails for a cooldown instead of burning 30–45s per CA. */
   crawlBreakerFailures: num('CRAWL_BREAKER_FAILURES', 5),
   crawlBreakerCooldownMs: num('CRAWL_BREAKER_COOLDOWN_MS', 60_000),
 
-  // Door pool / proxy routing (plan nansen-proxy-routing D2, D6). One proxy IP per
-  // door; '' → single-door fallback built from crawlWsEndpoint (current behaviour).
-  /** Path to the proxy list: one `http://user:pass@host:port` per line (# / blank skipped). */
+  // General door pool proxy routing. Fresh Wallet uses direct Browserless
+  // endpoints configured separately with CRAWL_FRESH_WALLET_WS_ENDPOINTS.
+  /** Path to the general proxy list: one `http://user:pass@host:port` per line. */
   crawlProxyFile: str('CRAWL_PROXY_FILE', ''),
   /** Per-(door,path) sliding-window budget — max requests to ONE path per window. */
   crawlPathBudget: posNum('CRAWL_PATH_BUDGET', 30),

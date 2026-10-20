@@ -37,6 +37,7 @@ interface Props {
   popupWidthScale?: number;
   showDecrease?: boolean;
   updatedAt?: number;
+  showRefreshStatus?: boolean;
   emptyMessage: string;
   pointDetailClassName?: string;
   valueClassName?: string;
@@ -76,6 +77,7 @@ export function MetricHistoryChart({
   secondaryColor = '#168bf2',
   secondaryDasharray,
   updatedAt,
+  showRefreshStatus = true,
   emptyMessage,
   secondaryMaxPoints = MAX_CHART_POINTS,
   maxPoints = MAX_CHART_POINTS,
@@ -416,7 +418,7 @@ export function MetricHistoryChart({
             && interactionPoints[0]!.peakBalance > interactionPoints[0]!.troughBalance
             && <p className="mt-1 font-mono">T100 balance: {balanceFormatter.format(interactionPoints[0]!.peakBalance)} → {balanceFormatter.format(interactionPoints[0]!.troughBalance)}</p>}
         </div> : <p className="rounded bg-surface2 px-3 py-3 text-sm text-ink2">{emptyMessage}</p>}
-        <p className="mt-2 text-xs text-muted">{updatedAt != null && Number.isFinite(updatedAt) ? `Metric refreshed ${formatTimestamp(updatedAt)}.` : 'Refresh time unavailable.'}</p>
+        {showRefreshStatus && <p className="mt-2 text-xs text-muted">{updatedAt != null && Number.isFinite(updatedAt) ? `Metric refreshed ${formatTimestamp(updatedAt)}.` : 'Refresh time unavailable.'}</p>}
         <p className="mt-1 text-xs text-muted">Snapshots use existing metric updates; opening this chart makes no upstream requests.</p>
       </div>,
       document.body,

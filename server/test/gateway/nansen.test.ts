@@ -25,6 +25,7 @@ import {
   NANSEN_DOOR_URLS,
   nansenCreditUpstream,
   doorEndpointFor,
+  handleNansenDoor,
   parseNansenCredit,
   parseNansenDoor,
   type DoorPost,
@@ -183,15 +184,49 @@ test('(b) the free-door route calls the DoorPool ONCE and returns the raw body',
     assert.equal(r.status, 200);
     const env = r.json as GatewayEnvelope;
     assert.equal(env.status, 200);
-    assert.equal(
-      env.body,
-      JSON.stringify({ data: [{ totalBalance: 208_428_160 }] }),
-      'the raw app-question body is returned (re-serialized from the DoorPool JSON)',
-    );
-
+    assert.equal(env.body, JSON.stringify({ data: [{ totalBalance: 208_428_160 }] }), 'the raw app-question body is returned (re-serialized from the DoorPool JSON)');
+    assert.equal(env.headers['x-nansen-door-classification'], 'ok');
     assert.equal(seen.length, 1, 'exactly ONE door call');
     assert.equal(seen[0].url, NANSEN_DOOR_URLS['tgm-holders-gini-stats'], 'the endpoint maps to its app-question URL');
     assert.deepEqual(seen[0].body, body, 'the upstream POST body is forwarded verbatim');
+  });
+});
+test('FW Gini uses its dedicated browser pool; other free questions keep the default door', async () => {
+  const normal: string[] = [];
+  const freshWallet: string[] = [];
+  const postJson: DoorPost = async (url) => {
+    normal.push(url);
+    return { status: 200, json: { data: [] } };
+  };
+  const freshWalletPostJson: DoorPost = async (url) => {
+    freshWallet.push(url);
+    return { status: 200, json: { data: [] } };
+  };
+
+  await handleNansenDoor(
+    { endpoint: 'tgm-holders-gini-stats', body: {} },
+    { postJson, freshWalletPostJson },
+  );
+  await handleNansenDoor(
+    { endpoint: 'tgm-volume-details', body: {} },
+    { postJson, freshWalletPostJson },
+  );
+
+  assert.deepEqual(freshWallet, [NANSEN_DOOR_URLS['tgm-holders-gini-stats']]);
+  assert.deepEqual(normal, [NANSEN_DOOR_URLS['tgm-volume-details']]);
+});
+
+test('free-door route preserves interstitial 403 classification in the envelope', async () => {
+  const door: DoorPost = async () => ({
+    status: 403,
+    json: null,
+    classification: 'interstitial',
+  });
+  await withServer({ nansenDoor: door }, async (base) => {
+    const response = await post(base, NANSEN_DOOR_PATH, { endpoint: 'tgm-volume-details', body: {} }, TOKENS.a);
+    const envelope = response.json as GatewayEnvelope;
+    assert.equal(envelope.status, 403);
+    assert.equal(envelope.headers['x-nansen-door-classification'], 'interstitial');
   });
 });
 test('Nansen Door schedules essential/new-CA ahead of background volume across callers', async () => {

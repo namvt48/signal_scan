@@ -153,18 +153,21 @@ not appear, and a trader whose newest buy is older than 24h still appears with z
 ## 4. Chain map and dedupe
 
 **Chain map.** The shared `Chain` union is `sol | base | bsc | robinhood`
-(`server/src/shared/chain.ts`, mirrored in `src/types.ts`), so the daemon maps:
+(`server/src/shared/chain.ts`, mirrored in `src/types.ts`), but this daemon accepts
+only Base, BSC, and Robinhood alerts:
 
 ```
-solana    -> sol
 base      -> base
 bsc       -> bsc
 robinhood -> robinhood
 ```
 
-Everything else is **dropped**: `ethereum`, `hyperliquid`, and the perp chainId
-`1337`. They cannot be stored, so they are discarded at the daemon and never
-reach the ingest route.
+Solana alerts are dropped by the daemon before any ingest POST. The FOMO instance also
+rejects Solana events and CA/wallet writes at the API boundary, hides historical
+Solana CA and wallet rows from dashboard lists, and deactivates previously active
+Solana CAs at startup without deleting their trade history or shared market data.
+`ethereum`, `hyperliquid`, and perp chainId `1337` are unsupported too.
+
 
 > **robinhood added 2026-10-01** (EVM, chainId 4663): the fomo dashboard now tracks
 > robinhood CAs end-to-end. The gateway's `CHAIN_SLUGS` must carry `robinhood` too
@@ -325,8 +328,8 @@ Work through these in order.
    a watched trader can legitimately have no rows for a coin right now.
 
 Also remember the by-design drops: a `perp`/`thesis`/`listing` alert, an alert with no
-`tokenAddress`, an untracked trader, and any chain outside `sol|base|bsc` all produce no
-row.
+`tokenAddress`, an untracked trader, and any chain outside `base|bsc|robinhood` all produce
+no row.
 
 ---
 
@@ -355,15 +358,15 @@ Two changes were added after the original build (todos 12 and 13 in the plan); t
 runbook above already reflects them.
 
 **A watched trader's BUY now enqueues its CA for tracking.** In
-`POST /api/fomo-watch/trades`, when the alert is a `type='buy'` and
+`POST /api/fomo-watch/trades`, when the alert is a `type='buy'`, is not Solana, and
 `findTrackedCa(ca, chain)` is falsy, the route calls
 `insertTrackedCa({ address, chain, note:'fomo', entryUsd })` then `kickCAs([...])`, so
 the normal poller starts tracking the token like any other tracked CA. It fires only
 for a genuinely new trade row and only when the CA is not already tracked, so a
-replayed alert is a strict no-op (no re-enqueue, no re-kick). This is **tracked-CA
-state, not wallet state**: `wallet_trades`, `insertTrades` and `kickWalletRow` remain
-untouched by the FOMO path. Only `buy` enqueues - a `sell` of an untracked CA adds
-nothing. There is no entry-size gate (per the user's request).
+replayed alert is a strict no-op (no re-enqueue, no re-kick).
+This is **tracked-CA state, not wallet state**: `wallet_trades`, `insertTrades` and
+`kickWalletRow` remain untouched by the FOMO path. Only `buy` enqueues - a `sell` of an
+untracked CA adds nothing. There is no entry-size gate (per the user's request).
 
 **`Sell PnL` - a separate realised-PnL figure.** Each FOMO user row now reports
 `sellPnlUsd` (SUM of SELL `usd_value`, may be negative) in addition to `buyUsd`; the

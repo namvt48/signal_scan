@@ -26,6 +26,9 @@ function parseItem(raw: unknown): PeriodicScanItem | null {
   const nansen = record(value?.nansen);
   if (value === null || nansen === null || typeof value.ca !== 'string' || value.ca === '' ||
       typeof value.chain !== 'string' || !(CHAINS as readonly string[]).includes(value.chain) ||
+      typeof nansen.freshCurrent !== 'boolean' ||
+      (nansen.freshUpdatedAt !== undefined &&
+        (!finite(nansen.freshUpdatedAt) || !Number.isSafeInteger(nansen.freshUpdatedAt) || nansen.freshUpdatedAt < 0)) ||
       !finite(value.volume24h) || !finite(value.trackedHolding)) return null;
   const rawT100 = record(nansen.t100);
   const t100 = rawT100 !== null && finite(rawT100.multiple) ? { multiple: rawT100.multiple } : undefined;
@@ -37,6 +40,8 @@ function parseItem(raw: unknown): PeriodicScanItem | null {
     ...(typeof value.iconUrl === 'string' ? { iconUrl: value.iconUrl } : {}),
     ...(typeof value.xHandle === 'string' ? { xHandle: value.xHandle } : {}),
     nansen: {
+      freshCurrent: nansen.freshCurrent,
+      ...(finite(nansen.freshUpdatedAt) ? { freshUpdatedAt: nansen.freshUpdatedAt } : {}),
       ...(t100 !== undefined ? { t100 } : {}),
       ...(finite(nansen.lf) ? { lf: nansen.lf } : {}),
       ...(finite(nansen.fresh) ? { fresh: nansen.fresh } : {}),

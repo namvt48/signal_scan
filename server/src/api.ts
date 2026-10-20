@@ -17,6 +17,7 @@ import { solanaRpcEndpoints } from './providers/solana.js';
 import {
   acknowledgeAlertMetricObservations,
   appendAlertMetricObservation,
+  getLatestAlertMetricObservationId,
   getAlertMetricObservations,
   importSharedAlertMetricObservations,
   deleteFomoUser,
@@ -83,10 +84,11 @@ import {
   type NansenThresholds,
 } from './settings.js';
 import { insertTrades } from './ingest.js';
-import { kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
+import { getSetupFreshnessStats, kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
 import { cohortLabelIndex } from './cohort-labels.js';
 import { getPeriodicScanSettings, updatePeriodicScanSettings } from './periodic-scan-settings.js';
 import { selectPeriodicScanSignals, toPeriodicScanItem } from './periodic-scan.js';
+import { exportActivity, exportAlerts, exportSnapshot, exportToken, exportTrades, exportWallets } from './public-export.js';
 
 interface WalletJson {
   id: string;
@@ -188,6 +190,7 @@ function parseWalletBody(body: unknown): ParseResult<WalletBody> {
   const b = body as Record<string, unknown>;
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
+  if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
   if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
   if (b.chain === 'evm' && !EVM_ADDRESS.test(address)) {
     return { error: 'invalid EVM address (expected 0x + 40 hex characters)' };
@@ -207,6 +210,7 @@ function parseWalletPatch(body: unknown): ParseResult<Partial<WalletBody>> {
   }
   if (b.chain !== undefined) {
     if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
+    if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
     patch.chain = b.chain;
   }
   if (b.name !== undefined) patch.name = strField(b, 'name');
@@ -567,6 +571,7 @@ type EnqueueOutcome =
   | { kind: 'inserted'; row: TrackedCaRow }
   | { kind: 'backfilled'; row: TrackedCaRow }
   | { kind: 'exists' }
+  | { kind: 'chain-disabled' }
   | { kind: 'skipped' };
 
 /**
@@ -585,6 +590,7 @@ function enqueueTrackedCa(input: {
   note: string;
   entryUsd?: number;
 }): EnqueueOutcome {
+  if (config.showFomo && input.chain === 'sol') return { kind: 'chain-disabled' };
   if (isPassTier(input.address, input.chain)) {
     return { kind: 'skipped' };
   }
@@ -646,6 +652,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       mode: config.mode,
       provider: providerName,
       lastTokenFetchAt: maxTokenFetchedAt(),
+      nansen: getSetupFreshnessStats(Date.now(), config.pollSetupMs * 2),
       healthy: true,
       // Door table from the gateway (single authority); null when GATEWAY_URL is
       // unset, the gateway is unreachable, or its pool is not built yet. /api/health
@@ -654,6 +661,69 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       ratelimit: limiters.snapshot(),
       providerCache: providerRequestCache.stats(),
     });
+  });
+  app.get('/api/internal/public-export', (req, res) => {
+    const resource = req.query.resource;
+    const limitRaw = req.query.limit;
+    const limit = limitRaw === undefined ? 100 : typeof limitRaw === 'string' && /^\d+$/.test(limitRaw) ? Number(limitRaw) : NaN;
+    const afterIdRaw = req.query.afterId;
+    const afterId = afterIdRaw === undefined ? 0 : typeof afterIdRaw === 'string' && /^\d+$/.test(afterIdRaw) ? Number(afterIdRaw) : NaN;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(afterId) || afterId < 0) {
+      res.status(400).json({ error: 'invalid pagination' });
+      return;
+    }
+    if (resource === 'tokens') {
+      const snapshot = exportSnapshot();
+      const offset = afterId;
+      res.json({ generatedAt: snapshot.generatedAt, data: snapshot.tokens.slice(offset, offset + limit), nextOffset: offset + limit < snapshot.tokens.length ? offset + limit : null });
+      return;
+    }
+    if (resource === 'wallets') {
+      const data = exportWallets();
+      res.json({ data: data.slice(afterId, afterId + limit), nextOffset: afterId + limit < data.length ? afterId + limit : null });
+      return;
+    }
+    if (resource === 'latestAlertId') {
+      res.json({ data: [], nextId: getLatestAlertMetricObservationId() });
+      return;
+    }
+    if (resource === 'alerts') {
+      res.json(exportAlerts(afterId, limit));
+      return;
+    }
+    if (resource === 'token') {
+      const chain = req.query.chain;
+      const ca = req.query.ca;
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
+        res.status(400).json({ error: 'invalid token identity' });
+        return;
+      }
+      const token = exportToken(chain as Chain, canonicalCa(ca, chain as Chain));
+      if (!token) { res.status(404).json({ error: 'token not found' }); return; }
+      res.json(token);
+      return;
+    }
+    if (resource === 'activity') {
+      const chain = req.query.chain; const ca = req.query.ca;
+      const from = Number(req.query.from); const to = Number(req.query.to);
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' ||
+          !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
+        res.status(400).json({ error: 'invalid activity query' }); return;
+      }
+      res.json(exportActivity(chain as Chain, canonicalCa(ca, chain as Chain), from, to));
+      return;
+    }
+    if (resource === 'trades') {
+      const walletId = req.query.walletId;
+      const from = Number(req.query.from); const to = Number(req.query.to);
+      if (typeof walletId !== 'string' || walletId.length > 128 || !Number.isSafeInteger(from) ||
+          !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
+        res.status(400).json({ error: 'invalid trade query' }); return;
+      }
+      res.json(exportTrades(walletId, afterId, limit, from, to));
+      return;
+    }
+    res.status(400).json({ error: 'unknown resource' });
   });
   app.get('/api/token-avatar/:chain/:ca', async (req, res) => {
     const { chain, ca } = req.params;
@@ -925,6 +995,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(404).json({ error: 'not found' });
       return;
     }
+    if (config.showFomo && cur.chain === 'sol') {
+      res.status(404).json({ error: 'not found' });
+      return;
+    }
     const parsed = parseWalletPatch(req.body);
     if (isParseError(parsed)) {
       res.status(400).json({ error: parsed.error });
@@ -1086,6 +1160,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(409).json({ error: 'CA already tracked on this chain' });
       return;
     }
+    if (r.kind === 'chain-disabled') {
+      res.json({ skipped: 'chain-disabled' });
+      return;
+    }
     res.status(200).json({ skipped: isPassTier(parsed.address, parsed.chain) ? 'pass-tier' : 'below-min-usd' });
   });
 
@@ -1151,6 +1229,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
+    if (config.showFomo && parsed.chain === 'sol') {
+      res.json({ inserted: 0, skipped: 'chain-disabled' });
+      return;
+    }
     if (isPassTier(parsed.ca, parsed.chain)) {
       res.json({ inserted: 0, skipped: 'pass-tier' });
       return;
@@ -1211,6 +1293,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     const parsed = parseFomoWatchTradeBody(req.body);
     if (isParseError(parsed)) {
       res.status(400).json({ error: parsed.error });
+      return;
+    }
+    if (config.showFomo && parsed.chain === 'sol') {
+      res.json({ inserted: 0, skipped: 'chain-disabled' });
       return;
     }
     // A FOMO user is NOT a wallet — resolve through the fomo_users accessors

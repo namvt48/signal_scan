@@ -18,6 +18,7 @@ import type { AddressInfo } from 'node:net';
 import {
   DoorPool,
   setPoolForTest,
+  setFreshWalletPoolForTest,
   type DoorConn,
   type DoorHttpResponse,
   type DoorPoolDeps,
@@ -25,6 +26,8 @@ import {
 import { createGatewayApp } from '../../src/gateway/app.js';
 import { open } from '../../src/db.js';
 import { createApp } from '../../src/api.js';
+import { nansenBrowserPostJson } from '../../src/gateway/main.js';
+import { NANSEN_HOLDERS_GINI_URL, NANSEN_VOLUME_DETAILS_URL } from '../../src/providers/nansen.js';
 
 before(() => {
   // /api/health reads maxTokenFetchedAt(); a real (in-memory) DB must be open.
@@ -106,6 +109,105 @@ test('(a) a door call is counted against the path + door budget', async () => {
   assert.equal(pool.stats()[0].requests, 2);
   assert.equal(pool.stats()[0].budgetUsed, 1, 'only the fresh hit remains inside the window');
 });
+test('FW direct pool load-balances calls across its configured Browserless endpoints', async () => {
+  const deps = fakeDeps({});
+  const connected: { ws: string; proxy: string | null }[] = [];
+  const connect = deps.connect;
+  deps.connect = async (spec) => {
+    connected.push({ ws: spec.ws, proxy: spec.proxy?.url ?? null });
+    return connect(spec);
+  };
+  deps.config.wsEndpoints = ['ws://vps-228/browser', 'ws://vps-250/browser'];
+  deps.config.proxies = [{ url: 'http://proxy.invalid:8080' }];
+  const pool = await startedPool(deps);
+
+  try {
+    const url = 'https://app.nansen.ai/api/questions/tgm-holders-gini-stats';
+    await pool.postJson(url, { parameters: { tokenAddress: 'CA', chain: 'sol' } });
+    await pool.postJson(url, { parameters: { tokenAddress: 'CA', chain: 'sol' } });
+
+    assert.deepEqual(
+      pool.stats().map(({ requests, proxy }) => ({ requests, proxy })),
+      [{ requests: 1, proxy: 'direct' }, { requests: 1, proxy: 'direct' }],
+    );
+    assert.deepEqual(
+      [...new Set(connected.map(({ ws }) => ws))].sort(),
+      ['ws://vps-228/browser', 'ws://vps-250/browser'],
+    );
+    assert.ok(connected.every(({ proxy }) => proxy === null), 'both browser hosts connect to Nansen without HTTP proxies');
+  } finally {
+    pool.stop();
+  }
+});
+
+test('shared collector sends Gini through the Fresh Wallet pool and other questions through the general pool', async () => {
+  const general = await startedPool(fakeDeps({}));
+  const freshWallet = await startedPool(fakeDeps({}));
+  setPoolForTest(general);
+  setFreshWalletPoolForTest(freshWallet);
+
+  try {
+    await nansenBrowserPostJson(NANSEN_HOLDERS_GINI_URL, { ca: 'gini' });
+    assert.deepEqual(
+      freshWallet.stats().map(({ requests }) => requests),
+      [1],
+    );
+    assert.deepEqual(
+      general.stats().map(({ requests }) => requests),
+      [0],
+    );
+
+    await nansenBrowserPostJson(NANSEN_VOLUME_DETAILS_URL, { ca: 'volume' });
+    assert.deepEqual(
+      freshWallet.stats().map(({ requests }) => requests),
+      [1],
+    );
+    assert.deepEqual(
+      general.stats().map(({ requests }) => requests),
+      [1],
+    );
+  } finally {
+    setPoolForTest(null);
+    setFreshWalletPoolForTest(null);
+    general.stop();
+    freshWallet.stop();
+  }
+});
+
+test('FW direct pool fails over after a bad Browserless route without queueing behind it', async () => {
+  const deps = fakeDeps({
+    fetch: (call) => call === 1
+      ? { ...okResponse(null), status: 503 }
+      : okResponse({ fresh: true }),
+  });
+  const connected: { ws: string; proxy: string | null }[] = [];
+  const connect = deps.connect;
+  deps.connect = async (spec) => {
+    connected.push({ ws: spec.ws, proxy: spec.proxy?.url ?? null });
+    return connect(spec);
+  };
+  deps.config.wsEndpoints = ['ws://vps-228/browser', 'ws://vps-250/browser'];
+  deps.config.proxies = [{ url: 'http://proxy.invalid:8080' }];
+  const pool = await startedPool(deps);
+
+  try {
+    const result = await pool.postJson(
+      'https://app.nansen.ai/api/questions/tgm-holders-gini-stats',
+      { parameters: { tokenAddress: 'CA', chain: 'sol' } },
+    );
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json, { fresh: true });
+    assert.deepEqual(
+      pool.stats().map(({ requests, proxy }) => ({ requests, proxy })),
+      [{ requests: 1, proxy: 'direct' }, { requests: 1, proxy: 'direct' }],
+    );
+    assert.ok(connected.every(({ proxy }) => proxy === null));
+  } finally {
+    pool.stop();
+  }
+});
+
 
 test('(b) a quarantined door is skipped with a clear 503, no stuck wait', async () => {
   const deps = fakeDeps({
@@ -128,22 +230,31 @@ test('(b) a quarantined door is skipped with a clear 503, no stuck wait', async 
   assert.equal(pool.stats()[0].requests, 1, 'the quarantined door was not dispatched again');
 });
 
-test('(c) the gateway /health reports the relocated pool stats', async () => {
+test('(c) the gateway /health reports both main and Fresh Wallet pool stats', async () => {
   const pool = await startedPool(fakeDeps({}));
+  const freshWalletPool = await startedPool(fakeDeps({}));
   setPoolForTest(pool);
+  setFreshWalletPoolForTest(freshWalletPool);
   const server = createGatewayApp({ tokens: { a: 'a', b: 'b', watcher: 'w' } }).listen(0);
   const base = await listen(server);
   try {
     const res = await fetch(`${base}/health`);
-    const body = (await res.json()) as { doors: Array<Record<string, unknown>> };
+    const body = (await res.json()) as {
+      doors: Array<Record<string, unknown>>;
+      freshWalletDoors: Array<Record<string, unknown>>;
+    };
     assert.equal(res.status, 200);
     assert.ok(Array.isArray(body.doors));
     assert.equal(body.doors.length, 1);
     assert.equal(body.doors[0].state, 'probation');
     assert.ok('egressIp' in body.doors[0], 'gateway /health carries egressIp (internal-only)');
+    assert.equal(body.freshWalletDoors.length, 1);
   } finally {
     server.close();
     setPoolForTest(null);
+    setFreshWalletPoolForTest(null);
+    pool.stop();
+    freshWalletPool.stop();
   }
 });
 

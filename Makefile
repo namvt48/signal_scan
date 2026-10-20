@@ -17,6 +17,7 @@
 #   make down [INSTANCE=b]  # docker compose down
 #   make restart [INSTANCE=b]# deploy + up
 #   make gateway-deploy     # sync instance-a source, build + restart the shared gateway
+#   make wallet-watch-deploy # deploy/restart Solana wallet watcher only
 #   make fomo-watch-deploy  # deploy/restart only the FOMO websocket watcher
 #   make logs / api-log / status / test / firewall
 #
@@ -87,7 +88,7 @@ COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NA
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
 
-FILES     := Dockerfile nginx.conf docker-compose.yml docker-compose.gateway.yml docker-compose.monitor.yml monitor.caddy .dockerignore package.json package-lock.json tsconfig.json vite.config.ts index.html
+FILES     := Dockerfile nginx.conf docker-compose.yml docker-compose.gateway.yml docker-compose.public-api.yml docker-compose.monitor.yml monitor.caddy .dockerignore package.json package-lock.json tsconfig.json vite.config.ts index.html
 SSH       := ssh -o BatchMode=yes -o ConnectTimeout=10 $(HOST)
 SCP       := scp -o BatchMode=yes -o ConnectTimeout=10
 RSYNC_SSH := ssh -o BatchMode=yes -o ConnectTimeout=10
@@ -112,7 +113,35 @@ FOMO_RELEASE_FILES := \
 	server/public/monitor.html
 
 # Keep Telegram presentation deploy isolated from alert-state and API changes.
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
+.PHONY: wallet-watch-deploy
+
+# Standalone partner API lifecycle on the selected production host.
+PUBLIC_API_PROJECT := signal_scan_public_api
+PUBLIC_API_COMPOSE = docker compose -p $(PUBLIC_API_PROJECT) -f docker-compose.public-api.yml
+.PHONY: public-api-deploy public-api-build public-api-up public-api-down public-api-logs public-api-status
+
+public-api-build:
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) build public-api"
+
+public-api-up:
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) up -d public-api"
+
+public-api-down:
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) stop public-api"
+
+public-api-logs:
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) logs -f public-api"
+
+public-api-status:
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) ps public-api"
+
+public-api-deploy:
+	@test "$(INSTANCE)" = a || { echo 'public-api-deploy currently publishes through instance A only'; exit 1; }
+	@$(MAKE) deploy INSTANCE=a
+	$(SSH) "set -eu; cd $(REMOTE_DIR); test -s server/.env; test -s server/public-api.env; docker network inspect signal-scan-gateway >/dev/null"
+	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build api web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build api web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api web; fi"
+	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=a $(PUBLIC_API_COMPOSE) config --quiet && INSTANCE=a $(PUBLIC_API_COMPOSE) build public-api && INSTANCE=a $(PUBLIC_API_COMPOSE) up -d public-api"
 
 routing-smoke:
 	$(SSH) 'bash -s' < scripts/test_instance_routing.sh
@@ -121,7 +150,7 @@ routing-smoke:
 deploy:
 	$(SSH) "mkdir -p $(REMOTE_DIR)"
 	$(SCP) -r $(FILES) $(HOST):$(REMOTE_DIR)/
-	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src $(HOST):$(REMOTE_DIR)/
+	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude public-api.env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src $(HOST):$(REMOTE_DIR)/
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose build && echo '== deploy OK — instance=$(INSTANCE) port=$(PORT) dir=$(REMOTE_DIR)'"
 
 # Deploy only the Fresh retry gate fix to instance A; never sync/rebuild web or B.
@@ -146,6 +175,11 @@ fomo-release-deploy:
 	@$(MAKE) fomo-api-deploy INSTANCE=a
 	@$(MAKE) fomo-api-deploy INSTANCE=b
 
+
+wallet-watch-deploy:
+	$(SSH) 'set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/wallet-watch/watchers/sol/feed.py; test -f /opt/wallet-watch/watchers/sol/classify.py; systemctl is-active --quiet wallet-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; stamp=$$(date +%Y%m%d%H%M%S); cp -p /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/feed.py.pre-inflow-$$stamp; cp -p /opt/wallet-watch/watchers/sol/classify.py /opt/wallet-watch/watchers/sol/classify.py.pre-inflow-$$stamp; printf "watcher backups: feed.py.pre-inflow-%s classify.py.pre-inflow-%s\\n" "$$stamp" "$$stamp"'
+	$(SCP) watchers/sol/feed.py watchers/sol/classify.py $(HOST):/opt/wallet-watch/watchers/sol/
+	$(SSH) "set -eu; /opt/wallet-watch/venv/bin/python -m py_compile /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/classify.py; systemctl restart wallet-watch.service; systemctl is-active --quiet wallet-watch.service; systemctl show wallet-watch.service -p ActiveState -p MainPID"
 
 fomo-evm-watch-deploy:
 	$(SSH) "set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -m 0750 /opt/fomo-wallet-watch/watchers/common /opt/fomo-wallet-watch/watchers/evm /opt/fomo-wallet-watch/data /root/signal-scan-monitor/heartbeats"
@@ -201,6 +235,13 @@ gateway-deploy:
 	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
 	$(SSH) "cd $(GATEWAY_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d gateway; else docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d gateway; fi"
 
+# Deploy Fresh Wallet's direct Browserless door on VPS 250; keep the proxy file and all other Nansen routes unchanged.
+nansen-egress-deploy:
+	@$(MAKE) deploy INSTANCE=a
+	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
+	@GATEWAY_DIR='$(GATEWAY_DIR)' deploy/nansen-egress/deploy.sh
+
 # Quiesce the legacy tables, force-import only public rows, then restart the gateway
 # so it merges the final A/B setup caches before resuming its single market poller.
 market-data-reconcile:
@@ -245,6 +286,7 @@ monitor-alerts-deploy:
 	$(SCP) server/src/monitor/telegram.ts $(HOST):/root/signal_scan/server/src/monitor/telegram.ts
 	$(SCP) server/src/token-avatar.ts $(HOST):/root/signal_scan/server/src/token-avatar.ts
 	$(SCP) server/src/monitor/main.ts $(HOST):/root/signal_scan/server/src/monitor/main.ts
+	$(SCP) server/src/monitor/notifications.ts $(HOST):/root/signal_scan/server/src/monitor/notifications.ts
 	$(SCP) server/src/monitor/alerts.ts $(HOST):/root/signal_scan/server/src/monitor/alerts.ts
 	$(SCP) server/src/telegram-alert-settings.ts $(HOST):/root/signal_scan/server/src/telegram-alert-settings.ts
 	$(SCP) server/src/alert-feed.ts $(HOST):/root/signal_scan/server/src/alert-feed.ts

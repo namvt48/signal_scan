@@ -440,7 +440,7 @@ test('sends periodic report header and splits captioned token photos into album 
       ca: `CA${index}`,
       symbol: `TOKEN${index}`,
       iconUrl: `https://cdn.dexscreener.com/cms/images/token-${index}.png`,
-      nansen: { lf: 1_000_000 },
+      nansen: { lf: 1_000_000, freshCurrent: true },
       volume24h: 1_000 + index,
       trackedHolding: 0,
     },
@@ -497,7 +497,7 @@ test('sends a single periodic entry as a CA-avatar photo after the outer header'
     source: 'B',
     signal: {
       chain: 'sol', ca: 'CA1', symbol: 'DEMO', iconUrl: 'https://cdn.dexscreener.com/cms/images/demo.png',
-      nansen: {}, volume24h: 1, trackedHolding: 0,
+      nansen: { freshCurrent: true }, volume24h: 1, trackedHolding: 0,
     },
   }], '2026-01-02T06:00+07:00', [6]);
   assert.deepEqual(methods, ['sendMessage', 'sendPhoto']);
@@ -517,7 +517,7 @@ test('never falls back to the live-alert channel when the periodic channel is mi
     source: 'A',
     signal: {
       chain: 'sol', ca: 'CA1', symbol: 'DEMO', iconUrl: 'https://cdn.example.com/token.png',
-      nansen: {}, volume24h: 1, trackedHolding: 0,
+      nansen: { freshCurrent: true }, volume24h: 1, trackedHolding: 0,
     },
   }], '2026-01-02T06:00+07:00', [6]), /Periodic scan Telegram channel is not configured/);
   assert.equal(requests, 0);

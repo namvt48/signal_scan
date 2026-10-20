@@ -52,12 +52,13 @@ import { limiters } from '../ratelimit/index.js';
 /** The credit-attributable callers (single source of truth: `auth.ts`). */
 export type { Caller } from './auth.js';
 
-/** Fixed response header allowlist - exactly these four, nothing else. */
+/** Fixed response header allowlist; only explicitly safe fields cross the gateway. */
 export const HEADER_ALLOWLIST = [
   'content-type',
   'retry-after',
   'x-ratelimit-reset',
   'x-nansen-credits-cost',
+  'x-nansen-door-classification',
 ] as const;
 
 export type AllowedHeader = (typeof HEADER_ALLOWLIST)[number];

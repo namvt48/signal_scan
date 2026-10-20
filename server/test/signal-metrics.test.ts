@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../../src/lib/signalMetrics.js';
+import { freshDisplayValue, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../../src/lib/signalMetrics.js';
+import { sortTrackedWalletsByBalance } from '../../src/lib/walletSort.js';
+import type { TrackedWalletStat } from '../../src/types.js';
 
 test('percentage ranges are inclusive, preserve zero, and exclude unknown only when armed', () => {
   assert.equal(percentageInRange(undefined, '', ''), true);
@@ -14,6 +16,32 @@ test('percentage ranges are inclusive, preserve zero, and exclude unknown only w
   assert.equal(percentageInRange(15, 'bad', ''), false);
   assert.equal(percentageInRange(15, '-1', ''), false);
   assert.equal(percentageInRange(15, '', '101'), false);
+});
+
+test('dashboard Fresh cell hides below-threshold values but keeps threshold equality and debug values', () => {
+  assert.equal(freshDisplayValue(11.99, 12, false), undefined);
+  assert.equal(freshDisplayValue(12, 12, false), 12);
+  assert.equal(freshDisplayValue(12.01, 12, false), 12.01);
+  assert.equal(freshDisplayValue(50, 12, false), 50, 'stale high historical readings may stay visible');
+  assert.equal(freshDisplayValue(11.99, 12, true), 11.99, 'all-factors debug remains ungated');
+  assert.equal(freshDisplayValue(11.99, null, false), undefined, 'unknown thresholds fail closed in normal mode');
+  assert.equal(freshDisplayValue(undefined, 12, true), undefined);
+});
+
+test('tracked-wallet Bal sort is per-list, stable for ties, and keeps unknown balances last', () => {
+  const wallets: TrackedWalletStat[] = [
+    { name: 'high-first', balUsd: 100, inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+    { name: 'low-first', balUsd: 5, inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+    { name: 'high-second', balUsd: 100, inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+    { name: 'low-second', balUsd: 5, inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+    { name: 'unknown-first', inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+    { name: 'unknown-second', balUsd: Number.NaN, inflow: 0, buys: 0, sells: 0, lastTs: 0 },
+  ];
+  const names = (direction: 'asc' | 'desc' | null) => sortTrackedWalletsByBalance(wallets, direction).map((wallet) => wallet.name);
+  assert.deepEqual(names('desc'), ['high-first', 'high-second', 'low-first', 'low-second', 'unknown-first', 'unknown-second']);
+  assert.deepEqual(names('asc'), ['low-first', 'low-second', 'high-first', 'high-second', 'unknown-first', 'unknown-second']);
+  assert.deepEqual(names(null), ['high-first', 'low-first', 'high-second', 'low-second', 'unknown-first', 'unknown-second']);
+  assert.deepEqual(wallets.map((wallet) => wallet.name), ['high-first', 'low-first', 'high-second', 'low-second', 'unknown-first', 'unknown-second']);
 });
 
 test('FOMO holding totals stay unknown until a user has a measured percentage', () => {

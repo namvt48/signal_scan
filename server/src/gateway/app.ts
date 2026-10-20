@@ -11,7 +11,7 @@ import { limiters } from '../ratelimit/index.js';
 import type { LimiterSnapshot } from '../ratelimit/types.js';
 import { log } from '../log.js';
 import { callerTokensFromConfig, requireCaller, type Caller, type CallerTokens } from './auth.js';
-import { poolStatsOrNull, browserPostJson } from './door.js';
+import { poolStatsOrNull, freshWalletPoolStatsOrNull } from './door.js';
 import {
   denial,
   parseGatewayRequest,
@@ -49,17 +49,11 @@ import { CHAINS, EVM_ADDRESS, canonicalCa, isSolanaAddress, type Chain } from '.
 import { acknowledgeMarketAlertDelivery, replaceMarketSubscriptions, type CaTarget, type MarketAlertCaller } from '../db.js';
 
 /**
- * DoorPool stats now come from the relocated pool in `gateway/door.ts` (todo 10).
- * `poolStatsOrNull()` is side-effect-free: it returns null until a door has
- * actually been used, so `/health` never spawns a chrome pool. The stats include
- * `egressIp`, which the GMGN-allowlist check (todo 22) needs.
- *
- * WHY THE `egressIp` MAY BE DISCLOSED UNAUTHENTICATED: `/health` binds loopback +
- * the private `signal-scan-gateway` net only, so the egress IP is not public.
- * `/health` is NOT token-authenticated — do not describe it as such; the
- * disclosure is intentional and safe given those bindings (plan todo 2). The
- * PUBLIC api-side `/api/health` (instance a/b) STRIPS `egressIp` + proxy strings
- * before re-serving the table (api.ts).
+ * DoorPool stats now come from `gateway/door.ts` (todo 10). Both health fields
+ * are side-effect-free: they return null until their pool has received a call,
+ * so `/health` never spawns a browser. The internal table includes egress IPs;
+ * public `/api/health` intentionally exposes only the general pool's sanitized
+ * fields.
  */
 export interface GatewayAppDeps {
   /** Token surface; defaults to the gateway's own env (config.ts, todo 6). */
@@ -85,8 +79,8 @@ export interface GatewayAppDeps {
   /** Nansen credit-API upstream (todo 7); defaults to the real fetcher that
    *  carries the gateway-held `apikey`. Injectable for tests. */
   nansenCreditUpstream?: UpstreamFetch;
-  /** Nansen free-door transport (todo 7); defaults to the relocated DoorPool's
-   *  `browserPostJson`. Injectable so the door route is testable without chrome. */
+  /** Optional override for the Nansen free-door transport.
+   *  Production dispatches Gini to the dedicated Fresh Wallet pool. */
   nansenDoor?: DoorPost;
   /** Limiter runner override (tests); defaults to the shared registry. */
   runLimiter?: LimiterRun;
@@ -200,14 +194,18 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
     next();
   });
 
-  // PUBLIC health probe (acceptance: `{ok:true}`). No auth by design — see the
-  // egressIp note above. `doors` is the relocated DoorPool's live stats (todo 10),
-  // or null until a door call has built the pool.
+  // The gateway listener is private; its pool inventory retains egress fields
+  // for internal diagnostics. The public API health proxy strips them.
   app.get('/health', (_req, res) => {
+    const doors = poolStatsOrNull();
     res.json({
       ok: true,
       ratelimit: limiters.snapshot(),
-      doors: poolStatsOrNull(),
+      doors,
+      freshWalletDoors: freshWalletPoolStatsOrNull(),
+      nansen: {
+        browserReady: doors === null ? null : doors.some(({ state }) => state === 'healthy' || state === 'probation'),
+      },
     });
   });
 
@@ -404,9 +402,6 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       .then((result) => send(res, result), next);
   });
 
-  // Nansen free browser door public CA reads share across callers for a short
-  // TTL; wallet/profile routes are not classified as cacheable by GatewayCache.
-  const doorPost: DoorPost = deps.nansenDoor ?? browserPostJson;
   app.post(NANSEN_DOOR_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
     const caller = req.caller;
     if (caller === undefined) {
@@ -418,7 +413,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
         NANSEN_DOOR_PATH,
         req.body,
         caller,
-        () => handleNansenDoor(req.body, { postJson: doorPost, caller }),
+        () => handleNansenDoor(req.body, { postJson: deps.nansenDoor, caller }),
       )
       .then((result) => send(res, result), next);
   });

@@ -33,11 +33,19 @@ export function percentageInRange(value: number | undefined, min: string, max: s
   return true;
 }
 
-interface FreshMetric { fresh?: number; rawFresh?: number }
+interface FreshMetric { fresh?: number; rawFresh?: number; freshCurrent: boolean }
 
-/** Setup visibility must not hide a known reading from the explicit range filter. */
+/** Blank bounds disable filtering; active bounds require an explicitly current FW reading. */
 export function freshPercentageInRange(metric: FreshMetric, min: string, max: string): boolean {
+  if (min.trim() === '' && max.trim() === '') return true;
+  if (!metric.freshCurrent) return false;
   return percentageInRange(metric.rawFresh ?? metric.fresh, min, max);
+}
+
+/** Hide below-threshold FW in the normal dashboard while preserving raw debug values. */
+export function freshDisplayValue(value: number | undefined, minPct: number | null, allFactors: boolean): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined;
+  return allFactors || (minPct !== null && Number.isFinite(minPct) && value >= minPct) ? value : undefined;
 }
 
 /** Shared USD emphasis for BAL and tracked inflow; thresholds use unrounded USD. */

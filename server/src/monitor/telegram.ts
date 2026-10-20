@@ -210,11 +210,12 @@ export function formatPeriodicScanAlert(signal: PeriodicScanItem): string {
   const xHandle = signal.xHandle && /^[A-Za-z0-9_]{1,15}$/.test(signal.xHandle) ? signal.xHandle : undefined;
   const xSearchUrl = `https://x.com/search?q=${encodeURIComponent(signal.ca)}`;
   const gmgnUrl = `https://gmgn.ai/${signal.chain}/token/${encodeURIComponent(signal.ca)}`;
+  const freshText = `Fresh Wallet ${metricValue(signal.nansen.rawFresh ?? signal.nansen.fresh, dashboardNumber, '%')}`;
   return [
     `${escapeHtml(ticker)}\nMC: ${marketCapText(signal.marketCap)}`,
     `CA: <a href="${escapeHtml(gmgnUrl)}">Gmgn</a>`,
     [
-      `Nansen: Top100 ${metricValue(signal.nansen.t100?.multiple, dashboardNumber)} | Low Float ${metricValue(signal.nansen.lf, dashboardCompact)} | Fresh Wallet ${metricValue(signal.nansen.rawFresh ?? signal.nansen.fresh, dashboardNumber, '%')}`,
+      `Nansen: Top100 ${metricValue(signal.nansen.t100?.multiple, dashboardNumber)} | Low Float ${metricValue(signal.nansen.lf, dashboardCompact)} | ${freshText}`,
       `24h volume: ${marketCapText(signal.volume24h)}`,
       `Tracker holding: ${value(signal.trackedHolding, '%')}`,
       `Twitter: ${xHandle ? `<a href="https://x.com/${xHandle}">@${escapeHtml(xHandle)}</a>` : 'unavailable'} | <a href="${escapeHtml(xSearchUrl)}">CA search on X</a>`,
@@ -402,6 +403,7 @@ export class TelegramBot {
       );
     }
   }
+
 
   private async request(
     method: 'sendPhoto' | 'sendMessage' | 'sendMediaGroup',

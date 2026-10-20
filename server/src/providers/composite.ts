@@ -21,13 +21,13 @@ export class CompositeProvider implements MarketDataProvider {
   /** gini → Nansen; volume → GMGN. Essential prefers GMGN and falls back to
    * Nansen for supply/deployed_at/supporting fields when GMGN is gated. Fallback
    * price and MC are omitted: only a fresh GMGN quote owns current MC in this mode. */
-  async metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
-    if (kind === 'gini') return this.nansen.metric(ca, chain, kind);
+  async metric(ca: string, chain: Chain, kind: MetricKind, signal?: AbortSignal): Promise<MetricPatch> {
+    if (kind === 'gini') return this.nansen.metric(ca, chain, kind, signal);
     try {
       return await this.gmgn.metric(ca, chain, kind);
     } catch (e) {
       if (kind !== 'essential') throw e;
-      const fallback = await this.nansen.metric(ca, chain, kind);
+      const fallback = await this.nansen.metric(ca, chain, kind, signal);
       return { ...fallback, price: undefined, marketCap: undefined };
     }
   }

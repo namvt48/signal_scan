@@ -2,8 +2,22 @@
 // frontend never imports server modules, so the small shape is duplicated on
 // purpose — keep the two in sync when the contract changes).
 
-import { T100_WINDOW_MS } from './config.js';
-import { allTokenStates, earliestSnapshotAt, getDb, isPassTier, latestSnapshot, latestWatchTradeTsByCa, listMetricPollCache, listTiers, listTrackedCas, snapshotAtOrBefore, snapshotsSince, type TokenStateRow } from './db.js';
+import { T100_WINDOW_MS, config } from './config.js';
+import {
+  allTokenStates,
+  earliestSnapshotAt,
+  getDb,
+  getMetricPollCache,
+  isPassTier,
+  latestSnapshot,
+  latestWatchTradeTsByCa,
+  listMetricPollCache,
+  listTiers,
+  listTrackedCas,
+  snapshotAtOrBefore,
+  snapshotsSince,
+  type TokenStateRow,
+} from './db.js';
 import { getDebugAllFactors, getThresholds, type NansenThresholds } from './settings.js';
 import { t100Decrease } from './snapshot.js';
 import { cohortLabelIndex } from './cohort-labels.js';
@@ -16,13 +30,16 @@ export interface NansenSetup {
   score: number;
   /**
    * Per-factor gate result under the thresholds in force for THIS response.
-   * false = the factor has a value but misses the current threshold (only
-   * visible when the allFactors debug flag is on, and rendered struck-through).
-   * A factor with no value at all is false too — `fresh`/`t100`/`lf` stay absent.
+   * Stale or unknown-time FW is historical, not a current passing factor.
    */
   pass: { fresh: boolean; t100: boolean; lf: boolean };
+  /** Whether the last successful Fresh reading is inside the configured TTL. */
+  freshCurrent: boolean;
+  /** Timestamp of the last successful Fresh reading, including legacy poll-cache provenance. */
+  freshUpdatedAt?: number;
+  /** Historical Fresh-wallet supply percentage. */
   fresh?: number;
-  /** Ungated measured Fresh %, for explicit range filters even when the setup fails. */
+  /** Ungated measured Fresh %, retained for explicit historical inspection. */
   rawFresh?: number;
   /** Genesis-to-trough: pct = (A−B)/A×100, multiple = A/B (absent until a genesis write lands). */
   t100?: { pct: number; multiple?: number };
@@ -52,6 +69,8 @@ export interface TrackedWalletStat {
   sells: number;
   /** Current token balance USD for this (wallet, CA) — absent when never measured (NULL). */
   balUsd?: number;
+  /** Current balance in token units from wallet_token_state; absent when not measured. */
+  holdingAmount?: number;
   /** Current token balance as a share of total supply; absent when balance/supply is unknown. */
   holdingPct?: number;
   /** Epoch ms of the wallet's newest watch trade for this CA inside the window; 0 = none. */
@@ -254,6 +273,7 @@ export function trackedWalletStats(ca: string, chain: string, now: number): Trac
       sells,
       lastTs,
       ...(balUsd != null ? { balUsd } : {}),
+      ...(holdingAmount != null ? { holdingAmount } : {}),
       ...(holdingPct !== undefined ? { holdingPct } : {}),
     };
   });
@@ -323,6 +343,7 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
       sells,
       lastTs,
       ...(balUsd != null ? { balUsd } : {}),
+      ...(holdingAmount != null ? { holdingAmount } : {}),
       ...(holdingPct !== undefined ? { holdingPct } : {}),
     };
     const key = `${chain}:${ca}`;
@@ -737,6 +758,9 @@ export function sanitizeSymbol(sym: string): string {
 export interface NansenScore {
   /** Fresh-wallet % used for the pass test (nansen_fresh_pct, or the mock-mode fresh_count derivation). */
   fresh?: number;
+  /** Timestamp of the last successful Fresh read, if known. */
+  freshUpdatedAt?: number;
+  freshCurrent: boolean;
   /** T100 genesis→trough multiple (A/B — the number the FE cell shows). */
   t100Multiple?: number;
   /** LF: the exchange chart's LEFTMOST point, token units. */
@@ -749,35 +773,60 @@ export interface NansenScore {
   /**
    * true ONLY when EVERY factor input has arrived: st exists, symbol non-empty
    * after trim, supply/price/nansen_fresh_pct/t100_multiple/genesis_bal all
-   * non-null. The raw nansen_fresh_pct column is required — the fresh_count
-   * fallback is mock-mode only and must NOT qualify a row as complete.
-   * false = "wait for the sweeps", never a rejection.
+   * non-null. FW must also have a successful observation within its TTL; stale
+   * or unknown-time FW waits rather than entering zero-score rejection.
    */
   complete: boolean;
 }
 
+function cachedFreshAt(st: TokenStateRow | undefined): number | undefined {
+  if (st?.fresh_updated_at != null) return st.fresh_updated_at;
+  if (!st) return undefined;
+  const cached = getMetricPollCache(st.ca, st.chain, 'gini');
+  if (cached?.response_at == null || cached.response_json === null) return undefined;
+  try {
+    const value: unknown = JSON.parse(cached.response_json);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+    const fresh = Reflect.get(value, 'nansenFreshPct');
+    return typeof fresh === 'number' && Number.isFinite(fresh) && fresh >= 0 && fresh <= 100
+      ? cached.response_at
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const FRESH_TIMESTAMP_UNKNOWN = Symbol('fresh-timestamp-unknown');
+
 /**
- * Single source of truth for the three factor gates and the score. Extracted
- * verbatim from assembleSignals so the zero-score rejection gate (poller) and
- * the dashboard read the SAME thresholds with the SAME semantics.
- *
- * Division guards (Metis blocker): mc = 0 -> holding 0 / lf absent; holders = 0 -> fresh absent.
- * nansen_fresh_pct (supply share, written every token sweep) wins; the
- * fresh_count derivation is the mock-mode fallback.
- * LF (user 2026-09-11): the exchange chart's LEFTMOST point, token units —
- * the display value AND the gate input (absolute band: lfMin <= lf <= lfMax).
- * The T100 gate reads the MULTIPLE (A/B), not the pct.
+ * FW is retained as a historical value, but scores as a factor only while its
+ * last successful observation is inside the configured TTL. Missing/future times
+ * are not current; a true 0% reading remains a valid measured value.
  */
-export function nansenScore(st: TokenStateRow | undefined, th: NansenThresholds): NansenScore {
+export function nansenScore(
+  st: TokenStateRow | undefined,
+  th: NansenThresholds,
+  now = Date.now(),
+  sampledFreshAt: number | null | typeof FRESH_TIMESTAMP_UNKNOWN = FRESH_TIMESTAMP_UNKNOWN,
+): NansenScore {
   const baseHolders = st?.holders ?? 0;
   const fresh =
     st?.nansen_fresh_pct ??
     (st?.fresh_count != null && baseHolders > 0 ? (st.fresh_count / baseHolders) * 100 : undefined);
+  const freshUpdatedAt = sampledFreshAt === FRESH_TIMESTAMP_UNKNOWN
+    ? cachedFreshAt(st)
+    : sampledFreshAt ?? undefined;
+  const freshCurrent =
+    fresh !== undefined &&
+    freshUpdatedAt !== undefined &&
+    Number.isFinite(freshUpdatedAt) &&
+    freshUpdatedAt <= now &&
+    now - freshUpdatedAt < config.pollSetupMs;
   const lf = st?.genesis_bal != null ? st.genesis_bal : undefined;
   const t100Multiple = st?.t100_multiple != null ? st.t100_multiple : undefined;
 
   // score counts factors that PASS, not merely present (Metis; thresholds runtime-adjustable via /api/settings).
-  const freshPass = fresh !== undefined && fresh >= th.freshMinPct;
+  const freshPass = freshCurrent && fresh !== undefined && fresh >= th.freshMinPct;
   const t100Pass = t100Multiple !== undefined && t100Multiple >= th.t100MinMultiple;
   const lfPass = lf !== undefined && lf >= th.lfMin && lf <= th.lfMax;
   let score = 0;
@@ -791,12 +840,14 @@ export function nansenScore(st: TokenStateRow | undefined, th: NansenThresholds)
     st.symbol.trim() !== '' &&
     st.supply != null &&
     st.price != null &&
+    freshCurrent &&
     st.nansen_fresh_pct != null &&
     st.t100_multiple != null &&
     st.genesis_bal != null;
 
-  return { fresh, t100Multiple, lf, freshPass, t100Pass, lfPass, score, complete };
+  return { fresh, freshUpdatedAt, freshCurrent, t100Multiple, lf, freshPass, t100Pass, lfPass, score, complete };
 }
+
 
 /** One TokenSignal per tracked CA. Rows without token_state yet render as zeros/absent factors. */
 export function assembleSignals(now: number = Date.now(), allFactors = getDebugAllFactors()): TokenSignal[] {
@@ -898,7 +949,8 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
 
     // Factor math lives in nansenScore (single source of truth, shared with the
     // poller's zero-score rejection gate) — output unchanged.
-    const ns = nansenScore(st, th);
+    const freshTimestamp = dataUpdatedAtByCa.get(`${c.chain}:${c.address}`)?.fresh ?? st?.fresh_updated_at ?? null;
+    const ns = nansenScore(st, th, now, freshTimestamp);
 
     out.push({
       id: `${c.chain}:${c.address}`,
@@ -912,7 +964,8 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       nansen: {
         score: ns.score,
         pass: { fresh: ns.freshPass, t100: ns.t100Pass, lf: ns.lfPass },
-        ...(ns.fresh !== undefined && (allFactors || ns.freshPass) ? { fresh: ns.fresh } : {}),
+        freshCurrent: ns.freshCurrent,
+        ...(ns.fresh !== undefined && (allFactors || ns.freshPass || !ns.freshCurrent) ? { fresh: ns.fresh } : {}),
         ...(ns.fresh !== undefined ? { rawFresh: ns.fresh } : {}),
         ...(t100Pct !== undefined && (allFactors || ns.t100Pass)
           ? { t100: { pct: t100Pct, ...(ns.t100Multiple !== undefined ? { multiple: ns.t100Multiple } : {}) } }
@@ -920,7 +973,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
         ...(ns.lf !== undefined && (allFactors || ns.lfPass) ? { lf: ns.lf } : {}),
         ...(st?.fresh_history_json ? { freshHistory: JSON.parse(st.fresh_history_json) as { t: number; value: number }[] } : {}),
         ...(st?.t100_history_json ? { t100History: JSON.parse(st.t100_history_json) as { t: number; value: number; peakBalance?: number; troughBalance?: number }[] } : {}),
-        ...(st?.fresh_updated_at != null ? { freshUpdatedAt: st.fresh_updated_at } : {}),
+        ...(ns.freshUpdatedAt !== undefined ? { freshUpdatedAt: ns.freshUpdatedAt } : {}),
       },
       holders,
       ...(st?.holders_history_json ? { holdersHistory: JSON.parse(st.holders_history_json) as { t: number; value: number }[] } : {}),

@@ -160,6 +160,37 @@ test('fresh T100 with missing LF fetches LF alone and fills consumer state', asy
   assert.ok(getSetupCacheEntry(ca, CHAIN)?.series_at, 'series freshness remains available after LF fill');
 });
 
+test('T100 persists before an unavailable LF request completes', async () => {
+  open(':memory:');
+  loadSetupCache(cacheFile());
+  const ca = 'CA-COORD-T100-BEFORE-LF';
+  const now = Date.now();
+  const deployedAt = now - 2 * DAY;
+  seed(ca, deployedAt);
+  putSetupCacheEntry(entry(ca, now, { info_at: now }));
+  const lfStarted = Promise.withResolvers<void>();
+  const lfRelease = Promise.withResolvers<void>();
+  setPollerDeps(provider(deployedAt), null, {
+    tokenFlows: async (request) => {
+      if (request.label === 'exchange') {
+        lfStarted.resolve();
+        await lfRelease.promise;
+        return [];
+      }
+      return rows(now);
+    },
+  });
+
+  const refresh = refreshSeries(ca, CHAIN);
+  await lfStarted.promise;
+  const cached = getSetupCacheEntry(ca, CHAIN);
+  assert.notEqual(getTokenState(ca, CHAIN)?.t100_multiple, null, 'successful T100 is written while LF is pending');
+  assert.equal(cached?.series_at, cached?.taken_at, 'fresh T100 cache marker is durable before LF completes');
+  assert.ok((cached?.series.length ?? 0) > 0, 'fresh T100 points are cached before LF completes');
+  lfRelease.resolve();
+  await refresh;
+});
+
 test('chart fallback and setup share a fetch whose result is reused by the next refresh', async () => {
   open(':memory:');
   loadSetupCache(cacheFile());

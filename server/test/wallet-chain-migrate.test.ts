@@ -127,6 +127,8 @@ test('migration: old prod-shape DB keeps every row, backfilled chain=sol', () =>
     assert.equal(fks[0].on_delete, 'CASCADE');
     const idx = getDb().prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wallet_trades' AND name='idx_trades_ca'").get();
     assert.ok(idx, 'idx_trades_ca recreated');
+    const walletStateIndex = getDb().prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wallet_token_state' AND name='idx_wallet_token_state_chain_ca'").get();
+    assert.ok(walletStateIndex, 'wallet balance repricing index created after legacy rebuild');
     assert.throws(
       () => getDb().prepare("INSERT INTO wallet_trades (wallet_id, ca, ts, side, amount_usd, price, tx) VALUES ('w1','ca-1',1,'hold',0,0,'tx-2')").run(),
       /CHECK/i,

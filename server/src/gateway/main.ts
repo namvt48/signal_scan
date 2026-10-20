@@ -13,12 +13,12 @@ import { listTrackedCas, open, expireMarketSubscriptions } from '../db.js';
 import { GatewayClient } from '../gateway-client.js';
 import { CompositeProvider } from '../providers/composite.js';
 import { GmgnMarketProvider } from '../providers/gmgn.js';
-import { NansenApiClient, NansenMarketProvider } from '../providers/nansen.js';
+import { NansenApiClient, NansenMarketProvider, NANSEN_HOLDERS_GINI_URL } from '../providers/nansen.js';
 import type { MarketDataProvider } from '../providers/provider.js';
 import { startPoller, kickCAs } from '../poller.js';
 import { mergeSetupCacheFiles } from '../setup-cache.js';
 import { migrateLegacyMarketDatabases } from '../market-data-migration.js';
-import { browserPostJson } from './door.js';
+import { browserPostJson, freshWalletBrowserPostJson } from './door.js';
 import { createGatewayApp } from './app.js';
 
 export { DEFAULT_GATEWAY_PORT };
@@ -70,6 +70,12 @@ export function parsePort(raw: string | undefined): number {
   return n;
 }
 
+/** Route the shared collector's Fresh Wallet question through the FW-only pool. */
+export function nansenBrowserPostJson(url: string, body: unknown, signal?: AbortSignal) {
+  const postJson = url === NANSEN_HOLDERS_GINI_URL ? freshWalletBrowserPostJson : browserPostJson;
+  return postJson(url, body, { caller: 'a', ...(signal === undefined ? {} : { signal }) });
+}
+
 
 function startSharedMarketPoller(): void {
   process.env.GATEWAY_URL = `http://127.0.0.1:${config.gatewayPort}`;
@@ -80,7 +86,7 @@ function startSharedMarketPoller(): void {
   });
   const nansenApi = new NansenApiClient(config.nansenApiKey, gatewayClient);
   const nansen = new NansenMarketProvider(
-    (url, body) => browserPostJson(url, body, { caller: 'a' }),
+    nansenBrowserPostJson,
     nansenApi,
     listTrackedCas,
   );

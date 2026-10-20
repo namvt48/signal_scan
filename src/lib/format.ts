@@ -41,6 +41,31 @@ export function pct(n: number): string {
   return `${fmtNum(n)}%`;
 }
 
+/** Full token-unit balance with comma grouping; retain the shortest exact JS number text. */
+export function tokenAmount(value?: number): string | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined;
+  const [coefficient, exponentText] = value.toString().toLowerCase().split('e');
+  const exponent = exponentText === undefined ? 0 : Number(exponentText);
+  const negative = coefficient!.startsWith('-');
+  const unsigned = negative ? coefficient!.slice(1) : coefficient!;
+  const [whole, fraction = ''] = unsigned.split('.');
+  const digits = `${whole}${fraction}`;
+  const decimalPlaces = fraction.length - exponent;
+  const integer = decimalPlaces <= 0
+    ? `${digits}${'0'.repeat(-decimalPlaces)}`
+    : decimalPlaces >= digits.length
+      ? '0'
+      : digits.slice(0, digits.length - decimalPlaces);
+  const fractional = decimalPlaces <= 0
+    ? ''
+    : decimalPlaces >= digits.length
+      ? `${'0'.repeat(decimalPlaces - digits.length)}${digits}`
+      : digits.slice(digits.length - decimalPlaces);
+  const grouped = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const trimmedFraction = fractional.replace(/0+$/, '');
+  return `${negative ? '-' : ''}${grouped}${trimmedFraction ? `.${trimmedFraction}` : ''}`;
+}
+
 /**
  * Balance-chart extremes (top-100 total balance, token units): "831.1M / 819.2M"
  * (đỉnh / đáy). "—" when the window has no crawled data yet.

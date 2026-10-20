@@ -261,10 +261,10 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
 
     // Configure CA_SCORE_0: complete 0/3 score (nansen_fresh_pct=0, t100_multiple=0, genesis_bal=999999)
     getDb().prepare(`
-      UPDATE token_state 
-         SET nansen_fresh_pct = 0, t100_multiple = 0, genesis_bal = 999999 
+      UPDATE token_state
+         SET nansen_fresh_pct = 0, fresh_updated_at = ?, t100_multiple = 0, genesis_bal = 999999
        WHERE ca = ?
-    `).run(CA_SCORE_0);
+    `).run(Date.now(), CA_SCORE_0);
 
     // Configure CA_PASS: tier Pass
     setTier(CA_PASS, 'sol', 'P');

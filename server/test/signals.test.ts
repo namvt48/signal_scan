@@ -1,7 +1,7 @@
 import { before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { getDb, getTokenState, insertTrackedCa, insertWallet, open } from '../src/db.js';
-import { insertSnapshot, insertTrades, replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, upsertTokenInfo } from '../src/ingest.js';
+import { insertSnapshot, insertTrades, replaceWalletBalances, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, upsertTokenInfo } from '../src/ingest.js';
 import { assembleSignals, computeBalanceRanges, computeT100Pct, sanitizeSymbol, sumHoldingAmount, trackedWalletStats } from '../src/signals.js';
 import { cohortLabelIndex } from '../src/cohort-labels.js';
 import { setDebugAllFactors, thresholdDefaults, updateThresholds } from '../src/settings.js';
@@ -54,6 +54,7 @@ before(() => {
 
   // CA_A: fresh 15% (pass >=10), t100 multiple 1.5 (pass >=1.2), lf = genesis 4e7 inside [1e6, 3e8] (pass) -> score 3.
   upsertTokenInfo(token(CA_A, { holders: 1000, freshCount: 150, marketCap: 50e6, volume24h: 123456, volume1h: 3210, symbol: 'mini' }));
+  updateTokenMetrics(CA_A, 'sol', { nansenFreshPct: 15 });
   updateTokenAnalytics(CA_A, 'sol', { t100Pct: 20, t100Multiple: 1.5, genesisBal: 4e7 });
   replaceWalletBalances(w1Id, 'sol', [{ ca: CA_A, amount: 1e7 }]); // 1e7 / 1e9 supply = 1%
   replaceWalletBalances(w2Id, 'sol', []);
@@ -90,7 +91,7 @@ beforeEach(() => {
 });
 
 test('assembleSignals: fresh%, pass-based score, t100, lf for CA_A', () => {
-  const sig = assembleSignals(NOW).find((s) => s.ca === CA_A);
+  const sig = assembleSignals().find((s) => s.ca === CA_A);
   assert.ok(sig, 'CA_A missing from signals');
   assert.equal(sig.id, `sol:${CA_A}`);
   assert.equal(sig.symbol, 'mini'); // stored + emitted as-is (FE uppercases)
@@ -220,6 +221,55 @@ test('trackedWallets: sell subtracts from wallet AND token net, counts, balUsd p
   assert.equal(sig.trackedInflow, 1250);
 });
 
+for (const writer of ['metrics', 'metrics-with-fresh', 'token-info'] as const) {
+  test(`wallet Bal USD reprices without new trades via ${writer}`, () => {
+    const ca = `reprice-${writer}`;
+    const baseWallet = insertWallet({ address: `base-wallet-${writer}`, name: 'Base wallet', tags: [], chain: 'base', source: 'test' });
+    upsertTokenInfo(token(ca, { price: 2 }));
+    upsertTokenInfo(token(ca, { chain: 'base', price: 7 }));
+    insertTrades(w1Id, [
+      activity(`buy-${writer}`, 'buy', 80, NOW - 2000, ca),
+      activity(`sell-${writer}`, 'sell', 20, NOW - 1000, ca),
+    ], 'watch');
+    insertTrades(w2Id, [activity(`buy-second-${writer}`, 'buy', 10, NOW - 3000, ca)], 'watch');
+    replaceWalletBalances(w1Id, 'sol', [{ ca, amount: 25 }]);
+    replaceWalletBalances(w2Id, 'sol', [{ ca, amount: 10 }]);
+    replaceWalletBalances(baseWallet.id, 'base', [{ ca, amount: 3 }]);
+    const trades = getDb().prepare('SELECT * FROM wallet_trades WHERE ca = ? ORDER BY id').all(ca);
+    const before = trackedWalletStats(ca, 'sol', NOW);
+    assert.equal(before.find((w) => w.name === 'CT01')?.balUsd, 50);
+    assert.equal(before.find((w) => w.name === 'CT01')?.inflow, 60);
+
+    if (writer === 'token-info') upsertTokenInfo(token(ca, { price: 4 }));
+    else updateTokenMetrics(ca, 'sol', { price: 4, ...(writer === 'metrics-with-fresh' ? { nansenFreshPct: 12 } : {}) });
+
+    const after = trackedWalletStats(ca, 'sol', NOW);
+    assert.deepEqual(after, before.map((w) => ({ ...w, balUsd: w.holdingAmount! * 4 })));
+    assert.deepEqual(getDb().prepare('SELECT * FROM wallet_trades WHERE ca = ? ORDER BY id').all(ca), trades);
+    assert.deepEqual(
+      getDb().prepare('SELECT balance_usd, token_amount FROM wallet_token_state WHERE ca = ? AND chain = ?').get(ca, 'base'),
+      { balance_usd: 21, token_amount: 3 },
+    );
+    updateTokenMetrics(ca, 'sol', { price: 1 });
+    assert.equal(trackedWalletStats(ca, 'sol', NOW).find((w) => w.name === 'CT01')?.balUsd, 25);
+    replaceWalletBalances(w1Id, 'sol', [{ ca, amount: 30 }]);
+    assert.equal(trackedWalletStats(ca, 'sol', NOW).find((w) => w.name === 'CT01')?.balUsd, 30);
+  });
+}
+
+test('first usable price values existing unpriced holdings; missing or invalid quotes do not manufacture USD', () => {
+  const ca = 'reprice-unpriced';
+  insertTrades(w1Id, [activity('unpriced-buy', 'buy', 80, NOW - 1000, ca)], 'watch');
+  replaceWalletBalances(w1Id, 'sol', [{ ca, amount: 25 }]);
+  for (const patch of [{ holders: 10 }, { price: 0 }, { price: -1 }, { price: NaN }, { price: Infinity }]) {
+    updateTokenMetrics(ca, 'sol', patch);
+    assert.equal(trackedWalletStats(ca, 'sol', NOW)[0]?.balUsd, undefined);
+  }
+  updateTokenMetrics(ca, 'sol', { price: 4 });
+  assert.equal(trackedWalletStats(ca, 'sol', NOW)[0]?.balUsd, 100);
+  assert.equal(trackedWalletStats(ca, 'sol', NOW)[0]?.inflow, 80);
+});
+
 test('trackedWallets: an UNPRICED holding emits no balUsd (FE "—"), never a fake $0', () => {
   const CA_NP = 'caNoPrice-bal-024';
   const wId = insertWallet({ address: 'wallet-addr-noprice', name: 'CTNP', tags: [], chain: 'sol', source: 'test' }).id;
@@ -296,7 +346,7 @@ test('trackedWalletStats: a watch buy OLDER than TRACKED_BY_WINDOW_MS still list
   assert.ok(sig);
   assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CTOLD']);
   // Zero 24h stats, but balUsd from the measured holding (5e6 × 0.002).
-  assert.deepEqual(sig.trackedWallets[0], { name: 'CTOLD', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 1e4, holdingPct: 0.5 });
+  assert.deepEqual(sig.trackedWallets[0], { name: 'CTOLD', tags: [], inflow: 0, buys: 0, sells: 0, lastTs: 0, balUsd: 1e4, holdingAmount: 5e6, holdingPct: 0.5 });
   // The exported fn must agree with the assembled column.
   assert.deepEqual(trackedWalletStats(CA_Q, 'sol', NOW), sig.trackedWallets);
 });
@@ -540,13 +590,13 @@ test('assembleSignals: pass flags track the live thresholds — a PUT re-scores 
   updateTokenAnalytics(CA_P, 'sol', { t100Pct: 6, t100Multiple: 1.5, genesisBal: 4e7 });
   updateNansenHolders(CA_P, 'sol', { holders: 100, freshSupplyPct: 12 });
 
-  let sig = assembleSignals(NOW).find((s) => s.ca === CA_P);
+  let sig = assembleSignals().find((s) => s.ca === CA_P);
   assert.deepEqual(sig?.nansen.pass, { fresh: true, t100: true, lf: true });
   assert.equal(sig?.nansen.score, 3);
 
   // Tighten every gate past the token's values: the SAME rows must flip, no restart, no new data.
   updateThresholds({ freshMinPct: 20, t100MinMultiple: 2, lfMin: 5e7, lfMax: 3e8 });
-  sig = assembleSignals(NOW).find((s) => s.ca === CA_P);
+  sig = assembleSignals().find((s) => s.ca === CA_P);
   assert.deepEqual(sig?.nansen.pass, { fresh: false, t100: false, lf: false });
   assert.equal(sig?.nansen.score, 0);
   assert.deepEqual(
@@ -555,7 +605,7 @@ test('assembleSignals: pass flags track the live thresholds — a PUT re-scores 
   );
 
   updateThresholds({ freshMinPct: 10, t100MinMultiple: 1.2, lfMin: 1e6, lfMax: 3e8 });
-  sig = assembleSignals(NOW).find((s) => s.ca === CA_P);
+  sig = assembleSignals().find((s) => s.ca === CA_P);
   assert.equal(sig?.nansen.score, 3); // restored
 });
 

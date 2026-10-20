@@ -2,7 +2,6 @@ import type { MonitorConfig } from './config.js';
 import { DiscordBot } from './discord.js';
 import { MonitorStore } from './store.js';
 import type { MonitorSnapshot } from './types.js';
-
 interface ZonedParts {
   year: number;
   month: number;
@@ -74,7 +73,8 @@ export class MonitorNotifications {
     private readonly bot: DiscordBot,
     private readonly config: MonitorConfig,
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+  }
 
   status(): MonitorSnapshot['notifications'] {
     const sentAt = this.store.lastNotificationDeliveryAt();
@@ -89,9 +89,36 @@ export class MonitorNotifications {
     if (!this.bot.configured) return;
     const now = this.now();
     await this.sendLowCreditWarnings(now);
+    await this.sendProviderIncidents(now);
     await this.sendDailyReport(now);
   }
 
+  private async sendProviderIncidents(now: number): Promise<void> {
+    // Nansen connectivity incidents are Discord-only; never fall back to Telegram.
+    if (!this.bot.configured) return;
+    const { services } = this.store.snapshot(now, this.config.sampleIntervalMs * 3);
+    for (const service of services) {
+      if (!service.id.startsWith('nansen-')) continue;
+      const key = `provider:${service.id}`;
+      const previous = this.store.notificationState(key);
+      const incident = service.status === 'down' || service.status === 'degraded';
+      if (incident) {
+        if (previous?.state === 'incident' || !this.mayRetry(key, now)) continue;
+        await this.deliver(key, 'incident',
+          `⚠️ Nansen provider incident · ${service.name}\n${service.detail ?? 'Provider readiness degraded'}`,
+          now, previous?.sentAt ?? null);
+      } else if (service.status === 'unknown' && previous?.state === 'incident') {
+        this.retryAt.delete(key);
+        this.store.setNotificationState(key, 'normal', previous.sentAt, null);
+      } else if (previous?.state === 'incident') {
+        this.retryAt.delete(key);
+        await this.deliver(key, 'recovered',
+          `✅ Nansen provider recovered · ${service.name}`,
+          now, previous.sentAt);
+    }
+  }
+
+  }
   private async sendLowCreditWarnings(now: number): Promise<void> {
     const { credits } = this.store.snapshot(now, this.config.sampleIntervalMs * 3);
     for (const metric of credits) {

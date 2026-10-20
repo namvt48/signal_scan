@@ -9,21 +9,21 @@
 // from here (never the reverse), so there is no module cycle.
 //
 // Transport = DOOR POOL (plan nansen-proxy-routing D1–D11): one "door" is one
-// browserless WS connection pinned to one proxy IP (`--proxy-server` query +
-// page.authenticate), with its own cookie jar / cf_clearance / egress IP. The
-// pool classifies every response (D4), quarantines 429s for their retry-after
-// (D3), re-queries a different door at most once per request (D5), enforces
-// per-(door,path) sliding-window budgets (D6), routes least-outstanding (D7),
-// and degrades to {status:503,json:null} when nothing is left — postJson NEVER
-// throws. Proxies come from CRAWL_PROXY_FILE, read once at pool creation
-// (change file = restart). No file/empty file → single door from
-// CRAWL_WS_ENDPOINT (old behaviour + the 429/warmup bug fixes).
+// Browserless WS connection with a private cookie jar, cf_clearance and egress.
+// General doors may use `--proxy-server` + page.authenticate; the Fresh Wallet
+// pool instead has one direct Browserless WS endpoint per VPS.
+// The pool classifies responses (D4), quarantines 429s (D3), retries via at
+// most one different door (D5), enforces per-(door,path) budgets (D6), routes
+// least-outstanding (D7), and degrades to {status:503,json:null} — postJson
+// NEVER throws. General proxy routes come from CRAWL_PROXY_FILE; Fresh Wallet
+// direct routes come from CRAWL_FRESH_WALLET_WS_ENDPOINTS.
 
 import { readFileSync } from 'node:fs';
 import puppeteer, { type Page } from 'puppeteer-core';
 import { config } from '../config.js';
 import { log, timed } from '../log.js';
 import type { Priority } from '../ratelimit/types.js';
+import type { DoorClassification } from '../shared/nansen-door.js';
 
 // ---------------------------------------------------------------------------
 // Frozen contract (decisions.md "T2/T3 FROZEN INTERFACE CONTRACT") — shapes
@@ -49,7 +49,7 @@ export interface DoorHttpResponse {
 }
 
 export interface DoorConn {
-  fetch(url: string, body: unknown, timeoutMs: number): Promise<DoorHttpResponse>;
+  fetch(url: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<DoorHttpResponse>;
   invalidate(): Promise<void>;
   close(): Promise<void>;
 }
@@ -61,6 +61,8 @@ export interface DoorSpec {
 
 export interface DoorPoolConfig {
   wsEndpoint: string;
+  /** Optional independent Browserless routes; each is a direct egress door. */
+  wsEndpoints?: string[];
   proxies: ProxySpec[];
   pathBudget: number;
   budgetWindowMs: number;
@@ -198,6 +200,7 @@ interface Door {
   readonly masked: string;
   state: DoorState;
   conn: DoorConn | null;
+  generation: number;
   outstanding: number;
   /** Monotonic dispatch counter — LRU tie-break for the router (D7). */
   useSeq: number;
@@ -227,12 +230,14 @@ interface PendingDoorAcquire {
   priority: Priority;
   enqueuedAt: number;
   resolve: (door: Door | null) => void;
+  timer: NodeJS.Timeout;
 }
 
 export interface DoorRequestOptions {
   /** Authenticated gateway caller; absent for internal browser-door use. */
   caller?: string;
   priority?: Priority;
+  signal?: AbortSignal;
 }
 
 const DOOR_QUEUE_MAX = 256;
@@ -244,27 +249,33 @@ export class DoorPool {
   private readonly pendingAcquires: PendingDoorAcquire[] = [];
   private readonly lastCaller = new Map<Priority, string>();
   private drainingAcquires = false;
+  private stopped = false;
   private seq = 0;
+  private requestSeq = 0;
   /** One-shot per blackout so an exhausted pool is loud once, not once per request. */
   private exhaustedLogged = false;
 
   constructor(deps: DoorPoolDeps) {
     this.deps = deps;
-    // D2: no proxies → single fallback door from the bare WS endpoint (proxy:null).
-    // A `direct` sentinel line yields the same null-proxy door alongside proxied ones.
+    const directEndpoints = deps.config.wsEndpoints?.filter(Boolean) ?? [];
+    // Explicit Browserless endpoints are always direct; the general pool keeps
+    // its existing proxy-file behavior when no endpoint list is supplied.
     const specs: DoorSpec[] =
-      deps.config.proxies.length > 0
-        ? deps.config.proxies.map((proxy) => ({
-            ws: deps.config.wsEndpoint,
-            proxy: proxy.url === 'direct' ? null : proxy,
-          }))
-        : [{ ws: deps.config.wsEndpoint, proxy: null }];
+      directEndpoints.length > 0
+        ? directEndpoints.map((ws) => ({ ws, proxy: null }))
+        : deps.config.proxies.length > 0
+          ? deps.config.proxies.map((proxy) => ({
+              ws: deps.config.wsEndpoint,
+              proxy: proxy.url === 'direct' ? null : proxy,
+            }))
+          : [{ ws: deps.config.wsEndpoint, proxy: null }];
     this.doors = specs.map((spec, id) => ({
       id,
       spec,
       masked: spec.proxy ? maskProxyUrl(spec.proxy.url) : 'direct',
       state: 'cold',
       conn: null,
+      generation: 0,
       outstanding: 0,
       useSeq: 0,
       requests: 0,
@@ -284,52 +295,126 @@ export class DoorPool {
 
   /** D8: fire-and-forget; every door warms up in parallel, none blocks boot. */
   start(): void {
+    if (this.stopped) return;
     this.deps.log(`[pool] starting ${this.doors.length} doors (proxies=${this.deps.config.proxies.length})`);
     for (const d of this.doors) void this.warm(d);
   }
 
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    for (const job of this.pendingAcquires.splice(0)) job.resolve(null);
+    for (const d of this.doors) {
+      d.generation += 1;
+      d.state = 'retired';
+      const conn = d.conn;
+      d.conn = null;
+      if (conn) void withTimeout(conn.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+    }
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+  }
+
   /**
-   * Route + fetch + classify + react (D5/D7). Never throws: no live door or
-   * router wait-cap → {status:503,json:null}; requery fail → {status:<original|502>,json:null}.
+   * Route + fetch + classify + react (D5/D7). Caller cancellation rejects;
+   * no live door or router wait-cap → {status:503,json:null}; requery fail → {status:<original|502>,json:null}.
    */
-  async postJson(url: string, body: unknown, options: DoorRequestOptions = {}): Promise<{ status: number; json: unknown | null }> {
+  async postJson(url: string, body: unknown, options: DoorRequestOptions = {}): Promise<{ status: number; json: unknown | null; classification: Classification | 'unavailable' }> {
+    const requestId = ++this.requestSeq;
     const path = pathKey(url);
+    const caller = options.caller ?? 'internal';
     const priority = options.priority ?? (path === 'tgm-essential-data' ? 0 : path === 'tgm-volume-details' ? 2 : 1);
-    const door = await this.acquire(path, options.caller ?? 'internal', priority);
-    if (!door) return { status: 503, json: null };
-    let res = await this.dispatch(door, url, body, path);
-    let cls = classify(res);
-    // CF often challenges the FIRST XHR on a freshly cleared page; the SAME page
-    // answers the immediate retry 200 (live 2026-09-26). Rewarming here re-arms that
-    // challenge and thrashes the pool (197 interstitial ↔ 228 re-warm-ok, 36 retired).
-    if (cls === 'interstitial') {
-      res = await this.dispatch(door, url, body, path);
-      cls = classify(res);
-    }
-    this.applyOutcome(door, cls, res, path);
-    if (cls === 'ok') return { status: res.status, json: res.json };
-    // D5: requery AT MOST once, immediately (no wait-loop), never to the same door.
-    this.logDoor(door, `requery class=${cls}`, path, res.status);
-    const alt = this.pick(path, door.id);
-    if (alt) {
-      const res2 = await this.dispatch(alt, url, body, path);
-      const cls2 = classify(res2);
-      this.applyOutcome(alt, cls2, res2, path);
-      if (cls2 === 'ok') return { status: res2.status, json: res2.json };
-    }
-    // D5b: no alternative door (single-door pool) — wait out this door's own
-    // re-warm, then retry it once. Owner directive: interstitial must not lose data.
-    if (!alt && cls === 'interstitial') {
-      for (let i = 0; i < 3 && door.state === 'warming'; i++) await this.deps.sleep(WARM_POLL_MS);
-      if (door.state === 'probation' || door.state === 'healthy') {
-        this.logDoor(door, 'requery class=interstitial same-door', path, res.status);
-        const res3 = await this.dispatch(door, url, body, path);
-        const cls3 = classify(res3);
-        this.applyOutcome(door, cls3, res3, path);
-        if (cls3 === 'ok') return { status: res3.status, json: res3.json };
+    const startedAt = performance.now();
+    const requestFields = {
+      requestId,
+      caller,
+      path,
+      priority,
+      ...(this.nansenIdentity(body)),
+    };
+    const queueDepth = this.pendingAcquires.length;
+    log.info('door request start', { ...requestFields, queueDepth });
+    try {
+      this.throwIfAborted(options.signal);
+      const door = await this.acquire(path, caller, priority, options.signal);
+      const waitMs = Math.round(performance.now() - startedAt);
+      if (options.signal?.aborted) {
+        log.info('door request admission', { ...requestFields, outcome: 'aborted', queueDepth: this.pendingAcquires.length, waitMs });
+        this.throwIfAborted(options.signal);
       }
+      if (!door) {
+        log.info('door request admission', { ...requestFields, outcome: 'rejected', queueDepth: this.pendingAcquires.length, waitMs });
+        log.info('door request finish', { ...requestFields, outcome: 'error', status: 503, runMs: waitMs });
+        return { status: 503, json: null, classification: 'unavailable' };
+      }
+      log.info('door request admission', { ...requestFields, outcome: 'admitted', doorId: door.id, queueDepth: this.pendingAcquires.length, waitMs });
+      let res = await this.dispatch(door, url, body, path, options.signal, requestId);
+      this.throwIfAborted(options.signal);
+      let cls = classify(res);
+      if (cls === 'interstitial') {
+        res = await this.dispatch(door, url, body, path, options.signal, requestId);
+        this.throwIfAborted(options.signal);
+        cls = classify(res);
+      }
+      this.applyOutcome(door, cls, res, path);
+      if (cls === 'ok') {
+        log.info('door request finish', { ...requestFields, outcome: 'success', doorId: door.id, status: res.status, runMs: Math.round(performance.now() - startedAt) });
+        return { status: res.status, json: res.json, classification: cls };
+      }
+      this.logDoor(door, `requery class=${cls}`, path, res.status);
+      const alt = this.pick(path, door.id);
+      let surfaced = { res, cls };
+      if (alt) {
+        const res2 = await this.dispatch(alt, url, body, path, options.signal, requestId);
+        this.throwIfAborted(options.signal);
+        const cls2 = classify(res2);
+        this.applyOutcome(alt, cls2, res2, path);
+        if (cls2 === 'ok') {
+          log.info('door request finish', { ...requestFields, outcome: 'success', doorId: alt.id, status: res2.status, runMs: Math.round(performance.now() - startedAt) });
+          return { status: res2.status, json: res2.json, classification: cls2 };
+        }
+        surfaced = { res: res2, cls: cls2 };
+      }
+      if (!alt && cls === 'interstitial') {
+        for (let i = 0; i < 3 && door.state === 'warming'; i++) {
+          await this.deps.sleep(WARM_POLL_MS);
+          this.throwIfAborted(options.signal);
+        }
+        if (door.state === 'probation' || door.state === 'healthy') {
+          this.logDoor(door, 'requery class=interstitial same-door', path, res.status);
+          const res3 = await this.dispatch(door, url, body, path, options.signal, requestId);
+          this.throwIfAborted(options.signal);
+          const cls3 = classify(res3);
+          this.applyOutcome(door, cls3, res3, path);
+          if (cls3 === 'ok') {
+            log.info('door request finish', { ...requestFields, outcome: 'success', doorId: door.id, status: res3.status, runMs: Math.round(performance.now() - startedAt) });
+            return { status: res3.status, json: res3.json, classification: cls3 };
+          }
+          surfaced = { res: res3, cls: cls3 };
+        }
+      }
+      const status = surfaced.res.status > 0 ? surfaced.res.status : 502;
+      log.info('door request finish', { ...requestFields, outcome: 'error', doorId: door.id, status, runMs: Math.round(performance.now() - startedAt) });
+      return { status, json: null, classification: surfaced.cls };
+    } catch (error) {
+      if (options.signal?.aborted) {
+        log.info('door request finish', { ...requestFields, outcome: 'aborted', runMs: Math.round(performance.now() - startedAt) });
+      }
+      throw error;
     }
-    return { status: res.status > 0 ? res.status : 502, json: null };
+  }
+
+  private nansenIdentity(body: unknown): { ca?: string; chain?: string } {
+    if (typeof body !== 'object' || body === null || !('parameters' in body)) return {};
+    const parameters = (body as { parameters?: unknown }).parameters;
+    if (typeof parameters !== 'object' || parameters === null) return {};
+    const { tokenAddress, chain } = parameters as { tokenAddress?: unknown; chain?: unknown };
+    return {
+      ...(typeof tokenAddress === 'string' ? { ca: tokenAddress } : {}),
+      ...(typeof chain === 'string' ? { chain } : {}),
+    };
   }
 
   /** Door table in proxy-file order (fallback door = index 0). */
@@ -349,7 +434,9 @@ export class DoorPool {
   // -- routing (D7) ----------------------------------------------------------
 
   /** Admit queued work by urgency and caller round-robin when a budget slot opens. */
-  private acquire(path: string, caller: string, priority: Priority): Promise<Door | null> {
+  private acquire(path: string, caller: string, priority: Priority, signal?: AbortSignal): Promise<Door | null> {
+    this.throwIfAborted(signal);
+    if (this.stopped) return Promise.resolve(null);
     if (this.pendingAcquires.length >= DOOR_QUEUE_MAX) {
       const now = this.deps.now();
       let victimIndex = -1;
@@ -376,8 +463,38 @@ export class DoorPool {
       victim?.resolve(null);
       this.deps.log(`[pool] admission queue displaced background path=${victim?.path ?? '-'}`);
     }
-    return new Promise((resolve) => {
-      this.pendingAcquires.push({ path, caller, priority, enqueuedAt: this.deps.now(), resolve });
+    return new Promise<Door | null>((resolve) => {
+      let job!: PendingDoorAcquire;
+      let removeAbortListener = () => {};
+      const finish = (door: Door | null) => {
+        clearTimeout(timer);
+        removeAbortListener();
+        resolve(door);
+      };
+      const timer = setTimeout(() => {
+        const index = this.pendingAcquires.indexOf(job);
+        if (index >= 0) this.pendingAcquires.splice(index, 1);
+        job.resolve(null);
+      }, ROUTER_WAIT_CAP_MS);
+      job = {
+        path,
+        caller,
+        priority,
+        enqueuedAt: this.deps.now(),
+        timer,
+        resolve: finish,
+      };
+      this.pendingAcquires.push(job);
+      if (signal) {
+        const abort = () => {
+          const index = this.pendingAcquires.indexOf(job);
+          if (index >= 0) this.pendingAcquires.splice(index, 1);
+          job.resolve(null);
+        };
+        signal.addEventListener('abort', abort, { once: true });
+        removeAbortListener = () => signal.removeEventListener('abort', abort);
+        if (signal.aborted) abort();
+      }
       queueMicrotask(() => { void this.drainAcquireQueue(); });
     });
   }
@@ -395,6 +512,10 @@ export class DoorPool {
     this.drainingAcquires = true;
     try {
       while (this.pendingAcquires.length > 0) {
+        if (this.stopped) {
+          for (const job of this.pendingAcquires.splice(0)) job.resolve(null);
+          break;
+        }
         const now = this.deps.now();
         this.tick();
         for (let i = this.pendingAcquires.length - 1; i >= 0; i -= 1) {
@@ -434,13 +555,14 @@ export class DoorPool {
           break;
         }
         if (admitted) continue;
+        const rearmed = this.rearmRetired(now);
+        if (rearmed) {
+          await this.deps.sleep(ROUTER_POLL_MS);
+          continue;
+        }
 
         const alive = this.doors.some((door) => door.state !== 'retired');
         if (!alive) {
-          if (this.rearmRetired(now)) {
-            await this.deps.sleep(ROUTER_POLL_MS);
-            continue;
-          }
           if (!this.exhaustedLogged) {
             this.exhaustedLogged = true;
             this.deps.log('[pool] ALL DOORS RETIRED — pool exhausted, serving 503 until re-arm');
@@ -540,7 +662,9 @@ export class DoorPool {
 
   // -- request lifecycle (D5) -------------------------------------------------
 
-  private async dispatch(d: Door, url: string, body: unknown, path: string): Promise<DoorHttpResponse> {
+  private async dispatch(d: Door, url: string, body: unknown, path: string, signal?: AbortSignal, requestId?: number): Promise<DoorHttpResponse> {
+    const startedAt = performance.now();
+    const fields = { ...(requestId === undefined ? {} : { requestId }), doorId: d.id, path };
     d.hits.push({ t: this.deps.now(), path });
     d.requests += 1;
     d.outstanding += 1;
@@ -548,15 +672,25 @@ export class DoorPool {
     const conn = d.conn;
     if (!conn) {
       d.outstanding -= 1;
-      return { status: 0, contentType: '', retryAfter: null, head: 'door has no connection', len: 0, json: null, threw: true };
+      const res: DoorHttpResponse = { status: 0, contentType: '', retryAfter: null, head: 'door has no connection', len: 0, json: null, threw: true };
+      log.info('door dispatch', { ...fields, outcome: 'complete', status: res.status, classification: classify(res), runMs: Math.round(performance.now() - startedAt) });
+      return res;
     }
     try {
-      const res = await conn.fetch(url, body, this.deps.config.requestTimeoutMs);
+      const res = await conn.fetch(url, body, this.deps.config.requestTimeoutMs, signal);
+      this.throwIfAborted(signal);
       d.lastStatus = res.status;
+      log.info('door dispatch', { ...fields, outcome: 'complete', status: res.status, classification: classify(res), runMs: Math.round(performance.now() - startedAt) });
       return res;
     } catch (e) {
-      // R4: dispatch never throws — a rejecting conn is a transport failure.
-      return { status: 0, contentType: '', retryAfter: null, head: String((e as Error)?.message ?? e).slice(0, 120), len: 0, json: null, threw: true };
+      if (signal?.aborted) {
+        d.requests -= 1;
+        log.info('door dispatch', { ...fields, outcome: 'aborted', runMs: Math.round(performance.now() - startedAt) });
+        throw signal.reason ?? e;
+      }
+      const res: DoorHttpResponse = { status: 0, contentType: '', retryAfter: null, head: String((e as Error)?.message ?? e).slice(0, 120), len: 0, json: null, threw: true };
+      log.info('door dispatch', { ...fields, outcome: 'complete', status: res.status, classification: classify(res), runMs: Math.round(performance.now() - startedAt) });
+      return res;
     } finally {
       d.outstanding -= 1;
     }
@@ -608,16 +742,30 @@ export class DoorPool {
 
   /** Initial warmup: connect (the real factory does goto + CF-clear polling inside). */
   private async warm(d: Door): Promise<void> {
+    if (this.stopped) return;
+    const generation = ++d.generation;
     d.state = 'warming';
+    const attempt = Promise.resolve().then(() => this.deps.connect(d.spec));
+    void attempt.then((late) => {
+      if (this.stopped || d.generation !== generation) {
+        void withTimeout(late.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+      }
+    }, () => {});
     try {
-      const conn = await this.deps.connect(d.spec);
+      const conn = await withTimeout(attempt, this.deps.config.warmupTimeoutMs);
+      if (this.stopped || d.generation !== generation) {
+        void withTimeout(conn.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+        return;
+      }
       d.conn = conn;
       d.egressIp = (conn as DoorConnWithEgress).egressIp ?? null;
       d.state = 'probation';
-      d.retiredReason = null; // re-arm path: a live door must not still read as retired
+      d.retiredReason = null;
       this.logDoor(d, 'warmup-ok');
       if (d.egressIp) this.logDoor(d, `egress ip=${d.egressIp}`);
     } catch (e) {
+      if (this.stopped || d.generation !== generation) return;
+      d.generation += 1;
       d.state = 'retired';
       d.retiredReason = 'broken-proxy';
       d.retiredAt = this.deps.now();
@@ -625,34 +773,56 @@ export class DoorPool {
     }
   }
 
-  /**
-   * Re-warm an existing connection: drop + rebuild the page behind the scenes
-   * (invalidate is async — the door parks in `warming`, so a same-request
-   * requery can never land back on it).
-   * ponytail: continuation only promotes from `warming`, so a concurrent
-   * penalize wins the race; per-door locks if stricter ordering ever matters.
-   */
   private rewarm(d: Door): void {
-    if (d.state === 'warming') return; // R1: one invalidate at a time — parallel rewarms overwrite `page` and leak pages (prod OOM 2026-09-19)
+    if (this.stopped || d.state === 'warming') return;
     const conn = d.conn;
     if (!conn) {
-      this.retire(d, 'broken-proxy');
+      void this.warm(d);
       return;
     }
+    let generation = ++d.generation;
     d.state = 'warming';
     this.logDoor(d, 're-warm');
-    void conn.invalidate().then(
+    void withTimeout(conn.invalidate(), this.deps.config.warmupTimeoutMs).then(
       () => {
+        if (this.stopped || d.generation !== generation || d.conn !== conn) return;
         d.rewarmFails = 0;
         if (d.state === 'warming') {
           d.state = 'probation';
           this.logDoor(d, 're-warm-ok');
         }
       },
-      () => {
-        // D5b: a rejected invalidate is a local page-rebuild hiccup, NOT proof the
-        // proxy is dead (that is the ≥2-transport-fails rule). Retiring here killed
-        // the whole pool when there is only one door.
+      async (error: unknown) => {
+        if (this.stopped || d.generation !== generation || d.conn !== conn) return;
+        const message = String((error as Error)?.message ?? error);
+        if (/timeout|disconnected|browser.*closed|target closed/i.test(message)) {
+          const replacementAttempt = Promise.resolve().then(() => this.deps.connect(d.spec));
+          void replacementAttempt.then((late) => {
+            if (this.stopped || d.generation !== generation) {
+              void withTimeout(late.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+            }
+          }, () => {});
+          try {
+            const replacement = await withTimeout(replacementAttempt, this.deps.config.warmupTimeoutMs);
+            if (this.stopped || d.generation !== generation || d.conn !== conn) {
+              void withTimeout(replacement.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+              return;
+            }
+            d.conn = replacement;
+            d.egressIp = (replacement as DoorConnWithEgress).egressIp ?? null;
+            void withTimeout(conn.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
+            d.rewarmFails = 0;
+            d.state = 'probation';
+            this.logDoor(d, 're-warm-reconnect-ok');
+            return;
+          } catch {
+            if (!this.stopped && d.generation === generation && d.conn === conn) {
+              generation = ++d.generation;
+            }
+            // Apply the established invalidate failure policy below.
+          }
+        }
+        if (this.stopped || d.generation !== generation) return;
         d.rewarmFails += 1;
         if (d.rewarmFails >= 2) {
           this.retire(d, 'broken-proxy');
@@ -663,6 +833,7 @@ export class DoorPool {
       },
     );
   }
+
 
   private penalize(d: Door): void {
     const backoffMs = BACKOFF_STAGES_MS[d.penaltyStage];
@@ -677,19 +848,22 @@ export class DoorPool {
   }
 
   private retire(d: Door, reason: string): void {
+    d.generation += 1;
     d.state = 'retired';
     d.retiredReason = reason;
     d.retiredAt = this.deps.now();
     this.logDoor(d, `retired reason=${reason}`);
-    void d.conn?.close().catch(() => {});
+    const conn = d.conn;
+    d.conn = null;
+    if (conn) void withTimeout(conn.close(), this.deps.config.warmupTimeoutMs).catch(() => {});
   }
 
   /**
-   * Give broken-proxy doors one more chance once RETIRED_RETRY_MS has passed. Called by
-   * acquire() only when NO door is alive, so a healthy pool pays nothing. Reputation
-   * retires (real403-reputation) stay terminal — a 403-ing IP must not be re-probed
-   * every minute. warm() flips the state to 'warming' synchronously, so two concurrent
-   * acquires cannot double-arm the same door.
+   * Give each broken-proxy Door another chance after RETIRED_RETRY_MS. The acquire
+   * drain checks independently of other Doors, so one warming Door cannot block a
+   * retired sibling's recovery; healthy pools pay nothing unless a Door is retired.
+   * Reputation retires (real403-reputation) stay terminal — a 403-ing IP must not
+   * be re-probed every minute. warm() flips state synchronously to prevent double-arm.
    */
   private rearmRetired(now: number): boolean {
     let armed = false;
@@ -738,12 +912,17 @@ function doorWsEndpoint(spec: DoorSpec): string {
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`timeout ${ms}ms`));
-    }, ms);
-    p.then(resolve, reject).finally(() => {
-      clearTimeout(timer);
-    });
+    const timer = setTimeout(() => reject(new Error(`timeout ${ms}ms`)), ms);
+    p.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 
@@ -752,13 +931,18 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * Never throws on HTTP status; `threw:true` only for transport/timeout. Reads
  * retry-after in-page (the old transport dropped it — issues.md gotcha).
  */
-async function inPageFetch(args: { url: string; body: unknown }) {
+async function inPageFetch(args: { url: string; body: unknown; requestId: string }) {
+  const state = window as unknown as { __signalScanDoorFetchControllers?: Record<string, AbortController> };
+  const controllers = state.__signalScanDoorFetchControllers ??= {};
+  const controller = new AbortController();
+  controllers[args.requestId] = controller;
   const t0 = Date.now();
   try {
     const r = await fetch(args.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(args.body),
+      signal: controller.signal,
     });
     const txt = await r.text();
     let json: unknown = null;
@@ -790,6 +974,8 @@ async function inPageFetch(args: { url: string; body: unknown }) {
       threw: true,
       ms: Date.now() - t0,
     };
+  } finally {
+    delete controllers[args.requestId];
   }
 }
 
@@ -853,20 +1039,37 @@ async function realConnect(spec: DoorSpec): Promise<DoorConn> {
     10_000,
   ).catch((e) => `TIMEOUT:${String((e as Error)?.message ?? e).slice(0, 60)}`);
   const egressIp = egressRaw && !egressRaw.startsWith('ERR:') && !egressRaw.startsWith('TIMEOUT:') ? egressRaw : null;
+  let requestSequence = 0;
   const conn: DoorConnWithEgress = {
     egressIp,
-    async fetch(url, body, timeoutMs) {
+    async fetch(url, body, timeoutMs, signal) {
       const cur = page;
       if (!cur) {
         return { status: 0, contentType: '', retryAfter: null, head: `${BROWSER_FAILURE_PREFIX} page unavailable (invalidated)`, len: 0, json: null, threw: true };
       }
+      if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+      const requestId = `door-${++requestSequence}`;
+      const abortBrowserRequest = () => {
+        void cur.evaluate((id: string) => {
+          const state = window as unknown as { __signalScanDoorFetchControllers?: Record<string, AbortController> };
+          state.__signalScanDoorFetchControllers?.[id]?.abort();
+        }, requestId).catch(() => {});
+      };
+      signal?.addEventListener('abort', abortBrowserRequest, { once: true });
       try {
-        return await withTimeout(cur.evaluate(inPageFetch, { url, body }), timeoutMs);
+        const response = await withTimeout(cur.evaluate(inPageFetch, { url, body, requestId }), timeoutMs);
+        if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
+        return response;
       } catch (e) {
+        abortBrowserRequest();
+        if (signal?.aborted) throw signal.reason ?? e;
         return { status: 0, contentType: '', retryAfter: null, head: `${BROWSER_FAILURE_PREFIX} ${String((e as Error)?.message ?? e).slice(0, 120)}`, len: 0, json: null, threw: true };
+      } finally {
+        signal?.removeEventListener('abort', abortBrowserRequest);
       }
     },
     async invalidate() {
+      if (!browser.isConnected()) throw new Error(`${BROWSER_FAILURE_PREFIX} browser disconnected`);
       const old = page;
       page = null;
       await old?.close().catch(() => {});
@@ -893,6 +1096,44 @@ let poolSingleton: DoorPool | null = null;
  * tests run a DoorPool over fake conns that COUNT fetches. null = lazy prod build. */
 export function setPoolForTest(pool: DoorPool | null): void {
   poolSingleton = pool;
+}
+let freshWalletPoolSingleton: DoorPool | null = null;
+
+/** Fresh Wallet's dedicated direct-browser pool; null until first FW request. */
+export function freshWalletPoolStatsOrNull(): DoorStat[] | null {
+  return freshWalletPoolSingleton ? freshWalletPoolSingleton.stats() : null;
+}
+
+/** Test seam for the FW-only pool. */
+export function setFreshWalletPoolForTest(pool: DoorPool | null): void {
+  freshWalletPoolSingleton = pool;
+}
+
+function getFreshWalletPool(): DoorPool {
+  if (freshWalletPoolSingleton) return freshWalletPoolSingleton;
+  const wsEndpoints = config.crawlFreshWalletWsEndpoints.length > 0
+    ? config.crawlFreshWalletWsEndpoints
+    : [config.crawlWsEndpoint];
+  log.info(`[crawl:fw] loaded ${wsEndpoints.length} direct Browserless endpoints`);
+  freshWalletPoolSingleton = new DoorPool({
+    connect: realConnect,
+    now: () => Date.now(),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    config: {
+      wsEndpoint: wsEndpoints[0] ?? config.crawlWsEndpoint,
+      wsEndpoints,
+      proxies: [],
+      pathBudget: config.crawlPathBudget,
+      budgetWindowMs: config.crawlBudgetWindowMs,
+      doorCapPerMin: config.crawlDoorCapPerMin,
+      warmupTimeoutMs: config.crawlWarmupTimeoutMs,
+      requestTimeoutMs: config.crawlRequestTimeoutMs,
+      quarantineJitterMs: config.crawlQuarantineJitterMs,
+    },
+    log: (line) => log.info('[crawl:fw]', line),
+  });
+  freshWalletPoolSingleton.start();
+  return freshWalletPoolSingleton;
 }
 
 /**
@@ -941,7 +1182,7 @@ function getPool(): DoorPool {
 /**
  * Injection point for NansenMarketProvider and nansenSeries. Existing two-arg
  * calls remain compatible; gateway calls may pass caller/priority metadata.
- * Delegates to DoorPool and NEVER throws: exhausted pool degrades to
+ * Delegates to DoorPool; caller cancellation rejects. Exhausted pool degrades to
  * {status:503,json:null}; failed requery to {status:<original|502>}. Callers
  * already throw on non-200, so the poller logs + moves on.
  */
@@ -949,9 +1190,20 @@ export async function browserPostJson<T = unknown>(
   url: string,
   body: unknown,
   options?: DoorRequestOptions,
-): Promise<{ status: number; json: T | null }> {
+): Promise<{ status: number; json: T | null; classification: DoorClassification }> {
   return timed('crawl postJson', { path: pathKey(url) }, async () => {
-    const { status, json } = await getPool().postJson(url, body, options);
-    return { status, json: json as T | null };
+    const { status, json, classification } = await getPool().postJson(url, body, options);
+    return { status, json: json as T | null, classification };
+  });
+}
+/** Dedicated direct Browserless pool for Fresh Wallet's free endpoint. */
+export async function freshWalletBrowserPostJson<T = unknown>(
+  url: string,
+  body: unknown,
+  options?: DoorRequestOptions,
+): Promise<{ status: number; json: T | null; classification: DoorClassification }> {
+  return timed('crawl fw postJson', { path: pathKey(url) }, async () => {
+    const { status, json, classification } = await getFreshWalletPool().postJson(url, body, options);
+    return { status, json: json as T | null, classification };
   });
 }

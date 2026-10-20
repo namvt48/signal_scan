@@ -65,6 +65,19 @@ export function recordMarketCapSnapshot(ca: string, chain: Chain, sampledAt = Da
     .run(JSON.stringify(next), ca, chain);
 }
 
+function usablePrice(price: number | undefined): price is number {
+  return price !== undefined && Number.isFinite(price) && price > 0;
+}
+
+function repriceStoredWalletBalances(ca: string, chain: Chain, price: number | undefined): void {
+  if (!usablePrice(price)) return;
+  getDb()
+    .prepare(`UPDATE wallet_token_state
+                SET balance_usd = token_amount * ?
+              WHERE chain = ? AND ca = ? AND token_amount > 0`)
+    .run(price, chain, ca);
+}
+
 export function upsertTokenInfo(info: TokenInfo, opts: UpsertTokenOptions = {}): void {
   const fetchedAt = Date.now();
   getDb()
@@ -139,6 +152,7 @@ export function upsertTokenInfo(info: TokenInfo, opts: UpsertTokenOptions = {}):
       symbol: info.symbol ?? null,
       fetchedAt,
     });
+  repriceStoredWalletBalances(info.ca, info.chain, info.price);
   recordMarketCapSnapshot(info.ca, info.chain, fetchedAt);
   recordHolderSnapshot(info.ca, info.chain, fetchedAt, true);
 }
@@ -210,6 +224,7 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch,
       ).run(ca, chain, ...vals, sampledAt);
     });
     tx();
+    repriceStoredWalletBalances(ca, chain, patch.price);
     if (patch.holders !== undefined || patch.nansenHolders !== undefined) {
       recordHolderSnapshot(ca, chain, sampledAt, patch.holders !== undefined);
     }
@@ -224,6 +239,7 @@ export function updateTokenMetrics(ca: string, chain: Chain, patch: MetricPatch,
        ON CONFLICT(ca, chain) DO UPDATE SET ${sets.join(', ')}`,
     )
     .run(ca, chain, ...vals, sampledAt);
+  repriceStoredWalletBalances(ca, chain, patch.price);
   if (patch.holders !== undefined || patch.nansenHolders !== undefined) {
     recordHolderSnapshot(ca, chain, sampledAt, patch.holders !== undefined);
   }
@@ -381,15 +397,12 @@ export function updateNansenHolders(
   chain: Chain,
   stats: { holders: number; freshSupplyPct: number; t100SupplyPct?: number; medianBalanceUsd?: number },
 ): void {
-  getDb()
-    .prepare(
-      `UPDATE token_state SET nansen_holders = ?, nansen_fresh_pct = ?,
-         nansen_t100_pct = COALESCE(?, nansen_t100_pct),
-         nansen_median_usd = COALESCE(?, nansen_median_usd)
-       WHERE ca = ? AND chain = ?`,
-    )
-    .run(stats.holders, stats.freshSupplyPct, stats.t100SupplyPct ?? null, stats.medianBalanceUsd ?? null, ca, chain);
-  recordHolderSnapshot(ca, chain, Date.now(), false);
+  updateTokenMetrics(ca, chain, {
+    nansenHolders: stats.holders,
+    nansenFreshPct: stats.freshSupplyPct,
+    ...(stats.t100SupplyPct !== undefined ? { nansenT100Pct: stats.t100SupplyPct } : {}),
+    ...(stats.medianBalanceUsd !== undefined ? { nansenMedianUsd: stats.medianBalanceUsd } : {}),
+  });
 }
 
 /** top10_rate — written by the holders snapshot slot from the top-10 percentOwnership sum. */

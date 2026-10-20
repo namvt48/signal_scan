@@ -9,8 +9,8 @@
 # Every `up` needs the net to exist, or compose refuses to start.
 #
 # Host deploy dir /root/signal-scan-gateway/ (root-owned) holds:
-#   gateway.env    mode 600  — upstream credentials + RL_* limiter knobs (todo 6)
-#   proxies.txt              — one http://user:pass@host:port per line (door pool)
+#   gateway.env    mode 600  — upstream credentials, RL_* knobs, optional direct FW WS endpoints
+#   proxies.txt              — general-pool http://user:pass@host:port routes
 # Both are bind-mounted READ-ONLY. Neither file is committed (secrets/proxy creds).
 # NOTE: /root, NOT /opt — the host runs the snap build of docker (Ubuntu Core 24),
 # whose confinement cannot bind-mount from /opt ("mkdir ...: read-only file system").
@@ -42,7 +42,8 @@ services:
       # MUST point at THIS project's browser (todo 4): copying a's ws://chrome:3000
       # would resolve nothing here.
       CRAWL_WS_ENDPOINT: ws://gateway-chrome:3000
-      # The door pool reads the proxy list from the read-only mount below.
+      # General-question proxy pool only; Fresh Wallet Gini uses direct Browserless
+      # endpoints supplied separately via the host-only gateway.env.
       CRAWL_PROXY_FILE: /data/proxies.txt
       MONITOR_API_TOKEN: ${MONITOR_API_TOKEN:-}
     volumes:

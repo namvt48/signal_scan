@@ -16,7 +16,9 @@ from watchers.common.config import RPC_DEFAULTS, load_config_from_api
 from watchers.common.emit import fmt, jl_write, track_event, watch_trade_event
 from watchers.common.price import _warm_prices
 from watchers.common.state import _beat, save_state
-from watchers.sol.classify import _keys, _target_event, detect_events
+from watchers.sol.classify import TIER_A, TIER_B, _keys, _target_event, detect_events
+
+_MAJOR_MINTS = TIER_A | TIER_B
 
 # (sig, wallet, mint, side, step) đã emit — cùng tx có thể tới 2 lần (ws + poll,
 # hoặc 2 run khi watermark lùi); ponytail: set không cap trong 1 run, LRU nếu chật.
@@ -69,27 +71,219 @@ def _handle_tx(tx, sig, wallets, st) -> None:
             fresh.append(ev)
             print(fmt(ev), flush=True)
             jl_write(ev)
-        # POST theo TỪNG hop net>0 (Q5): trước đây 1 CA/tx ⇒ hop 2..n mất khỏi
-        # queue/Tracked by. _target_event giữ làm fallback cho rule A (OTC fill:
-        # ví bán, không có BUY event nào của chính ví). `fresh` rỗng = tx đã xử lý
-        # (ws+poll trùng, hoặc watermark lùi) ⇒ không post lại.
+        # Keep every SWAP hop available to the route-cost pass: a later SELL of
+        # an intermediate mint may deliver the CA that the wallet finally holds.
+        route_events = [e for e in fresh if e.get("type") == "SWAP"]
         hops = [
             e
-            for e in fresh
-            if e.get("type") == "SWAP"
-            and (
-                (e.get("side") == "BUY" and (e.get("qty_net") or 0) > 0)
-                or e.get("side") == "SELL"
-            )
+            for e in route_events
+            if (e.get("side") == "SELL")
+            or (e.get("side") == "BUY" and (e.get("qty_net") or 0) > 0)
         ]
+        tracked = {
+            (ev.get("wallet"), ev.get("sig"), ev.get("mint"), ev.get("side"))
+            for ev in hops
+        }
         for ev in hops:
             track_event(ev)
+        for ev in _aggregate_watch_hops(route_events):
+            key = (ev.get("wallet"), ev.get("sig"), ev.get("mint"), ev.get("side"))
+            if ev.get("side") == "BUY" and key not in tracked:
+                track_event(ev)
             watch_trade_event(ev, tx.get("blockTime"))
         if fresh and not hops:
             ev = _target_event(tx, w, evs)
             if ev is not None:
                 track_event(ev)
                 watch_trade_event(ev, tx.get("blockTime"))
+
+
+def _aggregate_watch_hops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per (wallet, tx, CA, side), carrying closed-route buy cost."""
+    route_costs = _route_costs(events)
+    base_deltas: dict[tuple[str, str, str], float] = {}
+    base_seen: set[tuple[str, str, str]] = set()
+    base_unknown: set[tuple[str, str, str]] = set()
+    quote_seen: set[tuple[str, str, str]] = set()
+    quote_nonzero: set[tuple[str, str, str]] = set()
+    quote_unknown: set[tuple[str, str, str]] = set()
+    for event in events:
+        if event.get("type") != "SWAP":
+            continue
+        base_key = (event["wallet"], event["sig"], event.get("mint"))
+        if base_key[2] and "qty_net" in event:
+            delta = event["qty_net"]
+            if delta is None:
+                base_seen.add(base_key)
+            elif isinstance(delta, (int, float)) and not isinstance(delta, bool):
+                base_seen.add(base_key)
+                base_deltas[base_key] = base_deltas.get(base_key, 0.0) + delta
+            else:
+                base_unknown.add(base_key)
+        quote_key = (event["wallet"], event["sig"], event.get("quote_mint"))
+        if quote_key[2] and "quote_qty_net" in event:
+            delta = event["quote_qty_net"]
+            if isinstance(delta, (int, float)) and not isinstance(delta, bool):
+                quote_seen.add(quote_key)
+                if abs(delta) > 1e-9:
+                    quote_nonzero.add(quote_key)
+            else:
+                quote_unknown.add(quote_key)
+    zero_net_sells: set[tuple[str, str, str]] = set()
+    for hop in events:
+        if hop.get("side") != "SELL":
+            continue
+        delta_key = (hop["wallet"], hop["sig"], hop["mint"])
+        base_zero = (
+            delta_key in base_seen
+            and delta_key not in base_unknown
+            and abs(base_deltas.get(delta_key, 0.0)) <= 1e-9
+        )
+        quote_zero = (
+            delta_key in quote_seen
+            and delta_key not in quote_unknown
+            and delta_key not in quote_nonzero
+        )
+        base_nonzero = abs(base_deltas.get(delta_key, 0.0)) > 1e-9
+        if (base_zero or quote_zero) and not base_nonzero and delta_key not in quote_nonzero:
+            zero_net_sells.add(delta_key)
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for hop in events:
+        side = hop.get("side")
+        if side == "SELL" and (hop["wallet"], hop["sig"], hop["mint"]) in zero_net_sells:
+            continue
+        if hop.get("type") != "SWAP" or not (
+            side == "SELL" or (side == "BUY" and (hop.get("qty_net") or 0) > 0)
+        ):
+            continue
+        key = (hop["wallet"], hop["sig"], hop["mint"], side)
+        trade = grouped.get(key)
+        if trade is None:
+            trade = {**hop, "qty": 0.0, "quote_usd": 0.0, "_net_qty": 0.0}
+            trade.pop("quote_qty", None)
+            trade.pop("unit_price", None)
+            grouped[key] = trade
+        if side == "BUY":
+            trade["_net_qty"] += hop.get("qty_net") or 0.0
+        trade["qty"] += hop.get("qty") or 0.0
+        trade["quote_usd"] += hop.get("quote_usd") or 0.0
+    # A final token can arrive as the quote side of a SELL without any base-side
+    # BUY event. Its owner net delta is the exact token quantity for that row.
+    for hop in events:
+        if hop.get("type") != "SWAP" or hop.get("side") != "SELL":
+            continue
+        mint = hop.get("quote_mint")
+        qty_net = hop.get("quote_qty_net")
+        if (
+            not mint
+            or mint in _MAJOR_MINTS
+            or not isinstance(qty_net, (int, float))
+            or qty_net <= 0
+        ):
+            continue
+        key = (hop["wallet"], hop["sig"], mint, "BUY")
+        if key in grouped:
+            continue
+        grouped[key] = {
+            **hop,
+            "mint": mint,
+            "sym": hop.get("quote_sym"),
+            "side": "BUY",
+            "qty": qty_net,
+            "qty_net": qty_net,
+            "quote_mint": hop.get("mint"),
+            "quote_sym": hop.get("sym"),
+            "quote_qty": hop.get("qty"),
+            "quote_usd": route_costs.get(mint, hop.get("quote_usd") or 0.0),
+            "amount_basis": "route_cost",
+            "_net_qty": qty_net,
+        }
+    for trade in grouped.values():
+        if trade["side"] == "BUY":
+            if trade["_net_qty"] > 0:
+                trade["qty"] = trade["_net_qty"]
+            if trade["mint"] in route_costs:
+                trade["quote_usd"] = route_costs[trade["mint"]]
+        trade.pop("_net_qty", None)
+    return list(grouped.values())
+
+
+def _route_add(
+    inventory: dict[str, tuple[float, float | None]],
+    mint: str,
+    qty: float,
+    cost_usd: float | None,
+) -> None:
+    if qty <= 0:
+        return
+    old_qty, old_cost = inventory.get(mint, (0.0, 0.0))
+    cost = None if old_cost is None or cost_usd is None else old_cost + cost_usd
+    inventory[mint] = (old_qty + qty, cost)
+
+
+def _route_take(
+    inventory: dict[str, tuple[float, float | None]], mint: str, qty: float
+) -> tuple[float, float | None]:
+    held, cost = inventory.get(mint, (0.0, None))
+    taken = min(max(qty, 0.0), held)
+    if taken <= 0:
+        return 0.0, 0.0
+    used_cost = cost * taken / held if cost is not None else None
+    remaining = held - taken
+    if remaining <= 1e-9:
+        inventory.pop(mint, None)
+    else:
+        inventory[mint] = (
+            remaining,
+            cost - used_cost if cost is not None and used_cost is not None else None,
+        )
+    return taken, used_cost
+
+
+def _route_costs(events: list[dict[str, Any]]) -> dict[str, float]:
+    """Return the gross acquisition cost carried into each mint."""
+    inventory: dict[str, tuple[float, float | None]] = {}
+    buy_costs: dict[str, float] = {}
+    ordered = sorted(events, key=lambda e: e.get("step") or 0)
+    for event in ordered:
+        if event.get("type") != "SWAP":
+            continue
+        mint = event.get("mint")
+        quote_mint = event.get("quote_mint")
+        qty = float(event.get("qty") or 0.0)
+        quote_qty = float(event.get("quote_qty") or 0.0)
+        usd = event.get("quote_usd")
+        usd = float(usd) if isinstance(usd, (int, float)) else None
+        if not mint or not quote_mint or qty <= 0:
+            continue
+        if event.get("side") == "BUY":
+            used, used_cost = _route_take(inventory, quote_mint, quote_qty)
+            unpriced_qty = max(0.0, quote_qty - used)
+            if used_cost is not None and unpriced_qty <= 1e-9:
+                cost = used_cost
+            elif used_cost is not None and usd is not None and quote_qty > 0:
+                cost = used_cost + usd * unpriced_qty / quote_qty
+            elif used_cost is not None:
+                cost = None
+            else:
+                cost = usd
+            if cost is not None:
+                buy_costs[mint] = buy_costs.get(mint, 0.0) + cost
+            _route_add(inventory, mint, qty, cost)
+        elif event.get("side") == "SELL":
+            sold, sold_cost = _route_take(inventory, mint, qty)
+            if sold_cost is not None and sold >= qty - 1e-9:
+                cost = sold_cost
+            elif sold_cost is not None and usd is not None:
+                cost = sold_cost + usd * max(0.0, qty - sold) / qty
+            elif sold_cost is not None:
+                cost = None
+            else:
+                cost = usd
+            if cost is not None:
+                buy_costs[quote_mint] = buy_costs.get(quote_mint, 0.0) + cost
+            _route_add(inventory, quote_mint, quote_qty, cost)
+    return buy_costs
 
 
 # T7 §5.8: tham số getBlock cố định của block feed (hoist ra module để

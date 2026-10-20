@@ -91,6 +91,8 @@ export interface TrackedWalletStat {
   sells: number;
   /** Current token balance USD for this (wallet, CA) — ABSENT when never measured. */
   balUsd?: number;
+  /** Current held amount in token units; absent when no wallet balance measurement exists. */
+  holdingAmount?: number;
   /** Current token balance as a share of total supply; absent when balance/supply is unknown. */
   holdingPct?: number;
   /** Epoch ms of the wallet's newest watch trade for this CA; 0 = none. */
@@ -140,7 +142,7 @@ export interface TokenSignal {
   note?: string;
   buyVol24h?: number;
   sellVol24h?: number;
-  nansen: NansenSetup & { freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number; t100History?: { t: number; value: number; peakBalance?: number; troughBalance?: number }[] };
+  nansen: NansenSetup & { freshCurrent: boolean; freshHistory?: { t: number; value: number }[]; freshUpdatedAt?: number; t100History?: { t: number; value: number; peakBalance?: number; troughBalance?: number }[] };
   holders: number;
   /** Historical displayed holder counts, from successful existing metric writes. */
   holdersHistory?: { t: number; value: number }[];

@@ -76,7 +76,7 @@ export class GatewayDenialError extends HttpError {
 export class GatewayClient {
   constructor(private readonly opts: GatewayClientOptions) {}
 
-  async call(routePath: string, payload: unknown): Promise<GatewayCallResult> {
+  async call(routePath: string, payload: unknown, signal?: AbortSignal): Promise<GatewayCallResult> {
     const doFetch = this.opts.fetchImpl ?? fetch;
     let res: Response;
     try {
@@ -87,11 +87,9 @@ export class GatewayClient {
           Authorization: `Bearer ${this.opts.callerToken}`,
         },
         body: JSON.stringify(payload),
+        ...(signal ? { signal } : {}),
       });
     } catch (cause) {
-      // Connection error / timeout / DNS — the gateway is unreachable (todo 15
-      // fail-open category). Anything else the fetch could reject with is still a
-      // transport-level failure (no HTTP response was produced).
       throw new GatewayTransportError(routePath, cause);
     }
     const raw = (await res.json().catch(() => null)) as unknown;

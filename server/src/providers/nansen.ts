@@ -21,8 +21,9 @@ import { EvmRpcClient } from './evm.js';
 import { solanaRpcEndpoints, SolanaRpcClient, type AssetInfo } from './solana.js';
 import type { MarketDataProvider, MetricKind, MetricPatch, TokenInfo, WalletActivity, WalletTokenHolding } from './provider.js';
 import { log, timed } from '../log.js';
-import { HttpError, type Priority } from '../ratelimit/types.js';
 import { gatewayClientFromEnv, GatewayClient, GW_NANSEN_CREDIT_PATH } from '../gateway-client.js';
+import { HttpError, type Priority } from '../ratelimit/types.js';
+import { NansenDoorError, parseDoorClassification, type DoorClassification } from '../shared/nansen-door.js';
 
 export interface BalanceRange {
   peak: number;
@@ -268,7 +269,11 @@ export function extremesFromStats(rows: HourlyStatsRow[]): BalanceRange | undefi
   return peak !== undefined && trough !== undefined ? { peak, trough } : undefined;
 }
 
-export type PostJson = (url: string, body: unknown) => Promise<{ status: number; json: unknown }>;
+export type PostJson = (
+  url: string,
+  body: unknown,
+  signal?: AbortSignal,
+) => Promise<{ status: number; json: unknown; classification?: DoorClassification | null }>;
 
 export class NansenWebCrawler {
   readonly name = 'nansen-crawl';
@@ -334,9 +339,8 @@ export interface TgmFlowsRow {
 
 /** Narrow seam for the poller's T100/LF fetches — tests inject a counting stub. */
 export interface TokenFlowsClient {
-  tokenFlows(req: TgmFlowsRequest): Promise<TgmFlowsRow[]>;
+  tokenFlows(req: TgmFlowsRequest, signal?: AbortSignal): Promise<TgmFlowsRow[]>;
 }
-
 /** Fibonacci spacing for the credit-door retry: 1,1,2,3,5,8,13… × baseMs. */
 export function fiboDelayMs(n: number, baseMs: number): number {
   let a = 1;
@@ -363,9 +367,9 @@ export class NansenApiClient implements TokenFlowsClient {
    * `nansen-credit` limiter, the fibo retry and the apikey injection. An upstream
    * 4xx/5xx arrives as HTTP 200 + `envelope.status`; a gateway denial (429 budget /
    * 503 gated) is thrown as HttpError by the transport. */
-  private async post<T>(path: string, body: unknown, priority: Priority = 1): Promise<T> {
+  private async post<T>(path: string, body: unknown, priority: Priority = 1, signal?: AbortSignal): Promise<T> {
     return timed('nansen post', { path }, async () => {
-      const env = await this.gateway.call(GW_NANSEN_CREDIT_PATH, { endpoint: path, body, priority });
+      const env = await this.gateway.call(GW_NANSEN_CREDIT_PATH, { endpoint: path, body, priority }, signal);
       const costHeader = env.headers['x-nansen-credits-cost'];
       const cost = costHeader === undefined ? undefined : Number(costHeader);
       if (costHeader !== undefined) {
@@ -393,14 +397,14 @@ export class NansenApiClient implements TokenFlowsClient {
    * enough to fit, and per_page is raised to the API-wide max of 1000 — with 100
    * any token older than 100 buckets was silently truncated. No order_by/filters:
    * rows arrive DESC and readers sort defensively. */
-  async tokenFlows(req: TgmFlowsRequest): Promise<TgmFlowsRow[]> {
+  async tokenFlows(req: TgmFlowsRequest, signal?: AbortSignal): Promise<TgmFlowsRow[]> {
     const json = await this.post<{ data?: TgmFlowsRow[]; warnings?: unknown }>(NANSEN_FLOWS_PATH, {
       chain: nansenApiChain(req.chain),
       token_address: req.token_address,
       date: req.date,
       label: req.label,
       pagination: { page: 1, per_page: 1000 },
-    });
+    }, 1, signal);
     return json.data ?? [];
   }
 
@@ -563,14 +567,18 @@ export class NansenMarketProvider implements MarketDataProvider {
     private readonly evmRpc: EvmRpcClient = new EvmRpcClient(),
   ) {}
 
-  private async ask(url: string, body: unknown): Promise<unknown> {
-    const { status, json } = await this.postJson(url, body);
-    if (status !== 200) throw new Error(`nansen question ${url.split('/').pop()} ${status}`);
+  private async ask(url: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    const { status, json, classification } = await this.postJson(url, body, signal);
+    if (status !== 200) {
+      const doorClass = parseDoorClassification(classification) ??
+        (status === 403 ? 'real403' : status === 429 ? 'throttle' : status >= 500 ? '5xx' : 'transport');
+      throw new NansenDoorError(status, doorClass);
+    }
     return json;
   }
 
   /** ONE free question per kind — the poller runs each kind on its own cadence. */
-  async metric(ca: string, chain: Chain, kind: MetricKind): Promise<MetricPatch> {
+  async metric(ca: string, chain: Chain, kind: MetricKind, signal?: AbortSignal): Promise<MetricPatch> {
     switch (kind) {
       case 'essential': {
         // Two independent doors. Nansen 403s/timeouts (CF) or simply has no row for
@@ -579,7 +587,7 @@ export class NansenMarketProvider implements MarketDataProvider {
         let ess: ReturnType<typeof parseEssentialData> | null = null;
         let nansenError: unknown;
         try {
-          ess = optionalEssentialData(await this.ask(NANSEN_ESSENTIAL_DATA_URL, essentialDataBody(ca, chain)));
+          ess = optionalEssentialData(await this.ask(NANSEN_ESSENTIAL_DATA_URL, essentialDataBody(ca, chain), signal));
         } catch (e) {
           nansenError = e;
         }
@@ -606,11 +614,11 @@ export class NansenMarketProvider implements MarketDataProvider {
         // ONE call per sweep (user 2026-09-22): the 1h figure is the volume24h
         // growth since the previous sweep (the poller computes it), so the second
         // intervalSec=3600 fetch is gone.
-        const vol = parseVolumeDetails(await this.ask(NANSEN_VOLUME_DETAILS_URL, volumeDetailsBody(ca, chain)));
+        const vol = parseVolumeDetails(await this.ask(NANSEN_VOLUME_DETAILS_URL, volumeDetailsBody(ca, chain), signal));
         return { volume24h: vol.buy + vol.sell, buyVol24h: vol.buy, sellVol24h: vol.sell };
       }
       case 'gini': {
-        const g = parseGiniStats(await this.ask(NANSEN_HOLDERS_GINI_URL, holdersGiniBody(ca, chain)));
+        const g = parseGiniStats(await this.ask(NANSEN_HOLDERS_GINI_URL, holdersGiniBody(ca, chain), signal));
         return {
           nansenHolders: g.holders,
           nansenFreshPct: g.freshSupplyPct,

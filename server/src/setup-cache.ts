@@ -9,7 +9,7 @@
 // Note: `make ssh-rm` deletes REMOTE_DIR incl. data/ — this file does not
 // survive that, destructive-by-design (plan §4).
 
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { config } from './config.js';
 import { log } from './log.js';
@@ -62,6 +62,7 @@ let activeFile = config.setupCacheFile;
 let entries = new Map<string, SetupCacheEntry>();
 /** False until the map was populated from disk (explicit load or the lazy C1 load). */
 let loaded = false;
+let loadedFileSignature: string | null = null;
 
 /** Map/file key of a (ca, chain) record: `${chain}:${ca}` (T3 builds trackedKeys with this). */
 export function cacheKey(ca: string, chain: Chain): string {
@@ -82,6 +83,15 @@ function isChain(v: unknown): v is Chain {
 
 function isNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
+}
+
+function fileSignature(file: string): string | null {
+  try {
+    const stat = statSync(file, { bigint: true });
+    return `${stat.mtimeNs}:${stat.size}:${stat.ino}`;
+  } catch {
+    return null;
+  }
 }
 
 function parsePoint(v: unknown): SeriesPoint | undefined {
@@ -182,6 +192,7 @@ export function loadSetupCache(file: string = config.setupCacheFile): Map<string
   entries = new Map();
   retries = new Map();
   loaded = true;
+  loadedFileSignature = fileSignature(file);
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(file, 'utf8'));
@@ -217,6 +228,12 @@ export function loadSetupCache(file: string = config.setupCacheFile): Map<string
   if (skipped > 0) log.warn(`[setup-cache] skipped ${skipped} malformed entries/retries in ${file}`);
   if (discardedFreshRetry) persist();
   return entries;
+}
+
+/** Refresh the in-memory view when the shared cache file changed in another process. */
+export function refreshSetupCacheIfChanged(): void {
+  ensureLoaded();
+  if (fileSignature(activeFile) !== loadedFileSignature) loadSetupCache(activeFile);
 }
 
 /** Merge legacy per-instance caches into the gateway-owned cache before cutover. */
@@ -394,6 +411,7 @@ function persist(): void {
     mkdirSync(dirname(activeFile), { recursive: true });
     writeFileSync(tmp, JSON.stringify({ version: FILE_VERSION, entries: [...entries.values()], retries: Object.fromEntries(retries) }));
     renameSync(tmp, activeFile);
+    loadedFileSignature = fileSignature(activeFile);
   } catch (err) {
     try {
       rmSync(tmp, { force: true }); // never leave a *.tmp behind

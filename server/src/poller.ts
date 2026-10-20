@@ -18,6 +18,8 @@ import {
   reserveMetricPoll,
   saveMetricPollResponse,
   failMetricPoll,
+  deferMetricPoll,
+  METRIC_RECOVERY_RETRY_MS,
   listCaScoreGateCandidates,
   listCaTargetsMissingEssential,
   listCaTargetsMissingSymbol,
@@ -48,6 +50,7 @@ import type { BalancePoint } from './crawl.js';
 import {
   cacheKey,
   getSetupCacheEntry,
+  refreshSetupCacheIfChanged,
   getSetupRetry,
   recordSetupRetry,
   clearSetupRetry,
@@ -70,6 +73,7 @@ import { enqueueSetup } from './setup-queue.js';
 import { fetchTokenMeta, validatedIconUrl, type DexTokenMeta } from './providers/dexscreener.js';
 import { GatewayTransportError } from './gateway-client.js';
 import { log } from './log.js';
+import { NansenDoorError } from './shared/nansen-door.js';
 
 interface PollTask {
   name: string;
@@ -303,7 +307,14 @@ async function cachedMetric(
   const reservationKind = shared ? GMGN_MARKET_CACHE_KIND : kind;
   const reservationInterval = shared ? MIN_MARKET_CAP_QUERY_INTERVAL_MS : intervalMs;
   const reservation = reserveMetricPoll(ca, chain, reservationKind, now, reservationInterval);
-  if (!reservation.claimed) return cachedMetricResult(ca, chain, kind, reservation.row);
+  if (!reservation.claimed) {
+    if (kind === 'gini') log.debug('[collector] fw_deferred', {
+      ca, chain, nextAllowedAt: reservation.row?.next_allowed_at ?? null,
+      lastSuccessAt: reservation.row?.response_at ?? null,
+      failures: reservation.row?.failure_count ?? 0,
+    });
+    return cachedMetricResult(ca, chain, kind, reservation.row);
+  }
 
   const kindReservation = shared
     ? reserveMetricPoll(ca, chain, kind, now, intervalMs)
@@ -312,9 +323,37 @@ async function cachedMetric(
     failMetricPoll(ca, chain, reservationKind, kindReservation.row?.next_allowed_at ?? now + reservationInterval);
     return cachedMetricResult(ca, chain, kind, kindReservation.row);
   }
+  const controller = kind === 'gini' ? new AbortController() : undefined;
+  let timedOut = false;
+  if (kind === 'gini') log.info('[collector] fw_start', {
+    ca, chain, attemptAt: now, lastSuccessAt: reservation.row?.response_at ?? null,
+    failures: reservation.row?.failure_count ?? 0, timeoutMs: config.giniMetricTimeoutMs,
+  });
   const request = (async (): Promise<CachedMetricResult> => {
     try {
-      const patch = await provider.metric(ca, chain, kind);
+      const providerRequest = provider.metric(ca, chain, kind, controller?.signal);
+      if (kind === 'gini') void providerRequest.then(
+        () => {
+          if (timedOut) log.info('[collector] fw_late_result', { ca, chain, outcome: 'resolved_discarded', runMs: Date.now() - now });
+        },
+        () => {
+          if (timedOut) log.info('[collector] fw_late_result', { ca, chain, outcome: 'rejected', runMs: Date.now() - now });
+        },
+      );
+      const patch = controller
+        ? await Promise.race([
+          providerRequest,
+          new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+              reject(new Error(`gini metric timed out after ${config.giniMetricTimeoutMs}ms`));
+            }, config.giniMetricTimeoutMs);
+            providerRequest.finally(() => clearTimeout(timer)).catch(() => {});
+          }),
+        ])
+        : await providerRequest;
+      if (timedOut) throw new Error('gini metric completed after timeout');
       const responseAt = Date.now();
       if (kind === 'gini' && patch.nansenFreshPct === undefined) {
         const retryAt = failureNextAllowedAt(
@@ -323,19 +362,44 @@ async function cachedMetric(
           responseAt,
         );
         failMetricPoll(ca, chain, kind, retryAt);
+        log.info('[collector] fw_finish', {
+          ca, chain, outcome: 'missing_value', runMs: responseAt - now, nextAllowedAt: retryAt,
+          lastSuccessAt: reservation.row?.response_at ?? null,
+        });
         return { patch, fetched: true, responseAt };
       }
       if (shared) cacheSharedMarketResponse(ca, chain, responseAt, patch);
       else saveMetricPollResponse(ca, chain, kind, responseAt, responseAt + intervalMs, patch);
+      if (kind === 'gini') log.info('[collector] fw_finish', {
+        ca, chain, outcome: 'cache_persisted', responseAt, runMs: responseAt - now,
+        nextAllowedAt: responseAt + intervalMs, freshPct: patch.nansenFreshPct,
+      });
       return { patch, fetched: true, responseAt };
     } catch (error) {
-      const nextAllowedAt = failureNextAllowedAt(
-        reservation.row?.failure_count ?? 0,
-        metricFailureInterval(kind, intervalMs),
-        Date.now(),
-      );
-      failMetricPoll(ca, chain, reservationKind, nextAllowedAt);
-      if (shared) failMetricPoll(ca, chain, kind, nextAllowedAt);
+      const transientFwFailure = kind === 'gini' &&
+        (timedOut || (error instanceof NansenDoorError && error.transient));
+      const failedAt = Date.now();
+      const nextAllowedAt = transientFwFailure
+        ? failedAt + Math.min(config.pollSetupSweepMs, METRIC_RECOVERY_RETRY_MS)
+        : failureNextAllowedAt(
+          reservation.row?.failure_count ?? 0,
+          metricFailureInterval(kind, intervalMs),
+          failedAt,
+        );
+      if (transientFwFailure) {
+        deferMetricPoll(ca, chain, reservationKind, nextAllowedAt);
+        if (shared) deferMetricPoll(ca, chain, kind, nextAllowedAt);
+      } else {
+        failMetricPoll(ca, chain, reservationKind, nextAllowedAt);
+        if (shared) failMetricPoll(ca, chain, kind, nextAllowedAt);
+      }
+      if (kind === 'gini') log.info('[collector] fw_finish', {
+        ca, chain, outcome: timedOut ? 'timeout' : transientFwFailure ? 'door_retry' : 'error',
+        retryClass: transientFwFailure ? 'transient' : 'permanent',
+        runMs: failedAt - now, nextAllowedAt,
+        failures: (reservation.row?.failure_count ?? 0) + (transientFwFailure ? 0 : 1),
+        lastSuccessAt: reservation.row?.response_at ?? null,
+      });
       throw error;
     }
   })();
@@ -388,6 +452,12 @@ export async function metricSweep(
         const result = await cachedMetric(provider, c.address, c.chain, kind, intervalMs);
         if (!result.fetched || !result.patch) return;
         applyMetricPatch(c.address, c.chain, kind, result.patch);
+        if (kind === 'gini' && typeof result.patch.nansenFreshPct === 'number' && result.responseAt !== null) {
+          log.info('[collector] fw_applied', {
+            ca: c.address, chain: c.chain, source: 'upstream',
+            responseAt: result.responseAt, freshPct: result.patch.nansenFreshPct,
+          });
+        }
       } catch (e) {
         // Keep the last successful quote and metrics. The cache records this failure
         // and blocks another attempt until the cadence/backoff expires.
@@ -649,7 +719,7 @@ function isBackFill(rows: readonly TgmFlowsRow[]): boolean {
  * range is capped at 1000 buckets; the aligned first bucket includes listing-day
  * balances without admitting earlier buckets into the LF anchor.
  */
-async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null): Promise<{ total: number; points: BalancePoint[]; rule: 'bucket-hour-v2' | 'bucket-day-v2' } | undefined> {
+async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null, signal?: AbortSignal): Promise<{ total: number; points: BalancePoint[]; rule: 'bucket-hour-v2' | 'bucket-day-v2' } | undefined> {
   // Không có deployed_at ⇒ không biết genesis nằm đâu — giữ nguyên giá trị cũ (94/152
   // dòng LF hiện thuộc nhóm này — xem EVIDENCE-2026-09-21-lf-range-form-restore.md).
   if (!deployedAt) return undefined;
@@ -672,7 +742,7 @@ async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null):
       token_address: ca,
       date: { from: new Date(requestFrom).toISOString(), to: new Date(to).toISOString() },
       label: 'exchange',
-    });
+    }, signal);
     const points = flowsToPoints(rows);
     if (!seriesReachesStart(points, anchorFrom, lfRule === 'bucket-day-v2' ? 0 : bucketMs)) {
       log.error('[poller] genesisLF series cut ngan hon cua so xin, keep previous', ca.slice(0, 8), 'n=' + points.length);
@@ -718,6 +788,7 @@ function retryLater(ca: string, chain: Chain, field: SetupField): void {
   const misses = (getSetupRetry(ca, chain, field)?.misses ?? 0) + 1;
   const delay = isTooNewToken(ca, chain, now) ? config.newTokenRetryMs : setupRetryDelayMs(misses);
   recordSetupRetry(ca, chain, field, misses, now + delay);
+  log.info('[collector] setup_retry', { ca, chain, dataset: field, misses, nextAllowedAt: now + delay });
 }
 
 function owesInfo(ca: string, chain: Chain, now: number): boolean {
@@ -788,10 +859,23 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   // A cold cache would otherwise backfill the whole queue in one pass — each CA
   // costs ≥1 credit, so trickle: the cap bounds the burst, the rest wait the next pass.
   const cas = cappedSetupTargets(all, now);
+  log.info('[collector] setup_pass', {
+    tracked: tracked.length, due: all.length, selected: cas.length, capped: all.length - cas.length,
+    fwDue: all.filter((c) => owesInfo(c.address, c.chain, now)).length,
+    seriesDue: all.filter((c) => owesSeries(c.address, c.chain, now)).length,
+    lfDue: all.filter((c) => owesLf(c.address, c.chain, now)).length,
+  });
   if (all.length > cas.length) {
     log.warn('[poller] setup pass capped to', cas.length, 'of', all.length, 'CA(s)');
   }
   await runGatewaySweep('setupSweep', async (summary) => {
+    const seriesWork = cas.map(async (c) => {
+      try {
+        await refreshSeries(c.address, c.chain);
+      } catch (e) {
+        logProviderError(summary, e, 'setupSweep series', c.address);
+      }
+    });
     for (const c of cas) {
       if (!owesInfo(c.address, c.chain, Date.now())) continue;
       try {
@@ -799,24 +883,23 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
         const patch = result.patch;
         const fresh = patch?.nansenFreshPct;
         if (result.fetched && patch) updateTokenMetrics(c.address, c.chain, patch);
-        else if (fresh !== undefined && getTokenState(c.address, c.chain)?.nansen_fresh_pct == null && patch) {
+        else if (result.responseAt !== null && fresh !== undefined &&
+            getTokenState(c.address, c.chain)?.nansen_fresh_pct == null && patch) {
           updateTokenMetrics(c.address, c.chain, patch);
         }
         if (typeof fresh === 'number' && Number.isFinite(fresh) && result.responseAt !== null) {
           stampSetupCacheField(c.address, c.chain, 'info_at', result.responseAt);
+          log.info('[collector] fw_applied', {
+            ca: c.address, chain: c.chain, source: result.fetched ? 'upstream' : 'cache',
+            responseAt: result.responseAt, freshPct: fresh,
+          });
         }
       } catch (e) {
         logProviderError(summary, e, 'setupSweep gini', c.address);
       }
     }
-    // Finish the selected Fresh reads before awaiting the credit-door series queue.
-    for (const c of cas) {
-      try {
-        await refreshSeries(c.address, c.chain);
-      } catch (e) {
-        logProviderError(summary, e, 'setupSweep series', c.address);
-      }
-    }
+    await Promise.all(seriesWork);
+    log.info('[collector] setup_pass_finish', { selected: cas.length, runMs: Date.now() - now });
   });
   deleteSnapshotsBefore(now - SNAPSHOT_RETENTION_MS);
   // File-cache prune (plan setup-fill-on-add §4): drop entries whose CA left the
@@ -826,6 +909,52 @@ export async function setupSweep(provider: MarketDataProvider): Promise<void> {
   const trackedKeysNow = new Set(listTrackedCas().map((c) => cacheKey(c.address, c.chain)));
   const dropped = pruneSetupCache(Date.now(), trackedKeysNow);
   if (dropped > 0) log.info(`[setup-cache] pruned ${dropped} entries`);
+}
+export interface SetupFreshnessStats {
+  trackedCaCount: number;
+  latestFwSuccessAt: number | null;
+  latestT100SuccessAt: number | null;
+  fwFreshCount: number;
+  fwStaleCount: number;
+  fwUnknownCount: number;
+  t100FreshCount: number;
+  t100StaleCount: number;
+  t100UnknownCount: number;
+}
+
+/** Shared-cache-aware setup freshness summary for health reporting. */
+export function getSetupFreshnessStats(now: number, staleAfterMs: number): SetupFreshnessStats {
+  refreshSetupCacheIfChanged();
+  const stats: SetupFreshnessStats = {
+    trackedCaCount: 0,
+    latestFwSuccessAt: null,
+    latestT100SuccessAt: null,
+    fwFreshCount: 0,
+    fwStaleCount: 0,
+    fwUnknownCount: 0,
+    t100FreshCount: 0,
+    t100StaleCount: 0,
+    t100UnknownCount: 0,
+  };
+  for (const ca of listTrackedCas()) {
+    stats.trackedCaCount += 1;
+    const entry = getSetupCacheEntry(ca.address, ca.chain);
+    const fwAt = entry?.info_at;
+    const t100At = entry?.series_at;
+    if (fwAt === undefined) stats.fwUnknownCount += 1;
+    else {
+      stats.latestFwSuccessAt = Math.max(stats.latestFwSuccessAt ?? 0, fwAt);
+      if (now - fwAt <= staleAfterMs) stats.fwFreshCount += 1;
+      else stats.fwStaleCount += 1;
+    }
+    if (t100At === undefined) stats.t100UnknownCount += 1;
+    else {
+      stats.latestT100SuccessAt = Math.max(stats.latestT100SuccessAt ?? 0, t100At);
+      if (now - t100At <= staleAfterMs) stats.t100FreshCount += 1;
+      else stats.t100StaleCount += 1;
+    }
+  }
+  return stats;
 }
 
 /**
@@ -870,7 +999,7 @@ interface SeriesFetch {
  * and comfortably inside the wire's ~1000-row budget. */
 const SERIES_MAX_WINDOW_DAYS = 365;
 
-async function seriesAtRung(ca: string, chain: Chain): Promise<SeriesFetch | undefined> {
+async function seriesAtRung(ca: string, chain: Chain, signal?: AbortSignal): Promise<SeriesFetch | undefined> {
   const client = flowsClient();
   if (!client) return undefined;
   const now = Date.now();
@@ -894,7 +1023,7 @@ async function seriesAtRung(ca: string, chain: Chain): Promise<SeriesFetch | und
         token_address: ca,
         date: { from: new Date(reqFrom).toISOString(), to: new Date(end).toISOString() },
         label: 'top_100_holders',
-      });
+      }, signal);
       // Clamp the pre-genesis constant back-fill out before anchoring.
       const points = flowsToPoints(rows).filter((p) => {
         const t = typeof p.t === 'number' ? p.t : Date.parse(p.t);
@@ -985,13 +1114,13 @@ export function refreshSeries(ca: string, chain: Chain): Promise<void> {
   const tracked = findTrackedCa(ca, chain);
   const urgent = st?.t100_multiple == null || st?.genesis_bal == null ||
     isNewCa(tracked?.added_at, Date.now() - config.newCaPriorityMs);
-  return enqueueSetup(ca, chain, urgent ? 0 : 1, async () => {
+  return enqueueSetup(ca, chain, urgent ? 0 : 1, async (signal) => {
     const now = Date.now();
     const cached = getSetupCacheEntry(ca, chain);
     if (cached && isSeriesFresh(cached, now)) applySetupCacheEntry(cached);
     if (!owesSeries(ca, chain, now) && !owesLf(ca, chain, now)) return;
-    const entry = await applySeriesPass(ca, chain, now);
-    if (entry) putSetupCacheEntry(entry);
+    const entry = await applySeriesPass(ca, chain, now, signal);
+    if (!signal.aborted && entry) putSetupCacheEntry(entry);
   });
 }
 
@@ -1016,15 +1145,34 @@ export async function flowsSweep(): Promise<void> {
 /** One flows pass: fetch the series → T100 multiple / LF / bal_* windows → DB.
  * Returns the setup-cache entry, or undefined when the token row does not exist
  * yet (the essential sweep creates it). */
-async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<SetupCacheEntry | undefined> {
+async function applySeriesPass(
+  ca: string,
+  chain: Chain,
+  now: number,
+  signal: AbortSignal,
+): Promise<SetupCacheEntry | undefined> {
   const st = getTokenState(ca, chain);
-  if (!st) return undefined; // the essential sweep creates the row (supply + deployed_at)
+  if (!st) {
+    log.info('[collector] setup_deferred', { ca, chain, reason: 'missing_token_state' });
+    return undefined;
+  }
   const prev = getSetupCacheEntry(ca, chain);
   const fetchSeries = owesSeries(ca, chain, now);
-  const fetched = fetchSeries && flowsClient() ? await seriesAtRung(ca, chain) : undefined;
+  const seriesProviderAvailable = flowsClient() !== null;
+  const seriesStartedAt = Date.now();
+  if (fetchSeries) log.info('[collector] series_start', {
+    ca, chain, lastSuccessAt: prev?.series_at ?? null, providerAvailable: seriesProviderAvailable,
+  });
+  const fetched = fetchSeries && seriesProviderAvailable ? await seriesAtRung(ca, chain, signal) : undefined;
   const seriesResponseAt = fetched === undefined ? undefined : Date.now();
+  if (fetchSeries) log.info('[collector] series_finish', {
+    ca, chain, outcome: !seriesProviderAvailable ? 'provider_unavailable' : fetched ? 'fetched' : 'no_data',
+    responseAt: seriesResponseAt ?? null, points: fetched?.points.length ?? 0,
+    runMs: Date.now() - seriesStartedAt,
+  });
+  if (signal.aborted) return undefined;
   const series = fetched?.points;
-  if (fetchSeries && flowsClient()) {
+  if (fetchSeries && seriesProviderAvailable) {
     if (series && series.length > 0) clearSetupRetry(ca, chain, 'series');
     else retryLater(ca, chain, 'series');
   }
@@ -1043,13 +1191,51 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     }
   }
   const bal = series ? cacheSeriesWindows(ca, chain, series, now) : passThroughBal(st);
+  if (series && series.length > 0 && t100ObservationAt !== undefined && seriesResponseAt !== undefined) {
+    updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, t100BalanceDrawdown, genesisBal, anchorAt, bal }, t100ObservationAt);
+    putSetupCacheEntry({
+      ca,
+      chain,
+      taken_at: seriesResponseAt,
+      window: fetched?.window ?? prev?.window ?? '',
+      series_from: fetched?.from ?? prev?.series_from,
+      series,
+      exchange: prev?.exchange ?? [],
+      t100_pct: t100Pct,
+      t100_multiple: t100Multiple,
+      anchor_at: anchorAt,
+      genesis_bal: genesisBal,
+      lf_rule: prev?.lf_rule,
+      series_at: seriesResponseAt,
+      ...(getSetupCacheEntry(ca, chain)?.info_at !== undefined
+        ? { info_at: getSetupCacheEntry(ca, chain)?.info_at }
+        : {}),
+    });
+    log.info('[collector] t100_persisted', {
+      ca, chain, responseAt: seriesResponseAt, runMs: Date.now() - now,
+      points: series.length, multiple: t100Multiple,
+    });
+  }
   const fetchLf = owesLf(ca, chain, now);
-  const lf = fetchLf && flowsClient() ? await exchangeLf(ca, chain, st.deployed_at) : undefined;
+  const lfProviderAvailable = flowsClient() !== null;
+  const lfStartedAt = Date.now();
+  if (fetchLf) log.info('[collector] lf_start', {
+    ca, chain, providerAvailable: lfProviderAvailable, previousRule: prev?.lf_rule ?? null,
+  });
+  const lf = fetchLf && lfProviderAvailable ? await exchangeLf(ca, chain, st.deployed_at, signal) : undefined;
+  if (signal.aborted) return undefined;
+  if (fetchLf) log.info('[collector] lf_finish', {
+    ca, chain, outcome: !lfProviderAvailable ? 'provider_unavailable' : lf ? 'fetched' : 'no_data',
+    points: lf?.points.length ?? 0, runMs: Date.now() - lfStartedAt,
+  });
   if (lf !== undefined) {
     genesisBal = lf.total;
     clearSetupRetry(ca, chain, 'lf');
-  } else if (fetchLf && flowsClient()) retryLater(ca, chain, 'lf');
-  updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, t100BalanceDrawdown, genesisBal, anchorAt, bal }, t100ObservationAt);
+  } else if (fetchLf && lfProviderAvailable) retryLater(ca, chain, 'lf');
+  updateTokenAnalytics(ca, chain, { t100Pct, t100Multiple, t100BalanceDrawdown, genesisBal, anchorAt, bal });
+  if (lf !== undefined) log.info('[collector] lf_persisted', {
+    ca, chain, rule: lf.rule, points: lf.points.length, runMs: Date.now() - now,
+  });
   const infoAt = getSetupCacheEntry(ca, chain)?.info_at;
   return {
     ca,
@@ -1068,7 +1254,9 @@ async function applySeriesPass(ca: string, chain: Chain, now: number): Promise<S
     // `now` over it. An empty pass therefore keeps prev.series_at (no fresh stamp,
     // an existing marker is never lost).
     ...(prev?.series_at !== undefined ? { series_at: prev.series_at } : {}),
-    ...(series !== undefined && series.length > 0 ? { series_at: now } : {}),
+    ...(series !== undefined && series.length > 0 && seriesResponseAt !== undefined
+      ? { series_at: seriesResponseAt }
+      : {}),
     // A first-add gini result may have landed while the series request awaited.
     ...(infoAt !== undefined ? { info_at: infoAt } : {}),
   };
@@ -1416,6 +1604,7 @@ async function withFomoPositionSlot(run: () => Promise<void>): Promise<void> {
  *  response, never rejects (trackFomoWalletFromTx swallows every failure). */
 export function kickFomoHoldings(fomoUserId: string, chain: Chain, ca: string, txHash: string): void {
   if (txHash === '') return;
+  if (config.showFomo && chain === 'sol') return;
   fomoKickDrain = fomoKickDrain.then(() => trackFomoWalletFromTx(fomoUserId, chain, ca, txHash));
 }
 
@@ -1701,15 +1890,21 @@ async function bootstrapTokenInfo(provider: MarketDataProvider, address: string,
         }
       }
     } catch (error) {
+      const transientFwFailure = error instanceof NansenDoorError && error.transient;
+      const retryAt = Date.now() + Math.min(config.pollSetupSweepMs, METRIC_RECOVERY_RETRY_MS);
       for (const kind of METRIC_KINDS) {
         const intervalMs = intervals.get(kind)!;
         const previousFailures = reservations.get(kind)?.row?.failure_count ?? 0;
-        failMetricPoll(
-          address,
-          chain,
-          kind,
-          failureNextAllowedAt(previousFailures, metricFailureInterval(kind, intervalMs), Date.now()),
-        );
+        if (kind === 'gini' && transientFwFailure) {
+          deferMetricPoll(address, chain, kind, retryAt);
+        } else {
+          failMetricPoll(
+            address,
+            chain,
+            kind,
+            failureNextAllowedAt(previousFailures, metricFailureInterval(kind, intervalMs), Date.now()),
+          );
+        }
       }
       if (resourceReservation) {
         failMetricPoll(
@@ -1723,6 +1918,11 @@ async function bootstrapTokenInfo(provider: MarketDataProvider, address: string,
           ),
         );
       }
+      if (transientFwFailure) log.info('[collector] fw_finish', {
+        ca: address, chain, outcome: 'door_retry', retryClass: 'transient',
+        nextAllowedAt: retryAt, lastSuccessAt: reservations.get('gini')?.row?.response_at ?? null,
+        failures: reservations.get('gini')?.row?.failure_count ?? 0,
+      });
       throw error;
     }
   })();
@@ -1743,6 +1943,12 @@ async function applyDueMetric(
   const result = await cachedMetric(provider, address, chain, kind, metricIntervalFor(kind));
   if (!result.fetched || !result.patch) return;
   applyMetricPatch(address, chain, kind, result.patch);
+  if (kind === 'gini' && typeof result.patch.nansenFreshPct === 'number' && result.responseAt !== null) {
+    log.info('[collector] fw_applied', {
+      ca: address, chain, source: 'upstream', responseAt: result.responseAt,
+      freshPct: result.patch.nansenFreshPct,
+    });
+  }
   if (kind === 'gini' && typeof result.patch.nansenFreshPct === 'number' && result.responseAt !== null) {
     stampSetupCacheField(address, chain, 'info_at', result.responseAt);
   }
