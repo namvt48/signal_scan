@@ -14,10 +14,13 @@ Polling trades freshness for latency (-~1 minute) but keeps the alert contract:
   userId/trader -> from the watch list; token/price are optional
 
 The first poll for a user only records a cursor, so deploying this watcher does
-not replay the last 100 swaps as alerts. The cursor advances only after a
-successful ingest, so a failed POST is retried on the next cycle. If more than
-one page of swaps arrives between cycles, the oldest are dropped: this feed has
-never backfilled gaps and does not start now.
+not replay existing swaps as alerts. Later polls page backwards from the newest
+swap (`lastSwapIdV2`) until they reach that cursor, then emit every buy and sell
+newer than it. A detected watched-user BUY also triggers a one-time backfill of
+that user's full buy/sell history for the same (chain, CA), so Buy $ / Sell $
+have complete inputs instead of only the fills seen since the watcher started.
+The cursor advances only after a successful ingest, so a failed POST is retried
+on the next cycle.
 
 State/heartbeat use FOMO-specific files (`fomo_state.json` / `fomo_heartbeat`)
 so a second daemon cannot mask this watcher's liveness.
@@ -49,6 +52,9 @@ from watchers.common.config import _CFG_REFRESH_S, HERE, api_headers
 FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip("/")
 FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
+FOMO_SWAPS_MAX_PAGES = min(200, max(1, int(os.environ.get("FOMO_SWAPS_MAX_PAGES", "50"))))
+FOMO_BACKFILL_MAX_PAGES = min(200, max(1, int(os.environ.get("FOMO_BACKFILL_MAX_PAGES", "20"))))
+FOMO_BACKFILL_TTL_S = max(3600, int(os.environ.get("FOMO_BACKFILL_TTL_S", "604800")))
 FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
 FOMO_EVM_FEED_LIMIT = min(100, max(1, int(os.environ.get("FOMO_EVM_FEED_LIMIT", "100"))))
 FOMO_EVM_BOOTSTRAP_LOOKBACK_S = max(0, int(os.environ.get("FOMO_EVM_BOOTSTRAP_LOOKBACK_S", "900")))
@@ -839,39 +845,191 @@ def post_fomo_trade(
         return False
 
 
-def _fetch_swaps(identity: str, cycle_id: str) -> list[dict[str, Any]] | None:
-    url = f"{FOMO_PROD_URL}/v2/users/{urllib.parse.quote(identity, safe='')}/swaps?limit={FOMO_SWAPS_LIMIT}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        data = _request_bytes_with_retry(req, timeout=_PROD_TIMEOUT_S)
-        payload = json.loads(data)
-    except Exception as ex:
-        _diagnostic(
-            "swaps_fetch_failure",
-            cycle_id=cycle_id,
-            identity=identity,
-            error_type=type(ex).__name__,
-            status_code=getattr(ex, "code", None),
+def _fetch_swaps(
+    identity: str,
+    cycle_id: str,
+    *,
+    stop_at_ms: int | float | None = None,
+    max_pages: int = 1,
+) -> tuple[list[dict[str, Any]], bool] | None:
+    """Fetch newest-first swap pages, walking back to `stop_at_ms`.
+
+    Returns (swaps, truncated). `truncated` means the page cap was reached
+    before the requested timestamp, so the caller must not treat the result as
+    complete. A `None` result is a failed request: preserve the cursor.
+    """
+    swaps: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    after: str | None = None
+    has_next = False
+
+    for page_index in range(max_pages):
+        query = {"limit": str(FOMO_SWAPS_LIMIT)}
+        if after is not None:
+            query["lastSwapIdV2"] = after
+        url = (
+            f"{FOMO_PROD_URL}/v2/users/{urllib.parse.quote(identity, safe='')}"
+            f"/swaps?{urllib.parse.urlencode(query)}"
         )
-        print(f"  ! fomo swaps {identity[:8]}…: {type(ex).__name__}", file=sys.stderr)
-        return None
-    if not isinstance(payload, dict) or payload.get("success") is not True:
-        _diagnostic("swaps_fetch_failure", cycle_id=cycle_id, identity=identity, error_type="invalid_envelope")
-        return None
-    response = payload.get("responseObject")
-    swaps = response.get("swaps") if isinstance(response, dict) else None
-    if not isinstance(swaps, list):
-        _diagnostic("swaps_fetch_failure", cycle_id=cycle_id, identity=identity, error_type="invalid_payload")
-        return None
-    return [swap for swap in swaps if isinstance(swap, dict)]
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            data = _request_bytes_with_retry(req, timeout=_PROD_TIMEOUT_S)
+            payload = json.loads(data)
+        except Exception as ex:
+            _diagnostic(
+                "swaps_fetch_failure",
+                cycle_id=cycle_id,
+                identity=identity,
+                page=page_index + 1,
+                error_type=type(ex).__name__,
+                status_code=getattr(ex, "code", None),
+            )
+            print(f"  ! fomo swaps {identity[:8]}…: {type(ex).__name__}", file=sys.stderr)
+            return None
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            _diagnostic(
+                "swaps_fetch_failure",
+                cycle_id=cycle_id,
+                identity=identity,
+                page=page_index + 1,
+                error_type="invalid_envelope",
+            )
+            return None
+        response = payload.get("responseObject")
+        raw_swaps = response.get("swaps") if isinstance(response, dict) else None
+        if not isinstance(raw_swaps, list):
+            _diagnostic(
+                "swaps_fetch_failure",
+                cycle_id=cycle_id,
+                identity=identity,
+                page=page_index + 1,
+                error_type="invalid_payload",
+            )
+            return None
+
+        page_swaps = [swap for swap in raw_swaps if isinstance(swap, dict)]
+        seen_before = len(swaps)
+        for swap in page_swaps:
+            swap_id = _str(swap.get("id"))
+            if swap_id is not None:
+                if swap_id in seen:
+                    continue
+                seen.add(swap_id)
+            swaps.append(swap)
+        # A page that only repeated rows cannot make progress; stop rather than
+        # spend the remaining page budget on the same cursor.
+        if page_swaps and len(swaps) == seen_before:
+            return swaps, False
+
+        has_next = response.get("hasNextPage") is True
+        last_id = _str(page_swaps[-1].get("id")) if page_swaps else None
+        if not has_next or last_id is None:
+            return swaps, False
+
+        timestamps = [
+            at for at in (_ms(swap.get("createdAt")) for swap in page_swaps)
+            if at is not None
+        ]
+        oldest = min(timestamps) if timestamps else None
+        if stop_at_ms is not None and oldest is not None and oldest < stop_at_ms:
+            return swaps, False
+        after = last_id
+
+    return swaps, has_next
+
+
+def _same_token(left: str, right: str, chain: str) -> bool:
+    if left == right:
+        return True
+    return chain != "sol" and left.lower() == right.lower()
+
+
+def _backfill_user_ca(
+    user: dict[str, str],
+    chain: str,
+    ca: str,
+    st: dict[str, Any],
+    cycle_id: str,
+) -> int:
+    """Backfill one user's full buy/sell history for one (chain, CA), once.
+
+    The rolling poll only sees swaps after its cursor. Buy $ and Sell $ need the
+    whole position's fills, so a newly detected BUY triggers this one-shot walk.
+    The marker is written only after a complete read; a failed read retries on
+    the next BUY detection for the same pair.
+    """
+    identity = user["identity"]
+    key = f"{identity}|{chain}:{ca.lower() if chain != 'sol' else ca}"
+    done = st.setdefault("backfills", {})
+    now_ms = int(time.time() * 1000)
+    last = _num(done.get(key))
+    if last is not None and now_ms - last < FOMO_BACKFILL_TTL_S * 1000:
+        return 0
+
+    fetched = _fetch_swaps(
+        identity,
+        cycle_id,
+        stop_at_ms=None,
+        max_pages=FOMO_BACKFILL_MAX_PAGES,
+    )
+    if fetched is None:
+        return 0
+    swaps, truncated = fetched
+
+    posted = 0
+    for swap in swaps:
+        body, _reason = _swap_body(swap, user)
+        if body is None or body["chain"] != chain:
+            continue
+        if not _same_token(body["tokenAddress"], ca, chain):
+            continue
+        event_id = body["eventId"]
+        if event_id in _seen:
+            continue
+        if not post_fomo_trade(body, cycle_id=cycle_id):
+            _diagnostic(
+                "swap_backfill_failure",
+                cycle_id=cycle_id,
+                identity=identity,
+                chain=chain,
+                ca=ca,
+                event_id=event_id,
+            )
+            return posted
+        _dedupe(event_id)
+        posted += 1
+
+    done[key] = now_ms
+    save_state(st)
+    _diagnostic(
+        "swap_backfill",
+        cycle_id=cycle_id,
+        identity=identity,
+        chain=chain,
+        ca=ca,
+        swaps=len(swaps),
+        posted=posted,
+        truncated=truncated,
+    )
+    return posted
 
 
 def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
-    """Poll one user's newest swaps. Returns number of successfully ingested events."""
+    """Poll one user's swaps back to the stored cursor. Returns ingested events."""
     identity = user["identity"]
-    swaps = _fetch_swaps(identity, cycle_id)
-    if swaps is None:
+    cursors = st.setdefault("cursors", {})
+    cursor = _num(cursors.get(identity))
+    bootstrap = cursor is None
+    fetched = _fetch_swaps(
+        identity,
+        cycle_id,
+        stop_at_ms=None if bootstrap else cursor,
+        max_pages=1 if bootstrap else FOMO_SWAPS_MAX_PAGES,
+    )
+    if fetched is None:
         return 0
+    swaps, truncated = fetched
+
     page: list[tuple[int, dict[str, Any]]] = []
     for swap in swaps:
         at = _ms(swap.get("createdAt"))
@@ -879,11 +1037,9 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
             page.append((at, swap))
     page.sort(key=lambda item: item[0])
 
-    cursors = st.setdefault("cursors", {})
-    cursor = _num(cursors.get(identity))
-    if cursor is None:
+    if bootstrap:
         # Bootstrap: record the newest swap and emit nothing. This prevents a
-        # deploy or a newly watched user from replaying the last page.
+        # deploy or a newly watched user from replaying existing history.
         # One millisecond past the newest existing swap, so every fill already
         # on the first page (including same-millisecond fills) stays historical.
         cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
@@ -892,8 +1048,21 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
         _diagnostic("poll_bootstrap", cycle_id=cycle_id, identity=identity, cursor=int(cursor))
         return 0
 
+    if truncated:
+        # Do not advance past swaps we did not read. The next cycle retries with
+        # the same cursor; a partial ingest would silently lose old fills.
+        _diagnostic(
+            "swaps_truncated",
+            cycle_id=cycle_id,
+            identity=identity,
+            cursor=int(cursor),
+            pages=max(1, FOMO_SWAPS_MAX_PAGES),
+        )
+        return 0
+
     emitted = 0
     changed = False
+    buys: set[tuple[str, str]] = set()
     for at, swap in page:
         # Revisit the boundary timestamp: several fills can share one
         # millisecond. `_seen` skips acknowledged ones, while a failed POST at
@@ -932,6 +1101,8 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
         cursor = float(at)
         changed = True
         emitted += 1
+        if body["type"] == "buy":
+            buys.add((body["chain"], body["tokenAddress"]))
         st["last_ts"] = max(st.get("last_ts") or 0, at)
         st["emitted"] = int(st.get("emitted") or 0) + 1
         save_state(st)
@@ -953,6 +1124,9 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
     if changed:
         cursors[identity] = cursor
         save_state(st)
+
+    for chain, ca in sorted(buys):
+        _backfill_user_ca(user, chain, ca, st, cycle_id)
     return emitted
 
 

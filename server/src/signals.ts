@@ -78,9 +78,12 @@ export interface TrackedWalletStat {
 }
 
 /**
- * One watched FOMO trader's activity on a token (large trades only). buyUsd is
- * 24h BUY spend, null when any in-window amount is unresolved; sellPnlUsd is
- * SELL realised PnL, reported separately.
+ * One watched FOMO trader's activity on a token. buyUsd is 24h BUY spend and
+ * sellUsd is 24h SELL proceeds, both null when any in-window amount is
+ * unresolved. They are reported separately and never netted: spend and
+ * proceeds are different quantities. balUsd is the current position value
+ * (amount × FOMO position price); holdingPct is that value divided by the CA's
+ * market cap, not a share of token supply.
  */
 export interface FomoUserStat {
   handle: string;
@@ -89,16 +92,17 @@ export interface FomoUserStat {
   tags?: string[];
   clan?: string;
   buyUsd: number | null;
-  sellPnlUsd: number;
+  /** Σ sell proceeds (`trade_usd`) in the window; null if any SELL lacks it. */
+  sellUsd: number | null;
   buys: number;
   sells: number;
   trades: number;
   lastTs: number;
   /** Σ token units the user's wallets hold of this CA; absent until measured. */
   holdingAmount?: number;
-  /** holdingAmount / total supply × 100; absent when never measured or supply unknown. */
+  /** balUsd / CA market cap × 100; absent when value or market cap is unknown. */
   holdingPct?: number;
-  /** Current token balance USD for this user's (chain, CA) position. */
+  /** Current position value (amount × price); 0 only for a measured zero. */
   balUsd?: number;
 }
 
@@ -355,21 +359,23 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
 }
 
 /** Raw SQLite row behind fomoUserStats — name is '' and clan NULL when unset.
- *  holdingAmount/holdingPct are NULL until the wallet's holding is measured. */
+ *  holdingAmount is NULL until the wallet's holding is measured; Bal and its
+ *  market-cap percentage are derived in JS so both aggregations share one rule. */
 interface FomoUserStatRow {
   handle: string;
   name: string;
   tags: string;
   clan: string | null;
   buyUsd: number | null;
-  sellPnlUsd: number;
+  sellUsd: number | null;
   buys: number;
   sells: number;
   trades: number;
   lastTs: number;
   holdingAmount: number | null;
-  holdingPct: number | null;
-  balUsd: number | null;
+  positionPrice: number | null;
+  tokenPrice: number | null;
+  marketCap: number | null;
 }
 
 /**
@@ -386,6 +392,41 @@ const BUY_USD_SQL = `CASE
 END AS buyUsd`;
 
 /**
+ * Sell $ is gross proceeds, not realised PnL: `trade_usd` is the USD actually
+ * received, while a sell's `usd_value` is signed realised PnL. Same unknown
+ * rule as Buy $ — one unresolved SELL makes the whole total unknown.
+ */
+const SELL_USD_SQL = `CASE
+  WHEN SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) = 0 THEN 0
+  WHEN SUM(CASE WHEN t.type = 'sell' AND t.trade_usd IS NULL THEN 1 ELSE 0 END) > 0 THEN NULL
+  ELSE SUM(CASE WHEN t.type = 'sell' THEN t.trade_usd END)
+END AS sellUsd`;
+
+/** Position value and its market-cap share, shared by both aggregations. */
+function fomoPositionMetrics(
+  holdingAmount: number | null,
+  positionPrice: number | null,
+  tokenPrice: number | null,
+  marketCap: number | null,
+): { balUsd?: number; holdingPct?: number } {
+  const price = positionPrice ?? tokenPrice;
+  const balUsd = holdingAmount === 0
+    ? 0
+    : holdingAmount !== null && price !== null && Number.isFinite(price)
+      ? holdingAmount * price
+      : undefined;
+  const holdingPct = balUsd === 0
+    ? 0
+    : balUsd !== undefined && marketCap !== null && Number.isFinite(marketCap) && marketCap > 0
+      ? (balUsd * 100) / marketCap
+      : undefined;
+  return {
+    ...(balUsd !== undefined ? { balUsd } : {}),
+    ...(holdingPct !== undefined ? { holdingPct } : {}),
+  };
+}
+
+/**
  * Per-user FOMO stats for one CA — the fomo mirror of trackedWalletStats, with
  * the same membership-vs-stats-window split.
  *
@@ -399,13 +440,17 @@ END AS buyUsd`;
  * Buy $ is known trade_usd from BUY rows in the rolling 24h window. Scoped to ONE
  * (chain, ca) identity: the same ca string on two chains must not pool trades.
  *
- * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd sums only
+ * The stats cover the SAME 24h window trackedWalletStats uses. buyUsd sums
+ * `trade_usd` on in-window BUY rows; sellUsd sums `trade_usd` on in-window SELL
+ * rows (gross proceeds), never the sell's `usd_value` (signed realised PnL).
+ * The two are reported SEPARATELY and are never combined into a net/inflow
+ * figure: a buy's figure is a SPEND and a sell's is PROCEEDS — different
+ * quantities that must never be summed (fomo_trades DDL).
  *
- * `trade_usd` on in-window BUY rows; sellPnlUsd sums in-window SELL rows only
- * (a sell's usd_value is signed realised PnL). The two are reported SEPARATELY
- * and are never combined into a net/inflow figure: a buy's figure is a SPEND
- * and a sell's is a PnL — different quantities that must never be summed
- * (fomo_trades DDL).
+ * balUsd is the current position value: measured token amount × the FOMO
+ * position's own price when available, else the chain-scoped token price.
+ * holdingPct divides that value by token_state.market_cap — a share of the CA's
+ * market cap, NOT amount / supply.
  *
  * Rows are ordered newest-trade-first, so a member with no trade inside the
  * stats window (lastTs 0) sinks below the active ones. name '' / clan NULL
@@ -419,7 +464,7 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
               u.tags AS tags,
               u.clan AS clan,
               ${BUY_USD_SQL},
-              COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
+              ${SELL_USD_SQL},
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
@@ -428,30 +473,9 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
                          AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
                    WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
                    WHEN h.measured_at >= @apiSince THEN h.amount END AS holdingAmount,
-              CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                         AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN COALESCE(
-                a.pct,
-                CASE WHEN (SELECT supply FROM token_state WHERE ca = @ca AND chain = @chain) > 0
-                     THEN a.amount * 100.0 / (SELECT supply FROM token_state WHERE ca = @ca AND chain = @chain)
-                END)
-                   WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince
-                     THEN (p.amount / NULLIF((SELECT supply FROM token_state WHERE ca = @ca AND chain = @chain), 0)) * 100
-              WHEN h.measured_at >= @apiSince THEN h.pct END AS holdingPct,
-              CASE WHEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END) = 0 THEN 0
-                   WHEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END) IS NOT NULL
-                     AND (SELECT price FROM token_state WHERE ca = @ca AND chain = @chain) IS NOT NULL
-                     THEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END)
-                          * (SELECT price FROM token_state WHERE ca = @ca AND chain = @chain)
-                   END AS balUsd
+              MAX(CASE WHEN p.fetched_at >= @apiSince THEN p.price_usd END) AS positionPrice,
+              MAX(state.price) AS tokenPrice,
+              MAX(state.market_cap) AS marketCap
          FROM fomo_users u
          LEFT JOIN fomo_trades t
            ON t.fomo_user_id = u.id AND t.ca = @ca AND t.chain = @chain AND t.ts >= @statSince
@@ -461,6 +485,8 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
            ON a.fomo_user_id = u.id AND a.ca = @ca AND a.chain = @chain
          LEFT JOIN fomo_api_balance_snapshots s
            ON s.fomo_user_id = u.id
+         LEFT JOIN token_state state
+           ON state.ca = @ca AND state.chain = @chain
          LEFT JOIN (
            SELECT p.fomo_user_id, p.ca, p.chain, p.trade_id, p.status, p.amount, p.cost_basis_usd,
                   p.avg_entry_price, p.price_usd, p.realized_pnl_usd, p.unrealized_pnl_usd,
@@ -495,22 +521,22 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
         ORDER BY lastTs DESC, u.handle`,
     )
     .all({ ca, chain, statSince: now - 86_400_000, apiSince: now - 86_400_000 }) as FomoUserStatRow[];
-  return rows.map(({ handle, name, tags, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct, balUsd }) => {
+  return rows.map(({ handle, name, tags, clan, buyUsd, sellUsd, buys, sells, trades, lastTs, holdingAmount, positionPrice, tokenPrice, marketCap }) => {
     const tagList = parseTags(tags);
+    const metrics = fomoPositionMetrics(holdingAmount, positionPrice, tokenPrice, marketCap);
     return {
       handle,
       ...(name !== '' ? { name } : {}),
       ...(tagList.length > 0 ? { tags: tagList } : {}),
       ...(clan != null && clan !== '' ? { clan } : {}),
       buyUsd,
-      sellPnlUsd,
+      sellUsd,
       buys,
       sells,
       trades,
       lastTs,
       ...(holdingAmount != null ? { holdingAmount } : {}),
-      ...(holdingPct != null ? { holdingPct } : {}),
-      ...(balUsd != null ? { balUsd } : {}),
+      ...metrics,
     };
   });
 }
@@ -563,7 +589,7 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
               u.tags AS tags,
               u.clan AS clan,
               ${BUY_USD_SQL},
-              COALESCE(SUM(CASE WHEN t.type = 'sell' THEN t.usd_value END), 0) AS sellPnlUsd,
+              ${SELL_USD_SQL},
               SUM(CASE WHEN t.type = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.type = 'sell' THEN 1 ELSE 0 END) AS sells,
               COUNT(t.id) AS trades,
@@ -572,30 +598,9 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
                          AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
                    WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
                    WHEN h.measured_at >= @apiSince THEN h.amount END AS holdingAmount,
-              CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                         AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN COALESCE(
-                a.pct,
-                CASE WHEN (SELECT supply FROM token_state WHERE ca = m.ca AND chain = m.chain) > 0
-                     THEN a.amount * 100.0 / (SELECT supply FROM token_state WHERE ca = m.ca AND chain = m.chain)
-                END)
-                   WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince
-                     THEN (p.amount / NULLIF((SELECT supply FROM token_state WHERE ca = m.ca AND chain = m.chain), 0)) * 100
-                   WHEN h.measured_at >= @apiSince THEN h.pct END AS holdingPct,
-              CASE WHEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END) = 0 THEN 0
-                   WHEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END) IS NOT NULL
-                     AND (SELECT price FROM token_state WHERE ca = m.ca AND chain = m.chain) IS NOT NULL
-                     THEN (CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                                   AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                              WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
-                              WHEN h.measured_at >= @apiSince THEN h.amount END)
-                          * (SELECT price FROM token_state WHERE ca = m.ca AND chain = m.chain)
-                   END AS balUsd
+              MAX(CASE WHEN p.fetched_at >= @apiSince THEN p.price_usd END) AS positionPrice,
+              MAX(state.price) AS tokenPrice,
+              MAX(state.market_cap) AS marketCap
          FROM members m
          JOIN fomo_users u ON u.id = m.fomo_user_id
          LEFT JOIN fomo_trades t
@@ -614,12 +619,14 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
            ON p.fomo_user_id = m.fomo_user_id AND p.ca = m.ca AND p.chain = m.chain
          LEFT JOIN fomo_api_balance_snapshots s
            ON s.fomo_user_id = m.fomo_user_id
+         LEFT JOIN token_state state
+           ON state.ca = m.ca AND state.chain = m.chain
         GROUP BY m.chain, m.ca, m.fomo_user_id
         ORDER BY m.chain, m.ca, lastTs DESC, u.handle`,
     )
     .all({ statSince: now - 86_400_000, apiSince: now - 86_400_000 }) as (FomoUserStatRow & { ca: string; chain: string })[];
   const out = new Map<string, FomoUserStat[]>();
-  for (const { chain, ca, handle, name, tags, clan, buyUsd, sellPnlUsd, buys, sells, trades, lastTs, holdingAmount, holdingPct, balUsd } of rows) {
+  for (const { chain, ca, handle, name, tags, clan, buyUsd, sellUsd, buys, sells, trades, lastTs, holdingAmount, positionPrice, tokenPrice, marketCap } of rows) {
     // Same conditional spreads (and key order) as fomoUserStats — the JSON
     // response must stay byte-identical.
     const tagList = parseTags(tags);
@@ -629,14 +636,13 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
       ...(tagList.length > 0 ? { tags: tagList } : {}),
       ...(clan != null && clan !== '' ? { clan } : {}),
       buyUsd,
-      sellPnlUsd,
+      sellUsd,
       buys,
       sells,
       trades,
       lastTs,
       ...(holdingAmount != null ? { holdingAmount } : {}),
-      ...(holdingPct != null ? { holdingPct } : {}),
-      ...(balUsd != null ? { balUsd } : {}),
+      ...fomoPositionMetrics(holdingAmount, positionPrice, tokenPrice, marketCap),
     };
     const key = `${chain}:${ca}`;
     const list = out.get(key);

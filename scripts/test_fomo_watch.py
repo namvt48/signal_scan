@@ -126,7 +126,10 @@ feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1
 
 t0 = 1_760_000_000_000
 page = [swap(id="old", createdAt=t0), swap(id="new", createdAt=t0 + 1_000)]
-feed._fetch_swaps = lambda identity, cycle_id: list(page)
+_backfill_real = feed._backfill_user_ca
+_fetch_swaps_real = feed._fetch_swaps
+feed._backfill_user_ca = lambda *args, **kwargs: 0
+feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(page), False)
 st = {"cursors": {}}
 emitted = feed._poll_user(user, st, "cycle-1")
 check(emitted == 0 and posted == [], "bootstrap: first page is not replayed")
@@ -166,6 +169,59 @@ check(st["cursors"]["fomo-user-1"] == t0 + 4_000, "same-ms fills: cursor advance
 posted = []
 feed._poll_user(user, st, "cycle-7")
 check(posted == [], "same-ms fills: boundary re-read dedupes")
+
+
+# ---------- swap pagination ----------
+
+requests = []
+page1 = {"success": True, "responseObject": {"swaps": [
+    swap(id="p1-a", createdAt=t0 + 4_000),
+    swap(id="p1-b", createdAt=t0 + 3_000),
+], "hasNextPage": True}}
+page2 = {"success": True, "responseObject": {"swaps": [
+    swap(id="p2-a", createdAt=t0 + 2_000),
+    swap(id="p2-b", createdAt=t0 + 1_000),
+], "hasNextPage": True}}
+
+
+def fake_pages(req, **kwargs):
+    requests.append(req.full_url)
+    return json.dumps(page1 if len(requests) == 1 else page2).encode()
+
+
+feed._fetch_swaps = _fetch_swaps_real
+feed._request_bytes_with_retry = fake_pages
+fetched = feed._fetch_swaps("fomo-user-1", "cycle-pages", stop_at_ms=t0 + 1_500, max_pages=5)
+check(fetched is not None, "pagination: fetch succeeds")
+swaps, truncated = fetched
+check([s["id"] for s in swaps] == ["p1-a", "p1-b", "p2-a", "p2-b"], "pagination: pages are appended")
+check("lastSwapIdV2=p1-b" in requests[1], "pagination: next page uses the previous page's last swap id")
+check(not truncated, "pagination: stops after crossing the cursor")
+
+requests = []
+fetched = feed._fetch_swaps("fomo-user-1", "cycle-cap", stop_at_ms=t0, max_pages=1)
+check(fetched is not None and fetched[1] is True, "pagination: page cap reports truncation")
+
+# ---------- per-CA backfill ----------
+
+feed._seen = set()
+posted = []
+feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+target = "0x1111111111111111111111111111111111111111"
+quote = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+history = [
+    swap(id="hist-buy", outTokenAddress=target, createdAt=t0 - 5_000),
+    swap(id="hist-sell", inTokenAddress=target, outTokenAddress=quote, createdAt=t0 - 4_000),
+    swap(id="hist-other", outTokenAddress="0x2222222222222222222222222222222222222222", createdAt=t0 - 3_000),
+]
+feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(history), False)
+st = {"backfills": {}}
+backfilled = _backfill_real(user, "base", target, st, "cycle-backfill")
+check(backfilled == 2 and len(posted) == 2, "backfill: only this user/CA buys and sells")
+check([b["eventId"] for b in posted] == ["fomo-swap:hist-buy", "fomo-swap:hist-sell"], "backfill: both directions")
+check(st["backfills"]["fomo-user-1|base:" + target] > 0, "backfill: completion marker stored")
+again = _backfill_real(user, "base", target, st, "cycle-backfill-2")
+check(again == 0 and len(posted) == 2, "backfill: marker suppresses a second walk")
 
 
 # ---------- EVM CA refresh ----------

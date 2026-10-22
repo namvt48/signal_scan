@@ -13,7 +13,7 @@ The API process and the FOMO watcher call this bridge over the compose network
 Routes:
   GET /health
   GET /v2/users/{userId}/balances
-  GET /v2/users/{userId}/swaps?limit=100
+  GET /v2/users/{userId}/swaps?limit=100[&lastSwapIdV2=<swap id>]
 
 Everything else is rejected. Write/trade endpoints are never proxied.
 """
@@ -370,12 +370,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         query: dict[str, str] = {}
         if endpoint == "swaps":
-            raw_limit = parse_qs(parsed.query).get("limit", ["100"])[0]
+            qs = parse_qs(parsed.query)
+            raw_limit = qs.get("limit", ["100"])[0]
             try:
                 limit = max(1, min(100, int(raw_limit)))
             except ValueError:
                 limit = 100
             query["limit"] = str(limit)
+            # FOMO pages /swaps newest-first with lastSwapIdV2. Forward it so the
+            # watcher can walk back to its stored cursor instead of dropping
+            # everything beyond the first 100 fills.
+            after = qs.get("lastSwapIdV2", [""])[0].strip()
+            if after:
+                if len(after) > 128:
+                    self._send(400, b'{"error":"lastSwapIdV2 is too long"}')
+                    return
+                query["lastSwapIdV2"] = after
         status, body, content_type = upstream_get(
             f"/v2/users/{quote(identity, safe='')}/{endpoint}", query,
         )

@@ -47,10 +47,10 @@ const WALLET_COLS: readonly string[] = SHOW_CLAN
   : ['21%', '8%', '16%', '19%', '11%', '14%', '11%'];
 
 /*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Bal / Trades / Buy $ / Sell PnL / Age.
+ * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Bal / Trades / Buy $ / Sell $ / Age.
  * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
  * line up row for row. Shares track each column's widest content (user 2026-10-01):
- * the old split starved the right pair (Sell PnL ↔ Age ~16px) and left Clan/Trades
+ * the old split starved the right pair (Sell $ ↔ Age ~16px) and left Clan/Trades
  * with >100px of dead space, so the horizontal rhythm read ragged.
  */
 const FOMO_COLS: readonly string[] = SHOW_CLAN
@@ -64,9 +64,11 @@ const INLINE_ACTIVITY_LIMIT = 5;
 const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
 
 /**
- * FOMO rows retain FOMO-user inflow/holding semantics. The FOMO `Tracked in`
- * count includes both matched FOMO users and native wallets that traded this CA;
- * their names remain separate in the breakdown so identities are not conflated.
+ * FOMO rows retain FOMO-user inflow/holding semantics. FOMO holding is the sum
+ * of each user's position value ÷ CA market cap (not supply share). The FOMO
+ * `Tracked in` count includes both matched FOMO users and native wallets that
+ * traded this CA; their names remain separate in the breakdown so identities
+ * are not conflated.
  */
 const rowInflow = (s: TokenSignal): number | null => (SHOW_FOMO
   ? sumKnownUsd(s.fomoUsers.map((u) => u.buyUsd))
@@ -192,10 +194,11 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
 }
 
 /*
- * FOMO breakdown rows (User / Clan? / Bal / Trades / Buy $ / Sell PnL / Age), sibling of WalletTable.
- * `buyUsd` is Σ large-BUY size and `sellPnlUsd` is Σ realised PnL on SELL rows — reported
- * separately, never a net figure. Newest trade first; long handles truncate; numerics
- * right-aligned mono like the wallet rows.
+ * FOMO breakdown rows (User / Clan? / Bal / Trades / Buy $ / Sell $ / Age), sibling of WalletTable.
+ * `buyUsd` is Σ BUY spend and `sellUsd` is Σ SELL proceeds — reported separately,
+ * never a net figure. Bal is position value; its parenthesized percentage is
+ * that value divided by the CA market cap. Newest trade first; long handles
+ * truncate; numerics right-aligned mono like the wallet rows.
  */
 function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head?: boolean; limit?: number }) {
   const sortedRows = [...users].sort((a, b) => b.lastTs - a.lastTs);
@@ -215,7 +218,7 @@ function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head
             <th className="whitespace-nowrap pb-1 pr-1 text-right">Bal</th>
             <th className="pb-1 pr-3 text-right">Trades</th>
             <th className="pb-1 pr-3 text-right">Buy $</th>
-            <th className="pb-1 pr-3 text-right">Sell PnL</th>
+            <th className="pb-1 pr-3 text-right">Sell $</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
@@ -239,7 +242,7 @@ function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head
                 )}
               </td>
             )}
-            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title={tokenBalanceTooltip(u.holdingAmount) ?? 'Current held token balance in USD; parenthesized percentage is supply share'}>
+            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current position value; parenthesized percentage is position value ÷ CA market cap">
               <span className={trackedUsdClass(u.balUsd)} title={tokenBalanceTooltip(u.holdingAmount)}>{walletBalanceLabel(u)}</span>
             </td>
             <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
@@ -251,10 +254,10 @@ function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head
               <span className={volumeClass(u.buyUsd ?? undefined, 'buy')}>{u.buyUsd === null ? '—' : usd(u.buyUsd)}</span>
             </td>
             <td
-              className={`py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums ${u.sellPnlUsd >= 0 ? 'text-pos' : 'text-neg'}`}
-              title="Σ realised PnL on SELL rows — not sell volume"
+              className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-neg"
+              title="Σ sell proceeds (USD actually received) in the last 24h; — when any sell amount is unavailable"
             >
-              {usd(u.sellPnlUsd)}
+              {u.sellUsd === null ? '—' : usd(u.sellUsd)}
             </td>
             <td className="whitespace-nowrap py-1 pl-3 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
@@ -538,7 +541,7 @@ function SignalHead({
         className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'} text-center!`}
         title={
           SHOW_FOMO
-            ? 'FOMO watch-list activity. Buy $ is the sum of large BUY sizes, not net inflow or PnL.'
+            ? 'FOMO watch-list activity. Buy $ is Σ BUY spend, Sell $ is Σ SELL proceeds — neither is net inflow or PnL.'
             : undefined
         }
       >
@@ -548,13 +551,13 @@ function SignalHead({
             <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
               <span className="text-left">User</span>
               {SHOW_CLAN && <span className="text-left">Clan</span>}
-              <span className="whitespace-nowrap pr-1 text-right" title="Current held token balance in USD">Bal</span>
+              <span className="whitespace-nowrap pr-1 text-right" title="Current position value; percentage = value ÷ market cap">Bal</span>
               <span className="pr-3 text-right">Trades</span>
-              <span className="pr-3 text-right" title="Σ large BUY sizes — not net inflow/PnL">
+              <span className="pr-3 text-right" title="Σ BUY spend — not net inflow/PnL">
                 Buy $
               </span>
-              <span className="pr-3 text-right" title="Σ realised PnL on SELL rows — not sell volume">
-                Sell PnL
+              <span className="pr-3 text-right" title="Σ SELL proceeds — not realised PnL">
+                Sell $
               </span>
               <span className="pl-3 text-left">Age</span>
             </span>
@@ -1193,7 +1196,7 @@ export default function SignalTable({
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={inflow === null ? 'One or more in-window FOMO BUY amounts are unavailable' : undefined}><span className={volumeClass(inflow ?? undefined, 'inflow')}>{inflow === null ? '—' : usd(inflow)}</span></div>
                         </Td>
                         <Td className="w-24">
-                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={holdingPartial ? 'Partial measured FOMO-user holdings; unknown users are omitted' : undefined}>
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={holdingPartial ? 'Σ FOMO position value ÷ CA market cap; unknown users are omitted' : undefined}>
                             <span className={trackedHoldingClass(holding)}>{holding !== undefined ? `${holdingPartial ? '≈' : ''}${pct(holding)}` : '—'}</span>
                           </div>
                         </Td>

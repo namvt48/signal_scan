@@ -100,9 +100,10 @@ export interface TrackedWalletStat {
 }
 
 /**
- * One watched FOMO trader's activity on a token (large trades only). buyUsd is BUY size
- * for the trailing 24h, or null if any in-window BUY amount is unresolved; sellPnlUsd is
- * SELL realised PnL — reported separately, never combined into a net figure.
+ * One watched FOMO trader's activity on a token. buyUsd is BUY spend for the
+ * trailing 24h and sellUsd is SELL proceeds, both null if any in-window amount
+ * is unresolved; never netted. balUsd is the current position value and
+ * holdingPct is that value divided by the CA market cap.
  */
 export interface FomoUserStat {
   handle: string;
@@ -111,17 +112,17 @@ export interface FomoUserStat {
   tags?: string[];
   clan?: string;
   buyUsd: number | null;
-  /** Σ realised PnL on SELL rows. May be negative. NOT sell volume. */
-  sellPnlUsd: number;
+  /** Σ sell proceeds in the window; null when any SELL amount is unresolved. */
+  sellUsd: number | null;
   buys: number;
   sells: number;
   trades: number;
   lastTs: number;
   /** Σ token units the user's wallets hold of this CA; absent until measured. */
   holdingAmount?: number;
-  /** Share of total supply held; absent when never measured or supply unknown. */
+  /** Position value ÷ CA market cap × 100; absent when either is unknown. */
   holdingPct?: number;
-  /** Current token balance USD for this user's (chain, CA) position. */
+  /** Current position value (amount × price); 0 only for a measured zero. */
   balUsd?: number;
 }
 

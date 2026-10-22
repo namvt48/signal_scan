@@ -9,7 +9,7 @@ the only process that holds the Privy access/refresh tokens.
 ```text
 GET /health
 GET /v2/users/{userId}/balances
-GET /v2/users/{userId}/swaps?limit=100
+GET /v2/users/{userId}/swaps?limit=100[&lastSwapIdV2={swap id}]
 GET /feed/token?tokenAddress={ca}&networkId={id}
 ```
 
@@ -18,9 +18,12 @@ watcher skips watch-list rows without a `userId` (`skipped N without userId`).
 `/balances` returns at most 100 rows and no pagination flag; the API treats a
 full page as possibly truncated and does not close missing holdings.
 
-The per-user `/swaps` endpoint currently returns Solana activity only. EVM
-activity is available through `/feed/token` (token-scoped); the bridge exposes
-it for the watcher's EVM token-feed pass.
+The per-user `/swaps` endpoint is paged newest-first: `hasNextPage` +
+`lastSwapIdV2={last swap id}` walks backwards. The bridge forwards both the
+page size and cursor, and the watcher keeps paging until its stored timestamp
+cursor (then confirms a detected BUY with a one-time full buy/sell backfill for
+that user and CA). The endpoint currently returns Solana activity only; EVM
+activity is available through `/feed/token` (token-scoped).
 
 Only read-only routes are proxied. Write/trade endpoints are not reachable
 through this bridge.

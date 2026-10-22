@@ -300,6 +300,33 @@ body = r.json()["responseObject"]
 - Không suy trade size từ `usdValue` của alert cũ.
 - Missing/unknown phải giữ `unknown`, không đổi thành `0`.
 
+### 8.1 Bal và % trên dashboard
+
+`Bal` là **position value hiện tại** (mark-to-market), không phải số tiền đã mua:
+
+```text
+Bal = token amount × price
+```
+
+- Token amount: `balance.shiftedBalance` / `userToken.humanAmountRemaining` từ
+  `/v2/users/{id}/balances` (đã lưu ở `fomo_positions.amount`).
+- Price: `tokenFilterResult.priceUSD` từ `/balances` (lưu ở
+  `fomo_positions.price_usd`); nếu thiếu thì fallback `token_state.price`.
+- **Không** dùng `userToken.totalCostBasisUsd` (invested/cost basis) làm Bal.
+  Ví dụ đo được: position value $8,611.97, invested $7,969.97 — hai đại lượng khác nhau.
+- Giá di chuyển liên tục; $8,611.97 và $8,625.22 chỉ là hai thời điểm của cùng
+  phép nhân, không phải hai field khác nhau.
+
+`%` cạnh Bal:
+
+```text
+% = Bal / token_state.market_cap × 100
+```
+
+Không dùng `amount / token_state.supply × 100` cho cột này. Nếu amount, price
+hoặc market cap chưa biết, giữ `null`/`undefined` — không zero-fill; amount = 0
+đã đo được thì Bal = 0 và % = 0.
+
 ---
 
 ## 9. Rủi ro
