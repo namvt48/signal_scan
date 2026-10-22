@@ -83,6 +83,13 @@ body, reason = feed._swap_body(swap(
 ), user)
 check(reason is None and body and body["chain"] == "robinhood" and body["type"] == "buy", "robinhood: USDG quote maps to buy")
 
+body, reason = feed._swap_body(swap(
+    inTokenAddress="0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    outTokenAddress="0x3333333333333333333333333333333333333333",
+    networkId=56, inNetworkId=56, outNetworkId=56,
+), user)
+check(reason is None and body and body["chain"] == "bsc" and body["type"] == "buy", "bsc: WBNB quote maps to buy")
+
 body, reason = feed._swap_body(swap(networkId=1, inNetworkId=1, outNetworkId=1), user)
 check(body is None and reason == "unsupported_chain", "unsupported chain: skipped")
 body, reason = feed._swap_body(swap(id=None), user)
