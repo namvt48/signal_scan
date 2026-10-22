@@ -225,11 +225,29 @@ evm_page = [
     feed_item(id="evm-new", createdAt=t0 + 1_000),
 ]
 feed._fetch_token_feed = lambda chain, ca, cycle_id: list(evm_page)
+feed.FOMO_EVM_BOOTSTRAP_LOOKBACK_S = 0
 st = {"evm_cursors": {}}
 posted = []
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-1")
 check(ok and emitted == 0 and posted == [], "evm feed: bootstrap is not replayed")
 check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 1_001, "evm feed: cursor starts past newest")
+
+# New tracked CA: keep a grace window so the buy that triggered tracking is
+# ingested instead of being dropped by the bootstrap skip.
+feed.FOMO_EVM_BOOTSTRAP_LOOKBACK_S = 900
+feed._seen = set()
+st = {"evm_cursors": {}}
+posted = []
+evm_page = [
+    feed_item(id="evm-stale", createdAt=t0 - 2_000_000),
+    feed_item(id="evm-recent", createdAt=t0),
+]
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-grace")
+check(ok and emitted == 1 and len(posted) == 1, "evm feed: bootstrap grace ingests recent watched buy")
+check(posted[0]["eventId"] == "fomo-feed:evm-recent", "evm feed: grace skips stale history")
+feed.FOMO_EVM_BOOTSTRAP_LOOKBACK_S = 900
+feed._seen = set()
+posted = []
 
 evm_page = [
     feed_item(id="unwatched", createdAt=t0 + 2_000, userId="other-user"),

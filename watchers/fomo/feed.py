@@ -51,6 +51,7 @@ FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60"))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
 FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
 FOMO_EVM_FEED_LIMIT = min(100, max(1, int(os.environ.get("FOMO_EVM_FEED_LIMIT", "100"))))
+FOMO_EVM_BOOTSTRAP_LOOKBACK_S = max(0, int(os.environ.get("FOMO_EVM_BOOTSTRAP_LOOKBACK_S", "900")))
 FOMO_TRACKED_CAS_REFRESH_S = max(30, int(os.environ.get("FOMO_TRACKED_CAS_REFRESH_S", "300")))
 FOMO_MONITOR_HEARTBEAT = Path("/root/signal-scan-monitor/heartbeats/fomo")
 
@@ -651,12 +652,16 @@ def _poll_evm_ca(
     cursors = st.setdefault("evm_cursors", {})
     cursor = _num(cursors.get(key))
     if cursor is None:
-        # Same bootstrap rule as the per-user pass: never replay the current page.
-        cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
+        # Bootstrap skips old history, but keeps a short grace window: when a
+        # watched buy pulls a new CA into tracking, the feed poll must still
+        # ingest that buy instead of dropping the page wholesale.
+        if page and FOMO_EVM_BOOTSTRAP_LOOKBACK_S > 0:
+            cursor = float(max(0, page[-1][0] - FOMO_EVM_BOOTSTRAP_LOOKBACK_S * 1000))
+        else:
+            cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
         cursors[key] = cursor
         save_state(st)
         _diagnostic("evm_bootstrap", cycle_id=cycle_id, chain=chain, ca=ca, cursor=int(cursor))
-        return 0, len(page), True
 
     emitted = 0
     changed = False
