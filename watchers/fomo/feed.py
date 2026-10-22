@@ -50,6 +50,7 @@ FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip(
 FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
 FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
+FOMO_EVM_FEED_LIMIT = min(100, max(1, int(os.environ.get("FOMO_EVM_FEED_LIMIT", "100"))))
 FOMO_TRACKED_CAS_REFRESH_S = max(30, int(os.environ.get("FOMO_TRACKED_CAS_REFRESH_S", "300")))
 FOMO_MONITOR_HEARTBEAT = Path("/root/signal-scan-monitor/heartbeats/fomo")
 
@@ -601,7 +602,7 @@ def _fetch_token_feed(
         return None
     url = (
         f"{FOMO_PROD_URL}/feed/token?tokenAddress={urllib.parse.quote(ca, safe='')}"
-        f"&networkId={network_id}"
+        f"&networkId={network_id}&limit={FOMO_EVM_FEED_LIMIT}"
     )
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
