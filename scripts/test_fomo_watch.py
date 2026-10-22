@@ -5,6 +5,7 @@ Chạy: python3 scripts/test_fomo_watch.py
 Không gọi mạng/API thật: fetch swaps và POST ingest đều được stub.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -157,6 +158,93 @@ check(st["cursors"]["fomo-user-1"] == t0 + 4_000, "same-ms fills: cursor advance
 posted = []
 feed._poll_user(user, st, "cycle-7")
 check(posted == [], "same-ms fills: boundary re-read dedupes")
+
+
+# ---------- EVM CA refresh ----------
+
+feed._evm = {"cas": [], "next": 0.0}
+feed._request_bytes_with_retry = lambda req, timeout=None: json.dumps([
+    {"chain": "robinhood", "address": "0xAAA", "status": "active"},
+    {"chain": "robinhood", "address": "0xAAA", "status": "active"},
+    {"chain": "bsc", "address": "0xBBB", "status": "inactive"},
+    {"chain": "base", "address": "", "status": "active"},
+    {"chain": "sol", "address": "So111", "status": "active"},
+    {"chain": "bsc", "address": "0xCCC", "status": "queued"},
+]).encode()
+feed.refresh_evm_cas(force=True)
+check(feed._evm["cas"] == [
+    {"chain": "robinhood", "address": "0xAAA"},
+    {"chain": "bsc", "address": "0xCCC"},
+], "evm CAs: active EVM rows only, deduped")
+
+# ---------- EVM token feed ----------
+
+def feed_item(**overrides):
+    value = {
+        "type": "swap_buy",
+        "id": "feed-1",
+        "createdAt": t0,
+        "userId": "fomo-user-1",
+        "userHandle": "midcurver",
+        "usdAmount": 1000,
+        "price": 0.01,
+    }
+    value.update(overrides)
+    return value
+
+
+evm_ca = "0x30de7ae4c9578d110a97367ede9f7765cdce06ea"
+body, reason = feed._feed_body(feed_item(), "robinhood", evm_ca)
+check(reason is None and body is not None, "evm feed: buy mapped")
+check(body and body["eventId"] == "fomo-feed:feed-1", "evm feed: feed id is the event id")
+check(body and body["type"] == "buy" and body["chain"] == "robinhood", "evm feed: buy chain")
+check(body and body["tradeUsd"] == 1000 and body["usdValue"] == 1000, "evm feed: buy size")
+check(body and body["userId"] == "fomo-user-1" and body["trader"] == "midcurver", "evm feed: identity")
+check(body and body["price"] == 0.01, "evm feed: price")
+
+body, reason = feed._feed_body(feed_item(type="swap_sell"), "base", evm_ca)
+check(body and body["type"] == "sell" and "usdValue" not in body, "evm feed: sell has no entry size")
+
+body, reason = feed._feed_body(feed_item(type="thesis"), "bsc", evm_ca)
+check(body is None and reason == "not_swap", "evm feed: thesis ignored")
+body, reason = feed._feed_body(feed_item(userId=None), "bsc", evm_ca)
+check(body is None and reason == "missing_user_id", "evm feed: anonymous event ignored")
+
+feed._seen = set()
+feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+
+evm_page = [
+    feed_item(id="evm-old", createdAt=t0),
+    feed_item(id="evm-new", createdAt=t0 + 1_000),
+]
+feed._fetch_token_feed = lambda chain, ca, cycle_id: list(evm_page)
+st = {"evm_cursors": {}}
+posted = []
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-1")
+check(ok and emitted == 0 and posted == [], "evm feed: bootstrap is not replayed")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 1_001, "evm feed: cursor starts past newest")
+
+evm_page = [
+    feed_item(id="unwatched", createdAt=t0 + 2_000, userId="other-user"),
+    feed_item(id="watched", createdAt=t0 + 3_000),
+]
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-2")
+check(ok and emitted == 1 and len(posted) == 1, "evm feed: only watched users are posted")
+check(posted[0]["eventId"] == "fomo-feed:watched", "evm feed: watched event emitted")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 3_000, "evm feed: cursor advanced")
+posted = []
+feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-3")
+check(posted == [], "evm feed: re-reading dedupes")
+
+feed._seen = set()
+st = {"evm_cursors": {f"robinhood:{evm_ca}": 0}}
+evm_page = [feed_item(id="evm-retry", createdAt=t0 + 4_000)]
+feed.post_fomo_trade = lambda body, cycle_id=None: False
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-4")
+check(ok and emitted == 0 and st["evm_cursors"][f"robinhood:{evm_ca}"] == 0, "evm feed: failed ingest keeps cursor")
+feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-5")
+check(emitted == 1 and st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 4_000, "evm feed: retry succeeds")
 
 tmp.cleanup()
 print(f"\n{total - fail}/{total} checks passed")

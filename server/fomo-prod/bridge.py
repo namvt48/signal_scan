@@ -339,6 +339,26 @@ class Handler(BaseHTTPRequestHandler):
             }
             self._send(200 if body["ok"] else 503, json.dumps(body).encode())
             return
+        if parsed.path == "/feed/token":
+            qs = parse_qs(parsed.query)
+            token = qs.get("tokenAddress", [""])[0].strip()
+            if not token or len(token) > 128:
+                self._send(400, b'{"error":"tokenAddress is required"}')
+                return
+            try:
+                network_id = int(qs.get("networkId", [""])[0])
+            except ValueError:
+                self._send(400, b'{"error":"networkId must be an integer"}')
+                return
+            query = {"tokenAddress": token, "networkId": str(network_id)}
+            raw_limit = qs.get("limit", [""])[0]
+            if raw_limit:
+                try:
+                    query["limit"] = str(max(1, min(100, int(raw_limit))))
+                except ValueError:
+                    pass
+            self._send(*upstream_get("/feed/token", query))
+            return
         match = ALLOWED.match(parsed.path)
         if match is None:
             self._send(404, b'{"error":"not found"}')

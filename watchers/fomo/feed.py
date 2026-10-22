@@ -49,6 +49,8 @@ from watchers.common.config import _CFG_REFRESH_S, HERE, api_headers
 FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip("/")
 FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
+FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
+FOMO_TRACKED_CAS_REFRESH_S = max(30, int(os.environ.get("FOMO_TRACKED_CAS_REFRESH_S", "300")))
 FOMO_MONITOR_HEARTBEAT = Path("/root/signal-scan-monitor/heartbeats/fomo")
 
 # Network ids used by prod-api.fomo.family.
@@ -58,6 +60,7 @@ _CHAIN_BY_NETWORK = {
     56: "bsc",
     4663: "robinhood",
 }
+_NETWORK_BY_CHAIN = {chain: nid for nid, chain in _CHAIN_BY_NETWORK.items() if chain != "sol"}
 
 # A swap into one of these assets is a sell, not a buy. EVM addresses are
 # compared case-insensitively. Robinhood includes both USDG deployments the
@@ -320,6 +323,10 @@ _seen: set[str] = set()
 # Watch list loaded from GET /api/fomo-users; refreshed every ~300s so UI changes
 # take effect without a restart.
 _wl: dict[str, Any] = {"users": [], "next": 0.0, "skipped": 0}
+# Attached EVM chains have no per-user swap route on the free API; their
+# activity is only exposed by the token-scoped feed. Refresh the tracked
+# EVM CAs from the API so the feed pass follows the dashboard state.
+_evm: dict[str, Any] = {"cas": [], "next": 0.0}
 
 
 def _beat() -> None:
@@ -404,6 +411,41 @@ def refresh_watch_list(force: bool = False) -> None:
         _wl["skipped"] = skipped
     except Exception as ex:
         print(f"  ! fomo-users: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
+
+
+def refresh_evm_cas(force: bool = False) -> None:
+    """GET {api}/api/tracked-cas → active EVM CAs. Fail-soft: keep the old list."""
+    if not FOMO_EVM_FEED:
+        return
+    if not force and time.time() < _evm["next"]:
+        return
+    _evm["next"] = time.time() + FOMO_TRACKED_CAS_REFRESH_S
+    try:
+        req = urllib.request.Request(
+            f"{config._api_url}/api/tracked-cas", headers=api_headers()
+        )
+        data = json.loads(_request_bytes_with_retry(req))
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in data if isinstance(data, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            chain = entry.get("chain")
+            address = entry.get("address")
+            if chain not in _NETWORK_BY_CHAIN or not isinstance(address, str) or not address:
+                continue
+            if entry.get("status") == "inactive":
+                continue
+            key = f"{chain}:{address}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"chain": chain, "address": address})
+        if rows != _evm["cas"]:
+            print(f"# fomo EVM feed: {len(rows)} tracked CA(s)", flush=True)
+        _evm["cas"] = rows
+    except Exception as ex:
+        print(f"  ! fomo tracked-cas: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
 
 
 def _str(value: Any) -> str | None:
@@ -506,6 +548,226 @@ def _swap_body(
             if math.isfinite(price) and price > 0:
                 body["price"] = price
     return body, None
+
+
+def _feed_body(
+    item: dict[str, Any],
+    chain: str,
+    ca: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Map one /feed/token item to the fomo-watch body, or the skip reason."""
+    kind = item.get("type")
+    if kind not in ("swap_buy", "swap_sell"):
+        return None, "not_swap"
+    feed_id = _str(item.get("id"))
+    if feed_id is None:
+        return None, "missing_feed_id"
+    at = _ms(item.get("createdAt"))
+    if at is None:
+        return None, "invalid_timestamp"
+    user_id = _str(item.get("userId"))
+    if user_id is None:
+        return None, "missing_user_id"
+    usd = _num(item.get("usdAmount"))
+    price = _num(item.get("price"))
+    body: dict[str, Any] = {
+        "eventId": f"fomo-feed:{feed_id}",
+        "type": "buy" if kind == "swap_buy" else "sell",
+        "tokenAddress": ca,
+        "chain": chain,
+        "ts": at,
+        "userId": user_id,
+    }
+    handle = _str(item.get("userHandle"))
+    if handle:
+        body["trader"] = handle
+    if usd is not None and usd > 0:
+        body["tradeUsd"] = usd
+        # A buy's size is also its entry size for the tracked-CA gate.
+        if kind == "swap_buy":
+            body["usdValue"] = usd
+    if price is not None and price > 0:
+        body["price"] = price
+    return body, None
+
+
+def _fetch_token_feed(
+    chain: str,
+    ca: str,
+    cycle_id: str,
+) -> list[dict[str, Any]] | None:
+    network_id = _NETWORK_BY_CHAIN.get(chain)
+    if network_id is None:
+        return None
+    url = (
+        f"{FOMO_PROD_URL}/feed/token?tokenAddress={urllib.parse.quote(ca, safe='')}"
+        f"&networkId={network_id}"
+    )
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        data = _request_bytes_with_retry(req, timeout=_PROD_TIMEOUT_S)
+        payload = json.loads(data)
+    except Exception as ex:
+        _diagnostic(
+            "evm_feed_failure",
+            cycle_id=cycle_id,
+            chain=chain,
+            ca=ca,
+            error_type=type(ex).__name__,
+            status_code=getattr(ex, "code", None),
+        )
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        _diagnostic("evm_feed_failure", cycle_id=cycle_id, chain=chain, ca=ca, error_type="invalid_envelope")
+        return None
+    response = payload.get("responseObject")
+    items = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list):
+        _diagnostic("evm_feed_failure", cycle_id=cycle_id, chain=chain, ca=ca, error_type="invalid_payload")
+        return None
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _poll_evm_ca(
+    row: dict[str, str],
+    watched: set[str],
+    st: dict[str, Any],
+    cycle_id: str,
+) -> tuple[int, int, bool]:
+    """Poll one tracked EVM CA's token feed. Returns (emitted, page size, ok)."""
+    chain, ca = row["chain"], row["address"]
+    items = _fetch_token_feed(chain, ca, cycle_id)
+    if items is None:
+        return 0, 0, False
+    page: list[tuple[int, dict[str, Any]]] = []
+    for item in items:
+        at = _ms(item.get("createdAt"))
+        if at is not None:
+            page.append((at, item))
+    page.sort(key=lambda pair: (pair[0], str(pair[1].get("id") or "")))
+
+    key = f"{chain}:{ca}"
+    cursors = st.setdefault("evm_cursors", {})
+    cursor = _num(cursors.get(key))
+    if cursor is None:
+        # Same bootstrap rule as the per-user pass: never replay the current page.
+        cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
+        cursors[key] = cursor
+        save_state(st)
+        _diagnostic("evm_bootstrap", cycle_id=cycle_id, chain=chain, ca=ca, cursor=int(cursor))
+        return 0, len(page), True
+
+    emitted = 0
+    changed = False
+    for at, item in page:
+        if at < cursor:
+            continue
+        body, reason = _feed_body(item, chain, ca)
+        if body is None:
+            cursor = float(at)
+            changed = True
+            _diagnostic(
+                "evm_feed_decision",
+                cycle_id=cycle_id,
+                chain=chain,
+                ca=ca,
+                decision="ignored",
+                reason=reason,
+                feed_id=item.get("id"),
+            )
+            continue
+        # The token feed is not user-scoped: keep only watched traders.
+        if body.get("userId") not in watched:
+            cursor = float(at)
+            changed = True
+            continue
+        event_id = body["eventId"]
+        if event_id in _seen:
+            cursor = float(at)
+            changed = True
+            continue
+        if not post_fomo_trade(body, cycle_id=cycle_id):
+            _diagnostic(
+                "evm_feed_decision",
+                cycle_id=cycle_id,
+                chain=chain,
+                ca=ca,
+                decision="not_persisted",
+                reason="ingest_failed",
+                event_id=event_id,
+            )
+            break  # keep the cursor so this event retries next cycle
+        _dedupe(event_id)
+        cursor = float(at)
+        changed = True
+        emitted += 1
+        st["last_ts"] = max(st.get("last_ts") or 0, at)
+        st["emitted"] = int(st.get("emitted") or 0) + 1
+        save_state(st)
+        _diagnostic(
+            "evm_feed_decision",
+            cycle_id=cycle_id,
+            chain=chain,
+            ca=ca,
+            decision="ingest_acknowledged",
+            reason="ingested",
+            event_id=event_id,
+        )
+        print(
+            f"# fomo {body['type']} {body.get('trader') or body['userId'][:8]}"
+            f" {chain} {ca[:10]}… ${body.get('tradeUsd', 0):,.0f}"
+            f"  evt {event_id[:18]}…",
+            flush=True,
+        )
+
+    if changed:
+        cursors[key] = cursor
+        save_state(st)
+    return emitted, len(page), True
+
+
+def _poll_evm_feed(st: dict[str, Any], cycle_id: str) -> int:
+    """Poll token feeds for tracked EVM CAs and keep watched-user swaps."""
+    if not FOMO_EVM_FEED:
+        return 0
+    cas = list(_evm["cas"])
+    watched = {str(u.get("userId")) for u in _wl["users"] if u.get("userId")}
+    posted = 0
+    errors = 0
+    events = 0
+    for row in cas:
+        try:
+            emitted, page_size, ok = _poll_evm_ca(row, watched, st, cycle_id)
+        except Exception as ex:
+            errors += 1
+            _diagnostic(
+                "evm_feed_failure",
+                cycle_id=cycle_id,
+                chain=row.get("chain"),
+                ca=row.get("address"),
+                error_type=type(ex).__name__,
+            )
+            continue
+        if not ok:
+            errors += 1
+            continue
+        posted += emitted
+        events += page_size
+    if errors:
+        print(
+            f"  ! fomo EVM feed: {errors}/{len(cas)} CA(s) failed",
+            file=sys.stderr,
+        )
+    _diagnostic(
+        "evm_feed_cycle",
+        cycle_id=cycle_id,
+        cas=len(cas),
+        watched_users=len(watched),
+        page_items=events,
+        posted=posted,
+        errors=errors,
+    )
+    return posted
 
 
 def _dedupe(event_id: str) -> bool:
@@ -720,6 +982,9 @@ async def _poll_loop(st: dict[str, Any], once: bool) -> None:
                         identity=user["identity"],
                         error_type=type(ex).__name__,
                     )
+            if FOMO_EVM_FEED:
+                refresh_evm_cas(force=first)
+                _poll_evm_feed(st, cycle_id)
             _beat()
             _diagnostic(
                 "poll_cycle_finished",
@@ -747,7 +1012,8 @@ def run_feed(once: bool = False) -> None:
     )
     print(
         f"# fomo poll: {FOMO_PROD_URL} every {FOMO_POLL_INTERVAL_S}s"
-        f" (swaps limit {FOMO_SWAPS_LIMIT})",
+        f" (swaps limit {FOMO_SWAPS_LIMIT}"
+        f"{', EVM token feed' if FOMO_EVM_FEED else ', EVM feed off'})",
         flush=True,
     )
 

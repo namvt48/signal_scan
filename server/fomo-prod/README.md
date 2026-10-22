@@ -10,6 +10,7 @@ the only process that holds the Privy access/refresh tokens.
 GET /health
 GET /v2/users/{userId}/balances
 GET /v2/users/{userId}/swaps?limit=100
+GET /feed/token?tokenAddress={ca}&networkId={id}
 ```
 
 `userId` must be FOMO's UUID. Prod rejects handles with HTTP 400, so the
@@ -17,8 +18,12 @@ watcher skips watch-list rows without a `userId` (`skipped N without userId`).
 `/balances` returns at most 100 rows and no pagination flag; the API treats a
 full page as possibly truncated and does not close missing holdings.
 
-Only the two read-only user routes are proxied. Write/trade endpoints are not
-reachable through this bridge.
+The per-user `/swaps` endpoint currently returns Solana activity only. EVM
+activity is available through `/feed/token` (token-scoped); the bridge exposes
+it for the watcher's EVM token-feed pass.
+
+Only read-only routes are proxied. Write/trade endpoints are not reachable
+through this bridge.
 
 ## Credentials
 
