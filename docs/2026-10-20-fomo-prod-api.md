@@ -327,6 +327,35 @@ Không dùng `amount / token_state.supply × 100` cho cột này. Nếu amount, 
 hoặc market cap chưa biết, giữ `null`/`undefined` — không zero-fill; amount = 0
 đã đo được thì Bal = 0 và % = 0.
 
+### 8.2 Buy $/Sell $ cho EVM của FOMO user
+
+`/v2/users/{id}/swaps` chỉ trả Solana. EVM của FOMO user lấy từ token feed, không
+phải từ wallet watch:
+
+```text
+GET /feed/token?tokenAddress={ca}&networkId={id}
+  item: type, id (= swap id), tradeId, userId, userHandle, usdAmount, createdAt
+GET /trades/{tradeId}
+  responseObject.swaps[]: id, in/outNetworkId, in/outTokenAddress,
+                          humanUsdAmountIn/Out, in/outHumanAmount, createdAt
+```
+
+Khi watcher thấy một feed item mới của user trong watch list, nó gọi
+`/trades/{tradeId}` và ingest **toàn bộ** swap của trade đó (cả buy trước đó và
+sell vừa xảy ra, kể cả leg cross-chain). Event id dùng `fomo-feed:<swap id>` —
+trùng với feed id cũ nên không nhân đôi dữ liệu đã ingest. `trade_usd` của buy
+lấy `humanUsdAmountIn`, của sell lấy `humanUsdAmountOut`.
+
+Ví dụ đo được (`tradeId 8c589c0d-…`, CA `0x30de7ae4…`, network 4663):
+
+```text
+sell  id 938d0498-…  in 4663 -> out 1399811149  humanUsdAmountOut 2738.59
+buy   id be93f3ff-…  in 1399811149 -> out 4663  humanUsdAmountIn  4208.17
+```
+
+Đây vẫn là dữ liệu FOMO user (`userId`/`userHandle` do FOMO trả), không liên
+quan đến ví EVM nhập tay trong wallet watch.
+
 ---
 
 ## 9. Rủi ro

@@ -11,6 +11,7 @@ GET /health
 GET /v2/users/{userId}/balances
 GET /v2/users/{userId}/swaps?limit=100[&lastSwapIdV2={swap id}]
 GET /feed/token?tokenAddress={ca}&networkId={id}
+GET /trades/{tradeId}
 ```
 
 `userId` must be FOMO's UUID. Prod rejects handles with HTTP 400, so the
@@ -23,7 +24,10 @@ The per-user `/swaps` endpoint is paged newest-first: `hasNextPage` +
 page size and cursor, and the watcher keeps paging until its stored timestamp
 cursor (then confirms a detected BUY with a one-time full buy/sell backfill for
 that user and CA). The endpoint currently returns Solana activity only; EVM
-activity is available through `/feed/token` (token-scoped).
+activity is available through `/feed/token` (token-scoped). A feed item carries
+the position's `tradeId`; `/trades/{tradeId}` returns that trade's full `swaps[]`
+(buy and sell fills, including cross-chain legs), which the watcher ingests with
+the same `fomo-feed:<swap id>` event ids as the token feed.
 
 Only read-only routes are proxied. Write/trade endpoints are not reachable
 through this bridge.

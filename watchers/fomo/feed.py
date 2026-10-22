@@ -599,6 +599,70 @@ def _feed_body(
     return body, None
 
 
+def _trade_swap_body(
+    swap: dict[str, Any],
+    item: dict[str, Any],
+    chain: str,
+    ca: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Map one swap inside a FOMO trade detail to an EVM feed body.
+
+    The trade detail returns every fill that built the position, including the
+    buy before a sell. Feed ids and swap ids are the same UUID, so keeping the
+    `fomo-feed:<id>` namespace dedupes against fills already ingested from the
+    token feed.
+    """
+    swap_id = _str(swap.get("id"))
+    if swap_id is None:
+        return None, "missing_swap_id"
+    user = {"userId": _str(item.get("userId")) or "", "handle": _str(item.get("userHandle")) or ""}
+    body, reason = _swap_body(swap, user)
+    if body is None:
+        return None, reason
+    if body["chain"] != chain or not _same_token(body["tokenAddress"], ca, chain):
+        return None, "other_token"
+    body["eventId"] = f"fomo-feed:{swap_id}"
+    if body["type"] == "buy" and "tradeUsd" in body:
+        body["usdValue"] = body["tradeUsd"]
+    return body, None
+
+
+def _fetch_trade_swaps(trade_id: str, cycle_id: str) -> list[dict[str, Any]] | None:
+    """GET /trades/{tradeId} through the bridge; return its full swap list."""
+    url = f"{FOMO_PROD_URL}/trades/{urllib.parse.quote(trade_id, safe='')}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        data = _request_bytes_with_retry(req, timeout=_PROD_TIMEOUT_S)
+        payload = json.loads(data)
+    except Exception as ex:
+        _diagnostic(
+            "evm_trade_failure",
+            cycle_id=cycle_id,
+            trade_id=trade_id,
+            error_type=type(ex).__name__,
+        )
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        _diagnostic(
+            "evm_trade_failure",
+            cycle_id=cycle_id,
+            trade_id=trade_id,
+            error_type="invalid_envelope",
+        )
+        return None
+    response = payload.get("responseObject")
+    swaps = response.get("swaps") if isinstance(response, dict) else None
+    if not isinstance(swaps, list):
+        _diagnostic(
+            "evm_trade_failure",
+            cycle_id=cycle_id,
+            trade_id=trade_id,
+            error_type="invalid_payload",
+        )
+        return None
+    return [swap for swap in swaps if isinstance(swap, dict)]
+
+
 def _fetch_token_feed(
     chain: str,
     ca: str,
@@ -672,6 +736,7 @@ def _poll_evm_ca(
 
     emitted = 0
     changed = False
+    trade_cache: dict[str, list[dict[str, Any]] | None] = {}
     for at, item in page:
         if at < cursor:
             continue
@@ -694,44 +759,74 @@ def _poll_evm_ca(
             cursor = float(at)
             changed = True
             continue
-        event_id = body["eventId"]
-        if event_id in _seen:
-            cursor = float(at)
-            changed = True
-            continue
-        if not post_fomo_trade(body, cycle_id=cycle_id):
+
+        # One feed item is one fill, but its trade carries the whole position:
+        # the earlier buy before this sell (and any other fills on this CA).
+        # Fetch the trade once and ingest every matching swap, so Buy $/Sell $
+        # see both directions instead of only the fill that happened to page in.
+        bodies = [body]
+        trade_id = _str(item.get("tradeId"))
+        if trade_id:
+            if trade_id not in trade_cache:
+                trade_cache[trade_id] = _fetch_trade_swaps(trade_id, cycle_id)
+            swaps = trade_cache[trade_id]
+            if swaps is not None:
+                derived: list[dict[str, Any]] = []
+                derived_ids: set[str] = set()
+                for swap in swaps:
+                    candidate, _reason = _trade_swap_body(swap, item, chain, ca)
+                    if candidate is None or candidate["eventId"] in derived_ids:
+                        continue
+                    derived_ids.add(candidate["eventId"])
+                    derived.append(candidate)
+                if derived:
+                    # The current feed fill should be in the trade detail; if
+                    # it is not, keep the feed-mapped body as a fallback.
+                    if body["eventId"] not in derived_ids:
+                        derived.append(body)
+                    bodies = derived
+
+        failed = False
+        for candidate in bodies:
+            event_id = candidate["eventId"]
+            if event_id in _seen:
+                continue
+            if not post_fomo_trade(candidate, cycle_id=cycle_id):
+                _diagnostic(
+                    "evm_feed_decision",
+                    cycle_id=cycle_id,
+                    chain=chain,
+                    ca=ca,
+                    decision="not_persisted",
+                    reason="ingest_failed",
+                    event_id=event_id,
+                )
+                failed = True
+                break
+            _dedupe(event_id)
+            emitted += 1
+            st["last_ts"] = max(st.get("last_ts") or 0, at)
+            st["emitted"] = int(st.get("emitted") or 0) + 1
+            save_state(st)
             _diagnostic(
                 "evm_feed_decision",
                 cycle_id=cycle_id,
                 chain=chain,
                 ca=ca,
-                decision="not_persisted",
-                reason="ingest_failed",
+                decision="ingest_acknowledged",
+                reason="ingested",
                 event_id=event_id,
             )
-            break  # keep the cursor so this event retries next cycle
-        _dedupe(event_id)
+            print(
+                f"# fomo {candidate['type']} {candidate.get('trader') or candidate.get('userId', '')[:8]}"
+                f" {chain} {ca[:10]}… ${candidate.get('tradeUsd', 0):,.0f}"
+                f"  evt {event_id[:18]}…",
+                flush=True,
+            )
+        if failed:
+            break  # keep the cursor so this feed item retries next cycle
         cursor = float(at)
         changed = True
-        emitted += 1
-        st["last_ts"] = max(st.get("last_ts") or 0, at)
-        st["emitted"] = int(st.get("emitted") or 0) + 1
-        save_state(st)
-        _diagnostic(
-            "evm_feed_decision",
-            cycle_id=cycle_id,
-            chain=chain,
-            ca=ca,
-            decision="ingest_acknowledged",
-            reason="ingested",
-            event_id=event_id,
-        )
-        print(
-            f"# fomo {body['type']} {body.get('trader') or body['userId'][:8]}"
-            f" {chain} {ca[:10]}… ${body.get('tradeUsd', 0):,.0f}"
-            f"  evt {event_id[:18]}…",
-            flush=True,
-        )
 
     if changed:
         cursors[key] = cursor

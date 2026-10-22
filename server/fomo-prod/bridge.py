@@ -359,6 +359,13 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             self._send(*upstream_get("/feed/token", query))
             return
+        if parsed.path.startswith("/trades/"):
+            trade_id = unquote(parsed.path[len("/trades/"):])
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", trade_id):
+                self._send(400, b'{"error":"invalid trade id"}')
+                return
+            self._send(*upstream_get(f"/trades/{quote(trade_id, safe='')}", {}))
+            return
         match = ALLOWED.match(parsed.path)
         if match is None:
             self._send(404, b'{"error":"not found"}')

@@ -349,6 +349,57 @@ feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-5")
 check(emitted == 1 and st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 4_000, "evm feed: retry succeeds")
 
+# One feed fill expands to the trade's full buy/sell history. Feed ids and
+# swap ids are the same UUID, so the event ids stay in the fomo-feed namespace.
+feed._seen = set()
+posted = []
+st = {"evm_cursors": {f"robinhood:{evm_ca}": t0}}
+evm_page = [feed_item(id="evm-current", tradeId="trade-1", type="swap_sell", createdAt=t0 + 5_000)]
+feed._fetch_token_feed = lambda chain, ca, cycle_id: list(evm_page)
+feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
+    {
+        "id": "evm-current",
+        "networkId": 4663,
+        "inNetworkId": 4663,
+        "outNetworkId": 1399811149,
+        "inTokenAddress": evm_ca,
+        "outTokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "humanUsdAmountIn": 3028.85,
+        "humanUsdAmountOut": 2738.59,
+        "inHumanAmount": 1839010.05,
+        "outHumanAmount": 2752.91,
+        "createdAt": "2026-10-22T08:28:05.000Z",
+    },
+    {
+        "id": "evm-history",
+        "networkId": 4663,
+        "inNetworkId": 1399811149,
+        "outNetworkId": 4663,
+        "inTokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "outTokenAddress": evm_ca,
+        "humanUsdAmountIn": 4208.17,
+        "humanUsdAmountOut": 3984.25,
+        "inHumanAmount": 4187.82,
+        "outHumanAmount": 1839010.05,
+        "createdAt": "2026-10-21T23:02:50.000Z",
+    },
+]
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade")
+check(ok and emitted == 2 and len(posted) == 2, "evm trade: feed fill expands to both directions")
+check([b["eventId"] for b in posted] == ["fomo-feed:evm-current", "fomo-feed:evm-history"], "evm trade: swap ids keep feed namespace")
+check(posted[1]["type"] == "buy" and posted[1]["tradeUsd"] == 4208.17, "evm trade: historical buy carries trade USD")
+check(posted[1]["usdValue"] == 4208.17, "evm trade: historical buy carries entry size")
+check(posted[0]["type"] == "sell" and posted[0]["tradeUsd"] == 2738.59, "evm trade: sell uses proceeds")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 5_000, "evm trade: cursor advances past the fill")
+
+feed._seen = set()
+posted = []
+feed._fetch_trade_swaps = lambda trade_id, cycle_id: None
+evm_page = [feed_item(id="evm-fallback", tradeId="trade-2", createdAt=t0 + 6_000)]
+st = {"evm_cursors": {f"robinhood:{evm_ca}": t0 + 5_000}}
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade-fallback")
+check(ok and emitted == 1 and posted[0]["eventId"] == "fomo-feed:evm-fallback", "evm trade: detail failure falls back to the feed fill")
+
 tmp.cleanup()
 print(f"\n{total - fail}/{total} checks passed")
 sys.exit(1 if fail else 0)
