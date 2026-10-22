@@ -75,7 +75,9 @@ Chú thích trạng thái:
 `/feed/token` là route gần nhất với nhu cầu “alert”: trả swap_buy/swap_sell theo token, có `userId`, `tradeId`, USD, MC, price. Tuy nhiên:
 - Đây là **token-centric**, không phải “mọi giao dịch của user”.
 - `threshold` lọc theo position size; chưa rõ có bỏ giao dịch nhỏ hay không.
-- Chưa biết param trang tiếp → chưa chứng minh coverage.
+- `limit` nhận tới 100 (live 2026-10-22: `limit=100` trả 100 item). Response
+  không có cursor dùng được cho trang kế; watcher giữ cursor cục bộ theo
+  `createdAt` + `id` và poll lại trang đầu mỗi 60s.
 
 ### 3.3 Token / holders
 
