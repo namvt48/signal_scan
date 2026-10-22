@@ -69,6 +69,9 @@ check(body and body["tokenAddress"] == "0x11111111111111111111111111111111111111
 body, reason = feed._swap_body(swap(createdAt=1760000000), user)
 check(body and body["ts"] == 1760000000000, "timestamp: seconds are converted to ms")
 
+body, reason = feed._swap_body(swap(createdAt="2026-10-21T01:58:15.000Z"), user)
+check(body and body["ts"] == 1792547895000, "timestamp: ISO strings are converted to ms")
+
 body, reason = feed._swap_body(swap(inTokenAddress="0x833589FCD6EDB6E08F4C7C32D4F71B54BDA02913"), user)
 check(reason is None and body and body["type"] == "buy", "quote assets: EVM addresses compare case-insensitively")
 

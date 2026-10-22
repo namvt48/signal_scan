@@ -423,10 +423,19 @@ def _num(value: Any) -> float | None:
 
 def _ms(value: Any) -> int | None:
     number = _num(value)
-    if number is None:
-        return None
-    milliseconds = number * 1000 if number < 10_000_000_000 else number
-    return int(milliseconds) if milliseconds > 0 else None
+    if number is not None:
+        milliseconds = number * 1000 if number < 10_000_000_000 else number
+        return int(milliseconds) if milliseconds > 0 else None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        milliseconds = int(parsed.timestamp() * 1000)
+        return milliseconds if milliseconds > 0 else None
+    return None
 
 
 def _chain(network_id: Any) -> str | None:
