@@ -12,6 +12,11 @@ GET /v2/users/{userId}/balances
 GET /v2/users/{userId}/swaps?limit=100
 ```
 
+`userId` must be FOMO's UUID. Prod rejects handles with HTTP 400, so the
+watcher skips watch-list rows without a `userId` (`skipped N without userId`).
+`/balances` returns at most 100 rows and no pagination flag; the API treats a
+full page as possibly truncated and does not close missing holdings.
+
 Only the two read-only user routes are proxied. Write/trade endpoints are not
 reachable through this bridge.
 
@@ -26,8 +31,10 @@ refresh_token   # rotated Privy refresh token
 
 Both files should be mode `0600` and are never committed. The bridge refreshes
 the access token five minutes before expiry and atomically rewrites both files.
-If the refresh token is missing, read requests still work until the access token
-expires; `/health` reports `ok:false` after expiry.
+`FOMO_PRIVY_APP_ID` is required when the access-token audience is not the Privy
+app id (the fomo.family cookie token uses `privy.fomo.family`). If the refresh
+token is missing, read requests still work until the access token expires;
+`/health` reports `ok:false` after expiry or when the token file is absent.
 
 ## Runtime
 
