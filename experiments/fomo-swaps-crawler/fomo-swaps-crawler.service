@@ -1,0 +1,20 @@
+[Unit]
+Description=FOMO swaps crawler (standalone experiment)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fomo-swaps-crawler
+EnvironmentFile=/opt/fomo-swaps-crawler/.env
+ExecStart=/opt/fomo-swaps-crawler/venv/bin/python /opt/fomo-swaps-crawler/crawler.py
+Restart=on-failure
+RestartSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/fomo-swaps-crawler/data
+
+[Install]
+WantedBy=multi-user.target
