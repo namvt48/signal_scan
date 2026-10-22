@@ -89,6 +89,17 @@ body, reason = feed._swap_body(swap(
 ), user)
 check(body is None and reason == "unclassified_pair", "quote -> quote: skipped")
 
+# Watch-list refresh keeps only UUID identities: prod rejects handles with 400.
+feed._request_bytes_with_retry = lambda req, on_attempt=None, timeout=None: __import__("json").dumps([
+    {"userId": "uuid-1", "handle": "one"},
+    {"userId": "", "handle": "handle-only"},
+    {"userId": "uuid-1", "handle": "duplicate"},
+]).encode()
+feed._wl = {"users": [], "next": 0.0, "skipped": 0}
+feed.refresh_watch_list(force=True)
+check([u["identity"] for u in feed._wl["users"]] == ["uuid-1"], "watch list: handle-only rows are skipped")
+check(feed._wl["skipped"] == 1, "watch list: skipped count is reported")
+
 # ---------- cursor / dedupe / retry ----------
 
 tmp = tempfile.TemporaryDirectory()

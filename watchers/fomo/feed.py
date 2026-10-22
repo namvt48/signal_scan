@@ -319,7 +319,7 @@ HEARTBEAT = os.path.join(HERE, "fomo_heartbeat")
 _seen: set[str] = set()
 # Watch list loaded from GET /api/fomo-users; refreshed every ~300s so UI changes
 # take effect without a restart.
-_wl: dict[str, Any] = {"users": [], "next": 0.0}
+_wl: dict[str, Any] = {"users": [], "next": 0.0, "skipped": 0}
 
 
 def _beat() -> None:
@@ -382,19 +382,26 @@ def refresh_watch_list(force: bool = False) -> None:
         data = json.loads(_request_bytes_with_retry(req))
         users: list[dict[str, str]] = []
         seen: set[str] = set()
+        skipped = 0
         for entry in data if isinstance(data, list) else []:
             if not isinstance(entry, dict):
                 continue
             uid = entry.get("userId") if isinstance(entry.get("userId"), str) else ""
             handle = entry.get("handle") if isinstance(entry.get("handle"), str) else ""
-            identity = uid or handle
-            if not identity or identity in seen:
+            # prod /swaps and /balances reject handles with HTTP 400; polling a
+            # handle-only row every cycle would only log noise.
+            if not uid:
+                skipped += 1
                 continue
-            seen.add(identity)
-            users.append({"identity": identity, "userId": uid, "handle": handle})
-        if users != _wl["users"]:
-            print(f"# fomo watch list: {len(users)} user(s)", flush=True)
+            if uid in seen:
+                continue
+            seen.add(uid)
+            users.append({"identity": uid, "userId": uid, "handle": handle})
+        if users != _wl["users"] or skipped != _wl.get("skipped"):
+            suffix = f", skipped {skipped} without userId" if skipped else ""
+            print(f"# fomo watch list: {len(users)} user(s){suffix}", flush=True)
         _wl["users"] = users
+        _wl["skipped"] = skipped
     except Exception as ex:
         print(f"  ! fomo-users: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
 
@@ -566,6 +573,7 @@ def _fetch_swaps(identity: str, cycle_id: str) -> list[dict[str, Any]] | None:
             cycle_id=cycle_id,
             identity=identity,
             error_type=type(ex).__name__,
+            status_code=getattr(ex, "code", None),
         )
         print(f"  ! fomo swaps {identity[:8]}…: {type(ex).__name__}", file=sys.stderr)
         return None

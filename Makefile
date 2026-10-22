@@ -203,7 +203,7 @@ fomo-prod-deploy:
 	@test "$(INSTANCE)" = b || { echo 'fomo-prod-deploy currently targets the FOMO instance (INSTANCE=b)'; exit 1; }
 	rsync -azcR --exclude '__pycache__' -e "$(RSYNC_SSH)" server/fomo-prod $(HOST):$(REMOTE_DIR)/
 	$(SSH) "set -eu; cd $(REMOTE_DIR); install -d -m 0700 $(DATA_DIR)/fomo-prod-credentials; if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build fomo-prod && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate fomo-prod; else $(COMPOSE_ENV) docker compose build fomo-prod && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate fomo-prod; fi"
-	$(SSH) "for i in 1 2 3 4 5 6 7 8 9 10; do code=$$(curl -s -o /tmp/fomo-prod-health -w '%{http_code}' http://127.0.0.1:$(FOMO_BRIDGE_PORT)/health || true); if [ "$$code" = 200 ] || [ "$$code" = 503 ]; then cat /tmp/fomo-prod-health; echo; exit 0; fi; sleep 1; done; echo 'fomo-prod health endpoint did not answer' >&2; exit 1"
+	$(SSH) "curl -sS --max-time 10 http://127.0.0.1:$(FOMO_BRIDGE_PORT)/health"
 
 fomo-watch-deploy:
 	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs"
