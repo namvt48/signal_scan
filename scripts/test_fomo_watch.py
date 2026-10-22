@@ -223,6 +223,13 @@ check(st["backfills"]["fomo-user-1|base:" + target] > 0, "backfill: completion m
 again = _backfill_real(user, "base", target, st, "cycle-backfill-2")
 check(again == 0 and len(posted) == 2, "backfill: marker suppresses a second walk")
 
+feed._seen = set()
+feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(history), True)
+st_truncated = {"backfills": {}}
+truncated_posted = _backfill_real(user, "base", target, st_truncated, "cycle-backfill-3")
+check(truncated_posted == 2, "backfill: truncated read still posts what it saw")
+check("fomo-user-1|base:" + target not in st_truncated["backfills"], "backfill: truncated read is not marked complete")
+
 
 # ---------- EVM CA refresh ----------
 

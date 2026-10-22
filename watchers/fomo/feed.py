@@ -53,7 +53,7 @@ FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip(
 FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
 FOMO_SWAPS_MAX_PAGES = min(200, max(1, int(os.environ.get("FOMO_SWAPS_MAX_PAGES", "50"))))
-FOMO_BACKFILL_MAX_PAGES = min(200, max(1, int(os.environ.get("FOMO_BACKFILL_MAX_PAGES", "20"))))
+FOMO_BACKFILL_MAX_PAGES = min(500, max(1, int(os.environ.get("FOMO_BACKFILL_MAX_PAGES", "200"))))
 FOMO_BACKFILL_TTL_S = max(3600, int(os.environ.get("FOMO_BACKFILL_TTL_S", "604800")))
 FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
 FOMO_EVM_FEED_LIMIT = min(100, max(1, int(os.environ.get("FOMO_EVM_FEED_LIMIT", "100"))))
@@ -999,8 +999,9 @@ def _backfill_user_ca(
         _dedupe(event_id)
         posted += 1
 
-    done[key] = now_ms
-    save_state(st)
+    if not truncated:
+        done[key] = now_ms
+        save_state(st)
     _diagnostic(
         "swap_backfill",
         cycle_id=cycle_id,
