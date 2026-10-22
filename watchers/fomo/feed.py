@@ -765,12 +765,18 @@ def _poll_evm_ca(
         # Fetch the trade once and ingest every matching swap, so Buy $/Sell $
         # see both directions instead of only the fill that happened to page in.
         bodies = [body]
+        detail_failed = False
         trade_id = _str(item.get("tradeId"))
         if trade_id:
             if trade_id not in trade_cache:
                 trade_cache[trade_id] = _fetch_trade_swaps(trade_id, cycle_id)
             swaps = trade_cache[trade_id]
-            if swaps is not None:
+            if swaps is None:
+                # Post the one fill we have, but do NOT advance the cursor:
+                # the trade's earlier buy/sell must be retried, and a newer
+                # feed item must not bury it.
+                detail_failed = True
+            else:
                 derived: list[dict[str, Any]] = []
                 derived_ids: set[str] = set()
                 for swap in swaps:
@@ -823,7 +829,7 @@ def _poll_evm_ca(
                 f"  evt {event_id[:18]}…",
                 flush=True,
             )
-        if failed:
+        if failed or detail_failed:
             break  # keep the cursor so this feed item retries next cycle
         cursor = float(at)
         changed = True

@@ -399,6 +399,48 @@ evm_page = [feed_item(id="evm-fallback", tradeId="trade-2", createdAt=t0 + 6_000
 st = {"evm_cursors": {f"robinhood:{evm_ca}": t0 + 5_000}}
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade-fallback")
 check(ok and emitted == 1 and posted[0]["eventId"] == "fomo-feed:evm-fallback", "evm trade: detail failure falls back to the feed fill")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 5_000, "evm trade: detail failure holds the cursor")
+
+# Next cycle: the detail recovers after a newer feed item arrived. The held
+# cursor must still revisit the failed trade and ingest its historical buy
+# before moving past the newer item.
+posted = []
+feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
+    {
+        "id": "evm-fallback",
+        "networkId": 4663,
+        "inNetworkId": 4663,
+        "outNetworkId": 1399811149,
+        "inTokenAddress": evm_ca,
+        "outTokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "humanUsdAmountIn": 1000,
+        "humanUsdAmountOut": 900,
+        "inHumanAmount": 1000,
+        "outHumanAmount": 900,
+        "createdAt": "2026-10-22T08:30:00.000Z",
+    },
+    {
+        "id": "evm-fallback-buy",
+        "networkId": 4663,
+        "inNetworkId": 1399811149,
+        "outNetworkId": 4663,
+        "inTokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "outTokenAddress": evm_ca,
+        "humanUsdAmountIn": 1200,
+        "humanUsdAmountOut": 1100,
+        "inHumanAmount": 100,
+        "outHumanAmount": 1000,
+        "createdAt": "2026-10-22T07:00:00.000Z",
+    },
+]
+evm_page = [
+    feed_item(id="evm-fallback", tradeId="trade-2", createdAt=t0 + 6_000),
+    feed_item(id="evm-newer", createdAt=t0 + 7_000),
+]
+emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade-recovered")
+check(ok and emitted == 2, "evm trade: recovery ingests history plus the newer fill")
+check([b["eventId"] for b in posted] == ["fomo-feed:evm-fallback-buy", "fomo-feed:evm-newer"], "evm trade: history precedes the newer fill")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 7_000, "evm trade: cursor advances only after recovery")
 
 tmp.cleanup()
 print(f"\n{total - fail}/{total} checks passed")
