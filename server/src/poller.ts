@@ -1668,6 +1668,7 @@ async function refreshFomoBalances(
       fetched_at: fetchedAt,
     })),
     fetchedAt,
+    result.complete,
   );
   cancelFomoPositionCooldownRefresh(fomoUserId);
   return result.value;

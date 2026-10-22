@@ -35,6 +35,9 @@ export interface FomoApiResult<T> {
   attempts: number;
   attemptFailures: number;
   retryAfterMs: number | null;
+  /** Balance pages only: false when the page may be truncated, so a tracked
+   *  position missing from `value` must not be closed. */
+  complete: boolean;
 }
 
 export interface FomoApiEndpointUsage {
@@ -494,6 +497,7 @@ function finishFomoResult<T>(
   request: FomoApiRequest,
   outcome: FomoApiOutcome,
   value: T | null,
+  complete = true,
 ): FomoApiResult<T> {
   const result: FomoApiResult<T> = {
     outcome,
@@ -502,6 +506,7 @@ function finishFomoResult<T>(
     attempts: request.attempts,
     attemptFailures: request.attemptFailures,
     retryAfterMs: request.retryAfterMs,
+    complete,
   };
   recordResult(endpoint, result);
   return result;
@@ -543,7 +548,13 @@ function toBalance(raw: unknown): FomoPosition | null | undefined {
     ?? strOrNull(activeTrade?.tokenAddress)
     ?? strOrNull(balance?.tokenAddress);
   if (address === null) return null;
-  const amount = numFrom(userToken?.humanAmountRemaining) ?? numFrom(balance?.shiftedBalance);
+  const remaining = numFrom(userToken?.humanAmountRemaining);
+  const shifted = numFrom(balance?.shiftedBalance);
+  // Prod can report a tiny negative remaining for dust while the on-chain
+  // shifted balance is still positive; prefer the non-negative value.
+  const amount = remaining !== null && remaining >= 0
+    ? remaining
+    : shifted !== null && shifted >= 0 ? shifted : remaining ?? shifted;
   if (amount === null || amount < 0) return null;
   return {
     ca: canonicalCa(address, chain),
@@ -579,5 +590,8 @@ export async function fetchFomoBalances(identity: string): Promise<FomoApiResult
     seen.add(key);
     positions.push(position);
   }
-  return finishFomoResult('balances', request, 'success', positions);
+  // The prod page is capped at 100 rows and carries no pagination flag. Treat a
+  // full page as possibly truncated so sync never closes a tracked position
+  // that simply fell off the end.
+  return finishFomoResult('balances', request, 'success', positions, body.balances.length < 100);
 }

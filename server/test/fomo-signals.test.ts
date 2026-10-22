@@ -598,6 +598,37 @@ test('FOMO positions retain token amounts across unchanged snapshots and revalue
   assert.equal(fomoUserStatsByCa(NOW + 2_000).get(`base:${ca}`)?.[0]?.balUsd, 0.3);
 });
 
+test('a possibly truncated balance page updates holdings without closing missing positions', () => {
+  const ca = 'fomo-position-partial-023b';
+  const user = insertFomoUser({ handle: '@position-partial' });
+  insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
+  const position = (amount: number, fetched_at: number) => ({
+    fomo_user_id: user.id,
+    ca,
+    chain: 'base' as const,
+    trade_id: 'partial-id',
+    status: 'open',
+    amount,
+    cost_basis_usd: 50,
+    avg_entry_price: 0.5,
+    price_usd: 0.5,
+    realized_pnl_usd: 0,
+    unrealized_pnl_usd: 0,
+    fetched_at,
+  });
+  syncFomoPositionsSnapshot(user.id, [position(100, NOW)], NOW);
+  syncFomoPositionsSnapshot(user.id, [], NOW + 1_000, false);
+  const retained = getDb().prepare(
+    'SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+  ).get(user.id, ca, 'base') as { amount: number; status: string };
+  assert.deepEqual(retained, { amount: 100, status: 'open' });
+  syncFomoPositionsSnapshot(user.id, [], NOW + 2_000, true);
+  const closed = getDb().prepare(
+    'SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+  ).get(user.id, ca, 'base') as { amount: number; status: string };
+  assert.deepEqual(closed, { amount: 0, status: 'closed' });
+});
+
 test('positive position amount keeps a FOMO user visible when cost basis is absent', () => {
   const ca = 'fomo-position-no-cost-basis-024';
   const user = insertFomoUser({ handle: '@position-no-cost-basis' });

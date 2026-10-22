@@ -2638,6 +2638,7 @@ export function syncFomoPositionsSnapshot(
   fomoUserId: string,
   positions: readonly FomoPositionInput[],
   checkedAt: number,
+  closeMissing = true,
 ): void {
   const db = getDb();
   const run = db.transaction(() => {
@@ -2658,20 +2659,24 @@ export function syncFomoPositionsSnapshot(
     }
     for (const [key, target] of targets) {
       const position = incoming.get(key);
-      upsertFomoPosition(position ?? {
-        fomo_user_id: fomoUserId,
-        ca: target.ca,
-        chain: target.chain,
-        trade_id: null,
-        status: 'closed',
-        amount: 0,
-        cost_basis_usd: null,
-        avg_entry_price: null,
-        price_usd: null,
-        realized_pnl_usd: null,
-        unrealized_pnl_usd: null,
-        fetched_at: checkedAt,
-      });
+      if (position !== undefined) {
+        upsertFomoPosition(position);
+      } else if (closeMissing) {
+        upsertFomoPosition({
+          fomo_user_id: fomoUserId,
+          ca: target.ca,
+          chain: target.chain,
+          trade_id: null,
+          status: 'closed',
+          amount: 0,
+          cost_basis_usd: null,
+          avg_entry_price: null,
+          price_usd: null,
+          realized_pnl_usd: null,
+          unrealized_pnl_usd: null,
+          fetched_at: checkedAt,
+        });
+      }
     }
     upsertFomoPositionSnapshot({ fomo_user_id: fomoUserId, checked_at: checkedAt });
   });

@@ -207,6 +207,38 @@ test('fetchFomoBalances maps prod balances to active positions', async () => {
   });
 });
 
+test('fetchFomoBalances falls back to a non-negative shifted balance for dust', async () => {
+  await withBridge(() => new Response(JSON.stringify({
+    success: true,
+    responseObject: { balances: [{
+      balance: { tokenAddress: CA, shiftedBalance: '8.28' },
+      tokenFilterResult: { token: { address: CA, networkId: NET_SOL } },
+      userToken: { humanAmountRemaining: '-2.76' },
+    }] },
+  }), { status: 200 }), async () => {
+    const result = await fetchFomoBalances('fomo-user-id');
+    assert.equal(result.outcome, 'success');
+    assert.equal(result.complete, true);
+    assert.equal(result.value?.[0]?.amount, 8.28);
+  });
+});
+
+test('fetchFomoBalances marks a full 100-row page as possibly truncated', async () => {
+  const balances = Array.from({ length: 100 }, (_, index) => ({
+    tokenFilterResult: { token: { address: `0x${(index + 1).toString(16).padStart(40, '0')}`, networkId: NET_BASE } },
+    userToken: { humanAmountRemaining: '1' },
+  }));
+  await withBridge(() => new Response(JSON.stringify({
+    success: true,
+    responseObject: { balances },
+  }), { status: 200 }), async () => {
+    const result = await fetchFomoBalances('fomo-user-id');
+    assert.equal(result.outcome, 'success');
+    assert.equal(result.value?.length, 100);
+    assert.equal(result.complete, false);
+  });
+});
+
 test('fetchFomoBalances rejects missing, negative, or duplicate amounts', async () => {
   for (const payload of [
     { balances: [{ tokenFilterResult: { token: { address: CA } }, userToken: { humanAmountRemaining: '1' } }] },
