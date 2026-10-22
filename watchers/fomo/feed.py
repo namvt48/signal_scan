@@ -652,11 +652,12 @@ def _poll_evm_ca(
     cursors = st.setdefault("evm_cursors", {})
     cursor = _num(cursors.get(key))
     if cursor is None:
-        # Bootstrap skips old history, but keeps a short grace window: when a
-        # watched buy pulls a new CA into tracking, the feed poll must still
-        # ingest that buy instead of dropping the page wholesale.
+        # Bootstrap skips old history, but keeps a short grace window anchored
+        # to NOW: when a watched buy pulls a new CA into tracking, its recent
+        # buy must be ingested. A dormant CA whose whole page is old must stay
+        # silent rather than replaying months-old fills.
         if page and FOMO_EVM_BOOTSTRAP_LOOKBACK_S > 0:
-            cursor = float(max(0, page[-1][0] - FOMO_EVM_BOOTSTRAP_LOOKBACK_S * 1000))
+            cursor = float(max(0, int(time.time() * 1000) - FOMO_EVM_BOOTSTRAP_LOOKBACK_S * 1000))
         else:
             cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
         cursors[key] = cursor

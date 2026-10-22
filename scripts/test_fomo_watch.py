@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -232,22 +233,36 @@ emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca},
 check(ok and emitted == 0 and posted == [], "evm feed: bootstrap is not replayed")
 check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 1_001, "evm feed: cursor starts past newest")
 
-# New tracked CA: keep a grace window so the buy that triggered tracking is
-# ingested instead of being dropped by the bootstrap skip.
+# New tracked CA: keep a grace window anchored to NOW so the buy that
+# triggered tracking is ingested. A dormant CA whose entire page is old must
+# stay silent, not replay months-old fills.
 feed.FOMO_EVM_BOOTSTRAP_LOOKBACK_S = 900
+now_ms = 1_800_000_000_000
 feed._seen = set()
 st = {"evm_cursors": {}}
 posted = []
 evm_page = [
-    feed_item(id="evm-stale", createdAt=t0 - 2_000_000),
-    feed_item(id="evm-recent", createdAt=t0),
+    feed_item(id="evm-stale-a", createdAt=now_ms - 30 * 86_400_000),
+    feed_item(id="evm-stale-b", createdAt=now_ms - 30 * 86_400_000 + 1_000),
 ]
-emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-grace")
+with patch.object(feed.time, "time", return_value=now_ms / 1000):
+    emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-stale")
+check(ok and emitted == 0 and posted == [], "evm feed: dormant CA does not replay old buys")
+
+feed._seen = set()
+st = {"evm_cursors": {}}
+posted = []
+evm_page = [
+    feed_item(id="evm-stale", createdAt=now_ms - 30 * 86_400_000),
+    feed_item(id="evm-recent", createdAt=now_ms - 60_000),
+]
+with patch.object(feed.time, "time", return_value=now_ms / 1000):
+    emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-grace")
 check(ok and emitted == 1 and len(posted) == 1, "evm feed: bootstrap grace ingests recent watched buy")
 check(posted[0]["eventId"] == "fomo-feed:evm-recent", "evm feed: grace skips stale history")
-feed.FOMO_EVM_BOOTSTRAP_LOOKBACK_S = 900
 feed._seen = set()
 posted = []
+st = {"evm_cursors": {f"robinhood:{evm_ca}": t0 + 1_000}}
 
 evm_page = [
     feed_item(id="unwatched", createdAt=t0 + 2_000, userId="other-user"),
