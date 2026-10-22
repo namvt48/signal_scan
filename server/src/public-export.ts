@@ -1,7 +1,12 @@
-import { getDb, getAlertMetricObservations, listWallets } from './db.js';
+import { getDb, getAlertMetricObservations, getTokenState, listWallets } from './db.js';
+import { buildTokenDetail } from './detail.js';
+import { balanceSeries } from './crawl.js';
 import { assembleSignals, type TokenSignal } from './signals.js';
 import type { Chain } from './shared/chain.js';
-import type { PublicActivity, PublicAlert, PublicSnapshot, PublicToken, PublicTrade, PublicWallet } from './public-api-contract.js';
+import type {
+  PublicActivity, PublicAlert, PublicBalancePoint, PublicBalanceSeries, PublicSnapshot, PublicToken,
+  PublicTokenDetail, PublicTrade, PublicWallet, T100HistoryPoint,
+} from './public-api-contract.js';
 
 function points(raw: string | undefined): Array<{ t: number; value: number }> {
   if (raw === undefined) return [];
@@ -17,6 +22,31 @@ function points(raw: string | undefined): Array<{ t: number; value: number }> {
   return out;
 }
 
+function t100Points(raw: string | undefined): T100HistoryPoint[] {
+  if (raw === undefined) return [];
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return [];
+  const out: T100HistoryPoint[] = [];
+  for (const item of parsed) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
+    const t = Reflect.get(item, 't');
+    const value = Reflect.get(item, 'value');
+    if (typeof t !== 'number' || !Number.isSafeInteger(t) || typeof value !== 'number' || !Number.isFinite(value)) continue;
+    const peakBalance = Reflect.get(item, 'peakBalance');
+    const troughBalance = Reflect.get(item, 'troughBalance');
+    out.push({
+      t, value,
+      ...(typeof peakBalance === 'number' && Number.isFinite(peakBalance) ? { peakBalance } : {}),
+      ...(typeof troughBalance === 'number' && Number.isFinite(troughBalance) ? { troughBalance } : {}),
+    });
+  }
+  return out;
+}
+
+function iconPath(chain: Chain, ca: string): string {
+  return `/api/token-avatar/${chain}/${encodeURIComponent(ca)}`;
+}
+
 function toPublicToken(signal: TokenSignal): PublicToken {
   const db = getDb();
   const state = db.prepare('SELECT price, market_cap, holders, volume24h, vol_1h, buy_vol24h, sell_vol24h FROM token_state WHERE ca = ? AND chain = ?')
@@ -26,21 +56,38 @@ function toPublicToken(signal: TokenSignal): PublicToken {
   const freshness = signal.dataUpdatedAt;
   return {
     id: signal.id, ca: signal.ca, chain: signal.chain, symbol: signal.symbol ?? null, tier: signal.tier,
+    iconUrl: signal.iconUrl ?? iconPath(signal.chain, signal.ca),
+    xHandle: signal.xHandle ?? null,
     market: {
       price: state?.price ?? null, marketCap: signal.marketCap ?? null, holders: signal.holders,
       volume24h: signal.volume24h, volume1h: signal.volume1h ?? null,
       buyVol24h: signal.buyVol24h ?? null, sellVol24h: signal.sellVol24h ?? null,
-      dataUpdatedAt: { marketCap: freshness?.marketCap ?? null, volume24h: freshness?.volume24h ?? null, holders: freshness?.holders ?? null },
+      dataUpdatedAt: {
+        marketCap: freshness?.marketCap ?? null, volume24h: freshness?.volume24h ?? null,
+        holders: freshness?.holders ?? null, fresh: freshness?.fresh ?? null,
+        symbol: freshness?.symbol ?? null, icon: freshness?.icon ?? null,
+      },
     },
     metrics: {
-      score: signal.nansen.score, pass: { ...signal.nansen.pass }, fresh: signal.nansen.rawFresh ?? null,
+      score: signal.nansen.score, pass: { ...signal.nansen.pass },
+      fresh: signal.nansen.fresh ?? null, rawFresh: signal.nansen.rawFresh ?? null,
       freshCurrent: signal.nansen.freshCurrent, freshUpdatedAt: signal.nansen.freshUpdatedAt ?? null,
       t100: signal.nansen.t100 ? { pct: signal.nansen.t100.pct, multiple: signal.nansen.t100.multiple ?? null } : null,
       lf: signal.nansen.lf ?? null,
+      trackedHolding: signal.trackedHolding,
+      trackedInflow: signal.trackedInflow,
+      trackedActivityAt: signal.trackedActivityAt,
     },
+    balanceRange: signal.balanceRange
+      ? {
+        d1: signal.balanceRange.d1 ?? null,
+        d7: signal.balanceRange.d7 ?? null,
+        d30: signal.balanceRange.d30 ?? null,
+      }
+      : null,
     history: {
       marketCap: points(history?.market_cap_history_json ?? undefined), holders: points(history?.holders_history_json ?? undefined),
-      fresh: points(history?.fresh_history_json ?? undefined), t100: points(history?.t100_history_json ?? undefined),
+      fresh: points(history?.fresh_history_json ?? undefined), t100: t100Points(history?.t100_history_json ?? undefined),
     },
   };
 }
@@ -52,6 +99,45 @@ export function exportSnapshot(now = Date.now()): PublicSnapshot {
 export function exportToken(chain: Chain, ca: string, now = Date.now()): PublicToken | undefined {
   const found = assembleSignals(now, true).find((item) => item.chain === chain && item.ca === ca);
   return found ? toPublicToken(found) : undefined;
+}
+
+export function exportTokenDetail(chain: Chain, ca: string): PublicTokenDetail | undefined {
+  const detail = buildTokenDetail(ca, chain);
+  if (!detail) return undefined;
+  return {
+    ca: detail.ca, chain: detail.chain, price: detail.price, supply: detail.supply, holders: detail.holders,
+    freshSupplyPct: detail.freshSupplyPct ?? null,
+    top100SupplyPct: detail.top100SupplyPct ?? null,
+    medianHolderAmount: detail.medianHolderAmount ?? null,
+    medianHolderUsd: detail.medianHolderUsd ?? null,
+    top100: detail.top100.map((row) => ({
+      address: row.address, percentOwnership: row.percentOwnership, balance: row.balance,
+      balanceUsd: row.balanceUsd, addrType: row.addrType, isNew: row.isNew,
+      chg24h: row.chg24h ?? null, name: row.name ?? null,
+    })),
+    snapshotAt: detail.snapshotAt ?? null,
+  };
+}
+
+export async function exportBalanceSeries(
+  chain: Chain,
+  ca: string,
+  window: 'day' | 'week' | 'month',
+): Promise<PublicBalanceSeries> {
+  const series = await balanceSeries(ca, chain, window);
+  const points: PublicBalancePoint[] = [];
+  for (const point of series.points) {
+    const t = typeof point.t === 'number' ? point.t : Date.parse(String(point.t));
+    if (!Number.isFinite(t)) continue;
+    points.push({
+      t,
+      total: point.total,
+      totalUsd: point.totalUsd ?? null,
+      holders: point.holders ?? null,
+      inflow: point.inflow ?? null,
+    });
+  }
+  return { source: series.source, points, cachedAt: series.cachedAt ?? null };
 }
 
 export function exportWallets(): PublicWallet[] {
@@ -94,18 +180,22 @@ export function exportAlerts(afterId: number, limit: number): { data: PublicAler
   const db = getDb();
   const oldest = db.prepare('SELECT MIN(id) AS id FROM alert_metric_observations').get() as { id: number | null };
   const items = getAlertMetricObservations(afterId, limit + 1);
-  const page = items.slice(0, limit).map((item) => ({
-    id: item.id, ca: item.ca, chain: item.chain, metric: item.metric, value: item.value, responseAt: item.responseAt,
-    snapshot: {
-      capturedAt: item.snapshot.capturedAt, symbol: item.snapshot.symbol, marketCap: item.snapshot.marketCap,
-      marketCapAt: item.snapshot.marketCapAt, freshPct: item.snapshot.freshPct,
-      t100Multiple: item.snapshot.t100Multiple, lf: item.snapshot.lf,
-    },
-  }));
+  const page = items.slice(0, limit).map((item) => {
+    const state = getTokenState(item.ca, item.chain);
+    return {
+      id: item.id, ca: item.ca, chain: item.chain, metric: item.metric, value: item.value, responseAt: item.responseAt,
+      snapshot: {
+        capturedAt: item.snapshot.capturedAt, symbol: item.snapshot.symbol, marketCap: item.snapshot.marketCap,
+        marketCapAt: item.snapshot.marketCapAt, freshPct: item.snapshot.freshPct,
+        t100Multiple: item.snapshot.t100Multiple, lf: item.snapshot.lf,
+        trackedHoldingPct: item.snapshot.trackedHoldingPct ?? null,
+        iconUrl: iconPath(item.chain, item.ca),
+        xHandle: state?.x_handle != null && state.x_handle !== '' ? state.x_handle : null,
+      },
+    };
+  });
   return {
     data: page, nextId: page.at(-1)?.id ?? afterId, oldestAvailableId: oldest.id,
     gap: afterId > 0 && oldest.id !== null && afterId < oldest.id - 1,
   };
 }
-
-

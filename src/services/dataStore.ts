@@ -1,6 +1,7 @@
 import { EVM_CHAINS, CHAINS, type Chain, type FomoUser, type NansenThresholds, type PeriodicScanSettings, type Settings, type SettingsPatch, type TelegramAlertRules, type Tier, type TokenSignal, type Wallet, type WalletScope } from '../types';
 import { SHOW_FOMO } from '../config';
 import { restDataStore } from './restDataStore';
+import { byHandle, byName } from './sort';
 
 // ---------------------------------------------------------------------------
 // Public contract. Components import `dataStore` only; swap this file's
@@ -174,13 +175,7 @@ function createWalletRows(input: WalletWriteInput): Wallet[] {
   return EVM_CHAINS.map((chain) => ({ id: uid(), ...input, address, chain }));
 }
 
-export function byName(a: Wallet, b: Wallet): number {
-  return a.name.localeCompare(b.name, undefined, { numeric: true });
-}
-
-export function byHandle(a: FomoUser, b: FomoUser): number {
-  return a.handle.localeCompare(b.handle, undefined, { numeric: true });
-}
+export { byHandle, byName } from './sort';
 
 // --- CSV parsing (import) ---------------------------------------------------
 
@@ -617,13 +612,18 @@ export const localDataStore: DataStore = {
     const values = raw ? JSON.parse(raw) as Partial<TelegramAlertRules> : {};
     const minMcK = num(values.minMcK, -1);
     const maxMcK = num(values.maxMcK, -1);
+    const minHolders = num(values.minHolders, -1);
+    const maxHolders = num(values.maxHolders, -1);
     const validRange = minMcK < 0 || maxMcK < 0 || minMcK <= maxMcK;
+    const validHolderRange = minHolders < 0 || maxHolders < 0 || minHolders <= maxHolders;
     return {
       fwGrowthPct: num(values.fwGrowthPct, 30),
       minFwPct: num(values.minFwPct, 15),
       t100GrowthPct: num(values.t100GrowthPct, 30),
       minMcK: validRange && (minMcK === -1 || minMcK >= 0) ? minMcK : -1,
       maxMcK: validRange && (maxMcK === -1 || maxMcK >= 0) ? maxMcK : -1,
+      minHolders: validHolderRange && (minHolders === -1 || Number.isSafeInteger(minHolders) && minHolders >= 0) ? minHolders : -1,
+      maxHolders: validHolderRange && (maxHolders === -1 || Number.isSafeInteger(maxHolders) && maxHolders >= 0) ? maxHolders : -1,
       trackerBuyingK: num(values.trackerBuyingK, 0),
     };
   },
@@ -639,13 +639,18 @@ export const localDataStore: DataStore = {
     const values = JSON.parse(raw) as Partial<TelegramAlertRules>;
     const minMcK = num(values.minMcK, -1);
     const maxMcK = num(values.maxMcK, -1);
+    const minHolders = num(values.minHolders, -1);
+    const maxHolders = num(values.maxHolders, -1);
     const validRange = minMcK < 0 || maxMcK < 0 || minMcK <= maxMcK;
+    const validHolderRange = minHolders < 0 || maxHolders < 0 || minHolders <= maxHolders;
     return {
       fwGrowthPct: num(values.fwGrowthPct, 30),
       minFwPct: num(values.minFwPct, 15),
       t100GrowthPct: num(values.t100GrowthPct, 30),
       minMcK: validRange && (minMcK === -1 || minMcK >= 0) ? minMcK : -1,
       maxMcK: validRange && (maxMcK === -1 || maxMcK >= 0) ? maxMcK : -1,
+      minHolders: validHolderRange && (minHolders === -1 || Number.isSafeInteger(minHolders) && minHolders >= 0) ? minHolders : -1,
+      maxHolders: validHolderRange && (maxHolders === -1 || Number.isSafeInteger(maxHolders) && maxHolders >= 0) ? maxHolders : -1,
       trackerBuyingK: num(values.trackerBuyingK, 0),
     };
   },

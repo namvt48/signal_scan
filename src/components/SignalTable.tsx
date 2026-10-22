@@ -865,7 +865,12 @@ export default function SignalTable({
     return sort.dir === 'asc' ? av - bv : bv - av;
   });
   const visible: TokenSignal[] = mode === 'rated' ? ratedVisible : sorted;
-  const tickerWidth = visible.reduce((width, signal) => Math.max(width, (signal.symbol?.length ?? 1) * 12 + 64), 128);
+  /* Cap one symbol's contribution: a 95-char Zalgo ticker (2026-10-21) inflated the column to
+     1204px and left a blank gap before Tier. Real tickers up to 16 chars still size the column. */
+  const tickerWidth = visible.reduce(
+    (width, signal) => Math.max(width, Math.min(signal.symbol?.length ?? 1, 16) * 12 + 64),
+    128,
+  );
   const totalVolume = visible.reduce((acc, s) => acc + s.volume24h, 0);
 
   /* First click arms a column (desc for these magnitudes); clicking it again flips the direction. */
@@ -1085,7 +1090,7 @@ export default function SignalTable({
                             <span aria-hidden className="text-pos">
                               $
                             </span>
-                            <span className="min-w-max">{s.symbol?.toUpperCase() ?? '—'}</span>
+                            <span className="min-w-0 truncate">{s.symbol?.toUpperCase() ?? '—'}</span>
                             <TokenNote ca={s.ca} chain={s.chain} symbol={s.symbol} note={s.note} onSaved={(note) => {
                               setSignals((rows) => rows?.map((row) => row.ca === s.ca && row.chain === s.chain ? { ...row, note } : row) ?? rows);
                               notifyTierChange?.();

@@ -66,6 +66,8 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
   const marketCapAt = field(snapshotRaw, 'marketCapAt');
   const freshPct = field(snapshotRaw, 'freshPct');
   const t100Multiple = field(snapshotRaw, 't100Multiple');
+  const holders = field(snapshotRaw, 'holders');
+  const t100First = field(snapshotRaw, 't100First');
   const lf = field(snapshotRaw, 'lf');
   const trackedHoldingPct = field(snapshotRaw, 'trackedHoldingPct');
   const trackerBuyerRaw = field(snapshotRaw, 'trackerBuyer');
@@ -89,7 +91,9 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
   if (!Number.isSafeInteger(capturedAt) || (capturedAt as number) <= 0 ||
       (symbol !== null && typeof symbol !== 'string') ||
       !nullableNumber(marketCap) || !nullableNumber(marketCapAt) || !nullableNumber(freshPct) ||
-      !nullableNumber(t100Multiple) || !nullableNumber(lf) || !nullableNumber(trackedHoldingPct)) return null;
+      !nullableNumber(t100Multiple) || !nullableNumber(lf) || !nullableNumber(trackedHoldingPct) ||
+      (holders !== undefined && !nullableNumber(holders)) ||
+      (t100First !== undefined && !nullableNumber(t100First))) return null;
   return {
     id: id as number,
     ca,
@@ -104,6 +108,8 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
       marketCapAt,
       freshPct,
       t100Multiple,
+      ...(holders === undefined ? {} : { holders: holders as number | null }),
+      ...(t100First === undefined ? {} : { t100First: t100First as number | null }),
       lf,
       trackedHoldingPct,
       ...(trackerBuyer ? { trackerBuyer } : {}),
@@ -125,13 +131,20 @@ function parseRules(raw: unknown): TelegramAlertRules | null {
   const rawMaxMcK = field(raw, 'maxMcK');
   const minMcK = rawMinMcK === undefined ? -1 : rawMinMcK;
   const maxMcK = rawMaxMcK === undefined ? -1 : rawMaxMcK;
+  const rawMinHolders = field(raw, 'minHolders');
+  const rawMaxHolders = field(raw, 'maxHolders');
+  const minHolders = rawMinHolders === undefined ? -1 : rawMinHolders;
+  const maxHolders = rawMaxHolders === undefined ? -1 : rawMaxHolders;
   const trackerBuyingK = field(raw, 'trackerBuyingK');
   if (!finite(fwGrowthPct) || fwGrowthPct < 0 || !finite(minFwPct) || minFwPct < 0 || minFwPct > 100 ||
       !finite(t100GrowthPct) || t100GrowthPct < 0 || !finite(minMcK) || (minMcK !== -1 && minMcK < 0) ||
       !finite(maxMcK) || (maxMcK !== -1 && maxMcK < 0) ||
       (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK) ||
+      !finite(minHolders) || (minHolders !== -1 && !Number.isSafeInteger(minHolders)) || minHolders < -1 ||
+      !finite(maxHolders) || (maxHolders !== -1 && !Number.isSafeInteger(maxHolders)) || maxHolders < -1 ||
+      (minHolders >= 0 && maxHolders >= 0 && minHolders > maxHolders) ||
       !finite(trackerBuyingK) || trackerBuyingK < 0) return null;
-  return { fwGrowthPct, minFwPct, t100GrowthPct, minMcK, maxMcK, trackerBuyingK };
+  return { fwGrowthPct, minFwPct, t100GrowthPct, minMcK, maxMcK, minHolders, maxHolders, trackerBuyingK };
 }
 
 export class MonitorAlerts {

@@ -20,6 +20,10 @@ export interface AlertMetricSnapshot {
   marketCapAt: number | null;
   freshPct: number | null;
   t100Multiple: number | null;
+  /** Visible holder count when the observation was captured. */
+  holders?: number | null;
+  /** Earliest observed T100 multiple for this CA, used as the growth baseline. */
+  t100First?: number | null;
   lf: number | null;
   trackedHoldingPct: number | null;
   /** Snapshot of the buyer for trackerBuy: wallet address for tracked wallets, handle-only for FOMO users. */

@@ -1,11 +1,12 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { ArrowCounterClockwise, GearSix, SignOut } from '@phosphor-icons/react';
-import SignalTable from './components/SignalTable';
+// Keep the sign-in shell small: dashboard tables/charts load only after auth.
+const SignalTable = lazy(() => import('./components/SignalTable'));
 // Token detail page DISABLED (2026-09-16) — re-enable import + state + branch below.
 // import TokenDetailPage from './components/TokenDetailPage';
-import WalletsPage from './components/WalletsPage';
-import FomoUsersPage from './components/FomoUsersPage';
-import SettingsPanel from './components/SettingsPanel';
+const WalletsPage = lazy(() => import('./components/WalletsPage'));
+const FomoUsersPage = lazy(() => import('./components/FomoUsersPage'));
+const SettingsPanel = lazy(() => import('./components/SettingsPanel'));
 import { Button, IconButton } from './components/ui';
 import { AuthProvider } from './auth/auth-context';
 import { useAuth } from './auth/use-auth';
@@ -175,42 +176,46 @@ function DashboardShell() {
         </div>
       </header>
       <main className={`w-full px-4 py-6 sm:px-6 ${SHOW_FOMO ? '' : 'dashboard-a'}`}>
-        {visited.has('dashboard') && (
-          <div className={tab === 'dashboard' ? undefined : 'hidden'}>
-            <SignalTable
-              key={viewVersion}
-              refreshKey={settingsVersion}
-              active={tab === 'dashboard'}
-              onTierChange={() => setSettingsVersion((v) => v + 1)}
-            />
-          </div>
-        )}
-        {visited.has('rated') && (
-          <div className={tab === 'rated' ? undefined : 'hidden'}>
-            <SignalTable
-              key={`rated-${viewVersion}`}
-              mode="rated"
-              active={tab === 'rated'}
-              refreshKey={settingsVersion}
-              onTierChange={() => setSettingsVersion((v) => v + 1)}
-            />
-          </div>
-        )}
-        {tab === 'wallets' && (
-          <>
-            <WalletsPage />
-            {/* FOMO watch list is instance-b only: a sibling surface in the same tab,
-                behind SHOW_FOMO. Flag off → nothing renders (no tab, no heading, no button). */}
-            {SHOW_FOMO && (
-              <div className="mt-10">
-                <FomoUsersPage />
-              </div>
-            )}
-          </>
-        )}
+        <Suspense fallback={<div className="h-64 animate-pulse rounded-2xl bg-surface2" aria-label="Loading dashboard" />}>
+          {visited.has('dashboard') && (
+            <div className={tab === 'dashboard' ? undefined : 'hidden'}>
+              <SignalTable
+                key={viewVersion}
+                refreshKey={settingsVersion}
+                active={tab === 'dashboard'}
+                onTierChange={() => setSettingsVersion((v) => v + 1)}
+              />
+            </div>
+          )}
+          {visited.has('rated') && (
+            <div className={tab === 'rated' ? undefined : 'hidden'}>
+              <SignalTable
+                key={`rated-${viewVersion}`}
+                mode="rated"
+                active={tab === 'rated'}
+                refreshKey={settingsVersion}
+                onTierChange={() => setSettingsVersion((v) => v + 1)}
+              />
+            </div>
+          )}
+          {tab === 'wallets' && (
+            <>
+              <WalletsPage />
+              {/* FOMO watch list is instance-b only: a sibling surface in the same tab,
+                  behind SHOW_FOMO. Flag off → nothing renders (no tab, no heading, no button). */}
+              {SHOW_FOMO && (
+                <div className="mt-10">
+                  <FomoUsersPage />
+                </div>
+              )}
+            </>
+          )}
+        </Suspense>
       </main>
       {settingsOpen && (
-        <SettingsPanel fomo={SHOW_FOMO} onClose={() => setSettingsOpen(false)} onSaved={() => setSettingsVersion((v) => v + 1)} />
+        <Suspense fallback={null}>
+          <SettingsPanel fomo={SHOW_FOMO} onClose={() => setSettingsOpen(false)} onSaved={() => setSettingsVersion((v) => v + 1)} />
+        </Suspense>
       )}
     </div>
   );

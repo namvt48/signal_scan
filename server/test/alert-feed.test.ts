@@ -27,8 +27,8 @@ test('Fresh cache success and observation commit atomically with exact snapshot 
   try {
     insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
     const db = getDb();
-    db.prepare(`INSERT INTO token_state (ca, chain, symbol, market_cap, supply, nansen_fresh_pct, t100_multiple, genesis_bal)
-      VALUES (?, 'sol', 'ALERT', 25000, 1000, 10, 1.5, 80)`).run(ca);
+    db.prepare(`INSERT INTO token_state (ca, chain, symbol, market_cap, supply, holders, nansen_fresh_pct, t100_multiple, genesis_bal)
+      VALUES (?, 'sol', 'ALERT', 25000, 1000, 123, 10, 1.5, 80)`).run(ca);
     db.prepare(`INSERT INTO wallets (id, address, name, chain, source)
       VALUES ('wallet-1', 'wallet-1', 'tracked', 'sol', 'manual')`).run();
     db.prepare(`INSERT INTO wallet_token_state (wallet_id, ca, chain, token_amount)
@@ -58,8 +58,10 @@ test('Fresh cache success and observation commit atomically with exact snapshot 
     );
     assert.equal(observations[0]?.snapshot.freshPct, 42);
     assert.equal(observations[0]?.snapshot.t100Multiple, 1.5);
+    assert.equal(observations[0]?.snapshot.holders, 123);
     assert.equal(observations[0]?.snapshot.trackedHoldingPct, 12.5);
     assert.equal(observations[1]?.snapshot.t100Multiple, 1.25);
+    assert.equal(observations[1]?.snapshot.t100First, 1.25);
     assert.equal(observations[1]?.snapshot.lf, 80);
 
     assert.equal(acknowledgeAlertMetricObservations(observations[0]?.id ?? 0), true);
@@ -79,6 +81,32 @@ test('cached state rehydration and non-Gini cache writes do not create Fresh obs
     saveMetricPollResponse('cache-only', 'sol', 'gini', 2000, 3000, { nansenHolders: 10 });
     updateTokenMetrics('cache-only', 'sol', { nansenFreshPct: 42 }, 2000);
     assert.deepEqual(getAlertMetricObservations(0, 10), []);
+  } finally {
+    getDb().close();
+    open(':memory:');
+  }
+});
+
+test('T100 baseline stays at the first recorded observation after history pruning', () => {
+  resetDb();
+  const ca = 'T100FirstMint1111111111111111111111111111111';
+  try {
+    insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+    const db = getDb();
+    db.prepare("INSERT INTO token_state (ca, chain) VALUES (?, 'sol')").run(ca);
+
+    updateTokenAnalytics(ca, 'sol', { t100Multiple: 1.25 }, 1_000);
+    db.prepare('UPDATE token_state SET t100_history_json = ? WHERE ca = ? AND chain = ?')
+      .run(JSON.stringify([{ t: 1_500, value: 2 }]), ca, 'sol');
+    updateTokenAnalytics(ca, 'sol', { t100Multiple: 2.2 }, 2_000);
+
+    const t100 = getAlertMetricObservations(0, 10).filter((observation) => observation.metric === 't100');
+    assert.deepEqual(t100.map((observation) => observation.snapshot.t100First), [1.25, 1.25]);
+    assert.deepEqual(
+      db.prepare('SELECT first_multiple FROM t100_first_observations WHERE ca = ? AND chain = ?')
+        .get(ca, 'sol'),
+      { first_multiple: 1.25 },
+    );
   } finally {
     getDb().close();
     open(':memory:');

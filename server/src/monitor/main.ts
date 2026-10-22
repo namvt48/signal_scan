@@ -36,7 +36,7 @@ function main(): void {
   const config = readMonitorConfig();
   const store = new MonitorStore(config.dbPath);
   const collector = new MonitorCollector(store, config);
-  const notifications = new MonitorNotifications(store, new DiscordBot(config.discordBotToken, config.discordChannelId), config);
+  const notifications = new MonitorNotifications(store, new DiscordBot(config.discordBotToken, config.discordChannelId));
   const telegramBot = new TelegramBot(
     config.telegramBotToken,
     config.telegramChatId,
@@ -62,7 +62,6 @@ function main(): void {
     collecting = true;
     try {
       await collector.collect();
-      await notifications.tick();
       await periodicScan.tick();
       await alerts.tick();
     } catch (error) {

@@ -35,6 +35,8 @@ These routes confirm the public service is responding, not that the backend data
 | `GET /api/v1/tokens/{chain}/{address}/market` | Public | Market fields only. |
 | `GET /api/v1/tokens/{chain}/{address}/metrics` | Public | Signal and metric fields only. |
 | `GET /api/v1/tokens/{chain}/{address}/history` | Public | Stored metric history only. |
+| `GET /api/v1/tokens/{chain}/{address}/detail` | Public | Distribution metrics and the top-100 holder table. |
+| `GET /api/v1/tokens/{chain}/{address}/balance-chart` | Public | Top-100 total balance series for `day`, `week`, or `month`. |
 
 Supported chain path values: `sol`, `base`, `bsc`, `robinhood`. Address/CA must be 1–128 characters; invalid identity returns `400`.
 
@@ -56,6 +58,8 @@ A token object has this shape (fields may be `null` when the source has no value
   "chain": "sol",
   "symbol": "TICKER",
   "tier": "A",
+  "iconUrl": "/api/token-avatar/sol/token-address",
+  "xHandle": "token_x",
   "market": {
     "price": 0.001,
     "marketCap": 1000000,
@@ -64,25 +68,92 @@ A token object has this shape (fields may be `null` when the source has no value
     "volume1h": 12000,
     "buyVol24h": 140000,
     "sellVol24h": 110000,
-    "dataUpdatedAt": { "marketCap": 1700000000000, "volume24h": 1700000000000, "holders": 1700000000000 }
+    "dataUpdatedAt": {
+      "marketCap": 1700000000000, "volume24h": 1700000000000, "holders": 1700000000000,
+      "fresh": 1700000000000, "symbol": 1700000000000, "icon": 1700000000000
+    }
   },
   "metrics": {
     "score": 3,
     "pass": { "fresh": true, "t100": true, "lf": false },
     "fresh": 24.7,
+    "rawFresh": 24.7,
     "freshCurrent": true,
     "freshUpdatedAt": 1700000000000,
     "t100": { "pct": 25, "multiple": 1.25 },
-    "lf": 69000000
+    "lf": 69000000,
+    "trackedHolding": 4.2,
+    "trackedInflow": 1250,
+    "trackedActivityAt": 1700000000000
+  },
+  "balanceRange": {
+    "d1": { "peak": 1200, "trough": 900 },
+    "d7": null,
+    "d30": null
   },
   "history": {
     "marketCap": [{ "t": 1700000000000, "value": 1000000 }],
-    "holders": [], "fresh": [], "t100": []
+    "holders": [], "fresh": [],
+    "t100": [{ "t": 1700000000000, "value": 25, "peakBalance": 69000000, "troughBalance": 52000000 }]
   }
 }
 ```
 
-The individual subresource endpoints return `{ "data": <market|metrics|history value> }`. Token detail returns the token object directly.
+The individual subresource endpoints return `{ "data": <market|metrics|history value> }`. Token detail returns the token object directly. Token, subresource, and detail requests return `404` when the token has no stored state; `502` means the private backend is unavailable.
+
+Field notes:
+
+- `iconUrl` is a path relative to the API origin; the dashboard serves `/api/token-avatar/...` publicly.
+- `metrics.fresh` is the gated Fresh-wallet percentage the dashboard emits (`null` when the factor is hidden); `metrics.rawFresh` is the ungated measurement.
+- `metrics.trackedHolding` is the tracked-wallet token amount as a percentage of token supply (`0` when supply is unknown). Alert `snapshot.trackedHoldingPct` is the same measure captured when the alert was stored (`null` when no token state was available).
+- `metrics.trackedInflow` is net USD over the trailing 24h and may be negative; `metrics.trackedActivityAt` is the newest tracked buy/sell timestamp (`0` when none).
+- `balanceRange` is `null` until balance snapshots exist; individual windows are `null` when that window has no data.
+- `history.t100[]` keeps the optional `peakBalance`/`troughBalance` fields stored beside each sample.
+
+### Token detail
+
+`GET /api/v1/tokens/{chain}/{address}/detail` returns distribution metrics and the top-100 holder table built from stored snapshots:
+
+```json
+{
+  "ca": "token-address",
+  "chain": "sol",
+  "price": 0.001,
+  "supply": 1000000000,
+  "holders": 1200,
+  "freshSupplyPct": 24.7,
+  "top100SupplyPct": 25,
+  "medianHolderAmount": 500000,
+  "medianHolderUsd": 500,
+  "top100": [{
+    "address": "holder-address",
+    "percentOwnership": 5,
+    "balance": 50000000,
+    "balanceUsd": 50000,
+    "addrType": 1,
+    "isNew": false,
+    "chg24h": 1.5,
+    "name": "entity-label"
+  }],
+  "snapshotAt": 1700000000000
+}
+```
+
+Missing scalar values are `null`; `top100` is empty when no snapshot exists. `addrType` is the source classification (1 = wallet, 2 = exchange). The endpoint returns `404` when the token has no stored state. Top-100 addresses and labels are on-chain/public source data, but they reveal wallet correlation; treat them accordingly.
+
+### Balance chart
+
+`GET /api/v1/tokens/{chain}/{address}/balance-chart?window=day|week|month` returns the top-100 cohort's total balance series:
+
+```json
+{
+  "source": "nansen",
+  "points": [{ "t": 1700000000000, "total": 69000000, "totalUsd": 69000, "holders": 100, "inflow": 1200 }],
+  "cachedAt": 1700000000000
+}
+```
+
+`window` defaults to `day`; other values return `400`. `source` is `nansen` when a cached Nansen series exists and `snapshots` for the local snapshot fallback. `t` is normalized to epoch milliseconds. Optional point fields are `null` when the source did not provide them. This endpoint never performs a synchronous upstream fetch; stale cached series may trigger a background refresh.
 
 ### Token activity
 
@@ -108,7 +179,10 @@ Timestamps are Unix epoch milliseconds. Both bounds are optional; defaults are t
     "value": 24.7, "responseAt": 1700000000000,
     "snapshot": {
       "capturedAt": 1700000000000, "symbol": "TICKER", "marketCap": 1000000,
-      "marketCapAt": 1700000000000, "freshPct": 24.7, "t100Multiple": 1.25, "lf": 69000000
+      "marketCapAt": 1700000000000, "freshPct": 24.7, "t100Multiple": 1.25, "lf": 69000000,
+      "trackedHoldingPct": 4.2,
+      "iconUrl": "/api/token-avatar/sol/token-address",
+      "xHandle": "token_x"
     }
   }],
   "nextId": 42,

@@ -68,6 +68,8 @@ test('FOMO Telegram rules are persisted independently from instance A rules', as
         t100GrowthPct: 42,
         minMcK: -1,
         maxMcK: -1,
+        minHolders: 25,
+        maxHolders: 2_500,
         trackerBuyingK: 9,
       };
       const fomoRules = { ...aRules, fwGrowthPct: 12, trackerBuyingK: 3 };
@@ -141,6 +143,8 @@ test('alert feed is monitor-authenticated, ordered, paginated, and ack is bounde
         t100GrowthPct: 30,
         minMcK: -1,
         maxMcK: -1,
+        minHolders: -1,
+        maxHolders: -1,
         trackerBuyingK: 0,
       },
     });
@@ -247,6 +251,8 @@ test('alert feed enriches A and B observations with dashboard token and tracked-
         t100GrowthPct: 30,
         minMcK: -1,
         maxMcK: -1,
+        minHolders: -1,
+        maxHolders: -1,
         trackerBuyingK: 0,
       });
 

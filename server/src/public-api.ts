@@ -14,6 +14,9 @@ const WS_PAGE_SIZE = 100;
 const MAX_WS_CONNECTIONS = 64;
 const MAX_CONCURRENT = 16;
 const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
+/** Backend returned 404; only surfaced when the caller opts in via `preserveNotFound`. */
+const NOT_FOUND = Symbol('backend-not-found');
+type InternalResponse = unknown | null | typeof NOT_FOUND;
 interface WindowState { start: number; count: number }
 
 function parsePage(value: unknown, fallback: number): number | null {
@@ -147,7 +150,7 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
   const internalToken = options.internalToken ?? config.publicApiExportToken;
   let windowState: WindowState = { start: Date.now(), count: 0 };
   const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
-  const pending = new Map<string, Promise<unknown | null>>();
+  const pending = new Map<string, Promise<InternalResponse>>();
   let inFlight = 0;
   const app = express();
   app.disable('x-powered-by');
@@ -176,16 +179,33 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
   });
   app.get('/api/v1/tokens/:chain/:address', async (req, res) => {
     if (!CHAINS.includes(req.params.chain as typeof CHAINS[number]) || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
-    const result = await internal({ resource: 'token', chain: req.params.chain, ca: req.params.address });
+    const result = await internal({ resource: 'token', chain: req.params.chain, ca: req.params.address }, { preserveNotFound: true });
+    if (result === NOT_FOUND) { res.status(404).json({ error: 'token not found' }); return; }
     if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     res.json(result);
   });
   for (const resource of ['market', 'metrics', 'history'] as const) app.get(`/api/v1/tokens/:chain/:address/${resource}`, async (req, res) => {
     if (!CHAINS.includes(req.params.chain as typeof CHAINS[number]) || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
-    const result = await internal({ resource: 'token', chain: req.params.chain, ca: req.params.address });
+    const result = await internal({ resource: 'token', chain: req.params.chain, ca: req.params.address }, { preserveNotFound: true });
+    if (result === NOT_FOUND) { res.status(404).json({ error: 'token not found' }); return; }
     if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     const token = result as { market: unknown; metrics: unknown; history: unknown };
     res.json({ data: token[resource] });
+  });
+  app.get('/api/v1/tokens/:chain/:address/detail', async (req, res) => {
+    if (!CHAINS.includes(req.params.chain as typeof CHAINS[number]) || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
+    const result = await internal({ resource: 'detail', chain: req.params.chain, ca: req.params.address }, { preserveNotFound: true });
+    if (result === NOT_FOUND) { res.status(404).json({ error: 'token not found' }); return; }
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
+  });
+  app.get('/api/v1/tokens/:chain/:address/balance-chart', async (req, res) => {
+    if (!CHAINS.includes(req.params.chain as typeof CHAINS[number]) || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
+    const window = req.query.window ?? 'day';
+    if (typeof window !== 'string' || (window !== 'day' && window !== 'week' && window !== 'month')) { res.status(400).json({ error: 'invalid window' }); return; }
+    const result = await internal({ resource: 'balance', chain: req.params.chain, ca: req.params.address, window });
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
   });
   app.get('/api/v1/tokens/:chain/:address/activity', async (req, res) => {
     const range = parseTimeRange(req.query.from, req.query.to);
@@ -215,21 +235,27 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
     if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     res.json(data);
   });
-  async function internal(query: Record<string, string | number>): Promise<unknown | null> {
+  async function internal(query: Record<string, string | number>, options: { preserveNotFound: true }): Promise<InternalResponse>;
+  async function internal(query: Record<string, string | number>): Promise<unknown | null>;
+  async function internal(
+    query: Record<string, string | number>,
+    options: { preserveNotFound?: boolean } = {},
+  ): Promise<InternalResponse> {
     if (!internalUrl || !internalToken) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), INTERNAL_TIMEOUT_MS);
     try {
       const url = new URL('/api/internal/public-export', internalUrl);
       for (const [name, value] of Object.entries(query)) url.searchParams.set(name, String(value));
-      const key = url.toString();
+      const key = url.toString() + (options.preserveNotFound ? '#notfound' : '');
       const cached = responseCache.get(key);
       if (cached !== undefined && cached.expiresAt > Date.now()) return cached.value;
       const running = pending.get(key);
       if (running !== undefined) return await running;
-      const request = (async (): Promise<unknown | null> => {
+      const request = (async (): Promise<InternalResponse> => {
         try {
           const response = await fetch(url, { headers: { authorization: `Bearer ${internalToken}` }, signal: controller.signal, redirect: 'error' });
+          if (response.status === 404 && options.preserveNotFound) return NOT_FOUND;
           if (!response.ok) {
             console.warn('[public-api] export backend returned non-success status', response.status);
             return null;

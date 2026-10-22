@@ -257,6 +257,10 @@ export interface TelegramAlertRules {
   minMcK: number;
   /** Max market cap in thousands of USD; -1 disables this bound. */
   maxMcK: number;
+  /** Min holder count; -1 disables this bound. */
+  minHolders: number;
+  /** Max holder count; -1 disables this bound. */
+  maxHolders: number;
   /** Thousands of USD; 0 disables Tracker Buying alerts. */
   trackerBuyingK: number;
 }

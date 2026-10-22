@@ -83,6 +83,8 @@ Use one of these patterns:
 | `GET` | `/tokens/{chain}/{address}/market` | Token market fields. |
 | `GET` | `/tokens/{chain}/{address}/metrics` | Token metrics. |
 | `GET` | `/tokens/{chain}/{address}/history` | Stored token history. |
+| `GET` | `/tokens/{chain}/{address}/detail` | Distribution metrics and top-100 holder table. |
+| `GET` | `/tokens/{chain}/{address}/balance-chart` | Top-100 balance series (`day`, `week`, `month`). |
 | `GET` | `/tokens/{chain}/{address}/activity` | Time-bounded wallet-watch activity aggregates. |
 | `GET` | `/alerts` | Alert observations ordered by ID. |
 | `GET` | `/wallets` | Paginated tracked-wallet records. |
@@ -140,6 +142,8 @@ Response:
       "chain": "sol",
       "symbol": "TICKER",
       "tier": "A",
+      "iconUrl": "/api/token-avatar/sol/token-address",
+      "xHandle": "token_x",
       "market": {
         "price": 0.001,
         "marketCap": 1000000,
@@ -151,23 +155,35 @@ Response:
         "dataUpdatedAt": {
           "marketCap": 1700000000000,
           "volume24h": 1700000000000,
-          "holders": 1700000000000
+          "holders": 1700000000000,
+          "fresh": 1700000000000,
+          "symbol": 1700000000000,
+          "icon": 1700000000000
         }
       },
       "metrics": {
         "score": 3,
         "pass": {"fresh": true, "t100": true, "lf": false},
         "fresh": 24.7,
+        "rawFresh": 24.7,
         "freshCurrent": true,
         "freshUpdatedAt": 1700000000000,
         "t100": {"pct": 25, "multiple": 1.25},
-        "lf": 69000000
+        "lf": 69000000,
+        "trackedHolding": 4.2,
+        "trackedInflow": 1250,
+        "trackedActivityAt": 1700000000000
+      },
+      "balanceRange": {
+        "d1": {"peak": 1200, "trough": 900},
+        "d7": null,
+        "d30": null
       },
       "history": {
         "marketCap": [{"t": 1700000000000,"value":1000000}],
         "holders": [],
         "fresh": [],
-        "t100": []
+        "t100": [{"t": 1700000000000,"value":25,"peakBalance":69000000,"troughBalance":52000000}]
       }
     }
   ],
@@ -193,7 +209,46 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So111111111111111111
 curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112/market'
 ```
 
-Token detail returns the token object directly. Each subresource returns `{ "data": ... }`. Fields may be `null` if the source has no value. `chain` must be supported; address/CA must be 1–128 characters.
+Token detail returns the token object directly. Each subresource returns `{ "data": ... }`. Fields may be `null` if the source has no value. `chain` must be supported; address/CA must be 1–128 characters. A token, subresource, or detail request returns `404` when the token has no stored state; `502` means the private backend is unavailable.
+
+`metrics.trackedHolding` is the tracked-wallet token amount as a percentage of token supply (`0` when supply is unknown). Alert `snapshot.trackedHoldingPct` is the same measure captured when the alert was stored (`null` when no token state was available).
+
+`metrics.fresh` is the gated Fresh-wallet percentage the dashboard emits (`null` when the factor is hidden); `metrics.rawFresh` is the ungated measurement. `metrics.trackedInflow` is net USD over the trailing 24h (may be negative) and `metrics.trackedActivityAt` is the newest tracked buy/sell timestamp (`0` when none). `balanceRange` is `null` until balance snapshots exist, and each window is `null` independently. `iconUrl` is relative to the API origin; the dashboard serves `/api/token-avatar/...` publicly.
+
+### Token detail and balance chart
+
+```text
+GET /tokens/{chain}/{address}/detail
+GET /tokens/{chain}/{address}/balance-chart?window=day|week|month
+```
+
+Detail returns distribution metrics plus the top-100 holder table:
+
+```json
+{
+  "ca": "token-address", "chain": "sol", "price": 0.001, "supply": 1000000000, "holders": 1200,
+  "freshSupplyPct": 24.7, "top100SupplyPct": 25, "medianHolderAmount": 500000, "medianHolderUsd": 500,
+  "top100": [{
+    "address": "holder-address", "percentOwnership": 5, "balance": 50000000, "balanceUsd": 50000,
+    "addrType": 1, "isNew": false, "chg24h": 1.5, "name": "entity-label"
+  }],
+  "snapshotAt": 1700000000000
+}
+```
+
+Missing scalars are `null`; `top100` is empty when no snapshot exists. `addrType` is the source classification. Detail returns `404` when the token has no stored state. Top-100 addresses/labels are public on-chain data but reveal wallet correlation; handle them accordingly.
+
+Balance chart returns the top-100 cohort's total balance series:
+
+```json
+{
+  "source": "nansen",
+  "points": [{"t": 1700000000000, "total": 69000000, "totalUsd": 69000, "holders": 100, "inflow": 1200}],
+  "cachedAt": 1700000000000
+}
+```
+
+`window` defaults to `day`; invalid values return `400`. `source` is `nansen` for a cached Nansen series or `snapshots` for the local fallback. `t` is epoch milliseconds; optional fields are `null` when unavailable. The endpoint serves cache/snapshots without a synchronous upstream fetch; a stale cached series may trigger a background refresh.
 
 ## Token activity
 
@@ -255,7 +310,10 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/alerts?after_id=0&limit=50'
         "marketCapAt": 1700000000000,
         "freshPct": 24.7,
         "t100Multiple": 1.25,
-        "lf": 69000000
+        "lf": 69000000,
+        "trackedHoldingPct": 4.2,
+        "iconUrl": "/api/token-avatar/sol/token-address",
+        "xHandle": "token_x"
       }
     }
   ],
@@ -306,7 +364,10 @@ The server sends one `ready` message after connection setup:
       "marketCapAt": 1700000000000,
       "freshPct": 24.7,
       "t100Multiple": 1.25,
-      "lf": 69000000
+      "lf": 69000000,
+      "trackedHoldingPct": 4.2,
+      "iconUrl": "/api/token-avatar/sol/token-address",
+      "xHandle": "token_x"
     }
   }
 }

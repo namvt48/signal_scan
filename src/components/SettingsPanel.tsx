@@ -137,7 +137,7 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
       </div>
     );
   };
-  const renderTelegramField = (key: keyof TelegramAlertRules, label: string, min = 0, max?: number) => (
+  const renderTelegramField = (key: keyof TelegramAlertRules, label: string, min = 0, max?: number, step: number | 'any' = 'any') => (
     <div key={key}>
       <label htmlFor={`telegram-${key}`} className="block text-xs font-medium text-ink">{label}</label>
       <TextField
@@ -145,7 +145,7 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
         type="number"
         min={min}
         max={max}
-        step="any"
+        step={step}
         value={telegramDraft?.[key] ?? ''}
         onChange={(e) => {
           setTelegramSaved(false);
@@ -208,12 +208,14 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
   async function submitTelegramRules(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!telegramDraft) return;
-    const { minMcK, maxMcK, ...otherRules } = telegramDraft;
+    const { minMcK, maxMcK, minHolders, maxHolders, ...otherRules } = telegramDraft;
     if (Object.values(otherRules).some((value) => !Number.isFinite(value) || value < 0) ||
         telegramDraft.minFwPct > 100 ||
         [minMcK, maxMcK].some((value) => !Number.isFinite(value) || (value !== -1 && value < 0)) ||
-        (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK)) {
-      setTelegramError('MC bounds must be -1 or ≥ 0 with Min MC ≤ Max MC; other thresholds must be non-negative and Min FW ≤ 100.');
+        (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK) ||
+        [minHolders, maxHolders].some((value) => !Number.isSafeInteger(value) || (value !== -1 && value < 0)) ||
+        (minHolders >= 0 && maxHolders >= 0 && minHolders > maxHolders)) {
+      setTelegramError('MC bounds must be -1 or ≥ 0 with Min MC ≤ Max MC; holder bounds must be integers -1 or ≥ 0 with Min holders ≤ Max holders; other thresholds must be non-negative and Min FW ≤ 100.');
       setTelegramSaved(false);
       return;
     }
@@ -339,6 +341,14 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
                   <div className="mt-2 grid grid-cols-2 gap-3">
                     {renderTelegramField('minMcK', 'Min MC', -1)}
                     {renderTelegramField('maxMcK', 'Max MC', -1)}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-ink">Holder filter</p>
+                  <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
+                  <div className="mt-2 grid grid-cols-2 gap-3">
+                    {renderTelegramField('minHolders', 'Min holders', -1, undefined, 1)}
+                    {renderTelegramField('maxHolders', 'Max holders', -1, undefined, 1)}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-3">

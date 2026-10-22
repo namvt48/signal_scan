@@ -492,19 +492,34 @@ export class MonitorStore {
           (marketCapK !== null && Number.isFinite(marketCapK) &&
             (rules.minMcK === -1 || marketCapK >= rules.minMcK) &&
             (rules.maxMcK === -1 || marketCapK <= rules.maxMcK));
+        const minHolders = rules.minHolders ?? -1;
+        const maxHolders = rules.maxHolders ?? -1;
+        const holders = observation.snapshot.holders;
+        const holdersAllowed = (minHolders === -1 && maxHolders === -1) ||
+          (typeof holders === 'number' && Number.isFinite(holders) &&
+            (minHolders === -1 || holders >= minHolders) &&
+            (maxHolders === -1 || holders <= maxHolders));
         const growthThreshold = observation.metric === 'fresh' ? rules.fwGrowthPct : rules.t100GrowthPct;
         const freshAllowed = observation.metric !== 'fresh' ||
           (freshPctForAlert !== null &&
             Number.isFinite(freshPctForAlert) &&
             freshPctForAlert >= rules.minFwPct);
+        const firstT100 = observation.metric === 't100' &&
+          typeof observation.snapshot.t100First === 'number' &&
+          Number.isFinite(observation.snapshot.t100First) &&
+          observation.snapshot.t100First > 0
+          ? observation.snapshot.t100First
+          : undefined;
         const qualifyingBaseline = observation.metric === 'trackerBuy' || !freshAllowed
           ? undefined
-          : [baseline?.value, baseline?.previous_value].find((candidate) =>
-            candidate !== undefined &&
-            candidate !== null &&
-            candidate > 0 &&
-            current > candidate * (1 + growthThreshold / 100));
-        const shouldAlert = marketCapAllowed && (observation.metric === 'trackerBuy'
+          : observation.metric === 't100' && firstT100 !== undefined
+            ? current > firstT100 * (1 + growthThreshold / 100) ? firstT100 : undefined
+            : [baseline?.value, baseline?.previous_value].find((candidate) =>
+              candidate !== undefined &&
+              candidate !== null &&
+              candidate > 0 &&
+              current > candidate * (1 + growthThreshold / 100));
+        const shouldAlert = marketCapAllowed && holdersAllowed && (observation.metric === 'trackerBuy'
           ? rules.trackerBuyingK > 0 &&
             observation.snapshot.trackerBuyer !== undefined &&
             current > rules.trackerBuyingK * 1000

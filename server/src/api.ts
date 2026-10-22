@@ -62,6 +62,7 @@ import {
 import {
   getFomoTelegramAlertRules,
   getTelegramAlertRules,
+  TELEGRAM_ALERT_RULE_KEYS,
   updateFomoTelegramAlertRules,
   updateTelegramAlertRules,
 } from './telegram-alert-settings.js';
@@ -88,7 +89,7 @@ import { getSetupFreshnessStats, kickCAs, kickFomoHoldings, kickFomoPositions, k
 import { cohortLabelIndex } from './cohort-labels.js';
 import { getPeriodicScanSettings, updatePeriodicScanSettings } from './periodic-scan-settings.js';
 import { selectPeriodicScanSignals, toPeriodicScanItem } from './periodic-scan.js';
-import { exportActivity, exportAlerts, exportSnapshot, exportToken, exportTrades, exportWallets } from './public-export.js';
+import { exportActivity, exportAlerts, exportBalanceSeries, exportSnapshot, exportToken, exportTokenDetail, exportTrades, exportWallets } from './public-export.js';
 
 interface WalletJson {
   id: string;
@@ -662,7 +663,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       providerCache: providerRequestCache.stats(),
     });
   });
-  app.get('/api/internal/public-export', (req, res) => {
+  app.get('/api/internal/public-export', async (req, res) => {
     const resource = req.query.resource;
     const limitRaw = req.query.limit;
     const limit = limitRaw === undefined ? 100 : typeof limitRaw === 'string' && /^\d+$/.test(limitRaw) ? Number(limitRaw) : NaN;
@@ -701,6 +702,35 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       const token = exportToken(chain as Chain, canonicalCa(ca, chain as Chain));
       if (!token) { res.status(404).json({ error: 'token not found' }); return; }
       res.json(token);
+      return;
+    }
+    if (resource === 'detail') {
+      const chain = req.query.chain;
+      const ca = req.query.ca;
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
+        res.status(400).json({ error: 'invalid token identity' });
+        return;
+      }
+      const detail = exportTokenDetail(chain as Chain, canonicalCa(ca, chain as Chain));
+      if (!detail) { res.status(404).json({ error: 'token not found' }); return; }
+      res.json(detail);
+      return;
+    }
+    if (resource === 'balance') {
+      const chain = req.query.chain;
+      const ca = req.query.ca;
+      const windowRaw = req.query.window;
+      const window = windowRaw === undefined ? 'day' : windowRaw;
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' ||
+          ca.length < 1 || ca.length > 128 || (window !== 'day' && window !== 'week' && window !== 'month')) {
+        res.status(400).json({ error: 'invalid balance query' });
+        return;
+      }
+      try {
+        res.json(await exportBalanceSeries(chain as Chain, canonicalCa(ca, chain as Chain), window));
+      } catch {
+        res.status(503).json({ error: 'balance series unavailable' });
+      }
       return;
     }
     if (resource === 'activity') {
@@ -904,7 +934,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     }
     const values = body as Record<string, unknown>;
     const patch: Record<string, unknown> = {};
-    const ruleKeys = ['fwGrowthPct', 'minFwPct', 't100GrowthPct', 'minMcK', 'maxMcK', 'trackerBuyingK'] as const;
+    const ruleKeys = TELEGRAM_ALERT_RULE_KEYS;
     for (const key of ruleKeys) {
       if (values[key] !== undefined) patch[key] = values[key];
     }
@@ -939,7 +969,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     }
     const values = body as Record<string, unknown>;
     const patch: Record<string, unknown> = {};
-    const ruleKeys = ['fwGrowthPct', 'minFwPct', 't100GrowthPct', 'minMcK', 'maxMcK', 'trackerBuyingK'] as const;
+    const ruleKeys = TELEGRAM_ALERT_RULE_KEYS;
     for (const key of ruleKeys) {
       if (values[key] !== undefined) patch[key] = values[key];
     }

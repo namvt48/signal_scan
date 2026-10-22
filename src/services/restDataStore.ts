@@ -3,7 +3,8 @@
 // cannot tell them apart.
 
 import type { Chain, FomoUser, PeriodicScanSettings, Settings, SettingsPatch, TelegramAlertRules, Tier, TokenSignal, Wallet } from '../types';
-import { byHandle, byName, type DataStore, type FomoImportRow, type ImportResult, type ImportRow, type WalletWriteInput, type WalletWritePatch } from './dataStore';
+import type { DataStore, FomoImportRow, ImportResult, ImportRow, WalletWriteInput, WalletWritePatch } from './dataStore';
+import { byHandle, byName } from './sort';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
 

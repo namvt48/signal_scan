@@ -24,6 +24,8 @@ function observation(
   ca = 'AlertMint111111111111111111111111111111111',
   freshPct: number | null = metric === 'fresh' ? value : 41,
   marketCap: number | null = 25_000,
+  holders: number | null = 1_000,
+  t100First?: number,
 ): AlertMetricObservation {
   return {
     id, ca, chain: 'sol', metric, value,
@@ -35,6 +37,8 @@ function observation(
       marketCapAt: 1_700_000_000_000,
       freshPct,
       t100Multiple: metric === 't100' ? value : 2.5,
+      ...(holders === null ? {} : { holders }),
+      ...(t100First === undefined ? {} : { t100First }),
       lf: 100,
       trackedHoldingPct: 3.75,
       iconUrl: 'https://cdn.dexscreener.com/cms/images/token-icon.png',
@@ -270,6 +274,69 @@ test('T100 alerts require strictly more than 30% growth from a positive prior ba
     store.close();
   }
 });
+test('T100 growth is measured from the earliest observed point', () => {
+  const store = new MonitorStore(':memory:');
+  const ca = 'T100EarliestMint111111111111111111111111';
+  try {
+    store.commitAlertObservations('A', [
+      observation(1, 't100', 2, 'EARLIEST', ca, 41, 25_000, 1_000, 2),
+      observation(2, 't100', 2.5, 'EARLIEST', ca, 41, 25_000, 1_000, 2),
+      observation(3, 't100', 2.7, 'EARLIEST', ca, 41, 25_000, 1_000, 2),
+      observation(4, 't100', 2, 'EARLIEST', ca, 41, 25_000, 1_000, 2),
+      observation(5, 't100', 2.8, 'EARLIEST', ca, 41, 25_000, 1_000, 2),
+    ]);
+    const pending = store.pendingTelegramAlerts(Date.now(), 10);
+    assert.deepEqual(pending.map((alert) => alert.alertId), ['A:3', 'A:5']);
+    assert.ok(pending.every((alert) => alert.payload.trigger.previous === 2));
+  } finally {
+    store.close();
+  }
+});
+
+test('holder filter gates Fresh, T100, and Tracker Buying alerts', () => {
+  const store = new MonitorStore(':memory:');
+  const lowCa = 'HolderLowMint111111111111111111111111111';
+  const highCa = 'HolderHighMint11111111111111111111111111';
+  const equalCa = 'HolderEqualMint1111111111111111111111111';
+  const nullCa = 'HolderNullMint11111111111111111111111111';
+  const t100Ca = 'HolderT100Mint11111111111111111111111111';
+  const buyLowCa = 'HolderBuyLowMint111111111111111111111111';
+  const buyHighCa = 'HolderBuyHighMint11111111111111111111111';
+  const aboveCa = 'HolderAboveMint1111111111111111111111111';
+  const rules = {
+    fwGrowthPct: 30,
+    minFwPct: 15,
+    t100GrowthPct: 30,
+    minMcK: -1,
+    maxMcK: -1,
+    minHolders: 1_000,
+    maxHolders: 2_000,
+    trackerBuyingK: 50,
+  };
+  try {
+    store.commitAlertObservations('A', [
+      observation(1, 'fresh', 20, 'LOW', lowCa, 20, 25_000, 999),
+      observation(2, 'fresh', 26, 'LOW', lowCa, 26, 25_000, 999),
+      observation(3, 'fresh', 20, 'HIGH', highCa, 20, 25_000, 1_001),
+      observation(4, 'fresh', 26.2, 'HIGH', highCa, 26.2, 25_000, 1_001),
+      observation(5, 'fresh', 20, 'EQUAL', equalCa, 20, 25_000, 1_000),
+      observation(6, 'fresh', 26.2, 'EQUAL', equalCa, 26.2, 25_000, 1_000),
+      observation(7, 'fresh', 20, 'NULL', nullCa, 20, 25_000, null),
+      observation(8, 'fresh', 26.2, 'NULL', nullCa, 26.2, 25_000, null),
+      observation(9, 't100', 1, 'T-HIGH', t100Ca, 41, 25_000, 1_001),
+      observation(10, 't100', 2, 'T-HIGH', t100Ca, 41, 25_000, 1_001),
+      observation(11, 'trackerBuy', 50_001, 'BUY-LOW', buyLowCa, 0, 25_000, 999),
+      observation(12, 'trackerBuy', 50_001, 'BUY-HIGH', buyHighCa, 0, 25_000, 1_001),
+      observation(13, 'fresh', 20, 'ABOVE', aboveCa, 20, 25_000, 2_001),
+      observation(14, 'fresh', 26.2, 'ABOVE', aboveCa, 26.2, 25_000, 2_001),
+    ], rules);
+    const pending = store.pendingTelegramAlerts(Date.now(), 10);
+    assert.deepEqual(pending.map((alert) => alert.alertId), ['A:4', 'A:6', 'A:10', 'A:12']);
+  } finally {
+    store.close();
+  }
+});
+
 test('legacy alert baselines gain persisted n-2 history after a new observation', () => {
   const dir = mkdtempSync(join(tmpdir(), 'monitor-alert-baseline-'));
   const path = join(dir, 'monitor.sqlite3');

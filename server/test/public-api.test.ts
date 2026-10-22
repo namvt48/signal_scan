@@ -17,10 +17,18 @@ before(async () => {
     internalCalls++;
     if (req.headers.authorization !== 'Bearer internal-secret') { res.status(401).end(); return; }
     if (req.query.resource === 'tokens') res.json({ generatedAt: 123, data: [{ id: 'sol:CA', ca: 'CA', chain: 'sol', fomoUsers: undefined }], nextOffset: null });
-    else if (req.query.resource === 'token') res.json({ market: { marketCap: 10 }, metrics: { score: 2 }, history: { marketCap: [] } });
+    else if (req.query.resource === 'token') {
+      if (req.query.ca === 'missing') { res.status(404).end(); return; }
+      res.json({ market: { marketCap: 10 }, metrics: { score: 2 }, history: { marketCap: [] } });
+    }
     else if (req.query.resource === 'alerts') res.json({ data: [], nextId: 0, oldestAvailableId: null, gap: false });
     else if (req.query.resource === 'wallets') res.json({ data: [], nextOffset: null });
     else if (req.query.resource === 'activity') res.json({ buys: 1, sells: 0, netInflowUsd: 10 });
+    else if (req.query.resource === 'detail') {
+      if (req.query.ca === 'missing') { res.status(404).end(); return; }
+      res.json({ ca: 'CA', chain: 'sol', supply: 10, top100: [] });
+    }
+    else if (req.query.resource === 'balance') res.json({ source: 'snapshots', points: [] });
     else if (req.query.resource === 'trades') res.json({ data: [], nextId: null });
     else res.status(400).end();
   });
@@ -68,8 +76,18 @@ test('validates bounds and serves alerts, activity, wallets and trades', async (
   assert.equal((await get('/api/v1/alerts?after_id=-1')).status, 400);
   assert.equal((await get('/api/v1/alerts')).status, 200);
   assert.equal((await get('/api/v1/tokens/sol/CA/activity')).status, 200);
+  assert.equal((await get('/api/v1/tokens/sol/CA/detail')).status, 200);
+  assert.equal((await get('/api/v1/tokens/sol/CA/balance-chart')).status, 200);
+  assert.equal((await get('/api/v1/tokens/sol/CA/balance-chart?window=month')).status, 200);
+  assert.equal((await get('/api/v1/tokens/sol/CA/balance-chart?window=year')).status, 400);
   assert.equal((await get('/api/v1/wallets')).status, 200);
   assert.equal((await get('/api/v1/wallets/id/trades')).status, 200);
+});
+
+test('preserves backend 404 for missing tokens and detail', async () => {
+  assert.equal((await get('/api/v1/tokens/sol/missing')).status, 404);
+  assert.equal((await get('/api/v1/tokens/sol/missing/metrics')).status, 404);
+  assert.equal((await get('/api/v1/tokens/sol/missing/detail')).status, 404);
 });
 
 test('serves backend exports that take longer than three seconds', async () => {

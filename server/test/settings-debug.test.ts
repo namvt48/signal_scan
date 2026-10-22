@@ -63,6 +63,8 @@ test('Telegram alert rules persist, validate, and stay unavailable on instance B
     t100GrowthPct: 30,
     minMcK: -1,
     maxMcK: -1,
+    minHolders: -1,
+    maxHolders: -1,
     trackerBuyingK: 0,
   });
 
@@ -79,6 +81,17 @@ test('Telegram alert rules persist, validate, and stay unavailable on instance B
 
   assert.equal((await putTelegramRules({ minFwPct: 101 })).status, 400);
   assert.equal((await putTelegramRules({ minMcK: 81, maxMcK: 80 })).status, 400);
+  assert.equal((await putTelegramRules({ minHolders: -2 })).status, 400);
+  assert.equal((await putTelegramRules({ minHolders: 1.5 })).status, 400);
+  assert.equal((await putTelegramRules({ minHolders: 2_000, maxHolders: 1_000 })).status, 400);
+  const holderSaved = await putTelegramRules({ minHolders: 100, maxHolders: 2_000 });
+  assert.equal(holderSaved.status, 200);
+  const holderRules = await (await getTelegramRules()).json() as { minHolders: number; maxHolders: number };
+  assert.deepEqual(
+    { minHolders: holderRules.minHolders, maxHolders: holderRules.maxHolders },
+    { minHolders: 100, maxHolders: 2_000 },
+  );
+  await putTelegramRules({ minHolders: -1, maxHolders: -1 });
   assert.deepEqual(await (await getTelegramRules()).json(), saved.json);
   const lowerDisabled = await putTelegramRules({ minMcK: -1 });
   assert.equal(lowerDisabled.status, 200);

@@ -197,6 +197,13 @@ CREATE TABLE IF NOT EXISTS token_state (
   market_cap_history_json TEXT,
   PRIMARY KEY (ca, chain)
 );
+CREATE TABLE IF NOT EXISTS t100_first_observations (
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL,
+  first_multiple REAL NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  PRIMARY KEY (ca, chain)
+);
 CREATE TABLE IF NOT EXISTS metric_poll_cache (
   ca TEXT NOT NULL,
   chain TEXT NOT NULL,
@@ -675,6 +682,15 @@ export function open(path: string, sharedMarketPath = ''): void {
     }
   }
   instance.exec('CREATE INDEX IF NOT EXISTS idx_wallet_token_state_chain_ca ON wallet_token_state(chain, ca)');
+  // Created after the wallet-table rebuild: on a pre-T3 database the legacy
+  // wallet_trades has no `chain` column, so these cannot live in SCHEMA (exec'd
+  // before migration). Keeping them here covers both fresh and migrated shapes.
+  instance.exec(`
+    CREATE INDEX IF NOT EXISTS idx_trades_wallet_ca_side ON wallet_trades(wallet_id, chain, ca, side, source);
+    CREATE INDEX IF NOT EXISTS idx_trades_source_ts ON wallet_trades(source, ts);
+    CREATE INDEX IF NOT EXISTS idx_trades_wallet_ca_side_src ON wallet_trades(wallet_id, ca, side, source);
+    CREATE INDEX IF NOT EXISTS idx_trades_wallet_chain_ca_src_ts ON wallet_trades(wallet_id, chain, ca, source, ts);
+  `);
   // One-time LF re-resolve (user 2026-09-11): the LF rule became "the exchange
   // chart's LEFTMOST point", so every stored genesis_bal is stale — and stale is
   // self-locking, because refreshSeries only refetches while the column is NULL.
@@ -1731,6 +1747,20 @@ function freshValue(response: unknown): number | undefined {
     : undefined;
 }
 
+function earliestT100Multiple(raw: string | null): number | null {
+  if (raw === null) return null;
+  try {
+    const history: unknown = JSON.parse(raw);
+    if (!Array.isArray(history)) return null;
+    const first = history[0] as { value?: unknown } | undefined;
+    return typeof first?.value === 'number' && Number.isFinite(first.value) && first.value > 0
+      ? first.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function appendAlertMetricObservation(
   db: Database.Database,
   ca: string,
@@ -1742,15 +1772,19 @@ export function appendAlertMetricObservation(
 ): void {
   const canonical = canonicalCa(ca, chain);
   const state = db.prepare(`
-    SELECT symbol, market_cap, market_cap_history_json, supply, nansen_fresh_pct, t100_multiple, genesis_bal
+    SELECT symbol, market_cap, market_cap_history_json, supply, holders, nansen_holders,
+           nansen_fresh_pct, t100_multiple, t100_history_json, genesis_bal
     FROM token_state WHERE ca = ? AND chain = ?
   `).get(canonical, chain) as {
     symbol: string | null;
     market_cap: number | null;
     market_cap_history_json: string | null;
     supply: number | null;
+    holders: number | null;
+    nansen_holders: number | null;
     nansen_fresh_pct: number | null;
     t100_multiple: number | null;
+    t100_history_json: string | null;
     genesis_bal: number | null;
   } | undefined;
   const holdings = db.prepare(`
@@ -1777,6 +1811,27 @@ export function appendAlertMetricObservation(
       marketCapAt = null;
     }
   }
+  const holderCount = state?.holders != null && state.holders > 0
+    ? state.holders
+    : state?.nansen_holders != null && state.nansen_holders > 0
+      ? state.nansen_holders
+      : null;
+  const firstT100Row = metric === 't100'
+    ? db.prepare(
+      'SELECT first_multiple FROM t100_first_observations WHERE ca = ? AND chain = ?',
+    ).get(canonical, chain) as { first_multiple: number } | undefined
+    : undefined;
+  const firstT100 = metric === 't100'
+    ? firstT100Row?.first_multiple ??
+      earliestT100Multiple(state?.t100_history_json ?? null) ??
+      (Number.isFinite(value) && value > 0 ? value : null)
+    : null;
+  if (firstT100 !== null && firstT100Row === undefined) {
+    db.prepare(`
+      INSERT OR IGNORE INTO t100_first_observations (ca, chain, first_multiple, recorded_at)
+      VALUES (?, ?, ?, ?)
+    `).run(canonical, chain, firstT100, Date.now());
+  }
   const snapshot: AlertMetricSnapshot = {
     capturedAt: Date.now(),
     symbol: state?.symbol ?? null,
@@ -1784,6 +1839,8 @@ export function appendAlertMetricObservation(
     marketCapAt,
     freshPct: metric === 'fresh' ? value : state?.nansen_fresh_pct ?? null,
     t100Multiple: metric === 't100' ? value : state?.t100_multiple ?? null,
+    ...(holderCount === null ? {} : { holders: holderCount }),
+    ...(firstT100 === null ? {} : { t100First: firstT100 }),
     lf: state?.genesis_bal ?? null,
     trackedHoldingPct: state === undefined
       ? null

@@ -44,19 +44,6 @@ function metric(
   };
 }
 
-function captureDiscord(configuration: MonitorConfig): { bot: DiscordBot; messages: string[] } {
-  const messages: string[] = [];
-  const bot = new DiscordBot(configuration.discordBotToken, configuration.discordChannelId, async (_url, init) => {
-    const rawBody = init?.body;
-    const body: unknown = JSON.parse(typeof rawBody === 'string' ? rawBody : '{}');
-    if (typeof body === 'object' && body !== null && 'content' in body && typeof body.content === 'string') {
-      messages.push(body.content);
-    }
-    return new Response(null, { status: 204 });
-  });
-  return { bot, messages };
-}
-
 test('monitor store persists usage deltas, counter resets, services, and history across restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'signal-scan-monitor-'));
   const path = join(directory, 'monitor.sqlite3');
@@ -154,7 +141,7 @@ test('monitor store hides legacy Solana rows after merged RPC inventory cutover'
 test('monitor app serves dashboard APIs publicly, leaves healthz public, and bounds history queries', async () => {
   const configuration = config();
   const store = new MonitorStore(':memory:');
-  const notifications = new MonitorNotifications(store, new DiscordBot('', ''), configuration);
+  const notifications = new MonitorNotifications(store, new DiscordBot('', ''));
   const server = createMonitorApp({ config: configuration, store, notifications }).listen(0);
   await once(server, 'listening');
   const address = server.address();
@@ -201,152 +188,6 @@ test('Discord bot sends bounded content with bot auth and mentions disabled', as
   if (typeof content !== 'string') throw new Error('Discord content was not a string');
   assert.equal(content.length, 2_000);
   assert.deepEqual(allowedMentions, { parse: [] });
-});
-
-test('low-credit alerts deduplicate, then re-arm after the balance recovers', async () => {
-  const configuration = config({
-    MONITOR_DAILY_REPORT_HOUR: '23',
-    DISCORD_BOT_TOKEN: 'test-discord-token',
-    DISCORD_CHANNEL_ID: '12345678901234567',
-  });
-  const store = new MonitorStore(':memory:');
-  const { bot, messages } = captureDiscord(configuration);
-  let now = Date.UTC(2026, 0, 2, 12);
-  const notifications = new MonitorNotifications(store, bot, configuration, () => now);
-  try {
-    store.recordMetrics([metric('FOMO', 'account', 95, 5, 100, 'low', 'credits', 10)], now);
-    await notifications.tick();
-    await notifications.tick();
-    assert.equal(messages.length, 1);
-    assert.match(messages[0] ?? '', /Credit thấp/);
-
-    now += 60_000;
-    store.recordMetrics([metric('FOMO', 'account', 50, 50, 100, 'ok', 'credits', 10)], now);
-    await notifications.tick();
-    now += 60_000;
-    store.recordMetrics([metric('FOMO', 'account', 95, 5, 100, 'low', 'credits', 10)], now);
-    await notifications.tick();
-    assert.equal(messages.length, 2);
-  } finally {
-    store.close();
-  }
-});
-
-test('provider incidents deduplicate across store restart and notify once on recovery', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'signal-scan-monitor-incidents-'));
-  const dbPath = join(directory, 'monitor.db');
-  const configuration = config({
-    MONITOR_DAILY_REPORT_HOUR: '23',
-    DISCORD_BOT_TOKEN: 'test-discord-token',
-    DISCORD_CHANNEL_ID: '12345678901234567',
-  });
-  const { bot, messages } = captureDiscord(configuration);
-  let now = Date.UTC(2026, 0, 2, 12);
-  const incident: ServiceSample = {
-    id: 'nansen-fw-freshness', name: 'Nansen FW successful data', scope: 'Nansen',
-    status: 'down', checkedAt: new Date(now).toISOString(), latencyMs: null, detail: 'All tracked CAs stale',
-  };
-  let store = new MonitorStore(dbPath);
-  try {
-    store.recordServices([incident], now);
-    await new MonitorNotifications(store, bot, configuration, () => now).tick();
-    assert.equal(messages.length, 1);
-    store.close();
-
-    store = new MonitorStore(dbPath);
-    await new MonitorNotifications(store, bot, configuration, () => now).tick();
-    assert.equal(messages.length, 1);
-
-    now += 60_000;
-    store.recordServices([{ ...incident, status: 'healthy', detail: 'All tracked CAs fresh' }], now);
-    await new MonitorNotifications(store, bot, configuration, () => now).tick();
-    await new MonitorNotifications(store, bot, configuration, () => now).tick();
-    assert.equal(messages.length, 2);
-    assert.match(messages[1] ?? '', /recovered/i);
-  } finally {
-    store.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('server incidents, credit warnings and daily reports never fall back to Telegram', async () => {
-  const configuration = config({
-    MONITOR_DAILY_REPORT_HOUR: '8',
-    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
-    TELEGRAM_CHAT_ID: '-1001234567890',
-  });
-  const store = new MonitorStore(':memory:');
-  const incident: ServiceSample = {
-    id: 'nansen-fw-freshness', name: 'Nansen FW successful data', scope: 'Nansen',
-    status: 'down', checkedAt: new Date(Date.UTC(2026, 0, 2, 12)).toISOString(),
-    latencyMs: null, detail: 'All tracked CAs stale',
-  };
-  const telegramMessages: string[] = [];
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (_input, init) => {
-    const payload = JSON.parse(String(init?.body ?? '{}')) as { text?: unknown };
-    if (typeof payload.text === 'string') telegramMessages.push(payload.text);
-    return jsonResponse({ ok: true, result: { message_id: 1 } });
-  };
-  let now = Date.UTC(2026, 0, 2, 12);
-  try {
-    store.recordServices([incident], now);
-    store.recordMetrics([metric('FOMO', 'account', 95, 5, 100, 'low', 'credits', 10)], now);
-    await new MonitorNotifications(store, new DiscordBot('', ''), configuration, () => now).tick();
-
-    store.setNotificationState('provider:nansen-fw-freshness', 'incident', now, null);
-    now += 60_000;
-    store.recordServices([{ ...incident, status: 'healthy' }], now);
-    await new MonitorNotifications(store, new DiscordBot('', ''), configuration, () => now).tick();
-
-    assert.deepEqual(telegramMessages, []);
-  } finally {
-    globalThis.fetch = originalFetch;
-    store.close();
-  }
-});
-
-
-test('daily report uses observed per-provider deltas and persists once-per-day deduplication', async () => {
-  const configuration = config({
-    MONITOR_DAILY_REPORT_HOUR: '8',
-    DISCORD_BOT_TOKEN: 'test-discord-token',
-    DISCORD_CHANNEL_ID: '12345678901234567',
-  });
-  const store = new MonitorStore(':memory:');
-  const { bot, messages } = captureDiscord(configuration);
-  const sampleAt = Date.UTC(2026, 0, 2, 9);
-  const rowsBefore = [
-    metric('Nansen', 'caller-a', 1, 99, 100, 'ok'),
-    metric('FOMO', 'account', 5, 95, 100, 'ok', 'credits', 10),
-    metric('GMGN', 'key-1', 0, null, null, 'unknown', 'requests'),
-    metric('EVM RPC · base', 'api-a-application-evm-base-0', 0, null, null, 'unknown', 'requests'),
-  ];
-  const rowsAfter = [
-    metric('Nansen', 'caller-a', 4, 96, 100, 'ok'),
-    metric('FOMO', 'account', 8, 92, 100, 'ok', 'credits', 10),
-    metric('GMGN', 'key-1', 7, null, null, 'unknown', 'requests'),
-    metric('EVM RPC · base', 'api-a-application-evm-base-0', 2, null, null, 'unknown', 'requests'),
-  ];
-  try {
-    store.recordServices([{
-      id: 'api-a', name: 'API A', scope: 'API', status: 'healthy',
-      checkedAt: new Date(sampleAt).toISOString(), latencyMs: 12, detail: 'HTTP OK',
-    }], sampleAt);
-    store.recordMetrics(rowsBefore, sampleAt - 60_000);
-    store.recordMetrics(rowsAfter, sampleAt);
-    const clock = sampleAt + 1;
-    await new MonitorNotifications(store, bot, configuration, () => clock).tick();
-    assert.equal(messages.length, 1);
-    assert.match(messages[0] ?? '', /Nansen: 3 credits/);
-    assert.match(messages[0] ?? '', /FOMO: 8 \/ 100 credits/);
-    assert.match(messages[0] ?? '', /GMGN: 7 request/);
-    assert.match(messages[0] ?? '', /RPC: 2 outbound request/);
-    await new MonitorNotifications(store, bot, configuration, () => clock + 1_000).tick();
-    assert.equal(messages.length, 1, 'SQLite state prevents a duplicate report after notifier restart');
-  } finally {
-    store.close();
-  }
 });
 
 test('collector inventories and aggregates six shared Solana RPCs, merges Nansen, and preserves unknown balance', async () => {

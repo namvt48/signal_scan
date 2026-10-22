@@ -69,3 +69,7 @@ export interface HistorySeries {
   unit: string;
   points: HistoryPoint[];
 }
+
+export interface MonitorHistory {
+  series: HistorySeries[];
+}

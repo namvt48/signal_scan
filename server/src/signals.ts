@@ -849,6 +849,37 @@ export function nansenScore(
 }
 
 
+/**
+ * Sparklines in the list view aggregate to 32 points in the browser anyway
+ * (src/lib/chartHistory.ts); sending every stored sample made /api/signals
+ * ~3.4 MB for 300 rows. Keep the exact first/last point and one representative
+ * per time bucket so shape and tooltips survive while the payload shrinks.
+ */
+function downsampleHistory<T extends { t: number; value: number }>(points: readonly T[], maxPoints: number): T[] {
+  const ordered = points.filter((point) => Number.isFinite(point.t) && Number.isFinite(point.value)).sort((a, b) => a.t - b.t);
+  if (ordered.length <= maxPoints) return ordered;
+  const first = ordered[0]!;
+  const last = ordered[ordered.length - 1]!;
+  const bucketCount = maxPoints - 2;
+  const span = last.t - first.t;
+  const buckets: T[][] = Array.from({ length: bucketCount }, () => []);
+  for (let i = 1; i < ordered.length - 1; i += 1) {
+    const point = ordered[i]!;
+    const index = span > 0
+      ? Math.min(bucketCount - 1, Math.floor(((point.t - first.t) / span) * bucketCount))
+      : 0;
+    buckets[index]!.push(point);
+  }
+  const picked = buckets.flatMap((bucket) => {
+    if (bucket.length === 0) return [];
+    // Preserve the extra T100 fields carried by a real sample.
+    return [bucket[Math.floor(bucket.length / 2)]!];
+  });
+  return [first, ...picked, last];
+}
+
+const LIST_HISTORY_POINTS = 32;
+
 /** One TokenSignal per tracked CA. Rows without token_state yet render as zeros/absent factors. */
 export function assembleSignals(now: number = Date.now(), allFactors = getDebugAllFactors()): TokenSignal[] {
   // Read per call (not once per module) so a PUT /api/settings lands on the
@@ -971,14 +1002,14 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
           ? { t100: { pct: t100Pct, ...(ns.t100Multiple !== undefined ? { multiple: ns.t100Multiple } : {}) } }
           : {}),
         ...(ns.lf !== undefined && (allFactors || ns.lfPass) ? { lf: ns.lf } : {}),
-        ...(st?.fresh_history_json ? { freshHistory: JSON.parse(st.fresh_history_json) as { t: number; value: number }[] } : {}),
-        ...(st?.t100_history_json ? { t100History: JSON.parse(st.t100_history_json) as { t: number; value: number; peakBalance?: number; troughBalance?: number }[] } : {}),
+        ...(st?.fresh_history_json ? { freshHistory: downsampleHistory(JSON.parse(st.fresh_history_json) as { t: number; value: number }[], LIST_HISTORY_POINTS) } : {}),
+        ...(st?.t100_history_json ? { t100History: downsampleHistory(JSON.parse(st.t100_history_json) as { t: number; value: number; peakBalance?: number; troughBalance?: number }[], LIST_HISTORY_POINTS) } : {}),
         ...(ns.freshUpdatedAt !== undefined ? { freshUpdatedAt: ns.freshUpdatedAt } : {}),
       },
       holders,
-      ...(st?.holders_history_json ? { holdersHistory: JSON.parse(st.holders_history_json) as { t: number; value: number }[] } : {}),
+      ...(st?.holders_history_json ? { holdersHistory: downsampleHistory(JSON.parse(st.holders_history_json) as { t: number; value: number }[], LIST_HISTORY_POINTS) } : {}),
       ...(st?.market_cap != null ? { marketCap: st.market_cap } : {}),
-      ...(st?.market_cap_history_json ? { marketCapHistory: JSON.parse(st.market_cap_history_json) as { t: number; value: number }[] } : {}),
+      ...(st?.market_cap_history_json ? { marketCapHistory: downsampleHistory(JSON.parse(st.market_cap_history_json) as { t: number; value: number }[], LIST_HISTORY_POINTS) } : {}),
       trackedInflow,
       trackedActivityAt: lastActivityAt.get(c.address) ?? 0,
       fomoActivityAt: fomoActivityAt.get(`${c.chain}:${c.address}`) ?? 0,
