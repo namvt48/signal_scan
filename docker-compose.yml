@@ -44,6 +44,31 @@ services:
         aliases:
           - "signal-scan-chrome-${INSTANCE:-a}"
     logging: *default-logging
+  # Read-only FOMO prod bridge: curl_cffi + Privy token refresh inside the
+  # compose network. Node cannot pass Cloudflare's TLS check (HTTP 430), so the
+  # API and the host watcher call this service instead of prod-api directly.
+  fomo-prod:
+    build: ./server/fomo-prod
+    restart: unless-stopped
+    environment:
+      FOMO_API_BASE: https://prod-api.fomo.family
+      FOMO_AUTH_TOKEN_FILE: /credentials/access_token
+      FOMO_REFRESH_TOKEN_FILE: /credentials/refresh_token
+      FOMO_PRIVY_ORIGIN: https://fomo.family
+      FOMO_PRIVY_APP_ID: ${FOMO_PRIVY_APP_ID:-}
+      FOMO_IMPERSONATE: ${FOMO_IMPERSONATE:-chrome}
+      FOMO_REQUEST_DELAY_MS: ${FOMO_REQUEST_DELAY_MS:-62}
+      FOMO_CONCURRENCY: ${FOMO_CONCURRENCY:-4}
+      FOMO_TIMEOUT_SECONDS: ${FOMO_TIMEOUT_SECONDS:-30}
+      PORT: "8080"
+    volumes:
+      # access_token + refresh_token, mode 0600, never committed. The bridge
+      # rewrites both atomically when Privy rotates the session.
+      - ./${DATA_DIR:-data}/fomo-prod-credentials:/credentials
+    ports:
+      # Host watcher only; API uses the compose DNS name on the internal net.
+      - "127.0.0.1:${FOMO_BRIDGE_PORT:-8131}:8080"
+    logging: *default-logging
   api:
     build: ./server
     env_file:
@@ -62,6 +87,7 @@ services:
       COHORT_LABELS_URL: "http://ct-wallet-alpha-engine:8081/api/pnl/cohort-labels"
       CRAWL_WS_ENDPOINT: ws://signal-scan-chrome-${INSTANCE:-a}:3000
       NANSEN_CRAWL: "on"
+      FOMO_PROD_URL: ${FOMO_PROD_URL:-http://fomo-prod:8080}
       # Setup queue is serviced independently; TTL/retry clocks gate requests per CA.
       POLL_SETUP_SWEEP_MS: "300000"
     volumes:
@@ -72,6 +98,7 @@ services:
       - signal-scan-market-data:/market-data
     depends_on:
       - chrome
+      - fomo-prod
     expose:
       - "3001"
     # Keep default for same-project service membership. Shared-network callers

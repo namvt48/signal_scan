@@ -177,11 +177,10 @@ export const config = {
     .map(Number)
     .filter((n) => Number.isFinite(n) && n > 0),
 
-  /** FOMO positions refresh on alerts; without the API key, only captured alert
-   *  data is stored. Alerts lack token amounts, so positions are needed for Bal;
-   *  a missing BUY tradeUsd additionally uses exact swap matching. */
-  fomoApiKey: str('FOMO_API_KEY', ''),
-  fomoApiBase: str('FOMO_API_BASE', 'https://api.fomoapi.io'),
+  /** Read-only FOMO prod bridge. Empty disables FOMO holdings/enrichment. The
+   *  bridge owns the Privy token and the Chrome TLS fingerprint; this process
+   *  never talks to prod-api.fomo.family directly. */
+  fomoProdUrl: str('FOMO_PROD_URL', ''),
 
   // Auth (AUTH CONTRACT v1, src/auth.ts). All three default to '' = FAIL CLOSED:
   // no project id → browser tokens rejected; no roles → nobody is admin/viewer;

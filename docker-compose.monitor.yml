@@ -18,10 +18,8 @@ services:
       MONITOR_CHROME_B_URL: http://signal-scan-chrome-b:3000/pressure
       MONITOR_GATEWAY_CHROME_URL: http://signal-scan-gateway-chrome:3000/pressure
       MONITOR_PUBLIC_SITE_URL: https://signal-scan.duckdns.org:8443/healthz
-      MONITOR_FOMO_USAGE_PATH: /run/host-monitor/fomo-usage.json
       MONITOR_FOMO_HEARTBEAT_PATH: /run/watcher-heartbeats/fomo
       MONITOR_WALLET_HEARTBEAT_PATH: /run/watcher-heartbeats/wallet
-      MONITOR_FOMO_WARN_PERCENT: "${MONITOR_FOMO_WARN_PERCENT:-10}"
       MONITOR_NANSEN_WARN_REMAINING: "${MONITOR_NANSEN_WARN_REMAINING:-2}"
       MONITOR_DAILY_REPORT_HOUR: "${MONITOR_DAILY_REPORT_HOUR:-8}"
       MONITOR_TIMEZONE: "${MONITOR_TIMEZONE:-Asia/Ho_Chi_Minh}"

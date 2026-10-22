@@ -392,22 +392,21 @@ test('POST /api/fomo-watch/trades: a txHash opportunistically records the trader
 });
 test('FOMO alert requests positions for missing token amount, skips swaps when tradeUsd exists, and ignores duplicate alerts', async () => {
   const oldFetch = globalThis.fetch;
-  const oldKey = config.fomoApiKey;
-  const oldBase = config.fomoApiBase;
+  const oldUrl = config.fomoProdUrl;
   const upstreamPaths: string[] = [];
   const body = trade({ eventId: 'evt-fomo-event-refresh', tradeUsd: 23 });
-  config.fomoApiKey = 'test-key';
-  config.fomoApiBase = 'https://fomo.test';
+  config.fomoProdUrl = 'https://fomo.test';
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url === 'https://fomo.test/status') {
-      return new Response(JSON.stringify({
-        components: { api: { status: 'operational' }, liveData: { status: 'operational' } },
-      }), { status: 200 });
+    if (url === 'https://fomo.test/health') {
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }
     if (url.startsWith('https://fomo.test/')) {
       upstreamPaths.push(new URL(url).pathname);
-      return new Response(JSON.stringify({ trades: [] }), { status: 200 });
+      return new Response(JSON.stringify({
+        success: true,
+        responseObject: { balances: [] },
+      }), { status: 200 });
     }
     return oldFetch(input, init);
   }) as typeof fetch;
@@ -415,17 +414,16 @@ test('FOMO alert requests positions for missing token amount, skips swaps when t
     const inserted = await post(body);
     assert.equal(inserted.json.inserted, 1);
     await fomoHoldingsIdle();
-    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/positions'],
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances'],
       'alert lacks token amount, but known tradeUsd avoids a swaps read');
 
     const duplicate = await post(body);
     assert.equal(duplicate.json.inserted, 0);
     await fomoHoldingsIdle();
-    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/positions'],
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances'],
       'duplicate WS delivery must not create another API refresh');
   } finally {
     globalThis.fetch = oldFetch;
-    config.fomoApiKey = oldKey;
-    config.fomoApiBase = oldBase;
+    config.fomoProdUrl = oldUrl;
   }
 });

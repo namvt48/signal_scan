@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import type { MonitorConfig } from './config.js';
 import type { FomoApiHealthStatus, FomoApiSample, MetricSample, ServiceSample } from './types.js';
 import { MonitorStore } from './store.js';
@@ -27,15 +27,6 @@ interface CollectedMetric extends MetricSample {
   heliusFetchedAtMs?: number | null;
 }
 
-
-interface FomoUsageFile {
-  fetchedAtMs: number;
-  attemptedAtMs: number;
-  plan: string | null;
-  credits: { monthly: number; usedThisMonth: number; prepaid: number; remaining: number };
-  source: 'fomo-v2-me';
-  error: string | null;
-}
 
 type Fetcher = typeof fetch;
 
@@ -66,31 +57,6 @@ function heliusErrorDetail(error: string): string {
   return 'Helius Admin API balance is unavailable or could not be refreshed.';
 }
 
-function parseFomoUsage(raw: unknown): FomoUsageFile | null {
-  const source = field(raw, 'source');
-  const fetchedAtMs = field(raw, 'fetchedAtMs');
-  const attemptedAtMs = field(raw, 'attemptedAtMs');
-  const plan = field(raw, 'plan');
-  const credits = field(raw, 'credits');
-  const monthly = field(credits, 'monthly');
-  const usedThisMonth = field(credits, 'usedThisMonth');
-  const prepaid = field(credits, 'prepaid');
-  const remaining = field(credits, 'remaining');
-  const error = field(raw, 'error');
-  if (source !== 'fomo-v2-me' || !finiteNonNegative(fetchedAtMs) || !finiteNonNegative(attemptedAtMs)) return null;
-  if (plan !== null && typeof plan !== 'string') return null;
-  if (!finiteNonNegative(monthly) || !finiteNonNegative(usedThisMonth) ||
-      !finiteNonNegative(prepaid) || !finiteNonNegative(remaining)) return null;
-  if (typeof error !== 'string' && error !== null) return null;
-  return {
-    fetchedAtMs,
-    attemptedAtMs,
-    plan,
-    credits: { monthly, usedThisMonth, prepaid, remaining },
-    source: 'fomo-v2-me',
-    error,
-  };
-}
 
 function parseRpcUsageMetric(raw: unknown): RpcUsageMetric | null {
   const provider = field(raw, 'provider');
@@ -202,7 +168,6 @@ export class MonitorCollector {
       this.fetchPrivateMetrics('api-a-telemetry', 'Instance A telemetry', `${this.config.apiAUrl}/api/monitor/metrics`),
       this.fetchPrivateMetrics('api-b-telemetry', 'Instance B telemetry', `${this.config.apiBUrl}/api/monitor/metrics`),
       this.fetchPrivateMetrics('gateway-telemetry', 'Gateway telemetry', `${this.config.gatewayUrl}/monitor/metrics`),
-      this.readFomoUsage(ts),
     ]);
     const collected = telemetry.flatMap((result) => result.metrics);
     const fomoApiSamples = telemetry.flatMap((result) => result.fomoApiSamples);
@@ -394,10 +359,9 @@ export class MonitorCollector {
       const incomplete = field(raw, 'incomplete');
       const failures = field(raw, 'failures');
       const deferred = field(raw, 'deferred');
-      const creditsCost = field(raw, 'creditsCost');
       const lastOutcome = field(raw, 'lastOutcome');
       const lastOutcomeAtMs = field(raw, 'lastOutcomeAtMs');
-      if ((endpoint !== 'positions' && endpoint !== 'swaps') ||
+      if ((endpoint !== 'balances' && endpoint !== 'swaps') ||
           !finiteNonNegativeInteger(operations) ||
           !finiteNonNegativeInteger(attemptedOperations) ||
           !finiteNonNegativeInteger(attempts) ||
@@ -407,7 +371,6 @@ export class MonitorCollector {
           !finiteNonNegativeInteger(incomplete) ||
           !finiteNonNegativeInteger(failures) ||
           !finiteNonNegativeInteger(deferred) ||
-          !finiteNonNegative(creditsCost) ||
           (lastOutcome !== null && typeof lastOutcome !== 'string') ||
           (lastOutcomeAtMs !== null && !finiteNonNegative(lastOutcomeAtMs))) continue;
       samples.push({
@@ -422,7 +385,6 @@ export class MonitorCollector {
         incomplete,
         failures,
         deferred,
-        creditsCost,
         lastOutcome,
         lastOutcomeAtMs,
         sampledAtMs,
@@ -687,58 +649,5 @@ export class MonitorCollector {
       }
     }
     return result;
-  }
-  private async readFomoUsage(now: number): Promise<{ service: ServiceSample; metrics: MetricSample[]; fomoApiSamples: FomoApiSample[] }> {
-    try {
-      const raw: unknown = JSON.parse(await readFile(this.config.fomoUsagePath, 'utf8'));
-      const usage = parseFomoUsage(raw);
-      if (usage === null) throw new Error('invalid_usage_snapshot');
-      const ageMs = Math.max(0, now - usage.fetchedAtMs);
-      const stale = ageMs > this.config.fomoStaleMs;
-      const capacity = usage.credits.monthly + usage.credits.prepaid;
-      const threshold = capacity * this.config.fomoWarnPercent / 100;
-      const status = stale ? 'stale' : usage.credits.remaining <= 0 ? 'exhausted' : usage.credits.remaining <= threshold ? 'low' : 'ok';
-      const metric: MetricSample = {
-        provider: 'FOMO',
-        key: 'account',
-        label: `FOMO account${usage.plan === null ? '' : ` · ${usage.plan}`}`,
-        unit: 'credits',
-        used: usage.credits.usedThisMonth,
-        remaining: usage.credits.remaining,
-        limit: capacity,
-        threshold,
-        status,
-        source: `FOMO API /v2/me account-wide; ${usage.credits.monthly} monthly + ${usage.credits.prepaid} prepaid; alerts WebSocket itself is zero-credit. ${usage.error === null ? '' : `Last poll error: ${usage.error}`}`.trim(),
-        updatedAt: new Date(usage.fetchedAtMs).toISOString(),
-      };
-      return {
-        service: {
-          id: 'fomo-credit-source',
-          name: 'FOMO credit source',
-          scope: 'Provider',
-          status: stale || usage.error !== null ? 'degraded' : 'healthy',
-          checkedAt: new Date(usage.attemptedAtMs).toISOString(),
-          latencyMs: null,
-          detail: stale ? `Credit snapshot stale (${Math.floor(ageMs / 60_000)}m old)` : usage.error ?? 'FOMO /v2/me snapshot current',
-        },
-        metrics: [metric],
-        fomoApiSamples: [],
-      };
-    } catch (error) {
-      const kind = error instanceof Error && error.message === 'invalid_usage_snapshot' ? 'Invalid FOMO usage snapshot' : 'FOMO usage snapshot unavailable';
-      return {
-        service: {
-          id: 'fomo-credit-source',
-          name: 'FOMO credit source',
-          scope: 'Provider',
-          status: 'unknown',
-          checkedAt: new Date(now).toISOString(),
-          latencyMs: null,
-          detail: kind,
-        },
-        metrics: [],
-        fomoApiSamples: [],
-      };
-    }
   }
 }

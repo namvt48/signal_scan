@@ -284,8 +284,8 @@ body = r.json()["responseObject"]
 | Dữ liệu cần | Nguồn | Ghi chú |
 |---|---|---|
 | Bal / holdings | `/v2/users/{id}/balances` | `balances[]` lồng `balance`, `userToken`, `valuation`; amount token là nguồn, USD tính theo giá hiện tại |
-| Position active/closed | `/trades` | Map `activeTrades`/`closedTrades` → `FomoPosition`; cần adapter |
-| Từng fill | `/v2/users/{id}/swaps` | Map → `FomoSwap`; xử lý `inNetworkId`/`outNetworkId` |
+| Position active/closed | `/v2/users/{id}/balances` | `balances[]` là nguồn holding hiện tại; pair vắng mặt trong response đầy đủ ⇒ đóng về 0 qua `syncFomoPositionsSnapshot` |
+| Từng fill | `/v2/users/{id}/swaps` | Map → `FomoSwap`; watcher poll 60s và POST alert; xử lý `inNetworkId`/`outNetworkId` |
 | Equity/PnL history | `/v2/userTokens/aggregatedSnapshot` | `snapshotId`, `pnl`, `equity` |
 | Alert candidate | `/feed/token` | `swap_buy`/`swap_sell`, `usdAmount`, `tradeId`, `userId`; nhưng token-centric + threshold |
 | User directory | `/v2/leaderboard*` | Có `userId` ổn định, wallets, PnL/volume/holdings |

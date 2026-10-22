@@ -1,13 +1,19 @@
-// FOMO API client (api.fomoapi.io): position holdings and per-fill enrichment.
+// FOMO public-profile client (read-only prod bridge).
 //
-// Position amounts are authoritative; marks are kept separate from token quantity.
-// Calls return typed outcomes, not guessed empty data: poller callers preserve the
-// last good snapshot unless a complete positions payload was received.
+// The browser API at prod-api.fomo.family rejects ordinary Node TLS with HTTP
+// 430. `server/fomo-prod/bridge.py` owns the Chrome impersonation and Privy
+// token refresh; this module only talks to that bridge. Calls return typed
+// outcomes, not guessed empty data: callers preserve the last good snapshot
+// unless a complete balances/swaps payload was received.
+//
+// Balances are the authoritative current token amounts. USD and holding % are
+// derived by the dashboard from token_state price/supply, never fabricated here.
 
+import { setTimeout as delay } from 'node:timers/promises';
 import { canonicalCa, type Chain } from './shared/chain.js';
 import { config } from './config.js';
 
-export type FomoApiEndpoint = 'positions' | 'swaps';
+export type FomoApiEndpoint = 'balances' | 'swaps';
 export type FomoApiOutcome =
   | 'success'
   | 'no_data'
@@ -28,7 +34,6 @@ export interface FomoApiResult<T> {
   status: number | null;
   attempts: number;
   attemptFailures: number;
-  creditsCost: number;
   retryAfterMs: number | null;
 }
 
@@ -43,7 +48,6 @@ export interface FomoApiEndpointUsage {
   incomplete: number;
   failures: number;
   deferred: number;
-  creditsCost: number;
   lastOutcome: FomoApiOutcome | null;
   lastOutcomeAtMs: number | null;
 }
@@ -72,23 +76,22 @@ export interface FomoPosition {
   unrealizedPnlUsd: number | null;
 }
 
-// API chain names -> the repo's Chain union. A name outside the map (ethereum,
-// hyperliquid) is a chain this repo cannot track -> the position is SKIPPED.
-const CHAIN_BY_API_NAME: Record<string, Chain> = {
-  solana: 'sol',
-  base: 'base',
-  bsc: 'bsc',
-  robinhood: 'robinhood',
+// Network ids observed in prod-api.fomo.family responses. A chain outside this
+// map is one this repo cannot track -> the balance/swap is skipped.
+const CHAIN_BY_NETWORK_ID: Record<number, Chain> = {
+  1399811149: 'sol',
+  8453: 'base',
+  56: 'bsc',
+  4663: 'robinhood',
 };
-
 
 export interface FomoSwapLeg {
   address: string;
   usd: number | null;
 }
 
-/** One on-chain fill from `/v2/users/{handle}/swaps`; unlike `trades`, this is
- *  an individual swap, not an aggregated position. */
+/** One on-chain fill from `/v2/users/{id}/swaps`; unlike trades, this is an
+ *  individual swap, not an aggregated position. */
 export interface FomoSwap {
   chain: Chain;
   at: number;
@@ -104,25 +107,34 @@ export interface FomoBuySwapTarget {
   tradeId: string | null;
 }
 
+function chainFromNetworkId(value: unknown): Chain | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? CHAIN_BY_NETWORK_ID[value] : undefined;
+}
 
-function toSwapLeg(value: unknown): FomoSwapLeg | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || !('address' in value) || !('usd' in value)) return null;
-  if (typeof value.address !== 'string' || value.address === '') return null;
-  const usd = value.usd;
-  if (usd !== null && (typeof usd !== 'number' || !Number.isFinite(usd) || usd < 0)) return null;
-  return { address: value.address, usd };
+function toSwapLeg(address: unknown, usd: unknown): FomoSwapLeg | null {
+  if (typeof address !== 'string' || address === '') return null;
+  if (usd !== null && usd !== undefined && (typeof usd !== 'number' || !Number.isFinite(usd) || usd < 0)) return null;
+  return { address, usd: typeof usd === 'number' ? usd : null };
 }
 
 function toSwap(value: unknown): FomoSwap | null | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || !('chain' in value) || !('at' in value) || !('tokenIn' in value) || !('tokenOut' in value)) return null;
-  if (typeof value.chain !== 'string') return null;
-  const chain = CHAIN_BY_API_NAME[value.chain];
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const chain = chainFromNetworkId(raw.outNetworkId)
+    ?? chainFromNetworkId(raw.networkId)
+    ?? chainFromNetworkId(raw.inNetworkId);
   if (chain === undefined) return undefined;
-  const at = timestampMs(value.at);
-  const tokenIn = toSwapLeg(value.tokenIn);
-  const tokenOut = toSwapLeg(value.tokenOut);
+  const at = timestampMs(raw.createdAt ?? raw.at);
+  const tokenIn = toSwapLeg(raw.inTokenAddress, raw.humanUsdAmountIn);
+  const tokenOut = toSwapLeg(raw.outTokenAddress, raw.humanUsdAmountOut);
   if (at === null || tokenIn === null || tokenOut === null) return null;
-  return { chain, at, tradeIdOut: 'tradeIdOut' in value ? strOrNull(value.tradeIdOut) : null, tokenIn, tokenOut };
+  return {
+    chain,
+    at,
+    tradeIdOut: strOrNull(raw.outTradeId ?? raw.tradeIdOut),
+    tokenIn,
+    tokenOut,
+  };
 }
 
 /** Resolve a BUY only when exactly one swap matches the FOMO position, token,
@@ -133,7 +145,7 @@ export function matchFomoBuySwaps(targets: readonly FomoBuySwapTarget[], swaps: 
     const ca = canonicalCa(target.ca, target.chain);
     return swaps.filter((swap) =>
       swap.chain === target.chain &&
-      canonicalCa(swap.tokenOut.address, swap.chain) === ca &&
+      canonicalCa(swap.tokenOut.address, target.chain) === ca &&
       (target.tradeId === null || swap.tradeIdOut === target.tradeId) &&
       swap.at >= target.ts &&
       swap.at < target.ts + 5_000,
@@ -157,18 +169,23 @@ export function matchFomoBuySwap(target: FomoBuySwapTarget, swaps: readonly Fomo
   return matchFomoBuySwaps([target], swaps)[0] ?? null;
 }
 
+function unwrapEnvelope(body: unknown): Record<string, unknown> | null {
+  if (!isRecord(body)) return null;
+  if (body.success === false) return null;
+  const response = body.responseObject;
+  return isRecord(response) ? response : body;
+}
+
 /** One recent page of individual fills; pass FOMO's stable userId when known. */
 export async function fetchFomoSwaps(identity: string): Promise<FomoApiResult<FomoSwap[]>> {
   const request = await requestFomoEndpoint('swaps', identity);
   if (request.outcome !== 'success') return finishFomoResult<FomoSwap[]>('swaps', request, request.outcome, null);
-  if (!isRecord(request.body)) return finishFomoResult<FomoSwap[]>('swaps', request, 'invalid_payload', null);
-  if (request.body.available === false) return finishFomoResult<FomoSwap[]>('swaps', request, 'no_data', null);
-  if (request.body.partial === true || request.body.truncated === true) {
-    return finishFomoResult<FomoSwap[]>('swaps', request, 'incomplete', null);
-  }
-  if (!Array.isArray(request.body.swaps)) return finishFomoResult<FomoSwap[]>('swaps', request, 'invalid_payload', null);
+  const body = unwrapEnvelope(request.body);
+  if (body === null) return finishFomoResult<FomoSwap[]>('swaps', request, 'invalid_payload', null);
+  if (body.available === false) return finishFomoResult<FomoSwap[]>('swaps', request, 'no_data', null);
+  if (!Array.isArray(body.swaps)) return finishFomoResult<FomoSwap[]>('swaps', request, 'invalid_payload', null);
   const swaps: FomoSwap[] = [];
-  for (const raw of request.body.swaps) {
+  for (const raw of body.swaps) {
     const swap = toSwap(raw);
     if (swap === null) return finishFomoResult<FomoSwap[]>('swaps', request, 'invalid_payload', null);
     if (swap !== undefined) swaps.push(swap);
@@ -201,7 +218,6 @@ interface FomoApiRequest {
   status: number | null;
   attempts: number;
   attemptFailures: number;
-  creditsCost: number;
   retryAfterMs: number | null;
 }
 
@@ -216,7 +232,6 @@ interface TelemetryBucket {
   incomplete: number;
   failures: number;
   deferred: number;
-  creditsCost: number;
   lastOutcome: FomoApiOutcome | null;
   lastOutcomeAtMs: number | null;
 }
@@ -227,7 +242,7 @@ type CachedHealth = FomoApiUsageSnapshot['upstream'] & {
 };
 
 const telemetryBuckets: Record<FomoApiEndpoint, Array<TelemetryBucket | null>> = {
-  positions: Array.from({ length: TELEMETRY_BUCKET_COUNT }, () => null),
+  balances: Array.from({ length: TELEMETRY_BUCKET_COUNT }, () => null),
   swaps: Array.from({ length: TELEMETRY_BUCKET_COUNT }, () => null),
 };
 let cachedHealth: CachedHealth | null = null;
@@ -245,7 +260,6 @@ function emptyBucket(startAtMs: number): TelemetryBucket {
     incomplete: 0,
     failures: 0,
     deferred: 0,
-    creditsCost: 0,
     lastOutcome: null,
     lastOutcomeAtMs: null,
   };
@@ -279,7 +293,6 @@ function recordResult(endpoint: FomoApiEndpoint, result: FomoApiResult<unknown>,
   if (result.attempts > 0) bucket.attemptedOperations += 1;
   bucket.attempts += result.attempts;
   bucket.attemptFailures += result.attemptFailures;
-  bucket.creditsCost += result.creditsCost;
   if (result.outcome === 'success') bucket.successes += 1;
   else if (result.outcome === 'no_data') bucket.noData += 1;
   else if (result.outcome === 'incomplete') bucket.incomplete += 1;
@@ -309,7 +322,6 @@ function usageFor(endpoint: FomoApiEndpoint, now: number): FomoApiEndpointUsage 
     incomplete: 0,
     failures: 0,
     deferred: 0,
-    creditsCost: 0,
     lastOutcome: null,
     lastOutcomeAtMs: null,
   };
@@ -324,7 +336,6 @@ function usageFor(endpoint: FomoApiEndpoint, now: number): FomoApiEndpointUsage 
     result.incomplete += bucket.incomplete;
     result.failures += bucket.failures;
     result.deferred += bucket.deferred;
-    result.creditsCost += bucket.creditsCost;
     if (bucket.lastOutcomeAtMs !== null &&
         (result.lastOutcomeAtMs === null || bucket.lastOutcomeAtMs > result.lastOutcomeAtMs)) {
       result.lastOutcome = bucket.lastOutcome;
@@ -337,7 +348,7 @@ function usageFor(endpoint: FomoApiEndpoint, now: number): FomoApiEndpointUsage 
 /** Low-cardinality, rolling five-minute counters; no user or URL identifiers. */
 export function getFomoApiUsageSnapshot(now = Date.now()): FomoApiUsageSnapshot {
   const healthIsFresh = cachedHealth !== null &&
-    cachedHealth.base === config.fomoApiBase &&
+    cachedHealth.base === config.fomoProdUrl &&
     now - cachedHealth.checkedAtMs <= 60_000;
   return {
     sampledAtMs: now,
@@ -349,7 +360,7 @@ export function getFomoApiUsageSnapshot(now = Date.now()): FomoApiUsageSnapshot 
         checkedAtMs: cachedHealth.checkedAtMs,
       }
       : { apiStatus: 'unknown', liveDataStatus: 'unknown', checkedAtMs: null },
-    endpoints: [usageFor('positions', now), usageFor('swaps', now)],
+    endpoints: [usageFor('balances', now), usageFor('swaps', now)],
   };
 }
 
@@ -357,12 +368,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function statusValue(value: unknown): FomoHealthStatus {
-  return value === 'operational' || value === 'degraded' || value === 'down' ? value : 'unknown';
-}
-
+/** The bridge's /health only reads token expiry; it never burns an upstream call. */
 async function fomoUpstreamHealth(): Promise<FomoApiUsageSnapshot['upstream']> {
-  const base = config.fomoApiBase;
+  const base = config.fomoProdUrl;
   const now = Date.now();
   if (cachedHealth?.base === base && now - cachedHealth.checkedAtMs < STATUS_CACHE_MS) {
     return {
@@ -379,23 +387,22 @@ async function fomoUpstreamHealth(): Promise<FomoApiUsageSnapshot['upstream']> {
       checkedAtMs: Date.now(),
     };
     try {
-      const response = await fetch(new URL(`${base}/status`), {
+      const response = await fetch(new URL(`${base}/health`), {
         signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
       });
-      if (response.ok) {
-        const payload: unknown = await response.json();
-        if (isRecord(payload) && isRecord(payload.components)) {
-          const api = payload.components.api;
-          const liveData = payload.components.liveData;
-          state = {
-            apiStatus: isRecord(api) ? statusValue(api.status) : 'unknown',
-            liveDataStatus: isRecord(liveData) ? statusValue(liveData.status) : 'unknown',
-            checkedAtMs: Date.now(),
-          };
-        }
+      // The bridge answers 503 when the token is expired, with the same JSON
+      // `{ok:false}` shape as a 200 healthy response. Parse either.
+      const payload: unknown = await response.json();
+      if (isRecord(payload)) {
+        const status = payload.ok === true ? 'operational' : 'down';
+        state = {
+          apiStatus: status,
+          liveDataStatus: status,
+          checkedAtMs: Date.now(),
+        };
       }
     } catch {
-      // A failed keyless status probe must not prevent the alert-triggered read.
+      // A failed keyless health probe must not prevent the alert-triggered read.
     }
     cachedHealth = { ...state, checkedAtMs: state.checkedAtMs ?? Date.now(), base };
     return state;
@@ -423,59 +430,51 @@ async function requestFomoEndpoint(endpoint: FomoApiEndpoint, identity: string):
     status: null,
     attempts: 0,
     attemptFailures: 0,
-    creditsCost: 0,
     retryAfterMs: null,
   };
-  if (config.fomoApiKey === '') return empty;
+  if (config.fomoProdUrl === '') return empty;
 
   const health = await fomoUpstreamHealth();
   if (health.apiStatus === 'down' || health.liveDataStatus === 'down') {
     return { ...empty, outcome: 'upstream_down' };
   }
   const maxAttempts = health.apiStatus === 'operational' && health.liveDataStatus === 'operational' ? ATTEMPTS : 1;
-  const url = new URL(`${config.fomoApiBase}/v2/users/${encodeURIComponent(identity)}/${endpoint}`);
+  const url = new URL(`${config.fomoProdUrl}/v2/users/${encodeURIComponent(identity)}/${endpoint}`);
   if (endpoint === 'swaps') url.searchParams.set('limit', '100');
   let attempts = 0;
   let attemptFailures = 0;
-  let creditsCost = 0;
   let status: number | null = null;
   let lastOutcome: FomoApiOutcome = 'network_error';
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     attempts += 1;
     let response: Response;
     try {
-      response = await fetch(url, {
-        headers: { authorization: `Bearer ${config.fomoApiKey}` },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
+      response = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
     } catch (error) {
       attemptFailures += 1;
       lastOutcome = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
         ? 'timeout'
         : 'network_error';
       if (attempt < maxAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+        await delay(500 * 2 ** attempt);
         continue;
       }
-      return { ...empty, outcome: lastOutcome, attempts, attemptFailures, creditsCost };
+      return { ...empty, outcome: lastOutcome, attempts, attemptFailures };
     }
 
     status = response.status;
-    const costHeader = response.headers.get('x-credits-cost');
-    const parsedCost = costHeader === null ? NaN : Number(costHeader);
-    if (Number.isFinite(parsedCost) && parsedCost >= 0) creditsCost += parsedCost;
     if (!response.ok) {
       attemptFailures += 1;
       const retryAfter = (status === 429 || status === 503)
         ? retryAfterMs(response.headers.get('retry-after'), Date.now())
         : null;
       if (status === 429) {
-        return { ...empty, outcome: 'rate_limited', status, attempts, attemptFailures, creditsCost, retryAfterMs: retryAfter };
+        return { ...empty, outcome: 'rate_limited', status, attempts, attemptFailures, retryAfterMs: retryAfter };
       }
       if (status !== 503 || retryAfter !== null || attempt === maxAttempts) {
-        return { ...empty, outcome: 'http_error', status, attempts, attemptFailures, creditsCost, retryAfterMs: retryAfter };
+        return { ...empty, outcome: 'http_error', status, attempts, attemptFailures, retryAfterMs: retryAfter };
       }
-      await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+      await delay(500 * 2 ** attempt);
       continue;
     }
 
@@ -483,11 +482,11 @@ async function requestFomoEndpoint(endpoint: FomoApiEndpoint, identity: string):
     try {
       body = await response.json();
     } catch {
-      return { ...empty, outcome: 'invalid_payload', status, attempts, attemptFailures, creditsCost };
+      return { ...empty, outcome: 'invalid_payload', status, attempts, attemptFailures };
     }
-    return { ...empty, outcome: 'success', body, status, attempts, attemptFailures, creditsCost };
+    return { ...empty, outcome: 'success', body, status, attempts, attemptFailures };
   }
-  return { ...empty, outcome: lastOutcome, status, attempts, attemptFailures, creditsCost };
+  return { ...empty, outcome: lastOutcome, status, attempts, attemptFailures };
 }
 
 function finishFomoResult<T>(
@@ -502,7 +501,6 @@ function finishFomoResult<T>(
     status: request.status,
     attempts: request.attempts,
     attemptFailures: request.attemptFailures,
-    creditsCost: request.creditsCost,
     retryAfterMs: request.retryAfterMs,
   };
   recordResult(endpoint, result);
@@ -512,55 +510,74 @@ function finishFomoResult<T>(
 const numOrNull = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? v : null;
 const strOrNull = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+const numFrom = (v: unknown): number | null => {
+  const direct = numOrNull(v);
+  if (direct !== null) return direct;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const parsed = Number(v);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+};
 
+function nested(raw: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  return isRecord(raw[key]) ? raw[key] as Record<string, unknown> : undefined;
+}
 
-function toPosition(raw: Record<string, unknown>): FomoPosition | null | undefined {
-  if (typeof raw.chain !== 'string') return null;
-  const chain = CHAIN_BY_API_NAME[raw.chain];
+/** One `/balances` row -> the balance fields the dashboard needs. */
+function toBalance(raw: unknown): FomoPosition | null | undefined {
+  if (!isRecord(raw)) return null;
+  const token = nested(raw, 'tokenFilterResult');
+  const userToken = nested(raw, 'userToken');
+  const activeTrade = nested(raw, 'activeTrade');
+  const balance = nested(raw, 'balance');
+  const tokenMeta = token === undefined ? undefined : nested(token, 'token');
+  const networkId = tokenMeta?.networkId ?? userToken?.networkId ?? activeTrade?.networkId;
+  // Missing network metadata is an incomplete row, not an unsupported chain:
+  // skipping it could falsely close a tracked holding on the next full snapshot.
+  if (typeof networkId !== 'number' || !Number.isFinite(networkId)) return null;
+  const chain = chainFromNetworkId(networkId);
   if (chain === undefined) return undefined;
-  const token = raw.token as { address?: unknown } | undefined;
-  const address = typeof token?.address === 'string' ? token.address : '';
-  if (address === '') return null;
-  const status = strOrNull(raw.status);
-  const amount = numOrNull(raw.amount);
-  if (status !== 'closed' && amount === null) return null;
-  if (raw.amount != null && (amount === null || amount < 0)) return null;
+  const address = strOrNull(tokenMeta?.address)
+    ?? strOrNull(userToken?.tokenAddress)
+    ?? strOrNull(activeTrade?.tokenAddress)
+    ?? strOrNull(balance?.tokenAddress);
+  if (address === null) return null;
+  const amount = numFrom(userToken?.humanAmountRemaining) ?? numFrom(balance?.shiftedBalance);
+  if (amount === null || amount < 0) return null;
   return {
     ca: canonicalCa(address, chain),
     chain,
-    tradeId: strOrNull(raw.tradeId),
-    status,
-    // A closed position's amount describes historical traded size, not holdings.
-    amount: status === 'closed' ? 0 : amount,
-    costBasisUsd: numOrNull(raw.costBasisUsd),
-    avgEntryPrice: numOrNull(raw.avgEntryPrice),
-    priceUsd: numOrNull(raw.priceUsd),
-    realizedPnlUsd: numOrNull(raw.realizedPnlUsd),
-    unrealizedPnlUsd: numOrNull(raw.unrealizedPnlUsd),
+    tradeId: strOrNull(activeTrade?.id),
+    status: 'active',
+    amount,
+    costBasisUsd: numFrom(userToken?.totalCostBasisUsd) ?? numFrom(userToken?.currentCostBasisUsd),
+    avgEntryPrice: numFrom(userToken?.averageEntryPriceUsd) ?? numFrom(activeTrade?.avgEntryPrice),
+    priceUsd: numFrom(token?.priceUSD),
+    realizedPnlUsd: numFrom(userToken?.totalRealizedPnlUsd) ?? numFrom(userToken?.currentRealizedPnlUsd),
+    unrealizedPnlUsd: null,
   };
 }
 
-/** One page includes all open positions; older pages only add closed history. */
-export async function fetchFomoPositions(identity: string): Promise<FomoApiResult<FomoPosition[]>> {
-  const request = await requestFomoEndpoint('positions', identity);
-  if (request.outcome !== 'success') return finishFomoResult<FomoPosition[]>('positions', request, request.outcome, null);
-  if (!isRecord(request.body)) return finishFomoResult<FomoPosition[]>('positions', request, 'invalid_payload', null);
-  if (request.body.available === false) return finishFomoResult<FomoPosition[]>('positions', request, 'no_data', null);
-  if (request.body.partial === true || request.body.truncated === true) {
-    return finishFomoResult<FomoPosition[]>('positions', request, 'incomplete', null);
-  }
-  if (!Array.isArray(request.body.trades)) return finishFomoResult<FomoPosition[]>('positions', request, 'invalid_payload', null);
+/** One page contains every open balance; a tracked pair absent from the page is
+ *  closed by syncFomoPositionsSnapshot. */
+export async function fetchFomoBalances(identity: string): Promise<FomoApiResult<FomoPosition[]>> {
+  const request = await requestFomoEndpoint('balances', identity);
+  if (request.outcome !== 'success') return finishFomoResult<FomoPosition[]>('balances', request, request.outcome, null);
+  const body = unwrapEnvelope(request.body);
+  if (body === null) return finishFomoResult<FomoPosition[]>('balances', request, 'invalid_payload', null);
+  if (body.available === false) return finishFomoResult<FomoPosition[]>('balances', request, 'no_data', null);
+  if (!Array.isArray(body.balances)) return finishFomoResult<FomoPosition[]>('balances', request, 'invalid_payload', null);
   const positions: FomoPosition[] = [];
   const seen = new Set<string>();
-  for (const raw of request.body.trades) {
-    if (!isRecord(raw)) return finishFomoResult<FomoPosition[]>('positions', request, 'invalid_payload', null);
-    const position = toPosition(raw);
-    if (position === null) return finishFomoResult<FomoPosition[]>('positions', request, 'invalid_payload', null);
+  for (const raw of body.balances) {
+    const position = toBalance(raw);
+    if (position === null) return finishFomoResult<FomoPosition[]>('balances', request, 'invalid_payload', null);
     if (position === undefined) continue;
     const key = `${position.chain}:${position.ca}`;
-    if (seen.has(key)) return finishFomoResult<FomoPosition[]>('positions', request, 'invalid_payload', null);
+    if (seen.has(key)) return finishFomoResult<FomoPosition[]>('balances', request, 'invalid_payload', null);
     seen.add(key);
     positions.push(position);
   }
-  return finishFomoResult('positions', request, 'success', positions);
+  return finishFomoResult('balances', request, 'success', positions);
 }

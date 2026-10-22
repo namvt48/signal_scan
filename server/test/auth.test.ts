@@ -201,7 +201,7 @@ test('monitor telemetry accepts only its dedicated token, not the general servic
       rpcUsage = result.json.rpcUsage;
     }
     assert.equal(Array.isArray(rpcUsage), true);
-    assert.deepEqual(result.json.fomoApiUsage.endpoints.map((item: { endpoint: string }) => item.endpoint), ['positions', 'swaps']);
+    assert.deepEqual(result.json.fomoApiUsage.endpoints.map((item: { endpoint: string }) => item.endpoint), ['balances', 'swaps']);
     assert.equal(JSON.stringify(result.json.fomoApiUsage).includes('handle'), false);
   });
 });

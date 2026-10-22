@@ -16,7 +16,7 @@ const SOL_CA = '11111111111111111111111111111111';
 const SOL_WALLET = '11111111111111111111111111111111';
 const EVM_CA = `0x${'a'.repeat(40)}`;
 const previousShowFomo = config.showFomo;
-const previousFomoApiKey = config.fomoApiKey;
+const previousFomoProdUrl = config.fomoProdUrl;
 let dir = '';
 let base = '';
 let userId = '';
@@ -38,7 +38,7 @@ before(async () => {
   getDb().close();
   config.showFomo = true;
   open(path);
-  config.fomoApiKey = '';
+  config.fomoProdUrl = '';
   const auth = await createTestAuth();
   adminToken = await auth.signToken(auth.adminEmail);
   server = createApp('fomo-chain-policy', auth.deps).listen(0);
@@ -49,7 +49,7 @@ before(async () => {
 after(async () => {
   if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
   getDb().close();
-  config.fomoApiKey = previousFomoApiKey;
+  config.fomoProdUrl = previousFomoProdUrl;
   config.showFomo = previousShowFomo;
   if (dir) rmSync(dir, { recursive: true, force: true });
 });

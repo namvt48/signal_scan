@@ -12,11 +12,8 @@ export interface MonitorConfig {
   chromeBUrl: string;
   gatewayChromeUrl: string;
   publicSiteUrl: string;
-  fomoUsagePath: string;
   fomoHeartbeatPath: string;
   walletHeartbeatPath: string;
-  fomoStaleMs: number;
-  fomoWarnPercent: number;
   nansenWarnRemaining: number;
   dailyReportHour: number;
   timezone: string;
@@ -41,12 +38,6 @@ function nonNegative(raw: string | undefined, fallback: number, name: string): n
   if (raw === undefined || raw.trim() === '') return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a finite number >= 0`);
-  return value;
-}
-
-function percentage(raw: string | undefined, fallback: number, name: string): number {
-  const value = nonNegative(raw, fallback, name);
-  if (value > 100) throw new Error(`${name} must be <= 100`);
   return value;
 }
 
@@ -88,11 +79,8 @@ export function readMonitorConfig(env: NodeJS.ProcessEnv = process.env): Monitor
     chromeBUrl: env.MONITOR_CHROME_B_URL?.trim() || 'http://signal-scan-chrome-b:3000/pressure',
     gatewayChromeUrl: env.MONITOR_GATEWAY_CHROME_URL?.trim() || 'http://signal-scan-gateway-chrome:3000/pressure',
     publicSiteUrl: env.MONITOR_PUBLIC_SITE_URL?.trim() || 'https://signal-scan.duckdns.org:8443/healthz',
-    fomoUsagePath: env.MONITOR_FOMO_USAGE_PATH?.trim() || '/run/host-monitor/fomo-usage.json',
     fomoHeartbeatPath: env.MONITOR_FOMO_HEARTBEAT_PATH?.trim() || '/run/watcher-heartbeats/fomo',
     walletHeartbeatPath: env.MONITOR_WALLET_HEARTBEAT_PATH?.trim() || '/run/watcher-heartbeats/wallet',
-    fomoStaleMs: integer(env.MONITOR_FOMO_STALE_MS, 45 * 60_000, 'MONITOR_FOMO_STALE_MS', 60_000, 86_400_000),
-    fomoWarnPercent: percentage(env.MONITOR_FOMO_WARN_PERCENT, 10, 'MONITOR_FOMO_WARN_PERCENT'),
     nansenWarnRemaining: nonNegative(env.MONITOR_NANSEN_WARN_REMAINING, 2, 'MONITOR_NANSEN_WARN_REMAINING'),
     dailyReportHour: integer(env.MONITOR_DAILY_REPORT_HOUR, 8, 'MONITOR_DAILY_REPORT_HOUR', 0, 23),
     timezone,

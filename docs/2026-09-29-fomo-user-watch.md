@@ -1,5 +1,12 @@
 # FOMO user watch - runbook (2026-09-29)
 
+> **Superseded 2026-10-22:** the paid `api.fomoapi.io` WebSocket/key was removed.
+> The watcher now polls `/v2/users/{userId}/swaps` through the local prod bridge
+> (`server/fomo-prod`, `FOMO_PROD_URL`), and instance B reads holdings from `/balances`
+> through the same bridge. `FOMO_API_KEY` is no longer used. The historical capture and
+> alert-shape notes below still describe server idempotency, but socket sections are
+> retired; see `docs/2026-10-20-fomo-prod-api.md` for the bridge.
+
 **Feature:** a FOMO copy of the wallet-watch feature on instance "fomo" (dashboard b).
 You keep a list of FOMO traders you watch, one background daemon follows FOMO's live
 trade stream and records only the trades made by those traders, and one new column on
@@ -23,9 +30,9 @@ accessor.
 
 ## 0. Coverage limit - read this before trusting any number
 
-FOMO's feed carries **large trades only**, not every trade by every user. A watched
-trader's small trades will never appear on the socket, so the `FOMO by` column is
-inherently a partial view. FOMO's own documentation says, and this repo repeats it in
+The polling watcher sees the user's latest 100 swaps per cycle, not a complete
+history. Swaps older than the first page after an outage are dropped, so the `FOMO by`
+column is inherently a partial view. FOMO's own documentation says, and this repo repeats it in
 the column tooltip:
 
 > do not compute market share, trade counts, or volume from it
@@ -232,11 +239,10 @@ If it is missing, the daemon exits immediately with:
 
 ### 6.3 Host environment (secrets)
 
-The daemon reads **two** values from the host environment:
+The daemon reads two endpoints/values from the host environment:
 
-- `FOMO_API_KEY` - the FOMO key. It rides in the socket query string
-  (`wss://api.fomoapi.io/ws/alerts?key=...`), and the daemon masks it in every log line
-  (`?key=***`).
+- `FOMO_PROD_URL` - the local bridge (default `http://127.0.0.1:8131`), which owns the
+  Privy token and Chrome TLS fingerprint. The daemon never holds a FOMO key.
 - `SIGNAL_SCAN_SERVICE_TOKEN` - the instance-b service token. Both `GET /api/fomo-users`
   (the watch-list read) and `POST /api/fomo-watch/trades` (the ingest) require it; the
   daemon sends it as a `Bearer` header via `watchers/common/config.py`. Without it the
@@ -247,7 +253,7 @@ located on the server and never in the repo:
 
 ```
 /opt/fomo-watch/fomo.env   (host-only secret file, chmod 600)
-  FOMO_API_KEY                - the rotated FOMO key
+  FOMO_PROD_URL               - http://127.0.0.1:8131
   SIGNAL_SCAN_SERVICE_TOKEN   - instance-b service token
 ```
 
@@ -275,16 +281,18 @@ Instance b's API is on port 8125, which is also the daemon's default:
 python3 -m watchers.fomo --api-url http://127.0.0.1:8125
 ```
 
-Self-check (connects, then exits after the first emitted alert or a ~90s window):
+Self-check (runs one watch-list cycle, then exits):
 
 ```bash
 python3 -m watchers.fomo --once --api-url http://127.0.0.1:8125
 ```
 
-The daemon opens exactly **one** socket to `wss://api.fomoapi.io/ws/alerts`, matches
-alerts locally against the watch list (refreshed from `GET /api/fomo-users` about every
-300 seconds), dedupes by `eventId`, and POSTs each survivor individually to
-`/api/fomo-watch/trades`. GET and POST retry transient network errors and HTTP 429/500/502/503/504
+Every ~60 seconds the daemon refreshes the watch list from `GET /api/fomo-users`, asks
+the bridge for each user's newest swaps page, maps buys/sells against the quote-asset
+list, dedupes by swap id, and POSTs each survivor individually to
+`/api/fomo-watch/trades`. The first poll for a user only records a cursor, so deploying
+the watcher does not replay the last page. The cursor advances only after a successful
+POST; a failed ingest retries next cycle. GET and POST retry transient network errors and HTTP 429/500/502/503/504
 up to three attempts total, with bounded exponential backoff (0.5s, 1s; numeric
 `Retry-After` is capped at 2s). Other HTTP errors are not retried. A failed POST is not marked
 deduped or persisted, so a replayed alert can be tried again; a successful POST is acknowledged
@@ -303,8 +311,8 @@ the stale POST.
   (`data`, `data-b`) stay on the host and out of git.
 - `MODE=gmgn` (a server-side setting, not FOMO) needs that server-side env file to
   exist; the default `MODE=mock` runs without it.
-- The FOMO daemon's own secrets (`FOMO_API_KEY`, `SIGNAL_SCAN_SERVICE_TOKEN`) live in the
-  host env / service drop-in described in 6.3, not in the repo.
+- The FOMO daemon's own settings (`FOMO_PROD_URL`, `SIGNAL_SCAN_SERVICE_TOKEN`) live in
+  the host env / service drop-in described in 6.3, not in the repo.
 
 ---
 
@@ -316,15 +324,15 @@ Work through these in order.
    watch list. If the trader was never added (or their handle/userId differs from the
    stored row), their alerts are dropped by design. Confirm `GET /api/fomo-users` on
    instance b returns the row.
-2. **The socket.** Check the daemon log for `# fomo socket connected`. If it is
-   reconnecting, the key is missing or rejected. Confirm `FOMO_API_KEY` is set and not
-   expired. The log never prints the key.
+2. **The bridge.** Check `curl http://127.0.0.1:8131/health`. `ok:false` means the
+   Privy access token expired and the bridge could not refresh; refresh the files in
+   `data/fomo-prod-credentials/` and restart `fomo-prod`.
 3. **Ingest 404s.** A line like
    `! ingest 404 (<handle>) - watch list stale, refresh` means the server has no
    matching `fomo_users` row for that handle/userId. Fix the watch list; the daemon
    refreshes itself on a 404 but will keep 404ing until the row exists.
-4. **`replay:true` frames.** A replayed frame is just the delayed tier (section 5), not
-   a failure. The column is best-effort-fresh and, because the feed is large-trades-only,
+4. **Cursor bootstrap.** A newly added user emits nothing until the next swap after
+   its first poll; that is intentional, not a failure. The column is best-effort-fresh and, because the feed is large-trades-only,
    a watched trader can legitimately have no rows for a coin right now.
 
 Also remember the by-design drops: a `perp`/`thesis`/`listing` alert, an alert with no

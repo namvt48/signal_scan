@@ -268,7 +268,7 @@ export class MonitorStore {
         insert.run(
           ts, sample.instance, sample.endpoint, sample.operations, sample.attemptedOperations,
           sample.attempts, sample.attemptFailures, sample.successes, sample.noData,
-          sample.incomplete, sample.failures, sample.deferred, sample.creditsCost,
+          sample.incomplete, sample.failures, sample.deferred, 0,
           sample.lastOutcome, sample.lastOutcomeAtMs, sample.sampledAtMs,
           sample.upstreamApiStatus, sample.upstreamLiveDataStatus,
         );
@@ -299,7 +299,7 @@ export class MonitorStore {
              f.attempted_operations AS attemptedOperations,
              f.attempts, f.attempt_failures AS attemptFailures,
              f.successes, f.no_data AS noData, f.incomplete, f.failures, f.deferred,
-             f.credits_cost AS creditsCost, f.last_outcome AS lastOutcome,
+             f.last_outcome AS lastOutcome,
              f.last_outcome_at_ms AS lastOutcomeAtMs, f.sampled_at_ms AS sampledAtMs,
              f.upstream_api_status AS upstreamApiStatus,
              f.upstream_live_data_status AS upstreamLiveDataStatus, f.ts

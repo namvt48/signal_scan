@@ -44,7 +44,7 @@ import {
   type WalletRow,
 } from './db.js';
 import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, updateTokenIconIfMissing, upsertTokenInfo, clearCurrentMarketQuote, recomputeMarketCap } from './ingest.js';
-import { fetchFomoPositions, fetchFomoSwaps, matchFomoBuySwaps, recordFomoApiDeferred } from './fomo-api.js';
+import { fetchFomoBalances, fetchFomoSwaps, matchFomoBuySwaps, recordFomoApiDeferred } from './fomo-api.js';
 import type { FomoApiOutcome, FomoPosition, FomoSwap } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
@@ -1561,7 +1561,7 @@ function scheduleFomoPositionCooldownRefresh(
       const previous = fomoPositionUserDrains.get(fomoUserId) ?? Promise.resolve();
       const drain = previous
         .then(() => withFomoPositionSlot(async () => {
-          await refreshFomoPositions(fomoUserId, pending.handle, pending.apiUserId);
+          await refreshFomoBalances(fomoUserId, pending.handle, pending.apiUserId);
         }))
         .catch((e) => log.error('[poller] fomo cooldown refresh', e));
       let settled!: Promise<void>;
@@ -1630,26 +1630,26 @@ export async function fomoPositionCooldownRefreshIdle(): Promise<void> {
 
 
 /** Refresh ONE trader's positions from an alert; never called by a periodic sweep. */
-async function refreshFomoPositions(
+async function refreshFomoBalances(
   fomoUserId: string,
   handle: string,
   apiUserId: string | undefined,
 ): Promise<FomoPosition[] | null> {
   const now = Date.now();
-  const state = getFomoApiRequestState(fomoUserId, 'positions');
+  const state = getFomoApiRequestState(fomoUserId, 'balances');
   if (state !== undefined && state.next_eligible_at > now) {
-    recordFomoApiDeferred('positions', now);
+    recordFomoApiDeferred('balances', now);
     return null;
   }
   const previous = getFomoPositionSnapshot(fomoUserId);
   if (previous !== undefined && now - previous.checked_at < FOMO_POSITION_REFRESH_COOLDOWN_MS) {
-    recordFomoApiDeferred('positions', now);
+    recordFomoApiDeferred('balances', now);
     scheduleFomoPositionCooldownRefresh(fomoUserId, handle, apiUserId, previous.checked_at);
     return null;
   }
   const fetchedAt = Date.now();
-  const result = await fetchFomoPositions(apiUserId ?? handle);
-  saveFomoApiOutcome(fomoUserId, 'positions', result.outcome, result.retryAfterMs, Date.now());
+  const result = await fetchFomoBalances(apiUserId ?? handle);
+  saveFomoApiOutcome(fomoUserId, 'balances', result.outcome, result.retryAfterMs, Date.now());
   if (result.outcome !== 'success' || result.value === null) return null;
   syncFomoPositionsSnapshot(
     fomoUserId,
@@ -1690,7 +1690,7 @@ async function refreshFomoPositionAlertBatch(
   batch: FomoPositionAlertBatch,
 ): Promise<void> {
   const identity = batch.apiUserId ?? batch.handle;
-  const positions = await refreshFomoPositions(fomoUserId, batch.handle, batch.apiUserId);
+  const positions = await refreshFomoBalances(fomoUserId, batch.handle, batch.apiUserId);
   const targets: { eventId: string; ca: string; chain: Chain; ts: number; tradeId: string | null }[] = [];
   for (const eventId of batch.eventIds) {
     const trade = getFomoTradeEnrichmentTarget(fomoUserId, eventId);
@@ -1715,7 +1715,7 @@ export function kickFomoPositions(
   eventId?: string,
   apiUserId?: string,
 ): void {
-  if (handle === '' || config.fomoApiKey === '') return;
+  if (handle === '' || config.fomoProdUrl === '') return;
   const existing = fomoPositionAlertBatches.get(fomoUserId);
   if (existing !== undefined) {
     existing.handle = handle;

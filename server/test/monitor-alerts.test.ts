@@ -949,9 +949,9 @@ test('FOMO tracker-buy observations use the shared rule on source B and render h
   }
 });
 test('FOMO trade API feeds one thresholded Tracker Buying Telegram alert end-to-end', async () => {
-  const originalKey = config.fomoApiKey;
+  const originalUrl = config.fomoProdUrl;
   const originalShowFomo = config.showFomo;
-  config.fomoApiKey = '';
+  config.fomoProdUrl = '';
   config.showFomo = true;
   const store = new MonitorStore(':memory:');
   let api: Server | undefined;
@@ -1022,7 +1022,7 @@ test('FOMO trade API feeds one thresholded Tracker Buying Telegram alert end-to-
     await new Promise<void>((resolve) => api?.close(() => resolve()));
     store.close();
     getDb().close();
-    config.fomoApiKey = originalKey;
+    config.fomoProdUrl = originalUrl;
     config.showFomo = originalShowFomo;
   }
 });

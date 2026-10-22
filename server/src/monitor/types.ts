@@ -25,7 +25,7 @@ export interface MetricSample {
   updatedAt: string | null;
 }
 
-export type FomoApiEndpoint = 'positions' | 'swaps';
+export type FomoApiEndpoint = 'balances' | 'swaps';
 export type FomoApiHealthStatus = 'operational' | 'degraded' | 'down' | 'unknown';
 
 export interface FomoApiSample {
@@ -40,7 +40,6 @@ export interface FomoApiSample {
   incomplete: number;
   failures: number;
   deferred: number;
-  creditsCost: number;
   lastOutcome: string | null;
   lastOutcomeAtMs: number | null;
   sampledAtMs: number;

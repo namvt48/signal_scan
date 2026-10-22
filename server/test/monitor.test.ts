@@ -192,7 +192,6 @@ test('Discord bot sends bounded content with bot auth and mentions disabled', as
 
 test('collector inventories and aggregates six shared Solana RPCs, merges Nansen, and preserves unknown balance', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'signal-scan-collector-'));
-  const fomoUsagePath = join(directory, 'fomo-usage.json');
   const fomoHeartbeatPath = join(directory, 'fomo-heartbeat');
   const walletHeartbeatPath = join(directory, 'wallet-heartbeat');
   const now = Date.now();
@@ -206,19 +205,9 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
     MONITOR_CHROME_B_URL: 'http://chrome-b/pressure',
     MONITOR_GATEWAY_CHROME_URL: 'http://gateway-chrome/pressure',
     MONITOR_PUBLIC_SITE_URL: 'http://public/healthz',
-    MONITOR_FOMO_USAGE_PATH: fomoUsagePath,
     MONITOR_FOMO_HEARTBEAT_PATH: fomoHeartbeatPath,
     MONITOR_WALLET_HEARTBEAT_PATH: walletHeartbeatPath,
   });
-  const fomoSnapshot = {
-    fetchedAtMs: now - 1_000,
-    attemptedAtMs: now - 1_000,
-    plan: 'pro',
-    credits: { monthly: 100, usedThisMonth: 95, prepaid: 0, remaining: 5 },
-    source: 'fomo-v2-me',
-    error: null,
-  };
-  await writeFile(fomoUsagePath, JSON.stringify(fomoSnapshot));
   await writeFile(fomoHeartbeatPath, '');
   await writeFile(walletHeartbeatPath, '');
   const store = new MonitorStore(':memory:');
@@ -273,7 +262,7 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
         windowMs: 300_000,
         upstream: { apiStatus: 'operational', liveDataStatus: isA ? 'degraded' : 'operational', checkedAtMs: now },
         endpoints: [{
-          endpoint: 'positions',
+          endpoint: 'balances',
           operations: isA ? 5 : 2,
           attemptedOperations: isA ? 4 : 2,
           attempts: isA ? 6 : 2,
@@ -283,7 +272,6 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
           incomplete: 0,
           failures: isA ? 1 : 0,
           deferred: isA ? 1 : 0,
-          creditsCost: isA ? 3 : 1,
           lastOutcome: isA ? 'http_error' : 'success',
           lastOutcomeAtMs: now,
         }, {
@@ -297,7 +285,6 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
           incomplete: 0,
           failures: 0,
           deferred: 0,
-          creditsCost: 1,
           lastOutcome: 'success',
           lastOutcomeAtMs: now,
         }],
@@ -348,14 +335,12 @@ test('collector inventories and aggregates six shared Solana RPCs, merges Nansen
     assert.equal(services.get('api-a')?.status, 'healthy');
     assert.equal(services.get('fomo-watch')?.status, 'healthy');
     assert.equal(services.get('wallet-watch')?.status, 'healthy');
-    assert.equal(snapshot.credits.find((item) => item.provider === 'FOMO')?.status, 'low');
-    assert.equal(snapshot.credits.find((item) => item.provider === 'FOMO')?.used, 95);
     const nansen = snapshot.credits.filter((item) => item.provider === 'Nansen');
     assert.equal(snapshot.fomoApi.length, 4);
-    const fomoPositionsA = snapshot.fomoApi.find((sample) => sample.instance === 'A' && sample.endpoint === 'positions');
-    assert.equal(fomoPositionsA?.operations, 5);
-    assert.equal(fomoPositionsA?.attemptFailures, 2);
-    assert.equal(fomoPositionsA?.upstreamLiveDataStatus, 'degraded');
+    const fomoBalancesA = snapshot.fomoApi.find((sample) => sample.instance === 'A' && sample.endpoint === 'balances');
+    assert.equal(fomoBalancesA?.operations, 5);
+    assert.equal(fomoBalancesA?.attemptFailures, 2);
+    assert.equal(fomoBalancesA?.upstreamLiveDataStatus, 'degraded');
     const staleFomoApi = store.snapshot(now + 181_000, configuration.sampleIntervalMs * 3).fomoApi;
     assert.equal(staleFomoApi.every((sample) => sample.stale && sample.upstreamApiStatus === 'unknown'), true);
     assert.equal(nansen.length, 1);

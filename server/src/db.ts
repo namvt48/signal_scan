@@ -474,7 +474,7 @@ export function open(path: string, sharedMarketPath = ''): void {
   instance.exec(`
     CREATE TABLE IF NOT EXISTS fomo_api_request_state (
       fomo_user_id TEXT NOT NULL,
-      endpoint TEXT NOT NULL CHECK(endpoint IN ('positions', 'swaps')),
+      endpoint TEXT NOT NULL CHECK(endpoint IN ('balances', 'swaps')),
       last_attempt_at INTEGER NOT NULL,
       next_eligible_at INTEGER NOT NULL,
       consecutive_failures INTEGER NOT NULL DEFAULT 0,
@@ -483,6 +483,37 @@ export function open(path: string, sharedMarketPath = ''): void {
       FOREIGN KEY (fomo_user_id) REFERENCES fomo_users(id) ON DELETE CASCADE
     );
   `);
+  // The holdings endpoint moved from paid /positions to prod /balances. The old
+  // CHECK constraint rejects 'balances', so rebuild the tiny state table once
+  // and carry the backoff rows over under the new key.
+  const stateDb = instance;
+  const requestState = stateDb.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fomo_api_request_state'",
+  ).get() as { sql: string } | undefined;
+  if (requestState !== undefined && !requestState.sql.includes("'balances'")) {
+    stateDb.transaction(() => {
+      stateDb.exec(`
+        CREATE TABLE fomo_api_request_state_new (
+          fomo_user_id TEXT NOT NULL,
+          endpoint TEXT NOT NULL CHECK(endpoint IN ('balances', 'swaps')),
+          last_attempt_at INTEGER NOT NULL,
+          next_eligible_at INTEGER NOT NULL,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          last_outcome TEXT NOT NULL,
+          PRIMARY KEY (fomo_user_id, endpoint),
+          FOREIGN KEY (fomo_user_id) REFERENCES fomo_users(id) ON DELETE CASCADE
+        );
+        INSERT INTO fomo_api_request_state_new
+          (fomo_user_id, endpoint, last_attempt_at, next_eligible_at, consecutive_failures, last_outcome)
+          SELECT fomo_user_id,
+                 CASE endpoint WHEN 'positions' THEN 'balances' ELSE endpoint END,
+                 last_attempt_at, next_eligible_at, consecutive_failures, last_outcome
+            FROM fomo_api_request_state;
+        DROP TABLE fomo_api_request_state;
+        ALTER TABLE fomo_api_request_state_new RENAME TO fomo_api_request_state;
+      `);
+    })();
+  }
   const alertTable = instance.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_metric_observations'",
   ).get() as { sql: string } | undefined;
@@ -2665,7 +2696,7 @@ export function getFomoPositionSnapshot(fomoUserId: string): FomoPositionSnapsho
     .get(fomoUserId) as FomoPositionSnapshot | undefined;
 }
 
-export type FomoApiRequestEndpoint = 'positions' | 'swaps';
+export type FomoApiRequestEndpoint = 'balances' | 'swaps';
 export interface FomoApiRequestState {
   fomo_user_id: string;
   endpoint: FomoApiRequestEndpoint;

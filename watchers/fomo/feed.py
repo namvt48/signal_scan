@@ -1,33 +1,26 @@
-"""Feed FOMO: MỘT socket firehose `wss://api.fomoapi.io/ws/alerts` — match watch-list
-CỤC BỘ (không mở socket per-user), dedupe theo `eventId`, POST TỪNG survivor lên
-`/api/fomo-watch/trades`. Không backfill gap sau reconnect (cột display-only).
+"""Feed FOMO: poll prod-api.fomo.family swaps through the local bridge.
 
-Alert field → fomo_trades contract (server `parseFomoWatchTradeBody`, đo trên
-102/102 alert thật tại `.omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl`):
-  alertType buy|sell → `type` (perp/thesis/listing DROP; perp còn null tokenAddress)
-  trader (handle, 102/102) → `trader`;  userId (102/102) → `userId`
-  eventId (unique 102/102) → `eventId` = khoá idempotency (dedupe + UNIQUE server)
-  tokenAddress → `tokenAddress` (server canonical thành `ca`); thiếu → DROP
-  chain: solana→sol, base→base, bsc→bsc, robinhood→robinhood; chain khác
-    (ethereum/hyperliquid/perp-1337) → DROP (Chain union của repo:
-    sol|base|bsc|robinhood)
-  ts (epoch ms) → `ts`;  token (ticker) → `token`
-  usdValue → `usdValue` — TYPE-DEPENDENT: buy = position size SAU fill
-    (= positionValueUsd), sell = realized PnL CÓ DẤU (= realizedPnlUsd). Hai
-    hướng KHÔNG cùng đơn vị tiền ⇒ không bao giờ cộng/trừ chéo (plan cấm).
-    Là STOCK, không phải flow: cộng nó thành `Buy $` nhân sai số theo số lệnh
-    (user 2026-10-01 — iruletrenches bị đọc 285K trong khi GMGN ghi 59.8K).
-  tradeUsd → `tradeUsd` (optional, ~17/102 alert) — USD THẬT đã giao dịch, cả buy
-    lẫn sell. Đây mới là cơ sở của `Buy $`; vắng mặt ⇒ server fallback.
-  price → `price` (optional; không xuất hiện trong capture — pass-through nếu có)
-  txHash → `txHash` (optional, chỉ có ở ~17/102 alert) — server dùng để resolve ví
-    trader on-chain (opportunistic; thiếu ⇒ bỏ qua, không tạo row).
- Envelope KHÔNG phải trade: type='welcome'/'heartbeat', frame trần 'ping'/'pong'
- (non-JSON) — bỏ qua, không raise. `text` chỉ để log, KHÔNG parse.
+The public browser API is the free source of truth. This watcher no longer opens
+the paid firehose; it asks `server/fomo-prod/bridge.py` for each watched user's
+recent swaps, detects swaps that moved USD into or out of a token, and POSTs the
+same idempotent `/api/fomo-watch/trades` body the old socket watcher used.
 
-State/heartbeat dùng file FOMO-SPECIFIC (`fomo_state.json` / `fomo_heartbeat`) —
-KHÔNG dùng path cố định của `watchers/common/state.py`: daemon thứ 2 ghi chung
-file sẽ che mất liveness của sol watcher.
+Polling trades freshness for latency (-~1 minute) but keeps the alert contract:
+  swap id -> eventId = "fomo-swap:<id>"
+  buy  = outTokenAddress is the token and inTokenAddress is a quote asset
+  sell = inTokenAddress is the token and outTokenAddress is a quote asset
+  ts -> createdAt (epoch ms)
+  tradeUsd -> USD spent/received on the quote leg when the API reports it
+  userId/trader -> from the watch list; token/price are optional
+
+The first poll for a user only records a cursor, so deploying this watcher does
+not replay the last 100 swaps as alerts. The cursor advances only after a
+successful ingest, so a failed POST is retried on the next cycle. If more than
+one page of swaps arrives between cycles, the oldest are dropped: this feed has
+never backfilled gaps and does not start now.
+
+State/heartbeat use FOMO-specific files (`fomo_state.json` / `fomo_heartbeat`)
+so a second daemon cannot mask this watcher's liveness.
 """
 
 import asyncio
@@ -40,10 +33,11 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-import tempfile
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -52,124 +46,55 @@ from typing import Any
 from watchers.common import config
 from watchers.common.config import _CFG_REFRESH_S, HERE, api_headers
 
-
-FOMO_ME_URL = "https://api.fomoapi.io/v2/me"
-FOMO_USAGE_PATH = Path("/root/signal-scan-monitor/usage/fomo-usage.json")
-FOMO_CREDIT_FIELDS = ("monthly", "usedThisMonth", "prepaid", "remaining")
-FOMO_CREDIT_POLL_S = 15 * 60
+FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip("/")
+FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
+FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
 FOMO_MONITOR_HEARTBEAT = Path("/root/signal-scan-monitor/heartbeats/fomo")
 
+# Network ids used by prod-api.fomo.family.
+_CHAIN_BY_NETWORK = {
+    1399811149: "sol",
+    8453: "base",
+    56: "bsc",
+    4663: "robinhood",
+}
 
-def _parse_fomo_credits(payload: Any) -> tuple[str | None, dict[str, float]]:
-    """Validate and return sanitized plan and account credit values."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("credits"), dict):
-        raise ValueError("invalid FOMO account response")
-    raw = payload["credits"]
-    values: dict[str, float] = {}
-    for field in FOMO_CREDIT_FIELDS:
-        value = raw.get(field)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("invalid FOMO credit values")
-        number = float(value)
-        if not math.isfinite(number) or number < 0:
-            raise ValueError("invalid FOMO credit values")
-        values[field] = number
-    plan = payload.get("plan")
-    return (plan if isinstance(plan, str) else None), values
-
-
-def _fomo_me_request(key: str) -> tuple[str | None, dict[str, float]]:
-    """Fetch FOMO's zero-credit account endpoint with a bounded request."""
-    request = urllib.request.Request(
-        FOMO_ME_URL,
-        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return _parse_fomo_credits(json.loads(response.read()))
-
-
-def _safe_fomo_error(error: Exception) -> str:
-    """Persist only the exception class so transport text cannot expose credentials."""
-    return type(error).__name__
-
-
-def _write_fomo_usage(
-    key: str,
-    state: dict[str, Any],
-    now_ms: int,
-    fetch: Any = _fomo_me_request,
-    path: Path = FOMO_USAGE_PATH,
-) -> dict[str, Any]:
-    """Poll account credits and atomically persist only the sanitized snapshot."""
-    previous = state.get("snapshot")
-    try:
-        plan, credits = fetch(key)
-        snapshot = {
-            "fetchedAtMs": now_ms,
-            "attemptedAtMs": now_ms,
-            "plan": plan,
-            "credits": credits,
-            "source": "fomo-v2-me",
-            "error": None,
-        }
-    except Exception as error:
-        snapshot = dict(previous) if isinstance(previous, dict) else {
-            "fetchedAtMs": None,
-            "plan": None,
-            "credits": {field: None for field in FOMO_CREDIT_FIELDS},
-            "source": "fomo-v2-me",
-        }
-        snapshot["attemptedAtMs"] = now_ms
-        snapshot["error"] = _safe_fomo_error(error)
-    state["snapshot"] = snapshot
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, delete=False
-        ) as temporary:
-            json.dump(snapshot, temporary, separators=(",", ":"))
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = temporary.name
-        os.replace(temporary_path, path)
-    except OSError as error:
-        print(f"  ! fomo usage status unavailable: {type(error).__name__}", file=sys.stderr)
-        try:
-            if "temporary_path" in locals():
-                os.unlink(temporary_path)
-        except OSError:
-            pass
-    return snapshot
-
-
-def _fomo_credit_loop(key: str) -> Any:
-    """Run account poll immediately and then at the fixed 15-minute cadence."""
-    async def poll() -> None:
-        state: dict[str, Any] = {}
-        while True:
-            await asyncio.to_thread(_write_fomo_usage, key, state, int(time.time() * 1000))
-            await asyncio.sleep(FOMO_CREDIT_POLL_S)
-
-    return poll()
-
-
-
-WS_URL = "wss://api.fomoapi.io/ws/alerts"  # key ride query-string — KHÔNG log full URL
-_CHAIN = {
-    "base": "base",
-    "bsc": "bsc",
-    "robinhood": "robinhood",
-}  # ngoài map ⇒ DROP
-_SEEN_MAX = 4096  # bound như evm/feed.py _SEEN_MAX
+# A swap into one of these assets is a sell, not a buy. EVM addresses are
+# compared case-insensitively. Robinhood includes both USDG deployments the
+# chain explorer reports plus wrapped ETH.
+_QUOTE_ASSETS: dict[str, set[str]] = {
+    "sol": {
+        "So11111111111111111111111111111111111111112",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    },
+    "base": {
+        "0x4200000000000000000000000000000000000006",
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+    },
+    "bsc": {
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+        "0x55d398326f99059ff775485246999027b3197955",
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+    },
+    "robinhood": {
+        "0x4200000000000000000000000000000000000006",
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "0xdb81a12de6c0aebeddf2d85d531dd50cac7366ef",
+    },
+}
+_SEEN_MAX = 4096
 
 _HTTP_MAX_ATTEMPTS = 3
-_HTTP_TIMEOUT_S = 5
+_PROD_TIMEOUT_S = max(5, int(os.environ.get("FOMO_PROD_TIMEOUT_S", "40")))
+_INGEST_TIMEOUT_S = 5
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
-DIAGNOSTIC_LOG_PATH = Path(HERE) / "logs" / "fomo-ws.jsonl"
+DIAGNOSTIC_LOG_PATH = Path(HERE) / "logs" / "fomo-poll.jsonl"
 _DIAGNOSTIC_MAX_BYTES = 16 * 1024 * 1024
 _DIAGNOSTIC_BACKUPS = 10
-_DIAGNOSTIC_FRAME_SEQUENCE = itertools.count(1)
+_DIAGNOSTIC_SEQUENCE = itertools.count(1)
 _DIAGNOSTIC_LOGGER = logging.getLogger("watchers.fomo.diagnostics")
 _DIAGNOSTIC_SECRETS: tuple[bytes, ...] = ()
 _SENSITIVE_JSON_FIELD = re.compile(
@@ -201,7 +126,6 @@ _DIAGNOSTIC_WARNING_EMITTED = False
 
 
 def _warn_diagnostics_unavailable(error_type: str) -> None:
-    """Emit one bounded warning without exposing exception text or frame data."""
     global _DIAGNOSTIC_WARNING_EMITTED
     if _DIAGNOSTIC_WARNING_EMITTED:
         return
@@ -217,7 +141,6 @@ def _warn_diagnostics_unavailable(error_type: str) -> None:
 
 
 def _disable_diagnostics(error_type: str) -> None:
-    """Detach broken diagnostic handlers while preserving feed processing."""
     for handler in _DIAGNOSTIC_LOGGER.handlers[:]:
         _DIAGNOSTIC_LOGGER.removeHandler(handler)
         try:
@@ -270,7 +193,6 @@ def configure_diagnostics(
 
 
 def close_diagnostics() -> None:
-    """Close file handlers without allowing cleanup errors to stop shutdown."""
     global _DIAGNOSTIC_SECRETS
     for handler in _DIAGNOSTIC_LOGGER.handlers[:]:
         _DIAGNOSTIC_LOGGER.removeHandler(handler)
@@ -281,26 +203,18 @@ def close_diagnostics() -> None:
     _DIAGNOSTIC_SECRETS = ()
 
 
-def _diagnostic(
-    event: str,
-    *,
-    frame_id: str | None = None,
-    timestamp: str | None = None,
-    **fields: Any,
-) -> None:
-    """Append one machine-readable row with an explicit UTC millisecond timestamp."""
+def _diagnostic(event: str, *, cycle_id: str | None = None, **fields: Any) -> None:
     if not _DIAGNOSTIC_LOGGER.handlers:
         return
     try:
         row = {
-            "timestamp": timestamp
-            or datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
                 "+00:00", "Z"
             ),
             "event": event,
         }
-        if frame_id is not None:
-            row["frame_id"] = frame_id
+        if cycle_id is not None:
+            row["cycle_id"] = cycle_id
         row.update(fields)
         _DIAGNOSTIC_LOGGER.info(
             json.dumps(row, ensure_ascii=False, separators=(",", ":"))
@@ -309,9 +223,8 @@ def _diagnostic(
         _disable_diagnostics(type(error).__name__)
 
 
-
 def _diagnostic_payload(raw: Any) -> dict[str, str]:
-    """Preserve text or binary frames while masking credential-like values."""
+    """Preserve text or binary responses while masking credential-like values."""
     if isinstance(raw, bytes):
         payload = raw
         for secret in _DIAGNOSTIC_SECRETS:
@@ -339,21 +252,21 @@ def _diagnostic_payload(raw: Any) -> dict[str, str]:
     return {"encoding": "repr", "data": repr(raw)}
 
 
-def _new_frame_id() -> str:
-    return f"{time.time_ns()}-{next(_DIAGNOSTIC_FRAME_SEQUENCE)}"
-
-
+def _new_cycle_id() -> str:
+    return f"{time.time_ns()}-{next(_DIAGNOSTIC_SEQUENCE)}"
 
 
 def _request_bytes_with_retry(
     req: urllib.request.Request,
     on_attempt: Any = None,
+    *,
+    timeout: float = _INGEST_TIMEOUT_S,
 ) -> bytes:
     """Read a complete response inside each bounded HTTP/transport attempt."""
     for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 data = response.read()
                 if on_attempt is not None:
                     on_attempt(
@@ -399,23 +312,17 @@ def _request_bytes_with_retry(
     raise RuntimeError("unreachable retry state")
 
 
-
 STATE_PATH = os.path.join(HERE, "fomo_state.json")
 HEARTBEAT = os.path.join(HERE, "fomo_heartbeat")
 
-# eventId đã emit — replay/reconnect có thể đẩy lại; ponytail: clear-all khi đầy.
+# eventId emitted — replay/restart can show the same swap again; clear-all at cap.
 _seen: set[str] = set()
-
-# Watch list nạp từ GET /api/fomo-users, refresh mỗi ~_CFG_REFRESH_S (300s) —
-# KHÔNG nạp một lần lúc startup (UI đổi list phải có hiệu lực không cần restart).
-_wl: dict[str, Any] = {"ids": set(), "handles": set(), "next": 0.0}
-
-
-# ---------- state FOMO-specific ----------
+# Watch list loaded from GET /api/fomo-users; refreshed every ~300s so UI changes
+# take effect without a restart.
+_wl: dict[str, Any] = {"users": [], "next": 0.0}
 
 
 def _beat() -> None:
-    """Touch watchdog beacon and its private monitor mirror."""
     for path in (HEARTBEAT, FOMO_MONITOR_HEARTBEAT):
         try:
             open(path, "w").close()
@@ -424,7 +331,7 @@ def _beat() -> None:
 
 
 def load_state() -> dict[str, Any]:
-    """{last_ts, emitted, seen[]} — file hỏng/chưa có ⇒ state trắng, không raise."""
+    """{emitted, last_ts, seen[], cursors{}} — corrupt/missing file => empty state."""
     global _seen
     try:
         st = json.load(open(STATE_PATH))
@@ -433,25 +340,38 @@ def load_state() -> dict[str, Any]:
     except Exception:
         st = {}
     _seen = {e for e in (st.get("seen") or []) if isinstance(e, str)}
+    if not isinstance(st.get("cursors"), dict):
+        st["cursors"] = {}
     return st
 
 
 def save_state(st: dict[str, Any]) -> None:
-    """Atomic (tmp + replace) như common/state.save_state; seen bị bound _SEEN_MAX."""
+    """Atomic state write, bounded dedupe set, private mode."""
     st = {**st, "seen": list(_seen)[-_SEEN_MAX:]}
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(st, f)
-    os.replace(tmp, STATE_PATH)
-
-
-# ---------- watch list ----------
+    directory = os.path.dirname(STATE_PATH) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, delete=False
+        ) as temporary:
+            json.dump(st, temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = temporary.name
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, STATE_PATH)
+    except OSError as error:
+        print(f"  ! fomo state: {type(error).__name__}", file=sys.stderr)
+        try:
+            if temporary_path:
+                os.unlink(temporary_path)
+        except OSError:
+            pass
 
 
 def refresh_watch_list(force: bool = False) -> None:
-    """GET {api}/api/fomo-users → 2 set (userId, handle). Tới hạn ~300s mới fetch
-    (force=True bỏ qua đồng hồ — dùng sau 404 'list stale'). Fail-soft: lỗi mạng/
-    shape ⇒ GIỮ list cũ (một lần timeout không được xoá watch list). Không raise."""
+    """GET {api}/api/fomo-users → identities. Fail-soft: keep the previous list."""
     if not force and time.time() < _wl["next"]:
         return
     _wl["next"] = time.time() + _CFG_REFRESH_S
@@ -460,125 +380,134 @@ def refresh_watch_list(force: bool = False) -> None:
             f"{config._api_url}/api/fomo-users", headers=api_headers()
         )
         data = json.loads(_request_bytes_with_retry(req))
-        ids, handles = set(), set()
-        for u in data if isinstance(data, list) else []:
-            if not isinstance(u, dict):
+        users: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in data if isinstance(data, list) else []:
+            if not isinstance(entry, dict):
                 continue
-            if isinstance(u.get("userId"), str) and u["userId"]:
-                ids.add(u["userId"])
-            if isinstance(u.get("handle"), str) and u["handle"]:
-                handles.add(u["handle"])
-        if (ids, handles) != (_wl["ids"], _wl["handles"]):
-            print(
-                f"# fomo watch list: {len(handles)} handle, {len(ids)} userId",
-                flush=True,
-            )
-        _wl["ids"], _wl["handles"] = ids, handles
+            uid = entry.get("userId") if isinstance(entry.get("userId"), str) else ""
+            handle = entry.get("handle") if isinstance(entry.get("handle"), str) else ""
+            identity = uid or handle
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            users.append({"identity": identity, "userId": uid, "handle": handle})
+        if users != _wl["users"]:
+            print(f"# fomo watch list: {len(users)} user(s)", flush=True)
+        _wl["users"] = users
     except Exception as ex:
         print(f"  ! fomo-users: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
 
 
-def _match(alert_uid: str | None, trader: str | None) -> bool:
-    """userId exact TRƯỚC, handle trader SAU (đúng thứ tự server resolve).
-    Không bao giờ HỌC user mới từ firehose — chỉ membership test."""
-    if alert_uid and alert_uid in _wl["ids"]:
-        return True
-    return bool(trader and trader in _wl["handles"])
+def _str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
-# ---------- frame → body ----------
-
-
-def _str(m: dict[str, Any], k: str) -> str | None:
-    v = m.get(k)
-    return v if isinstance(v, str) and v else None
-
-
-def _num(m: dict[str, Any], k: str) -> float | None:
-    v = m.get(k)
-    if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
-        return float(v)
+def _num(value: Any) -> float | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
     return None
 
 
-def _alert_body_result(
-    msg: Any,
+def _ms(value: Any) -> int | None:
+    number = _num(value)
+    if number is None:
+        return None
+    milliseconds = number * 1000 if number < 10_000_000_000 else number
+    return int(milliseconds) if milliseconds > 0 else None
+
+
+def _chain(network_id: Any) -> str | None:
+    number = _num(network_id)
+    return _CHAIN_BY_NETWORK.get(int(number)) if number is not None else None
+
+
+def _is_quote_asset(chain: str, address: str) -> bool:
+    assets = _QUOTE_ASSETS.get(chain)
+    if not assets:
+        return False
+    return address in assets or (chain != "sol" and address.lower() in assets)
+
+
+def _swap_body(
+    swap: dict[str, Any],
+    user: dict[str, str],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Return the ingest body or the exact validation reason for diagnostics."""
-    if not isinstance(msg, dict):
-        return None, "not_json_object"
-    if msg.get("type") != "alert":
-        return None, "not_alert_message"
-    if msg.get("alertType") not in ("buy", "sell"):
-        return None, "unsupported_alert_type"
-    ca, chain = _str(msg, "tokenAddress"), _CHAIN.get(msg.get("chain") or "")
-    if not ca:
-        return None, "missing_token_address"
-    if chain is None:
-        return None, "unsupported_chain"
-    uid, trader = _str(msg, "userId"), _str(msg, "trader")
-    if not _match(uid, trader):
-        return None, "unwatched_trader"
-    ev = _str(msg, "eventId")
-    if not ev:
-        return None, "missing_event_id"
-    ts = _num(msg, "ts")
-    if ts is None or ts <= 0:
+    """Map one prod swap to the fomo-watch body, or the exact skip reason."""
+    swap_id = _str(swap.get("id"))
+    if swap_id is None:
+        return None, "missing_swap_id"
+    at = _ms(swap.get("createdAt"))
+    if at is None:
         return None, "invalid_timestamp"
+    token_in = _str(swap.get("inTokenAddress"))
+    token_out = _str(swap.get("outTokenAddress"))
+    if token_in is None or token_out is None:
+        return None, "missing_token_address"
+
+    fallback_network = swap.get("networkId")
+    in_network = swap.get("inNetworkId") or fallback_network
+    out_network = swap.get("outNetworkId") or fallback_network
+    in_chain = _chain(in_network)
+    out_chain = _chain(out_network)
+    if in_chain is None or out_chain is None:
+        return None, "unsupported_chain"
+
+    in_quote = _is_quote_asset(in_chain, token_in)
+    out_quote = _is_quote_asset(out_chain, token_out)
+    if in_quote == out_quote:
+        return None, "unclassified_pair"
+
+    if in_quote:
+        kind, chain, ca = "buy", out_chain, token_out
+        usd = _num(swap.get("humanUsdAmountIn"))
+        amount = _num(swap.get("outHumanAmount"))
+    else:
+        kind, chain, ca = "sell", in_chain, token_in
+        usd = _num(swap.get("humanUsdAmountOut"))
+        amount = _num(swap.get("inHumanAmount"))
 
     body: dict[str, Any] = {
-        "eventId": ev,
-        "type": msg["alertType"],
+        "eventId": f"fomo-swap:{swap_id}",
+        "type": kind,
         "tokenAddress": ca,
         "chain": chain,
-        "ts": ts,
+        "ts": at,
     }
-    if uid:
-        body["userId"] = uid
-    if trader:
-        body["trader"] = trader
-    tok = _str(msg, "token")
-    if tok:
-        body["token"] = tok
-    usd, px = _num(msg, "usdValue"), _num(msg, "price")
-    if usd is not None:
-        body["usdValue"] = usd
-    if px is not None:
-        body["price"] = px
-    # The USD actually traded only appears in some upstream alert payloads.
-    trade_usd = _num(msg, "tradeUsd")
-    if trade_usd is not None:
-        body["tradeUsd"] = trade_usd
-    tx_hash = _str(msg, "txHash")
-    if tx_hash:
-        body["txHash"] = tx_hash
+    if user.get("userId"):
+        body["userId"] = user["userId"]
+    if user.get("handle"):
+        body["trader"] = user["handle"]
+    if usd is not None and usd > 0:
+        body["tradeUsd"] = usd
+        if amount is not None and amount > 0:
+            price = usd / amount
+            if math.isfinite(price) and price > 0:
+                body["price"] = price
     return body, None
 
 
-def alert_body(msg: Any) -> dict[str, Any] | None:
-    """Parse a frame into the ingest contract, dropping unsupported alerts."""
-    return _alert_body_result(msg)[0]
-
-
-def _dedupe(ev: str) -> bool:
-    """True = lần đầu thấy eventId. Bound như evm _seen_tx: đầy ⇒ clear-all."""
-    if ev in _seen:
+def _dedupe(event_id: str) -> bool:
+    """True = first sighting. Bounded like the other watchers: clear-all at cap."""
+    if event_id in _seen:
         return False
     if len(_seen) > _SEEN_MAX:
-        _seen.clear()  # ponytail: clear-all; LRU nếu cần chặt
-    _seen.add(ev)
+        _seen.clear()
+    _seen.add(event_id)
     return True
-
-
-# ---------- emit ----------
 
 
 def post_fomo_trade(
     body: dict[str, Any],
     *,
-    frame_id: str | None = None,
+    cycle_id: str | None = None,
 ) -> bool:
-    """POST one idempotent event and log each request attempt without auth headers."""
+    """POST one idempotent event and log each attempt without auth headers."""
     try:
         req = urllib.request.Request(
             f"{config._api_url}/api/fomo-watch/trades",
@@ -589,7 +518,7 @@ def post_fomo_trade(
         def log_attempt(**details: Any) -> None:
             _diagnostic(
                 "ingest_attempt",
-                frame_id=frame_id,
+                cycle_id=cycle_id,
                 event_id=body["eventId"],
                 **details,
             )
@@ -599,7 +528,7 @@ def post_fomo_trade(
     except urllib.error.HTTPError as ex:
         _diagnostic(
             "ingest_failure",
-            frame_id=frame_id,
+            cycle_id=cycle_id,
             event_id=body["eventId"],
             error_type=type(ex).__name__,
             status_code=ex.code,
@@ -617,7 +546,7 @@ def post_fomo_trade(
     except Exception as ex:
         _diagnostic(
             "ingest_failure",
-            frame_id=frame_id,
+            cycle_id=cycle_id,
             event_id=body["eventId"],
             error_type=type(ex).__name__,
         )
@@ -625,206 +554,192 @@ def post_fomo_trade(
         return False
 
 
-def handle_frame(raw: Any, st: dict[str, Any]) -> None:
-    """Persist every received frame before parsing, then log its processing decision."""
-    frame_id = _new_frame_id()
-    _diagnostic(
-        "frame_received",
-        frame_id=frame_id,
-        payload=_diagnostic_payload(raw),
-    )
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", "replace")
+def _fetch_swaps(identity: str, cycle_id: str) -> list[dict[str, Any]] | None:
+    url = f"{FOMO_PROD_URL}/v2/users/{urllib.parse.quote(identity, safe='')}/swaps?limit={FOMO_SWAPS_LIMIT}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        msg = json.loads(raw)
-    except (ValueError, TypeError) as ex:
-        reason = (
-            "control_text"
-            if isinstance(raw, str) and raw.strip() in ("ping", "pong")
-            else "invalid_json"
-        )
+        data = _request_bytes_with_retry(req, timeout=_PROD_TIMEOUT_S)
+        payload = json.loads(data)
+    except Exception as ex:
         _diagnostic(
-            "frame_decision",
-            frame_id=frame_id,
-            decision="ignored",
-            reason=reason,
+            "swaps_fetch_failure",
+            cycle_id=cycle_id,
+            identity=identity,
             error_type=type(ex).__name__,
         )
-        if reason != "control_text":
-            print(f"  ! frame non-JSON bỏ qua: {raw[:40]!r}", file=sys.stderr)
-        return
-    if not isinstance(msg, dict):
-        body, reason = None, "not_json_object"
-    elif msg.get("type") in ("welcome", "heartbeat"):
-        body, reason = None, "control_message"
-    else:
-        body, reason = _alert_body_result(msg)
-    if body is None:
+        print(f"  ! fomo swaps {identity[:8]}…: {type(ex).__name__}", file=sys.stderr)
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        _diagnostic("swaps_fetch_failure", cycle_id=cycle_id, identity=identity, error_type="invalid_envelope")
+        return None
+    response = payload.get("responseObject")
+    swaps = response.get("swaps") if isinstance(response, dict) else None
+    if not isinstance(swaps, list):
+        _diagnostic("swaps_fetch_failure", cycle_id=cycle_id, identity=identity, error_type="invalid_payload")
+        return None
+    return [swap for swap in swaps if isinstance(swap, dict)]
+
+
+def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
+    """Poll one user's newest swaps. Returns number of successfully ingested events."""
+    identity = user["identity"]
+    swaps = _fetch_swaps(identity, cycle_id)
+    if swaps is None:
+        return 0
+    page: list[tuple[int, dict[str, Any]]] = []
+    for swap in swaps:
+        at = _ms(swap.get("createdAt"))
+        if at is not None:
+            page.append((at, swap))
+    page.sort(key=lambda item: item[0])
+
+    cursors = st.setdefault("cursors", {})
+    cursor = _num(cursors.get(identity))
+    if cursor is None:
+        # Bootstrap: record the newest swap and emit nothing. This prevents a
+        # deploy or a newly watched user from replaying the last page.
+        # One millisecond past the newest existing swap, so every fill already
+        # on the first page (including same-millisecond fills) stays historical.
+        cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
+        cursors[identity] = cursor
+        save_state(st)
+        _diagnostic("poll_bootstrap", cycle_id=cycle_id, identity=identity, cursor=int(cursor))
+        return 0
+
+    emitted = 0
+    changed = False
+    for at, swap in page:
+        # Revisit the boundary timestamp: several fills can share one
+        # millisecond. `_seen` skips acknowledged ones, while a failed POST at
+        # the cursor is retried instead of being stranded behind it.
+        if at < cursor:
+            continue
+        body, reason = _swap_body(swap, user)
+        if body is None:
+            cursor = float(at)
+            changed = True
+            _diagnostic(
+                "swap_decision",
+                cycle_id=cycle_id,
+                identity=identity,
+                decision="ignored",
+                reason=reason,
+                swap_id=swap.get("id"),
+            )
+            continue
+        event_id = body["eventId"]
+        if event_id in _seen:
+            cursor = float(at)
+            changed = True
+            continue
+        if not post_fomo_trade(body, cycle_id=cycle_id):
+            _diagnostic(
+                "swap_decision",
+                cycle_id=cycle_id,
+                identity=identity,
+                decision="not_persisted",
+                reason="ingest_failed",
+                event_id=event_id,
+            )
+            break  # keep the cursor so this swap and later ones retry next cycle
+        _dedupe(event_id)
+        cursor = float(at)
+        changed = True
+        emitted += 1
+        st["last_ts"] = max(st.get("last_ts") or 0, at)
+        st["emitted"] = int(st.get("emitted") or 0) + 1
+        save_state(st)
         _diagnostic(
-            "frame_decision",
-            frame_id=frame_id,
-            decision="ignored",
-            reason=reason,
-        )
-        return
-    event_id = body["eventId"]
-    if event_id in _seen:
-        _diagnostic(
-            "frame_decision",
-            frame_id=frame_id,
-            decision="ignored",
-            reason="duplicate",
+            "swap_decision",
+            cycle_id=cycle_id,
+            identity=identity,
+            decision="ingest_acknowledged",
+            reason="ingested",
             event_id=event_id,
         )
-        return
-    if not post_fomo_trade(body, frame_id=frame_id):
-        _diagnostic(
-            "frame_decision",
-            frame_id=frame_id,
-            decision="not_persisted",
-            reason="ingest_failed",
-            event_id=event_id,
+        print(
+            f"# fomo {body['type']} {body.get('trader') or body.get('userId') or identity[:8]}"
+            f" {body['chain']} {body['tokenAddress'][:10]}…"
+            f" ${body.get('tradeUsd', 0):,.0f}  evt {event_id[:18]}…",
+            flush=True,
         )
-        return
-    _diagnostic(
-        "frame_decision",
-        frame_id=frame_id,
-        decision="ingest_acknowledged",
-        reason="ingested",
-        event_id=event_id,
-    )
-    _dedupe(event_id)
-    st["last_ts"] = max(st.get("last_ts") or 0, body["ts"])
-    st["emitted"] = int(st.get("emitted") or 0) + 1
-    print(
-        f"# fomo {body['type']} {body.get('trader') or body.get('userId')}"
-        f" ${body.get('token') or '?'} {body['chain']}"
-        f" ≈ ${body.get('usdValue', 0):,.0f}  evt {event_id[:8]}…",
-        flush=True,
-    )
-    save_state(st)
-    _diagnostic(
-        "frame_state",
-        frame_id=frame_id,
-        state_saved=True,
-        event_id=event_id,
-        emitted=st["emitted"],
-    )
+
+    if changed:
+        cursors[identity] = cursor
+        save_state(st)
+    return emitted
 
 
-# ---------- socket ----------
-
-_BACKOFF_BASE_S = 1.0
-_BACKOFF_CAP_S = 60.0
-_ONCE_WINDOW_S = 90.0  # --once: đủ dài cho buffered replay (tier delay ~60s)
-_RECV_POLL_S = 5.0  # wait_for(recv) — tới hạn để xét điều kiện thoát --once
+async def _beat_loop() -> None:
+    while True:
+        _beat()
+        await asyncio.sleep(30)
 
 
-def _safe(key: str, e: Exception) -> str:
-    """Sanitize credentials from websocket exception text."""
-    message = f"{type(e).__name__}: {str(e)}"
-    for secret in _DIAGNOSTIC_SECRETS:
-        message = message.replace(secret.decode("utf-8", "ignore"), "***")
-    if key:
-        message = message.replace(key, "***")
-    return message[:100]
+async def _poll_loop(st: dict[str, Any], once: bool) -> None:
+    first = True
+    while True:
+        try:
+            refresh_watch_list(force=first)
+            users = list(_wl["users"])
+            cycle_id = _new_cycle_id()
+            _diagnostic(
+                "poll_cycle_started",
+                cycle_id=cycle_id,
+                watchlist_users=len(users),
+                endpoint=FOMO_PROD_URL,
+            )
+            for user in users:
+                try:
+                    _poll_user(user, st, cycle_id)
+                except Exception as ex:
+                    print(
+                        f"  ! fomo poll {user['identity'][:8]}…: {type(ex).__name__}",
+                        file=sys.stderr,
+                    )
+                    _diagnostic(
+                        "poll_user_failure",
+                        cycle_id=cycle_id,
+                        identity=user["identity"],
+                        error_type=type(ex).__name__,
+                    )
+            _beat()
+            _diagnostic(
+                "poll_cycle_finished",
+                cycle_id=cycle_id,
+                emitted=st.get("emitted", 0),
+            )
+        except Exception as ex:
+            print(f"  ! fomo poll cycle: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
+        first = False
+        if once:
+            return
+        await asyncio.sleep(FOMO_POLL_INTERVAL_S)
 
-def _safe_endpoint(url: str) -> str:
-    """Remove query credentials from the endpoint before logging it."""
-    return url.split("?", 1)[0]
 
-
-
-def run_feed(key: str, ws_url: str = WS_URL, once: bool = False) -> None:
-    """Loop chính: connect (lazy import websockets như sol/feed.py), recv →
-    handle_frame, đứt ⇒ backoff mũ có trần rồi reconnect (CHẤP NHẬN gap — không
-    gọi /v2/alerts backfill). --once: thoát sau emit đầu tiên hoặc hết window."""
-    try:
-        import websockets
-    except ImportError:
-        sys.exit("fomo watcher cần:  pip install websockets")
-    configure_diagnostics(
-        secret_values=(key, getattr(config, "_service_token", ""))
-    )
-
-
+def run_feed(once: bool = False) -> None:
+    """Run the polling loop. `once` runs exactly one watch-list cycle."""
+    configure_diagnostics(secret_values=(getattr(config, "_service_token", ""),))
     st = load_state()
-    refresh_watch_list(force=True)
+    _beat()
     _diagnostic(
         "watcher_started",
-        endpoint=_safe_endpoint(ws_url),
-        watchlist_handles=len(_wl["handles"]),
-        watchlist_user_ids=len(_wl["ids"]),
+        endpoint=FOMO_PROD_URL,
+        interval_seconds=FOMO_POLL_INTERVAL_S,
+        dedupe_entries=len(_seen),
     )
-
-    # KHÔNG log full URL — key nằm trong query string.
     print(
-        f"# fomo feed: {_safe_endpoint(ws_url)}?key=***",
+        f"# fomo poll: {FOMO_PROD_URL} every {FOMO_POLL_INTERVAL_S}s"
+        f" (swaps limit {FOMO_SWAPS_LIMIT})",
         flush=True,
     )
 
-    async def _beat_loop():
-        while True:  # feed im lặng vẫn phải đập nhịp cho watchdog
-            _beat()
-            await asyncio.sleep(30)
-
-    async def _sock() -> None:
-        backoff = _BACKOFF_BASE_S
-        deadline = time.monotonic() + _ONCE_WINDOW_S
-        while True:
-            try:
-                async with websockets.connect(
-                    f"{ws_url}?key={key}",
-                    open_timeout=10,
-                    ping_interval=20,
-                    max_size=None,
-                ) as ws:
-                    print("# fomo socket connected", flush=True)
-                    _diagnostic("ws_connected", endpoint=_safe_endpoint(ws_url))
-                    backoff, n0 = _BACKOFF_BASE_S, int(st.get("emitted") or 0)
-                    _beat()
-                    while True:
-                        if once and (
-                            int(st.get("emitted") or 0) > n0
-                            or time.monotonic() >= deadline
-                        ):
-                            return
-                        try:
-                            raw = await asyncio.wait_for(
-                                ws.recv(), timeout=_RECV_POLL_S
-                            )
-                        except (TimeoutError, asyncio.TimeoutError):
-                            continue  # không frame — lặp lại để xét thoát --once
-                        handle_frame(raw, st)
-                        refresh_watch_list()  # tới hạn ~300s mới fetch thật
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as e:
-                _diagnostic(
-                    "ws_disconnected",
-                    endpoint=_safe_endpoint(ws_url),
-                    error=_safe(key, e),
-                    reconnect_after_seconds=backoff,
-                    reconnect_scheduled=not once,
-                )
-                if once:
-                    raise SystemExit(f"fomo socket lỗi: {_safe(key, e)}") from None
-                print(
-                    f"  ! fomo ws đứt ({_safe(key, e)}) -> reconnect sau"
-                    f" {backoff:.0f}s (chấp nhận gap, không backfill)",
-                    file=sys.stderr,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, _BACKOFF_CAP_S)
-
-    async def _run():
+    async def _run() -> None:
         beat = asyncio.create_task(_beat_loop())
-        credits = asyncio.create_task(_fomo_credit_loop(key))
         try:
-            await _sock()
+            await _poll_loop(st, once)
         finally:
             beat.cancel()
-            credits.cancel()
 
     try:
         asyncio.run(_run())
@@ -840,7 +755,6 @@ def run_feed(key: str, ws_url: str = WS_URL, once: bool = False) -> None:
     if once:
         print(
             f"# fomo --once xong: emitted={st.get('emitted', 0)}"
-            f" last_ts={st.get('last_ts')}"
-            + ("" if st.get("emitted") else " — no alerts in window"),
+            f" last_ts={st.get('last_ts')}",
             flush=True,
         )

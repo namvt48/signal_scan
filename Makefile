@@ -18,7 +18,8 @@
 #   make restart [INSTANCE=b]# deploy + up
 #   make gateway-deploy     # sync instance-a source, build + restart the shared gateway
 #   make wallet-watch-deploy # deploy/restart Solana wallet watcher only
-#   make fomo-watch-deploy  # deploy/restart only the FOMO websocket watcher
+#   make fomo-watch-deploy  # deploy/restart only the FOMO swaps poller
+#   make fomo-prod-deploy   # build/restart only the FOMO prod bridge
 #   make logs / api-log / status / test / firewall
 #
 # Ghi chú:
@@ -74,6 +75,13 @@ BIND      ?= 0.0.0.0
 DOMAIN    ?=
 endif
 
+# One published bridge port per compose project; only B's host watcher uses it.
+ifeq ($(INSTANCE),a)
+FOMO_BRIDGE_PORT ?= 8130
+else
+FOMO_BRIDGE_PORT ?= 8131
+endif
+
 # URL mà `make test` dùng để kiểm tra TỪ MÁY LOCAL.
 ifeq ($(DOMAIN),)
 BASE ?= http://$(SERVER):$(PORT)
@@ -83,7 +91,7 @@ endif
 LEGACY_CONTAINER := signal_scan
 
 # Passed to every docker compose call so the two instances stay isolated.
-COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS) POLL_SETUP_MS=$(POLL_SETUP_MS)
+COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS) POLL_SETUP_MS=$(POLL_SETUP_MS) FOMO_BRIDGE_PORT=$(FOMO_BRIDGE_PORT)
 
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
@@ -113,7 +121,7 @@ FOMO_RELEASE_FILES := \
 	server/public/monitor.html
 
 # Keep Telegram presentation deploy isolated from alert-state and API changes.
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
 .PHONY: wallet-watch-deploy
 
 # Standalone partner API lifecycle on the selected production host.
@@ -189,10 +197,18 @@ fomo-evm-watch-deploy:
 	$(SCP) deploy/fomo-evm-wallet-watch.service $(HOST):/etc/systemd/system/fomo-evm-wallet-watch.service
 	$(SSH) "systemctl daemon-reload && systemctl reset-failed fomo-evm-wallet-watch.service && systemctl enable fomo-evm-wallet-watch.service && systemctl restart fomo-evm-wallet-watch.service && systemctl --no-pager --full status fomo-evm-wallet-watch.service"
 
+# Build/restart only the read-only prod bridge. Credentials live in
+# $(DATA_DIR)/fomo-prod-credentials and are never copied by a Makefile.
+fomo-prod-deploy:
+	@test "$(INSTANCE)" = b || { echo 'fomo-prod-deploy currently targets the FOMO instance (INSTANCE=b)'; exit 1; }
+	rsync -azcR --exclude '__pycache__' -e "$(RSYNC_SSH)" server/fomo-prod $(HOST):$(REMOTE_DIR)/
+	$(SSH) "set -eu; cd $(REMOTE_DIR); install -d -m 0700 $(DATA_DIR)/fomo-prod-credentials; if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build fomo-prod && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate fomo-prod; else $(COMPOSE_ENV) docker compose build fomo-prod && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate fomo-prod; fi"
+	$(SSH) "for i in 1 2 3 4 5 6 7 8 9 10; do code=$$(curl -s -o /tmp/fomo-prod-health -w '%{http_code}' http://127.0.0.1:$(FOMO_BRIDGE_PORT)/health || true); if [ "$$code" = 200 ] || [ "$$code" = 503 ]; then cat /tmp/fomo-prod-health; echo; exit 0; fi; sleep 1; done; echo 'fomo-prod health endpoint did not answer' >&2; exit 1"
+
 fomo-watch-deploy:
 	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs"
-	$(SCP) watchers/fomo/feed.py $(HOST):/opt/fomo-watch/watchers/fomo/feed.py
-	$(SSH) "set -eu; /opt/fomo-watch/venv/bin/python -m py_compile /opt/fomo-watch/watchers/fomo/feed.py; systemctl restart fomo-watch.service; systemctl is-active --quiet fomo-watch.service; systemctl --no-pager --full status fomo-watch.service"
+	$(SCP) watchers/fomo/feed.py watchers/fomo/main.py $(HOST):/opt/fomo-watch/watchers/fomo/
+	$(SSH) "set -eu; /opt/fomo-watch/venv/bin/python -m py_compile /opt/fomo-watch/watchers/fomo/feed.py /opt/fomo-watch/watchers/fomo/main.py; systemctl restart fomo-watch.service; systemctl is-active --quiet fomo-watch.service; systemctl --no-pager --full status fomo-watch.service"
 
 fomo-rpc-apply:
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --force-recreate api; else $(COMPOSE_ENV) docker compose up -d --force-recreate api; fi"
