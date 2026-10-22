@@ -278,7 +278,7 @@ gateway-log:
 
 monitor-deploy:
 	$(SSH) 'set -eu; dir=/root/signal-scan-monitor; envfile=$$dir/monitor.env; install -d -m 700 "$$dir"; if [ ! -f "$$envfile" ]; then umask 077; token=$$(openssl rand -hex 32); printf "MONITOR_API_TOKEN=%s\\nDISCORD_BOT_TOKEN=\\nDISCORD_CHANNEL_ID=\\nTELEGRAM_BOT_TOKEN=\\nTELEGRAM_CHAT_ID=\\nTELEGRAM_ALERT_THREAD_ID=\\nTELEGRAM_PERIODIC_CHAT_ID=\\n" "$$token" > "$$envfile"; fi; chmod 600 "$$envfile"; grep -q "^MONITOR_API_TOKEN=." "$$envfile"; install -d -m 0750 "$$dir/data" "$$dir/usage" "$$dir/heartbeats"; test -f /opt/fomo-watch/fomo_heartbeat; test -f /opt/wallet-watch/heartbeat; test -f /opt/fomo-watch/watchers/fomo/feed.py; test -f /opt/wallet-watch/watchers/common/state.py'
-	$(SCP) watchers/fomo/feed.py $(HOST):/opt/fomo-watch/watchers/fomo/feed.py
+	$(SCP) watchers/fomo/feed.py watchers/fomo/main.py $(HOST):/opt/fomo-watch/watchers/fomo/
 	$(SCP) watchers/common/state.py $(HOST):/opt/wallet-watch/watchers/common/state.py
 	$(SSH) "systemctl restart fomo-watch.service wallet-watch.service"
 	@$(MAKE) deploy INSTANCE=a
