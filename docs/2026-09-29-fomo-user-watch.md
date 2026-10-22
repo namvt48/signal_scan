@@ -3,7 +3,9 @@
 > **Superseded 2026-10-22:** the paid `api.fomoapi.io` WebSocket/key was removed.
 > The watcher now polls `/v2/users/{userId}/swaps` through the local prod bridge
 > (`server/fomo-prod`, `FOMO_PROD_URL`), and instance B reads holdings from `/balances`
-> through the same bridge. `FOMO_API_KEY` is no longer used. The historical capture and
+> through the same bridge. `FOMO_API_KEY` is no longer used. Prod requires a UUID,
+> so the poller skips watch-list rows that only have a handle (`skipped N without
+> userId`). The historical capture and
 > alert-shape notes below still describe server idempotency, but socket sections are
 > retired; see `docs/2026-10-20-fomo-prod-api.md` for the bridge.
 
