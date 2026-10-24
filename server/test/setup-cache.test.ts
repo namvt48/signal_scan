@@ -125,7 +125,7 @@ test('malformed entries are skipped; the valid sibling survives', () => {
   const file = tmpFile();
   const good = sampleEntry('good', Date.now());
   const badDerived: Record<string, unknown> = { ...sampleEntry('badDerived', Date.now()), genesis_bal: null };
-  const badChain: Record<string, unknown> = { ...sampleEntry('badChain', Date.now()), chain: 'eth' };
+  const badChain: Record<string, unknown> = { ...sampleEntry('badChain', Date.now()), chain: 'polygon' };
   writeFileSync(file, JSON.stringify({ version: 1, entries: [good, badDerived, badChain] }));
 
   // When loading

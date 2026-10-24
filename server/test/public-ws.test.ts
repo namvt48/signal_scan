@@ -74,6 +74,43 @@ test('streams only new durable inflow alerts, paginates bursts and isolates new 
   assert.equal((await fetch(url.replace('ws:', 'http:').replace('/ws', '/status'))).status, 200);
 });
 
+test('streams tracker-buy alerts from the FOMO upstream on its own path', { timeout: 10_000 }, async (t) => {
+  let alerts: Array<PublicAlert> = [];
+  const fomoApp = express();
+  fomoApp.get('/api/internal/public-export', (req, res) => {
+    const afterId = Number(req.query.afterId ?? 0);
+    if (req.query.resource === 'latestAlertId') { res.json({ data: [], nextId: alerts.at(-1)?.id ?? 0 }); return; }
+    const page = alerts.filter((alert) => alert.id > afterId).slice(0, Number(req.query.limit ?? 100));
+    res.json({ data: page, nextId: page.at(-1)?.id ?? afterId, oldestAvailableId: null, gap: false });
+  });
+  const fomoSource = fomoApp.listen(0, '127.0.0.1');
+  await once(fomoSource, 'listening');
+  const fomoUrl = `http://127.0.0.1:${(fomoSource.address() as AddressInfo).port}`;
+  const service = createPublicApiServer({ internalUrl: '', internalToken: 'fomo-ws-token', fomoInternalUrl: fomoUrl });
+  service.listen(0, '127.0.0.1');
+  await once(service, 'listening');
+  const ws = new WebSocket(`ws://127.0.0.1:${(service.address() as AddressInfo).port}/api/v1/fomo/ws`);
+  const messages: Array<{ type: string; data?: PublicAlert }> = [];
+  ws.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
+  t.after(async () => {
+    ws.terminate();
+    await Promise.all([new Promise<void>((resolve) => service.close(() => resolve())), new Promise<void>((resolve) => fomoSource.close(() => resolve()))]);
+  });
+  await until(() => messages.some((message) => message.type === 'ready'));
+  alerts = [{
+    id: 1, ca: 'fomo-ca', chain: 'eth', metric: 'trackerBuy', value: 42, responseAt: 1_758_000_000_000,
+    snapshot: {
+      capturedAt: 1_758_000_000_000, symbol: 'FOMO', marketCap: 1000, marketCapAt: 1_758_000_000_000,
+      freshPct: 10, t100Multiple: 1, lf: 1, trackedHoldingPct: null, iconUrl: null, xHandle: null,
+    },
+  }];
+  await until(() => messages.some((message) => message.type === 'inflow'));
+  const inflow = messages.find((message) => message.type === 'inflow')!.data!;
+  assert.equal(inflow.ca, 'fomo-ca');
+  assert.equal(inflow.metric, 'trackerBuy');
+  assert.equal(inflow.value, 42);
+});
+
 async function until(predicate: () => boolean) {
   const deadline = Date.now() + 10_000;
   while (!predicate()) {
@@ -86,10 +123,14 @@ test('closes with an explicit error when the private data source is unavailable'
   const service = createPublicApiServer({ internalUrl: '', internalToken: '' });
   service.listen(0, '127.0.0.1');
   await once(service, 'listening');
-  const ws = new WebSocket(`ws://127.0.0.1:${(service.address() as AddressInfo).port}/api/v1/ws`);
-  t.after(() => { ws.terminate(); service.close(); });
+  const port = (service.address() as AddressInfo).port;
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws`);
+  const fomoWs = new WebSocket(`ws://127.0.0.1:${port}/api/v1/fomo/ws`);
+  t.after(() => { ws.terminate(); fomoWs.terminate(); service.close(); });
   const [code] = await once(ws, 'close');
   assert.equal(code, 1011);
+  const [fomoCode] = await once(fomoWs, 'close');
+  assert.equal(fomoCode, 1011);
 });
 
 test('terminates a client that does not answer heartbeat pings', { timeout: 5_000 }, async (t) => {

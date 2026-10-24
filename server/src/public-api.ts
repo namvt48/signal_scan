@@ -14,9 +14,17 @@ const WS_PAGE_SIZE = 100;
 const MAX_WS_CONNECTIONS = 64;
 const MAX_CONCURRENT = 16;
 const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
+/** FOMO data additionally tracks `eth`; token/watch endpoints stay on CHAINS. */
+const FOMO_CHAINS = [...CHAINS, 'eth'] as const;
 /** Backend returned 404; only surfaced when the caller opts in via `preserveNotFound`. */
 const NOT_FOUND = Symbol('backend-not-found');
 type InternalResponse = unknown | null | typeof NOT_FOUND;
+interface AlertStream {
+  path: string;
+  baseUrl: string | undefined;
+  clients: Map<WebSocket, { cursor: number; alive: boolean }>;
+  polling: boolean;
+}
 interface WindowState { start: number; count: number }
 
 function parsePage(value: unknown, fallback: number): number | null {
@@ -31,19 +39,22 @@ function parseTimeRange(fromRaw: unknown, toRaw: unknown): { from: number; to: n
   return from !== null && to !== null && from >= 0 && to > from && to - from <= 31 * 86_400_000 ? { from, to } : null;
 }
 
-export function createPublicApiServer(options: { internalUrl?: string; internalToken?: string; heartbeatIntervalMs?: number } = {}): Server {
+export function createPublicApiServer(options: { internalUrl?: string; internalToken?: string; fomoInternalUrl?: string; heartbeatIntervalMs?: number } = {}): Server {
   const app = createPublicApiApp(options);
   const server = createServer(app);
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: false });
-  const clients = new Map<WebSocket, { cursor: number; alive: boolean }>();
+  const token = options.internalToken ?? config.publicApiExportToken;
+  const streams: Record<string, AlertStream> = {
+    '/api/v1/ws': { path: '/api/v1/ws', baseUrl: options.internalUrl ?? config.publicApiInternalUrl, clients: new Map(), polling: false },
+    '/api/v1/fomo/ws': { path: '/api/v1/fomo/ws', baseUrl: options.fomoInternalUrl ?? config.publicApiFomoInternalUrl, clients: new Map(), polling: false },
+  };
   let reservedConnections = 0;
-  let polling = false;
 
   server.on('upgrade', (request, socket, head) => {
     let pathname: string;
     try { pathname = new URL(request.url ?? '/', 'http://localhost').pathname; }
     catch { socket.destroy(); return; }
-    if (pathname !== '/api/v1/ws') { socket.destroy(); return; }
+    if (streams[pathname] === undefined) { socket.destroy(); return; }
     if (reservedConnections >= MAX_WS_CONNECTIONS) {
       socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
@@ -55,9 +66,14 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
       sockets.emit('connection', ws, request);
     });
   });
-  sockets.on('connection', (ws) => {
+  sockets.on('connection', (ws, request) => {
+    let stream: AlertStream | undefined;
+    try { stream = streams[new URL(request.url ?? '/', 'http://localhost').pathname]; }
+    catch { stream = undefined; }
+    if (stream === undefined) { ws.close(1008, 'unknown stream'); return; }
+    const clients = stream.clients;
     void (async () => {
-      const page = await fetchAlerts({ resource: 'latestAlertId', afterId: 0, limit: 1 });
+      const page = await fetchAlerts(stream!.baseUrl, { resource: 'latestAlertId', afterId: 0, limit: 1 });
       if (page === null) { ws.close(1011, 'data source unavailable'); return; }
       if (ws.readyState !== WebSocket.OPEN) return;
       clients.set(ws, { cursor: page.nextId, alive: true });
@@ -72,63 +88,67 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
     });
   });
   const heartbeat = setInterval(() => {
-    for (const [ws, state] of clients) {
-      if (!state.alive) {
-        clients.delete(ws);
-        ws.terminate();
-        continue;
+    for (const stream of Object.values(streams)) {
+      for (const [ws, state] of stream.clients) {
+        if (!state.alive) {
+          stream.clients.delete(ws);
+          ws.terminate();
+          continue;
+        }
+        state.alive = false;
+        ws.ping();
       }
-      state.alive = false;
-      ws.ping();
     }
   }, options.heartbeatIntervalMs ?? 25_000);
   heartbeat.unref();
 
   const timer = setInterval(() => {
-    if (polling || clients.size === 0) return;
-    polling = true;
-    void (async () => {
-      for (const [ws] of clients) {
-        if (ws.readyState !== WebSocket.OPEN) clients.delete(ws);
-        else if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
-          ws.close(1013, 'consumer too slow');
-          clients.delete(ws);
-        }
-      }
-      if (clients.size === 0) return;
-      let afterId = Math.min(...Array.from(clients.values(), (state) => state.cursor));
-      for (;;) {
-        const page = await fetchAlerts({ resource: 'alerts', afterId, limit: WS_PAGE_SIZE });
-        if (page === null) {
-          for (const ws of clients.keys()) ws.close(1011, 'data source unavailable');
-          clients.clear();
-          return;
-        }
-        for (const alert of page.data) {
-          if (alert.metric === 'trackerBuy') {
-            for (const [ws, state] of clients) {
-              if (alert.id <= state.cursor || ws.readyState !== WebSocket.OPEN) continue;
-              if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
-                clients.delete(ws);
-                ws.terminate();
-                continue;
-              }
-              ws.send(JSON.stringify({ type: 'inflow', data: alert }));
-            }
-          }
-        }
-        afterId = page.nextId;
-        for (const state of clients.values()) state.cursor = Math.max(state.cursor, afterId);
-        if (page.data.length < WS_PAGE_SIZE) break;
-      }
-    })().finally(() => { polling = false; });
+    for (const stream of Object.values(streams)) {
+      if (stream.polling || stream.clients.size === 0) continue;
+      stream.polling = true;
+      void pollStream(stream).finally(() => { stream.polling = false; });
+    }
   }, WS_POLL_MS);
   timer.unref();
   server.once('close', () => { clearInterval(timer); clearInterval(heartbeat); sockets.close(); });
 
-  async function fetchAlerts(query: { resource: string; afterId: number; limit: number }): Promise<{ data: PublicAlert[]; nextId: number } | null> {
-    const base = options.internalUrl ?? config.publicApiInternalUrl;
-    const token = options.internalToken ?? config.publicApiExportToken;
+  async function pollStream(stream: AlertStream): Promise<void> {
+    const clients = stream.clients;
+    for (const [ws] of clients) {
+      if (ws.readyState !== WebSocket.OPEN) clients.delete(ws);
+      else if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+        ws.close(1013, 'consumer too slow');
+        clients.delete(ws);
+      }
+    }
+    if (clients.size === 0) return;
+    let afterId = Math.min(...Array.from(clients.values(), (state) => state.cursor));
+    for (;;) {
+      const page = await fetchAlerts(stream.baseUrl, { resource: 'alerts', afterId, limit: WS_PAGE_SIZE });
+      if (page === null) {
+        for (const ws of clients.keys()) ws.close(1011, 'data source unavailable');
+        clients.clear();
+        return;
+      }
+      for (const alert of page.data) {
+        if (alert.metric !== 'trackerBuy') continue;
+        for (const [ws, state] of clients) {
+          if (alert.id <= state.cursor || ws.readyState !== WebSocket.OPEN) continue;
+          if (ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+            clients.delete(ws);
+            ws.terminate();
+            continue;
+          }
+          ws.send(JSON.stringify({ type: 'inflow', data: alert }));
+        }
+      }
+      afterId = page.nextId;
+      for (const state of clients.values()) state.cursor = Math.max(state.cursor, afterId);
+      if (page.data.length < WS_PAGE_SIZE) break;
+    }
+  }
+
+  async function fetchAlerts(base: string | undefined, query: { resource: string; afterId: number; limit: number }): Promise<{ data: PublicAlert[]; nextId: number } | null> {
     if (!base || !token) return null;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), INTERNAL_TIMEOUT_MS);
@@ -145,9 +165,10 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
   }
   return server;
 }
-export function createPublicApiApp(options: { internalUrl?: string; internalToken?: string } = {}): Express {
+export function createPublicApiApp(options: { internalUrl?: string; internalToken?: string; fomoInternalUrl?: string } = {}): Express {
   const internalUrl = options.internalUrl ?? config.publicApiInternalUrl;
   const internalToken = options.internalToken ?? config.publicApiExportToken;
+  const fomoInternalUrl = options.fomoInternalUrl ?? config.publicApiFomoInternalUrl;
   let windowState: WindowState = { start: Date.now(), count: 0 };
   const responseCache = new Map<string, { expiresAt: number; value: unknown }>();
   const pending = new Map<string, Promise<InternalResponse>>();
@@ -235,17 +256,82 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
     if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     res.json(data);
   });
-  async function internal(query: Record<string, string | number>, options: { preserveNotFound: true }): Promise<InternalResponse>;
-  async function internal(query: Record<string, string | number>): Promise<unknown | null>;
+  // FOMO dashboard data lives on the separate FOMO instance (B). These routes
+  // read it through the same private export contract but a distinct upstream;
+  // when PUBLIC_API_FOMO_INTERNAL_URL is unset every FOMO route returns 502.
+  app.get('/api/v1/fomo/users', async (req, res) => {
+    const limit = parsePage(req.query.limit, 50); const offset = parsePage(req.query.offset, 0);
+    if (limit === null || limit < 1 || limit > MAX_PAGE || offset === null || offset > 1_000_000) { res.status(400).json({ error: 'invalid pagination' }); return; }
+    const result = await fomoInternal({ resource: 'fomoUsers', limit, afterId: offset });
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
+  });
+  app.get('/api/v1/fomo/users/:id/trades', async (req, res) => {
+    const range = parseTimeRange(req.query.from, req.query.to); const afterId = parsePage(req.query.after_id, 0); const limit = parsePage(req.query.limit, 50);
+    if (req.params.id.length < 1 || req.params.id.length > 128 || !range || afterId === null || afterId < 0 || limit === null || limit < 1 || limit > MAX_PAGE) { res.status(400).json({ error: 'invalid fomo trade query' }); return; }
+    const data = await fomoInternal({ resource: 'fomoTrades', userId: req.params.id, ...range, afterId, limit });
+    if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(data);
+  });
+  app.get('/api/v1/fomo/users/:id/positions', async (req, res) => {
+    if (req.params.id.length < 1 || req.params.id.length > 128) { res.status(400).json({ error: 'invalid fomo user id' }); return; }
+    const data = await fomoInternal({ resource: 'fomoPositions', userId: req.params.id });
+    if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(data);
+  });
+  app.get('/api/v1/fomo/tokens', async (req, res) => {
+    const limit = parsePage(req.query.limit, 50); const offset = parsePage(req.query.offset, 0);
+    if (limit === null || limit < 1 || limit > MAX_PAGE || offset === null || offset > 1_000_000) { res.status(400).json({ error: 'invalid pagination' }); return; }
+    const result = await fomoInternal({ resource: 'fomoTokens', limit, afterId: offset });
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
+  });
+  app.get('/api/v1/fomo/tokens/:chain/:address', async (req, res) => {
+    if (!FOMO_CHAINS.includes(req.params.chain as typeof FOMO_CHAINS[number]) || req.params.address.length < 1 || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
+    const result = await fomoInternal({ resource: 'fomoToken', chain: req.params.chain, ca: req.params.address }, { preserveNotFound: true });
+    if (result === NOT_FOUND) { res.status(404).json({ error: 'token not found' }); return; }
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
+  });
+  app.get('/api/v1/fomo/alerts', async (req, res) => {
+    const afterId = parsePage(req.query.after_id, 0); const limit = parsePage(req.query.limit, 50);
+    if (afterId === null || afterId < 0 || limit === null || limit < 1 || limit > MAX_PAGE) { res.status(400).json({ error: 'invalid pagination' }); return; }
+    const data = await fomoInternal({ resource: 'alerts', afterId, limit });
+    if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(data);
+  });
+  app.get('/api/v1/fomo/wallets', async (req, res) => {
+    const limit = parsePage(req.query.limit, 50); const offset = parsePage(req.query.offset, 0);
+    if (limit === null || limit < 1 || limit > MAX_PAGE || offset === null || offset > 1_000_000) { res.status(400).json({ error: 'invalid pagination' }); return; }
+    const result = await fomoInternal({ resource: 'wallets', limit, afterId: offset });
+    if (result === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(result);
+  });
+  app.get('/api/v1/fomo/wallets/:id/trades', async (req, res) => {
+    const range = parseTimeRange(req.query.from, req.query.to); const afterId = parsePage(req.query.after_id, 0); const limit = parsePage(req.query.limit, 50);
+    if (req.params.id.length < 1 || req.params.id.length > 128 || !range || afterId === null || afterId < 0 || limit === null || limit < 1 || limit > MAX_PAGE) { res.status(400).json({ error: 'invalid trade query' }); return; }
+    const data = await fomoInternal({ resource: 'trades', walletId: req.params.id, ...range, afterId, limit });
+    if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(data);
+  });
+  app.get('/api/v1/fomo/tokens/:chain/:address/users', async (req, res) => {
+    if (!FOMO_CHAINS.includes(req.params.chain as typeof FOMO_CHAINS[number]) || req.params.address.length < 1 || req.params.address.length > 128) { res.status(400).json({ error: 'invalid token identity' }); return; }
+    const data = await fomoInternal({ resource: 'fomoTokenStats', chain: req.params.chain, ca: req.params.address });
+    if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
+    res.json(data);
+  });
+  async function internal(query: Record<string, string | number>, options: { preserveNotFound: true; baseUrl?: string }): Promise<InternalResponse>;
+  async function internal(query: Record<string, string | number>, options?: { baseUrl?: string }): Promise<unknown | null>;
   async function internal(
     query: Record<string, string | number>,
-    options: { preserveNotFound?: boolean } = {},
+    options: { preserveNotFound?: boolean; baseUrl?: string } = {},
   ): Promise<InternalResponse> {
-    if (!internalUrl || !internalToken) return null;
+    const base = options.baseUrl ?? internalUrl;
+    if (!base || !internalToken) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), INTERNAL_TIMEOUT_MS);
     try {
-      const url = new URL('/api/internal/public-export', internalUrl);
+      const url = new URL('/api/internal/public-export', base);
       for (const [name, value] of Object.entries(query)) url.searchParams.set(name, String(value));
       const key = url.toString() + (options.preserveNotFound ? '#notfound' : '');
       const cached = responseCache.get(key);
@@ -279,6 +365,11 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
     } finally {
       clearTimeout(timer);
     }
+  }
+  function fomoInternal(query: Record<string, string | number>, options: { preserveNotFound: true }): Promise<InternalResponse>;
+  function fomoInternal(query: Record<string, string | number>): Promise<unknown | null>;
+  function fomoInternal(query: Record<string, string | number>, options: { preserveNotFound?: boolean } = {}): Promise<InternalResponse> {
+    return internal(query, { ...options, baseUrl: fomoInternalUrl });
   }
   return app;
 }

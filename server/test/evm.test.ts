@@ -381,7 +381,7 @@ test('EvmRpcClient: dead primary → second configured key, then public fallback
     // no endpoints at all → config-level error naming the env knobs
     await assert.rejects(
       new EvmRpcClient(() => []).walletTokenHoldings(WALLET, 'base', [WETH]),
-      /no endpoint for base \(set BASE_RPC_URL\/BSC_RPC_URL\/ROBINHOOD_RPC_URL\)/,
+      /no endpoint for base \(set BASE_RPC_URL\/BSC_RPC_URL\/ROBINHOOD_RPC_URL\/ETH_RPC_URL\)/,
     );
   } finally {
     globalThis.fetch = origFetch;
@@ -414,6 +414,7 @@ test('evmEndpointList parses comma-separated URLs in order and appends the fallb
   assert.deepEqual(evmRpcEndpoints('base'), ['https://mainnet.base.org']);
   assert.deepEqual(evmRpcEndpoints('bsc'), ['https://bsc-dataseed.binance.org']);
   assert.deepEqual(evmRpcEndpoints('robinhood'), ['https://rpc.mainnet.chain.robinhood.com']);
+  assert.deepEqual(evmRpcEndpoints('eth'), ['https://ethereum-rpc.publicnode.com']);
   assert.throws(() => evmRpcEndpoints('sol'), /no EVM RPC source/);
   // pure part: primary first, fallback appended once, duplicates collapsed
   assert.deepEqual(evmEndpointList('https://alchemy.test/v2/k', 'https://mainnet.base.org'), [

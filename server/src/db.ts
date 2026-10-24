@@ -623,6 +623,22 @@ export function open(path: string, sharedMarketPath = ''): void {
   // feed resolves it on-chain), so it is nullable and Buy-$ falls back (user 2026-10-01).
   const fomoTradeCols = (instance.pragma('table_info(fomo_trades)') as { name: string }[]).map((c) => c.name);
   if (!fomoTradeCols.includes('trade_usd')) instance.exec('ALTER TABLE fomo_trades ADD COLUMN trade_usd REAL');
+  // One event namespace for FOMO fills: the token feed used to write
+  // `fomo-feed:<swap id>` while /swaps wrote `fomo-swap:<swap id>`. Both routes
+  // now use fomo-swap; rewrite stored feed ids so a replay (the feed re-reads
+  // `at == cursor` and expands a trade's older swaps) cannot insert the same
+  // swap under a second key. The swap id proves both rows are the same fill.
+  instance.exec(`
+    DELETE FROM fomo_trades
+     WHERE event_id LIKE 'fomo-feed:%'
+       AND EXISTS (
+         SELECT 1 FROM fomo_trades AS other
+          WHERE other.event_id = 'fomo-swap:' || substr(fomo_trades.event_id, 11)
+       );
+    UPDATE OR IGNORE fomo_trades
+       SET event_id = 'fomo-swap:' || substr(event_id, 11)
+     WHERE event_id LIKE 'fomo-feed:%';
+  `);
   // fomo_users.tags — parity with wallets.tags (user 2026-10-02): a JSON array of
   // display-only labels the FE renders as chips (and 'Unicon' → rainbow name).
   // Never filters/routes; DEFAULT '[]' so pre-existing rows read as untagged.
@@ -1010,7 +1026,7 @@ export function importWallets(
       }
       if (r.chain === 'evm') {
         if (!config.showFomo) {
-          skipped.push({ row: i, reason: 'invalid chain "evm" (expected one of sol, base, bsc, robinhood)' });
+          skipped.push({ row: i, reason: `invalid chain "evm" (expected one of ${CHAINS.join(', ')})` });
           return;
         }
         const canonicalAddress = address.toLowerCase();
@@ -2428,6 +2444,43 @@ export function getFomoTradeEnrichmentTarget(fomoUserId: string, eventId: string
     .get(fomoUserId, eventId) as FomoTradeEnrichmentTarget | undefined;
 }
 
+/** Read-only rows for the public FOMO export: one user's trades by ascending
+ *  fomo_trades.id, capped to the half-open [from, to) window. */
+export interface FomoTradeRow {
+  id: number;
+  fomo_user_id: string;
+  handle: string;
+  event_id: string;
+  ca: string;
+  chain: Chain;
+  type: 'buy' | 'sell';
+  usd_value: number | null;
+  trade_usd: number | null;
+  price: number | null;
+  token: string | null;
+  ts: number;
+  source: string;
+}
+
+export function listFomoTradesForUser(
+  fomoUserId: string,
+  afterId: number,
+  limit: number,
+  from: number,
+  to: number,
+): FomoTradeRow[] {
+  return getDb()
+    .prepare(
+      `SELECT t.id, t.fomo_user_id, u.handle, t.event_id, t.ca, t.chain, t.type,
+              t.usd_value, t.trade_usd, t.price, t.token, t.ts, t.source
+         FROM fomo_trades t
+         JOIN fomo_users u ON u.id = t.fomo_user_id
+        WHERE t.fomo_user_id = ? AND t.id > ? AND t.ts >= ? AND t.ts < ?
+        ORDER BY t.id LIMIT ?`,
+    )
+    .all(fomoUserId, afterId, from, to, limit + 1) as FomoTradeRow[];
+}
+
 /** Fill only a still-unknown BUY amount; alert-provided tradeUsd stays authoritative. */
 export function updateFomoTradeUsd(fomoUserId: string, eventId: string, amount: number): boolean {
   if (!Number.isFinite(amount) || amount <= 0) return false;
@@ -2633,12 +2686,43 @@ export function listFomoPositionTargets(fomoUserId: string, now = Date.now()): F
   ).all(fomoUserId, fomoUserId, fomoUserId, now - 86_400_000) as FomoPositionTarget[];
 }
 
-/** Apply one complete per-user positions response to tracked dashboard pairs. */
+/** Clear a stored mark so live token_state.price drives Bal again. */
+export function clearFomoPositionPrice(fomoUserId: string, ca: string, chain: Chain): void {
+  getDb().prepare(
+    'UPDATE fomo_positions SET price_usd = NULL WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
+  ).run(fomoUserId, canonicalCa(ca, chain), chain);
+}
+
+export interface FomoPositionEvidence {
+  trade_id: string | null;
+  buy_ts: number | null;
+  sell_ts: number | null;
+}
+
+/** DB-only evidence for one omitted position. Closure is never inferred from a
+ *  sell timestamp alone: the caller must confirm with `/trades/{trade_id}`. */
+export function getFomoPositionEvidence(
+  fomoUserId: string,
+  ca: string,
+  chain: Chain,
+): FomoPositionEvidence {
+  return getDb().prepare(
+    `SELECT (SELECT trade_id FROM fomo_positions
+              WHERE fomo_user_id = ? AND ca = ? AND chain = ?) AS trade_id,
+            (SELECT MAX(ts) FROM fomo_trades
+              WHERE fomo_user_id = ? AND ca = ? AND chain = ? AND type = 'buy') AS buy_ts,
+            (SELECT MAX(ts) FROM fomo_trades
+              WHERE fomo_user_id = ? AND ca = ? AND chain = ? AND type = 'sell') AS sell_ts`,
+  ).get(fomoUserId, ca, chain, fomoUserId, ca, chain, fomoUserId, ca, chain) as FomoPositionEvidence;
+}
+
+/** Apply resolved positions to tracked dashboard pairs. Omission alone is never
+ *  closure: the caller adds a `closed` row only after `/trades/{tradeId}`
+ *  confirms it, and adds an active row when that detail is still open. */
 export function syncFomoPositionsSnapshot(
   fomoUserId: string,
   positions: readonly FomoPositionInput[],
   checkedAt: number,
-  closeMissing = true,
 ): void {
   const db = getDb();
   const run = db.transaction(() => {
@@ -2649,34 +2733,8 @@ export function syncFomoPositionsSnapshot(
       if (!dashboardCas.has(`${position.chain}:${ca}`)) continue;
       incoming.set(`${position.chain}:${ca}`, { ...position, ca, fomo_user_id: fomoUserId });
     }
-    const targets = new Map<string, FomoPositionTarget>();
-    for (const target of listFomoPositionTargets(fomoUserId, checkedAt)) {
-      const ca = canonicalCa(target.ca, target.chain);
-      if (dashboardCas.has(`${target.chain}:${ca}`)) targets.set(`${target.chain}:${ca}`, { ...target, ca });
-    }
-    for (const [key, position] of incoming) {
-      targets.set(key, { chain: position.chain, ca: position.ca });
-    }
-    for (const [key, target] of targets) {
-      const position = incoming.get(key);
-      if (position !== undefined) {
-        upsertFomoPosition(position);
-      } else if (closeMissing) {
-        upsertFomoPosition({
-          fomo_user_id: fomoUserId,
-          ca: target.ca,
-          chain: target.chain,
-          trade_id: null,
-          status: 'closed',
-          amount: 0,
-          cost_basis_usd: null,
-          avg_entry_price: null,
-          price_usd: null,
-          realized_pnl_usd: null,
-          unrealized_pnl_usd: null,
-          fetched_at: checkedAt,
-        });
-      }
+    for (const position of incoming.values()) {
+      upsertFomoPosition(position);
     }
     upsertFomoPositionSnapshot({ fomo_user_id: fomoUserId, checked_at: checkedAt });
   });
@@ -2699,6 +2757,75 @@ export function getFomoPositionSnapshot(fomoUserId: string): FomoPositionSnapsho
   return getDb()
     .prepare('SELECT fomo_user_id, checked_at FROM fomo_position_snapshots WHERE fomo_user_id = ?')
     .get(fomoUserId) as FomoPositionSnapshot | undefined;
+}
+
+export interface FomoApiBalanceSnapshot {
+  fomo_user_id: string;
+  checked_at: number;
+  captured_at: number | null;
+  complete: number;
+  truncated: number;
+  available: number;
+}
+
+export function getFomoApiBalanceSnapshot(fomoUserId: string): FomoApiBalanceSnapshot | undefined {
+  return getDb()
+    .prepare(
+      'SELECT fomo_user_id, checked_at, captured_at, complete, truncated, available FROM fomo_api_balance_snapshots WHERE fomo_user_id = ?',
+    )
+    .get(fomoUserId) as FomoApiBalanceSnapshot | undefined;
+}
+
+/** Stored position row for the public FOMO export (raw API values, no 24h gate). */
+export interface FomoPositionRow {
+  ca: string;
+  chain: Chain;
+  trade_id: string | null;
+  status: string | null;
+  amount: number | null;
+  cost_basis_usd: number | null;
+  avg_entry_price: number | null;
+  price_usd: number | null;
+  realized_pnl_usd: number | null;
+  unrealized_pnl_usd: number | null;
+  fetched_at: number;
+}
+
+/** One stored balance measurement: API balances or an RPC holding measurement. */
+export interface FomoHoldingMeasurementRow {
+  source: 'api' | 'rpc';
+  ca: string;
+  chain: Chain;
+  amount: number | null;
+  pct: number | null;
+  captured_at: number;
+  /** RPC measurements only; null for API balance rows. */
+  wallet: string | null;
+}
+
+export function listFomoPositionsForUser(fomoUserId: string): FomoPositionRow[] {
+  return getDb()
+    .prepare(
+      `SELECT ca, chain, trade_id, status, amount, cost_basis_usd, avg_entry_price,
+              price_usd, realized_pnl_usd, unrealized_pnl_usd, fetched_at
+         FROM fomo_positions
+        WHERE fomo_user_id = ?
+        ORDER BY chain, ca`,
+    )
+    .all(fomoUserId) as FomoPositionRow[];
+}
+
+export function listFomoHoldingsForUser(fomoUserId: string): FomoHoldingMeasurementRow[] {
+  return getDb()
+    .prepare(
+      `SELECT 'api' AS source, ca, chain, amount, pct, captured_at, NULL AS wallet
+         FROM fomo_api_holdings WHERE fomo_user_id = ?
+        UNION ALL
+       SELECT 'rpc' AS source, ca, chain, amount, pct, measured_at AS captured_at, wallet
+         FROM fomo_holdings WHERE fomo_user_id = ?
+        ORDER BY chain, ca, source`,
+    )
+    .all(fomoUserId, fomoUserId) as FomoHoldingMeasurementRow[];
 }
 
 export type FomoApiRequestEndpoint = 'balances' | 'swaps';

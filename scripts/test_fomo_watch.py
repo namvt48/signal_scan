@@ -7,6 +7,7 @@ Không gọi mạng/API thật: fetch swaps và POST ingest đều được stub
 
 import json
 import os
+import re
 import sys
 import tempfile
 from unittest.mock import patch
@@ -18,6 +19,8 @@ if ROOT not in sys.path:
 
 from watchers.fomo import feed  # noqa: E402
 
+feed.save_state = lambda st: None
+
 fail = 0
 total = 0
 
@@ -27,6 +30,16 @@ def check(cond, msg):
     total += 1
     print(("PASS" if cond else "FAIL"), msg)
     fail += not cond
+
+
+for _chain, _assets in feed._QUOTE_ASSETS.items():
+    for _address in _assets:
+        _ok = (
+            32 <= len(_address) <= 44
+            if _chain == "sol"
+            else bool(re.fullmatch(r"0x[0-9a-f]{40}", _address))
+        )
+        check(_ok, f"quote asset format: {_chain}:{_address[:12]}…")
 
 
 def swap(**overrides):
@@ -85,13 +98,47 @@ body, reason = feed._swap_body(swap(
 check(reason is None and body and body["chain"] == "robinhood" and body["type"] == "buy", "robinhood: USDG quote maps to buy")
 
 body, reason = feed._swap_body(swap(
+    inTokenAddress="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    outTokenAddress="0x2222222222222222222222222222222222222222",
+    networkId=4663, inNetworkId=4663, outNetworkId=4663,
+), user)
+check(reason is None and body and body["chain"] == "robinhood" and body["type"] == "buy", "robinhood: canonical WETH quote maps to buy")
+
+body, reason = feed._swap_body(swap(
+    inTokenAddress="0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+    outTokenAddress="0x2222222222222222222222222222222222222222",
+), user)
+check(reason is None and body and body["chain"] == "base" and body["type"] == "buy", "base: DAI quote maps to buy")
+
+body, reason = feed._swap_body(swap(
+    inTokenAddress="0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",
+    outTokenAddress="0x3333333333333333333333333333333333333333",
+    networkId=56, inNetworkId=56, outNetworkId=56,
+), user)
+check(reason is None and body and body["chain"] == "bsc" and body["type"] == "buy", "bsc: FDUSD quote maps to buy")
+
+body, reason = feed._swap_body(swap(
+    inTokenAddress="2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",
+    outTokenAddress="11111111111111111111111111111111",
+    networkId=1399811149, inNetworkId=1399811149, outNetworkId=1399811149,
+), user)
+check(reason is None and body and body["chain"] == "sol" and body["type"] == "buy", "sol: PYUSD quote maps to buy")
+
+body, reason = feed._swap_body(swap(
     inTokenAddress="0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
     outTokenAddress="0x3333333333333333333333333333333333333333",
     networkId=56, inNetworkId=56, outNetworkId=56,
 ), user)
 check(reason is None and body and body["chain"] == "bsc" and body["type"] == "buy", "bsc: WBNB quote maps to buy")
 
-body, reason = feed._swap_body(swap(networkId=1, inNetworkId=1, outNetworkId=1), user)
+body, reason = feed._swap_body(swap(
+    inTokenAddress="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    outTokenAddress="0x4444444444444444444444444444444444444444",
+    networkId=1, inNetworkId=1, outNetworkId=1,
+), user)
+check(reason is None and body and body["chain"] == "eth" and body["type"] == "buy", "eth: WETH quote maps to buy")
+
+body, reason = feed._swap_body(swap(networkId=137, inNetworkId=137, outNetworkId=137), user)
 check(body is None and reason == "unsupported_chain", "unsupported chain: skipped")
 body, reason = feed._swap_body(swap(id=None), user)
 check(body is None and reason == "missing_swap_id", "missing swap id: skipped")
@@ -108,67 +155,89 @@ feed._request_bytes_with_retry = lambda req, on_attempt=None, timeout=None: __im
     {"userId": "uuid-1", "handle": "duplicate"},
 ]).encode()
 feed._wl = {"users": [], "next": 0.0, "skipped": 0}
-feed.refresh_watch_list(force=True)
+feed._deploy_window_ms = None
+watch_state = {"deployed_at": 1_760_000_000_000, "crawl_at": {}, "first_seen_at": {}}
+feed.refresh_watch_list(watch_state, force=True)
 check([u["identity"] for u in feed._wl["users"]] == ["uuid-1"], "watch list: handle-only rows are skipped")
 check(feed._wl["skipped"] == 1, "watch list: skipped count is reported")
 
-# ---------- cursor / dedupe / retry ----------
+# ---------- crawl window / dedupe / retry ----------
 
 tmp = tempfile.TemporaryDirectory()
 feed.STATE_PATH = os.path.join(tmp.name, "fomo_state.json")
 feed.HEARTBEAT = os.path.join(tmp.name, "fomo_heartbeat")
 feed.FOMO_MONITOR_HEARTBEAT = os.path.join(tmp.name, "monitor_fomo_heartbeat")
 feed._seen = set()
-feed.FOMO_MONITOR_HEARTBEAT = os.path.join(tmp.name, "monitor_fomo_heartbeat")
 
 posted = []
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+feed.post_fomo_trade = lambda body, **kwargs: (posted.append(body), True)[1]
 
 t0 = 1_760_000_000_000
-page = [swap(id="old", createdAt=t0), swap(id="new", createdAt=t0 + 1_000)]
-_backfill_real = feed._backfill_user_ca
 _fetch_swaps_real = feed._fetch_swaps
-feed._backfill_user_ca = lambda *args, **kwargs: 0
-feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(page), False)
-st = {"cursors": {}}
-emitted = feed._poll_user(user, st, "cycle-1")
-check(emitted == 0 and posted == [], "bootstrap: first page is not replayed")
-check(st["cursors"]["fomo-user-1"] == t0 + 1_001, "bootstrap: cursor starts past the newest swap")
 
-page = [swap(id="old", createdAt=t0), swap(id="new", createdAt=t0 + 1_000), swap(id="newer", createdAt=t0 + 2_000)]
-emitted = feed._poll_user(user, st, "cycle-2")
-check(emitted == 1 and len(posted) == 1, "poll: only swaps after the cursor are emitted")
-check(posted[0]["eventId"] == "fomo-swap:newer", "poll: emitted the newest swap")
-check(st["cursors"]["fomo-user-1"] == t0 + 2_000, "poll: cursor advanced")
-feed._poll_user(user, st, "cycle-3")
-check(len(posted) == 1, "poll: re-reading the same page dedupes")
 
-# Failed ingest must not advance the cursor; the retry succeeds next cycle.
+def poll_at(now_ms, st, page, truncated=False):
+    feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(page), truncated)
+    with patch.object(feed.time, "time", return_value=now_ms / 1000):
+        return feed._poll_user(user, st, "cycle")
+
+
+# /swaps is chain-agnostic: the default swap() is Base (8453).
+st = {"deployed_at": t0 - 1_000, "crawl_at": {}, "first_seen_at": {"fomo-user-1": t0 - 1_000}}
+page = [
+    swap(id="too-old", createdAt=t0 - 2_000),
+    swap(id="buy", createdAt=t0),
+    swap(id="newer", createdAt=t0 + 1_000),
+]
+emitted = poll_at(t0 + 2_000, st, page)
+check(emitted == 2 and len(posted) == 2, "poll: only swaps inside the window are emitted")
+check([b["eventId"] for b in posted] == ["fomo-swap:buy", "fomo-swap:newer"], "poll: event ids are swap ids")
+check([b["chain"] for b in posted] == ["base", "base"], "poll: EVM swaps from /swaps are handled normally")
+check(st["crawl_at"]["fomo-user-1"] == t0 + 2_000, "poll: window advances to the cycle start")
+
+# An inactive user still advances the window, so the next cycle asks for one page.
+fetches = []
+feed._fetch_swaps = lambda identity, cycle_id, *, stop_at_ms=None, max_pages=1: (
+    fetches.append(stop_at_ms) or [swap(id="old", createdAt=t0 - 5_000)], False
+)
+with patch.object(feed.time, "time", return_value=(t0 + 3_000) / 1000):
+    emitted = feed._poll_user(user, st, "cycle-inactive")
+check(emitted == 0 and len(posted) == 2, "poll: inactive user emits nothing")
+check(fetches == [t0 + 2_000], "poll: inactive user starts at the previous crawl time")
+check(st["crawl_at"]["fomo-user-1"] == t0 + 3_000, "poll: inactive user still advances the window")
+
+# Failed ingest must not advance the window; the retry emits and advances.
 feed._seen = set()
-st = {"cursors": {"fomo-user-1": 0}}
-page = [swap(id="retry-me", createdAt=t0 + 3_000)]
-feed.post_fomo_trade = lambda body, cycle_id=None: False
-emitted = feed._poll_user(user, st, "cycle-4")
-check(emitted == 0 and st["cursors"]["fomo-user-1"] == 0, "retry: failed ingest keeps the cursor")
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
-emitted = feed._poll_user(user, st, "cycle-5")
-check(emitted == 1 and st["cursors"]["fomo-user-1"] == t0 + 3_000, "retry: next cycle emits and advances")
-
+st = {"deployed_at": t0, "crawl_at": {"fomo-user-1": t0 + 3_000}, "first_seen_at": {}}
+page = [swap(id="retry-me", createdAt=t0 + 4_000)]
+feed.post_fomo_trade = lambda body, **kwargs: False
+emitted = poll_at(t0 + 5_000, st, page)
+check(emitted == 0 and st["crawl_at"]["fomo-user-1"] == t0 + 3_000, "retry: failed ingest keeps the window")
+posted = []
+feed.post_fomo_trade = lambda body, **kwargs: (posted.append(body), True)[1]
+emitted = poll_at(t0 + 6_000, st, page)
+check(emitted == 1 and st["crawl_at"]["fomo-user-1"] == t0 + 6_000, "retry: next cycle emits and advances")
 check(feed._seen == {"fomo-swap:retry-me"}, "dedupe: acknowledged event is remembered")
 
-# Two fills in the same millisecond must both be emitted; the cursor boundary is
-# revisited and dedupe prevents a replay.
+# Truncation keeps the window and posts nothing.
 feed._seen = set()
 posted = []
-st = {"cursors": {"fomo-user-1": t0 + 3_000}}
-page = [swap(id="same-a", createdAt=t0 + 4_000), swap(id="same-b", createdAt=t0 + 4_000)]
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
-emitted = feed._poll_user(user, st, "cycle-6")
-check(emitted == 2 and len(posted) == 2, "same-ms fills: both emitted")
-check(st["cursors"]["fomo-user-1"] == t0 + 4_000, "same-ms fills: cursor advances once")
+st = {"deployed_at": t0, "crawl_at": {"fomo-user-1": t0 + 6_000}, "first_seen_at": {}}
+emitted = poll_at(t0 + 7_000, st, [swap(id="cut", createdAt=t0 + 6_500)], truncated=True)
+check(emitted == 0 and posted == [] and st["crawl_at"]["fomo-user-1"] == t0 + 6_000,
+      "truncation: window and dedupe state are preserved")
+
+# Two fills in the same millisecond both emit; the next window skips the boundary.
+feed._seen = set()
 posted = []
-feed._poll_user(user, st, "cycle-7")
-check(posted == [], "same-ms fills: boundary re-read dedupes")
+st = {"deployed_at": t0, "crawl_at": {"fomo-user-1": t0 + 7_000}, "first_seen_at": {}}
+page = [swap(id="same-a", createdAt=t0 + 8_000), swap(id="same-b", createdAt=t0 + 8_000)]
+emitted = poll_at(t0 + 9_000, st, page)
+check(emitted == 2 and len(posted) == 2, "same-ms fills: both emitted")
+check(st["crawl_at"]["fomo-user-1"] == t0 + 9_000, "same-ms fills: window advances once")
+posted = []
+poll_at(t0 + 10_000, st, page)
+check(posted == [], "same-ms fills: next window does not replay the boundary")
 
 
 # ---------- swap pagination ----------
@@ -201,35 +270,6 @@ check(not truncated, "pagination: stops after crossing the cursor")
 requests = []
 fetched = feed._fetch_swaps("fomo-user-1", "cycle-cap", stop_at_ms=t0, max_pages=1)
 check(fetched is not None and fetched[1] is True, "pagination: page cap reports truncation")
-
-# ---------- per-CA backfill ----------
-
-feed._seen = set()
-posted = []
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
-target = "0x1111111111111111111111111111111111111111"
-quote = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-history = [
-    swap(id="hist-buy", outTokenAddress=target, createdAt=t0 - 5_000),
-    swap(id="hist-sell", inTokenAddress=target, outTokenAddress=quote, createdAt=t0 - 4_000),
-    swap(id="hist-other", outTokenAddress="0x2222222222222222222222222222222222222222", createdAt=t0 - 3_000),
-]
-feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(history), False)
-st = {"backfills": {}}
-backfilled = _backfill_real(user, "base", target, st, "cycle-backfill")
-check(backfilled == 2 and len(posted) == 2, "backfill: only this user/CA buys and sells")
-check([b["eventId"] for b in posted] == ["fomo-swap:hist-buy", "fomo-swap:hist-sell"], "backfill: both directions")
-check(st["backfills"]["fomo-user-1|base:" + target] > 0, "backfill: completion marker stored")
-again = _backfill_real(user, "base", target, st, "cycle-backfill-2")
-check(again == 0 and len(posted) == 2, "backfill: marker suppresses a second walk")
-
-feed._seen = set()
-feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (list(history), True)
-st_truncated = {"backfills": {}}
-truncated_posted = _backfill_real(user, "base", target, st_truncated, "cycle-backfill-3")
-check(truncated_posted == 2, "backfill: truncated read still posts what it saw")
-check("fomo-user-1|base:" + target not in st_truncated["backfills"], "backfill: truncated read is not marked complete")
-
 
 # ---------- EVM CA refresh ----------
 
@@ -267,7 +307,7 @@ def feed_item(**overrides):
 evm_ca = "0x30de7ae4c9578d110a97367ede9f7765cdce06ea"
 body, reason = feed._feed_body(feed_item(), "robinhood", evm_ca)
 check(reason is None and body is not None, "evm feed: buy mapped")
-check(body and body["eventId"] == "fomo-feed:feed-1", "evm feed: feed id is the event id")
+check(body and body["eventId"] == "fomo-swap:feed-1", "evm feed: feed id is the event id")
 check(body and body["type"] == "buy" and body["chain"] == "robinhood", "evm feed: buy chain")
 check(body and body["tradeUsd"] == 1000 and body["usdValue"] == 1000, "evm feed: buy size")
 check(body and body["userId"] == "fomo-user-1" and body["trader"] == "midcurver", "evm feed: identity")
@@ -281,8 +321,20 @@ check(body is None and reason == "not_swap", "evm feed: thesis ignored")
 body, reason = feed._feed_body(feed_item(userId=None), "bsc", evm_ca)
 check(body is None and reason == "missing_user_id", "evm feed: anonymous event ignored")
 
+# A fill already seen via /swaps is not posted again by the token feed: a feed
+# item's id is the swap id, so both routes share the canonical event id.
+feed._seen = {"fomo-swap:feed-1"}
+posted = []
+feed._fetch_token_feed = lambda chain, ca, cycle_id: [feed_item(id="feed-1", createdAt=t0 + 1_000)]
+st = {"evm_cursors": {f"robinhood:{evm_ca}": t0}}
+emitted, size, ok = feed._poll_evm_ca(
+    {"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-cross-source",
+)
+check(ok and emitted == 0 and posted == [], "dedupe: /swaps fill is not re-posted by the feed")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 1_000, "dedupe: feed cursor advances")
+
 feed._seen = set()
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+feed.post_fomo_trade = lambda body, **kwargs: (posted.append(body), True)[1]
 
 evm_page = [
     feed_item(id="evm-old", createdAt=t0),
@@ -322,7 +374,7 @@ evm_page = [
 with patch.object(feed.time, "time", return_value=now_ms / 1000):
     emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-grace")
 check(ok and emitted == 1 and len(posted) == 1, "evm feed: bootstrap grace ingests recent watched buy")
-check(posted[0]["eventId"] == "fomo-feed:evm-recent", "evm feed: grace skips stale history")
+check(posted[0]["eventId"] == "fomo-swap:evm-recent", "evm feed: grace skips stale history")
 feed._seen = set()
 posted = []
 st = {"evm_cursors": {f"robinhood:{evm_ca}": t0 + 1_000}}
@@ -333,7 +385,7 @@ evm_page = [
 ]
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-2")
 check(ok and emitted == 1 and len(posted) == 1, "evm feed: only watched users are posted")
-check(posted[0]["eventId"] == "fomo-feed:watched", "evm feed: watched event emitted")
+check(posted[0]["eventId"] == "fomo-swap:watched", "evm feed: watched event emitted")
 check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 3_000, "evm feed: cursor advanced")
 posted = []
 feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-3")
@@ -342,15 +394,15 @@ check(posted == [], "evm feed: re-reading dedupes")
 feed._seen = set()
 st = {"evm_cursors": {f"robinhood:{evm_ca}": 0}}
 evm_page = [feed_item(id="evm-retry", createdAt=t0 + 4_000)]
-feed.post_fomo_trade = lambda body, cycle_id=None: False
+feed.post_fomo_trade = lambda body, **kwargs: False
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-4")
 check(ok and emitted == 0 and st["evm_cursors"][f"robinhood:{evm_ca}"] == 0, "evm feed: failed ingest keeps cursor")
-feed.post_fomo_trade = lambda body, cycle_id=None: (posted.append(body), True)[1]
+feed.post_fomo_trade = lambda body, **kwargs: (posted.append(body), True)[1]
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-5")
 check(emitted == 1 and st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 4_000, "evm feed: retry succeeds")
 
 # One feed fill expands to the trade's full buy/sell history. Feed ids and
-# swap ids are the same UUID, so the event ids stay in the fomo-feed namespace.
+# swap ids are the same UUID, so both routes use the canonical fomo-swap id.
 feed._seen = set()
 posted = []
 st = {"evm_cursors": {f"robinhood:{evm_ca}": t0}}
@@ -386,7 +438,7 @@ feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
 ]
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade")
 check(ok and emitted == 2 and len(posted) == 2, "evm trade: feed fill expands to both directions")
-check([b["eventId"] for b in posted] == ["fomo-feed:evm-current", "fomo-feed:evm-history"], "evm trade: swap ids keep feed namespace")
+check([b["eventId"] for b in posted] == ["fomo-swap:evm-current", "fomo-swap:evm-history"], "evm trade: swap ids use the canonical id")
 check(posted[1]["type"] == "buy" and posted[1]["tradeUsd"] == 4208.17, "evm trade: historical buy carries trade USD")
 check(posted[1]["usdValue"] == 4208.17, "evm trade: historical buy carries entry size")
 check(posted[0]["type"] == "sell" and posted[0]["tradeUsd"] == 2738.59, "evm trade: sell uses proceeds")
@@ -398,7 +450,7 @@ feed._fetch_trade_swaps = lambda trade_id, cycle_id: None
 evm_page = [feed_item(id="evm-fallback", tradeId="trade-2", createdAt=t0 + 6_000)]
 st = {"evm_cursors": {f"robinhood:{evm_ca}": t0 + 5_000}}
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade-fallback")
-check(ok and emitted == 1 and posted[0]["eventId"] == "fomo-feed:evm-fallback", "evm trade: detail failure falls back to the feed fill")
+check(ok and emitted == 1 and posted[0]["eventId"] == "fomo-swap:evm-fallback", "evm trade: detail failure falls back to the feed fill")
 check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 5_000, "evm trade: detail failure holds the cursor")
 
 # Next cycle: the detail recovers after a newer feed item arrived. The held
@@ -439,8 +491,84 @@ evm_page = [
 ]
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade-recovered")
 check(ok and emitted == 2, "evm trade: recovery ingests history plus the newer fill")
-check([b["eventId"] for b in posted] == ["fomo-feed:evm-fallback-buy", "fomo-feed:evm-newer"], "evm trade: history precedes the newer fill")
+check([b["eventId"] for b in posted] == ["fomo-swap:evm-fallback-buy", "fomo-swap:evm-newer"], "evm trade: history precedes the newer fill")
 check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0 + 7_000, "evm trade: cursor advances only after recovery")
+
+# Cutover regression: stored `fomo-feed:` seen ids must normalize. The feed
+# re-reads `at == cursor` and expands the trade's older swaps, so without
+# normalization those fills would be posted under the new canonical id and
+# inserted again.
+with open(feed.STATE_PATH, "w", encoding="utf-8") as state_file:
+    json.dump({"seen": ["fomo-feed:old-fill", "fomo-feed:old-history"]}, state_file)
+st = feed.load_state()
+check(feed._seen == {"fomo-swap:old-fill", "fomo-swap:old-history"},
+      "cutover: stored feed ids normalize to the swap namespace")
+
+posted = []
+feed.post_fomo_trade = lambda body, **kwargs: (posted.append(body), True)[1]
+feed._fetch_token_feed = lambda chain, ca, cycle_id: [
+    feed_item(id="old-fill", tradeId="trade-old", createdAt=t0),
+]
+feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
+    {
+        "id": "old-fill",
+        "networkId": 4663,
+        "inNetworkId": 4663,
+        "outNetworkId": 4663,
+        "inTokenAddress": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "outTokenAddress": evm_ca,
+        "humanUsdAmountIn": 1000,
+        "humanUsdAmountOut": 900,
+        "inHumanAmount": 1000,
+        "outHumanAmount": 900,
+        "createdAt": "2026-10-22T08:30:00.000Z",
+    },
+    {
+        "id": "old-history",
+        "networkId": 4663,
+        "inNetworkId": 4663,
+        "outNetworkId": 4663,
+        "inTokenAddress": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "outTokenAddress": evm_ca,
+        "humanUsdAmountIn": 1200,
+        "humanUsdAmountOut": 1100,
+        "inHumanAmount": 100,
+        "outHumanAmount": 1000,
+        "createdAt": "2026-10-22T07:00:00.000Z",
+    },
+]
+st["evm_cursors"] = {f"robinhood:{evm_ca}": t0}
+emitted, size, ok = feed._poll_evm_ca(
+    {"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "cutover-replay",
+)
+check(ok and emitted == 0 and posted == [], "cutover: cursor-item and trade history do not replay")
+check(st["evm_cursors"][f"robinhood:{evm_ca}"] == t0, "cutover: cursor stays at the skipped item")
+
+# A genuinely new fill still ingests after normalization.
+feed._fetch_token_feed = lambda chain, ca, cycle_id: [
+    feed_item(id="new-fill", tradeId="trade-new", createdAt=t0 + 1_000),
+]
+feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
+    {
+        "id": "new-fill",
+        "networkId": 4663,
+        "inNetworkId": 4663,
+        "outNetworkId": 4663,
+        "inTokenAddress": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "outTokenAddress": evm_ca,
+        "humanUsdAmountIn": 500,
+        "humanUsdAmountOut": 450,
+        "inHumanAmount": 500,
+        "outHumanAmount": 450,
+        "createdAt": "2026-10-22T08:31:00.000Z",
+    },
+]
+st = {"evm_cursors": {f"robinhood:{evm_ca}": t0}}
+emitted, size, ok = feed._poll_evm_ca(
+    {"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "cutover-new",
+)
+check(ok and emitted == 1, "cutover: a new fill still ingests")
+check(posted[-1]["eventId"] == "fomo-swap:new-fill", "cutover: new fill uses the canonical id")
 
 tmp.cleanup()
 print(f"\n{total - fail}/{total} checks passed")

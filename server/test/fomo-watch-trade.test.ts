@@ -390,7 +390,7 @@ test('POST /api/fomo-watch/trades: a txHash opportunistically records the trader
     globalThis.fetch = orig;
   }
 });
-test('FOMO alert requests positions for missing token amount, skips swaps when tradeUsd exists, and ignores duplicate alerts', async () => {
+test('FOMO alert requests positions for a missing token amount and ignores duplicate alerts', async () => {
   const oldFetch = globalThis.fetch;
   const oldUrl = config.fomoProdUrl;
   const upstreamPaths: string[] = [];
@@ -414,16 +414,36 @@ test('FOMO alert requests positions for missing token amount, skips swaps when t
     const inserted = await post(body);
     assert.equal(inserted.json.inserted, 1);
     await fomoHoldingsIdle();
-    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances'],
-      'alert lacks token amount, but known tradeUsd avoids a swaps read');
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances', '/v2/users/fomo-uid-1/swaps'],
+      'a missing balance needs the swap id before the trade-detail fallback can run');
 
     const duplicate = await post(body);
     assert.equal(duplicate.json.inserted, 0);
     await fomoHoldingsIdle();
-    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances'],
+    assert.deepEqual(upstreamPaths, ['/v2/users/fomo-uid-1/balances', '/v2/users/fomo-uid-1/swaps'],
       'duplicate WS delivery must not create another API refresh');
   } finally {
     globalThis.fetch = oldFetch;
     config.fomoProdUrl = oldUrl;
   }
+});
+
+test('POST /api/fomo-watch/trades: a legacy fomo-feed event id is stored as fomo-swap', async () => {
+  const legacy = 'fomo-feed:evt-legacy-feed';
+  const canonical = 'fomo-swap:evt-legacy-feed';
+  const body = trade({
+    eventId: legacy,
+    chain: 'base',
+    tokenAddress: '0x2222222222222222222222222222222222222222',
+    ts: 1_758_000_100_000,
+  });
+  const res = await post(body);
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  assert.ok(rowOf(canonical));
+  assert.equal(rowOf(legacy), undefined);
+
+  const again = await post({ ...body, eventId: canonical });
+  assert.equal(again.status, 200);
+  assert.equal(again.json.inserted, 0);
 });

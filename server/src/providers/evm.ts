@@ -1,11 +1,11 @@
 // EVM JSON-RPC wallet-holdings client (plan evm-base-bsc T5/D5) — the non-sol
 // sibling of solana.ts, replacing the Nansen credit door (currentBalance,
-// 1 credit per wallet×CA) for chain 'base'/'bsc'/'robinhood'.
+// 1 credit per wallet×CA) for chain 'base'/'bsc'/'robinhood'/'eth'.
 //
 // ONE Multicall3 `eth_call` per wallet covers every asked (wallet, CA) pair:
 // `balanceOf(wallet)` for all CAs plus `decimals()` for the CAs whose scale is
-// not cached yet. Multicall3 sits at the SAME address on Base, BSC and
-// Robinhood Chain (plan R6; robinhood verified live 2026-09-30):
+// not cached yet. Multicall3 sits at the SAME address on Base, BSC,
+// Robinhood Chain and Ethereum (plan R6; robinhood verified live 2026-09-30):
 //   0xcA11bde05977b3631167028862bE2a173976CA11
 //   aggregate3((address target, bool allowFailure, bytes callData)[])
 //     → (bool success, bytes returnData)[]
@@ -49,6 +49,7 @@ const KEYLESS_RPC: Partial<Record<Chain, string>> = {
   base: 'https://mainnet.base.org',
   bsc: 'https://bsc-dataseed.binance.org',
   robinhood: 'https://rpc.mainnet.chain.robinhood.com',
+  eth: 'https://ethereum-rpc.publicnode.com',
 };
 
 /** Error whose message is built locally (status + capped RPC error) and is
@@ -73,7 +74,9 @@ export function evmRpcEndpoints(chain: Chain): string[] {
         ? config.bscRpcUrl
         : chain === 'robinhood'
           ? config.robinhoodRpcUrl
-          : '';
+          : chain === 'eth'
+            ? config.ethRpcUrl
+            : '';
   return evmEndpointList(envUrl, KEYLESS_RPC[chain]);
 }
 
@@ -325,7 +328,7 @@ export class EvmRpcClient {
   private async rpc(chain: Chain, method: string, params: unknown[]): Promise<unknown> {
     const endpoints = this.endpointsFor(chain);
     if (endpoints.length === 0) {
-      throw new Error(`evm rpc: no endpoint for ${chain} (set BASE_RPC_URL/BSC_RPC_URL/ROBINHOOD_RPC_URL)`);
+      throw new Error(`evm rpc: no endpoint for ${chain} (set BASE_RPC_URL/BSC_RPC_URL/ROBINHOOD_RPC_URL/ETH_RPC_URL)`);
     }
     const scope = this.endpointScopes.get(chain) ?? createHash('sha256').update(endpoints.join('\0')).digest('hex');
     this.endpointScopes.set(chain, scope);

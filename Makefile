@@ -109,8 +109,13 @@ FOMO_RELEASE_FILES := \
 	server/src/db.ts \
 	server/src/fomo-api.ts \
 	server/src/poller.ts \
+	server/src/public-api-contract.ts \
+	server/src/public-export.ts \
 	server/src/setup-cache.ts \
 	server/src/signals.ts \
+	server/src/shared/chain.ts \
+	server/src/shared/chain-slugs.ts \
+	server/src/providers/evm.ts \
 	server/src/telegram-alert-settings.ts \
 	server/src/monitor/alert-policy.ts \
 	server/src/monitor/alerts.ts \
@@ -121,13 +126,13 @@ FOMO_RELEASE_FILES := \
 	server/public/monitor.html
 
 # Keep Telegram presentation deploy isolated from alert-state and API changes.
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-chain-sync gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
 .PHONY: wallet-watch-deploy
 
 # Standalone partner API lifecycle on the selected production host.
 PUBLIC_API_PROJECT := signal_scan_public_api
 PUBLIC_API_COMPOSE = docker compose -p $(PUBLIC_API_PROJECT) -f docker-compose.public-api.yml
-.PHONY: public-api-deploy public-api-build public-api-up public-api-down public-api-logs public-api-status
+.PHONY: public-api-deploy public-api-build public-api-up public-api-down public-api-logs public-api-status docs-deploy
 
 public-api-build:
 	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) build public-api"
@@ -151,6 +156,15 @@ public-api-deploy:
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build api web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build api web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api web; fi"
 	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=a $(PUBLIC_API_COMPOSE) config --quiet && INSTANCE=a $(PUBLIC_API_COMPOSE) build public-api && INSTANCE=a $(PUBLIC_API_COMPOSE) up -d public-api"
 
+# Publish the static developer docs (public/) through instance A's web container.
+# Rebuilds/recreates `web` only: the API and public-api containers are untouched.
+docs-deploy:
+	@test "$(INSTANCE)" = a || { echo 'docs-deploy currently publishes through instance A only'; exit 1; }
+	rsync -azc --delete -e "$(RSYNC_SSH)" public $(HOST):$(REMOTE_DIR)/
+	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate web; fi"
+	@sleep 2
+	@for page in api-docs.html feature-history.html docs.css; do curl -fsS -o /dev/null -w "== HTTP %{http_code} — $(BASE)/$$page\n" "$(BASE)/$$page"; done
+
 routing-smoke:
 	$(SSH) 'bash -s' < scripts/test_instance_routing.sh
 
@@ -158,7 +172,7 @@ routing-smoke:
 deploy:
 	$(SSH) "mkdir -p $(REMOTE_DIR)"
 	$(SCP) -r $(FILES) $(HOST):$(REMOTE_DIR)/
-	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude public-api.env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src $(HOST):$(REMOTE_DIR)/
+	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude public-api.env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src public $(HOST):$(REMOTE_DIR)/
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose build && echo '== deploy OK — instance=$(INSTANCE) port=$(PORT) dir=$(REMOTE_DIR)'"
 
 # Deploy only the Fresh retry gate fix to instance A; never sync/rebuild web or B.
@@ -245,6 +259,13 @@ restart:
 
 # ---------- request-plane gateway (its own compose project) ----------
 # docker-compose.gateway.yml ships via $(FILES); the external net is created here too.
+# Chain-only refresh: sync the shared chain maps into the gateway's build source
+# and rebuild the shared gateway WITHOUT deploying/restarting instance A's API.
+gateway-chain-sync:
+	rsync -azcR -e "$(RSYNC_SSH)" server/src/shared/chain.ts server/src/shared/chain-slugs.ts server/src/monitor/telegram.ts $(HOST):$(GATEWAY_DIR)/
+	$(SSH) "docker network create signal-scan-gateway || true"
+	$(SSH) "cd $(GATEWAY_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d gateway; else docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d gateway; fi"
+
 gateway-deploy:
 	@$(MAKE) deploy INSTANCE=a
 	$(SSH) "docker network create signal-scan-gateway || true"

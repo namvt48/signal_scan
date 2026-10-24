@@ -14,7 +14,7 @@ import { FreshWalletChart } from './FreshWalletChart';
 import { T100Chart } from './T100Chart';
 import { HolderCountChart } from './HolderCountChart';
 import { MarketCapChart } from './MarketCapChart';
-import { Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
+import { Chip, EmptyState, ErrorState, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { ChainBadge } from './ChainBadge';
 import { useAuth } from '../auth/use-auth';
 
@@ -59,7 +59,6 @@ const FOMO_COLS: readonly string[] = SHOW_CLAN
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
-const INLINE_ACTIVITY_LIMIT = 5;
 /** Keep ticker text readable beside its note button in both deployment variants. */
 const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
 
@@ -255,9 +254,9 @@ function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head
             </td>
             <td
               className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-neg"
-              title="Σ sell proceeds (USD actually received) in the last 24h; — when any sell amount is unavailable"
+              title="Σ sell proceeds (USD actually received) in the last 24h; - when any sell amount is unavailable"
             >
-              {u.sellUsd === null ? '—' : usd(u.sellUsd)}
+              {u.sellUsd != null && Number.isFinite(u.sellUsd) ? usd(u.sellUsd) : '-'}
             </td>
             <td className="whitespace-nowrap py-1 pl-3 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
           </tr>
@@ -639,8 +638,6 @@ export default function SignalTable({
 }) {
   const [signals, setSignals] = useState<TokenSignal[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [walletsPopup, setWalletsPopup] = useState<TokenSignal | null>(null);
-  const [fomoPopup, setFomoPopup] = useState<TokenSignal | null>(null);
   const lastSignalsAt = useRef(0);
   const queryKeyRef = useRef<string | null>(null);
   const refreshKeyRef = useRef<number | undefined>(undefined);
@@ -661,15 +658,6 @@ export default function SignalTable({
   const [holdingMin, setHoldingMin] = useState('');
   const [holdingMax, setHoldingMax] = useState('');
   const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(RATED_TIERS));
-
-  const openActivity = (signal: TokenSignal, target: 'wallets' | 'fomo') => {
-    setWalletsPopup(target === 'wallets' ? signal : null);
-    setFomoPopup(target === 'fomo' ? signal : null);
-  };
-  const closeActivity = () => {
-    setWalletsPopup(null);
-    setFomoPopup(null);
-  };
 
   const toggleWalletBalanceSort = () => setWalletBalanceSort((current) => current === 'desc' ? 'asc' : 'desc');
   useEffect(() => {
@@ -1060,8 +1048,6 @@ export default function SignalTable({
                     const holdingPartial = rowHoldingPartial(s);
                     const trackedWalletCount = s.trackedWallets.length;
                     const fomoUserCount = s.fomoUsers.length;
-                    const hiddenActivityCount = Math.max(0, fomoUserCount - INLINE_ACTIVITY_LIMIT)
-                      + Math.max(0, trackedWalletCount - INLINE_ACTIVITY_LIMIT);
                     const isPass = s.tier === 'P';
                     return (
                       <tr
@@ -1122,42 +1108,22 @@ export default function SignalTable({
                               {fomoUserCount > 0 && (
                                 <section>
                                   <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">FOMO users</div>
-                                  <FomoTable users={s.fomoUsers} limit={INLINE_ACTIVITY_LIMIT} />
+                                  <FomoTable users={s.fomoUsers} />
                                 </section>
                               )}
                               {trackedWalletCount > 0 && (
                                 <section className={fomoUserCount > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
                                   <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">Native wallets</div>
-                                  <WalletTable wallets={s.trackedWallets} limit={INLINE_ACTIVITY_LIMIT} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
+                                  <WalletTable wallets={s.trackedWallets} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
                                 </section>
                               )}
                               {fomoUserCount === 0 && trackedWalletCount === 0 && <Pill active={false}>none</Pill>}
-                              {hiddenActivityCount > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => void openActivity(s, 'fomo')}
-                                  className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
-                                  title="Xem toàn bộ FOMO users và native wallets đã trade token này"
-                                >
-                                  +{hiddenActivityCount} more
-                                </button>
-                              )}
                             </div>
                           ) : trackedWalletCount === 0 ? (
                             <Pill active={false}>none</Pill>
                           ) : (
                             <div className="min-w-0">
-                              <WalletTable wallets={s.trackedWallets} limit={INLINE_ACTIVITY_LIMIT} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
-                              {trackedWalletCount > INLINE_ACTIVITY_LIMIT && (
-                                <button
-                                  type="button"
-                                  onClick={() => void openActivity(s, 'wallets')}
-                                  className="mt-1.5 block text-[10.5px] font-medium text-pos hover:underline"
-                                  title="Xem toàn bộ wallet đang track token này"
-                                >
-                                  +{trackedWalletCount - INLINE_ACTIVITY_LIMIT} more
-                                </button>
-                              )}
+                              <WalletTable wallets={s.trackedWallets} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
                             </div>
                           )}
                         </Td>
@@ -1226,46 +1192,6 @@ export default function SignalTable({
         </div>
       )}
       <ScanFooter />
-      {walletsPopup && (
-        <Modal
-          title={`Tracked by — ${walletsPopup.symbol ?? walletsPopup.ca} (${walletsPopup.trackedWallets.length} wallets)`}
-          onClose={closeActivity}
-          className="trade-breakdown-modal"
-        >
-          <div className="trade-breakdown-content overflow-auto">
-            {walletsPopup.trackedWallets.length > 0
-              ? <WalletTable wallets={walletsPopup.trackedWallets} head balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
-              : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
-          </div>
-        </Modal>
-      )}
-      {SHOW_FOMO && fomoPopup && (
-        <Modal
-          title={`FOMO by — ${fomoPopup.symbol ?? fomoPopup.ca} (${fomoPopup.fomoUsers.length} users · ${fomoPopup.trackedWallets.length} native wallets)`}
-          onClose={closeActivity}
-          className="trade-breakdown-modal"
-        >
-          <div className="trade-breakdown-content space-y-4 overflow-auto">
-            <p className="font-mono text-xs text-ink2">
-              Tracked holding: {rowHolding(fomoPopup) !== undefined
-                ? `${rowHoldingPartial(fomoPopup) ? '≈' : ''}${pct(rowHolding(fomoPopup)!)}`
-                : '— (not measured)'}
-            </p>
-            <section>
-              <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">FOMO users</h3>
-              {fomoPopup.fomoUsers.length > 0
-                ? <FomoTable users={fomoPopup.fomoUsers} head />
-                : <p className="text-xs text-muted">No FOMO users traded this CA.</p>}
-            </section>
-            <section className="border-t border-line pt-3">
-              <h3 className="mb-2 font-mono text-[10px] font-bold uppercase tracking-wide text-muted">Native wallets</h3>
-              {fomoPopup.trackedWallets.length > 0
-                ? <WalletTable wallets={fomoPopup.trackedWallets} head balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
-                : <p className="text-xs text-muted">No tracked native-wallet trades.</p>}
-            </section>
-          </div>
-        </Modal>
-      )}
     </div>
   );
 }

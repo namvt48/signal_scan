@@ -2,7 +2,7 @@ import type { Chain } from './types';
 
 /**
  * Per-chain display links. FE-local copy of the server's chain map — this Vite build cannot
- * import `server/src/shared`. GMGN slugs verified: sol→sol, base→base, bsc→bsc, robinhood→robinhood.
+ * import `server/src/shared`. GMGN slugs verified: sol→sol, base→base, bsc→bsc, robinhood→robinhood, eth→eth.
  */
 export const CHAIN_LINKS: Record<Chain, { gmgnSlug: string; explorerUrl: (ca: string) => string }> = {
   sol: { gmgnSlug: 'sol', explorerUrl: (ca) => `https://solscan.io/token/${ca}` },
@@ -12,4 +12,5 @@ export const CHAIN_LINKS: Record<Chain, { gmgnSlug: string; explorerUrl: (ca: st
     gmgnSlug: 'robinhood',
     explorerUrl: (ca) => `https://robinhoodchain.blockscout.com/token/${ca}`,
   },
+  eth: { gmgnSlug: 'eth', explorerUrl: (ca) => `https://etherscan.io/token/${ca}` },
 };

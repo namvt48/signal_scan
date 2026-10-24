@@ -60,7 +60,7 @@ test('does not duplicate the dollar prefix when a symbol already includes it', (
   assert.doesNotMatch(text.split('\n')[0]!, /\$\$STONK/);
 });
 test('links the CA to GMGN for every supported alert chain without linking the ticker', () => {
-  for (const chain of ['sol', 'base', 'bsc', 'robinhood'] as const) {
+  for (const chain of ['sol', 'base', 'bsc', 'robinhood', 'eth'] as const) {
     const text = formatTelegramAlert({ ...alert, chain, ca: 'Token/CA' });
     assert.match(text, /^\$&lt;TOKEN &amp; &quot;x&quot;&gt;\n/);
     assert.ok(text.includes(`CA: <a href="https://gmgn.ai/${chain}/token/Token%2FCA">Gmgn</a>`));

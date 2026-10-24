@@ -14,6 +14,8 @@ Routes:
   GET /health
   GET /v2/users/{userId}/balances
   GET /v2/users/{userId}/swaps?limit=100[&lastSwapIdV2=<swap id>]
+  GET /trades?userId={userId}&orderBy=closedAt[&tokenAddress={ca}]
+  GET /trades/{tradeId}
 
 Everything else is rejected. Write/trade endpoints are never proxied.
 """
@@ -54,6 +56,15 @@ MAX_CONCURRENCY = max(1, int(os.environ.get("FOMO_CONCURRENCY", "4")))
 TIMEOUT_S = max(1, int(os.environ.get("FOMO_TIMEOUT_SECONDS", "30")))
 PORT = int(os.environ.get("PORT", os.environ.get("FOMO_PROD_PORT", "8080")))
 ALLOWED = re.compile(r"^/v2/users/([^/]+)/(balances|swaps)$")
+
+# The FOMO web client declares the chains it wants on /balances, /swaps and the
+# /trades list; without this header prod-api defaults to Solana only. Instance B
+# rejects/hides sol, so Solana (1399811149) is deliberately absent. Keep this
+# configurable so the list can track FOMO's chain set without rebuilding the
+# bridge.
+SUPPORTED_CHAINS = os.environ.get(
+    "FOMO_SUPPORTED_CHAINS", "1,56,143,4663,5042,8453"
+).strip()
 
 
 def _read_private_text(path: str) -> str:
@@ -282,11 +293,14 @@ def upstream_get(path: str, query: dict[str, str]) -> tuple[int, bytes, str]:
     for attempt in range(1, 4):
         PACER.wait()
         try:
+            headers = _request_headers(token)
+            if (path.endswith("/balances") or path.endswith("/swaps") or path == "/trades") and SUPPORTED_CHAINS:
+                headers["x-supported-chains"] = SUPPORTED_CHAINS
             with SLOTS:
                 response = curl_requests.get(
                     f"{BASE}{path}",
                     params=query or None,
-                    headers=_request_headers(token),
+                    headers=headers,
                     impersonate=IMPERSONATE,
                     timeout=TIMEOUT_S,
                 )
@@ -358,6 +372,21 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
             self._send(*upstream_get("/feed/token", query))
+            return
+        if parsed.path == "/trades":
+            qs = parse_qs(parsed.query)
+            user_id = qs.get("userId", [""])[0].strip()
+            if not user_id or len(user_id) > 64 or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", user_id):
+                self._send(400, b'{"error":"valid userId is required"}')
+                return
+            query = {"userId": user_id, "orderBy": "closedAt"}
+            token_address = qs.get("tokenAddress", [""])[0].strip()
+            if token_address:
+                if len(token_address) > 128:
+                    self._send(400, b'{"error":"tokenAddress is too long"}')
+                    return
+                query["tokenAddress"] = token_address
+            self._send(*upstream_get("/trades", query))
             return
         if parsed.path.startswith("/trades/"):
             trade_id = unquote(parsed.path[len("/trades/"):])

@@ -11,6 +11,7 @@ range getLogs ⇒ tự halve chunk rồi chia lại phần còn lại (R2).
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -29,21 +30,26 @@ DEFAULT_RPC = {
     "bsc": "https://bsc-rpc.publicnode.com",
     # Robinhood official HTTP RPC; WS requires provider-specific configuration.
     "robinhood": "https://rpc.mainnet.chain.robinhood.com",
+    # Publicnode is fast for head blocks/logs; flashbots handles archive ranges.
+    "eth": "https://ethereum-rpc.publicnode.com",
 }
 DEFAULT_CONFIRMATIONS = (
     8  # Base ~2s / BSC ~3s block ⇒ ~16-24s trễ, ngoài độ sâu reorg thường
 )
 DEFAULT_CHUNK = 500  # R2: bề rộng eth_getLogs; halve khi provider chê range
 POLL_MAX_CHUNKS_PER_CHAIN = 16
+CHUNK_RECOVER_AFTER = 16  # successful chunks before probing a wider getLogs range
 _BSC_LOGS_POOL = ThreadPoolExecutor(max_workers=2)
 _SEEN_MAX = 4096
 
 _journal = None
 _seen_tx: set[tuple[str, str]] = set()  # transaction dedupe remains process-local without journal
+_startup_checked: set[str] = set()  # chains that already applied the startup backlog policy
 _decimals: dict[str, int] = {}  # "chain:ca" -> int (cache decimals())
 _block_ts: dict[tuple[str, int], int] = {}  # (chain, block) -> unix ts
 _tracked: set[tuple[str, str]] = set()
 _candidate_errors: dict[tuple[str, str], float] = {}
+_trace_defer_logged: set[str] = set()
 
 _chain_locks: dict[str, threading.RLock] = {}
 _chain_locks_guard = threading.Lock()
@@ -66,9 +72,6 @@ def save_state(state):
     if _journal is None:
         st_mod.save_state(state)
     else:
-        for chain, cursor in state.get("evm", {}).items():
-            if isinstance(cursor, dict):
-                cursor.update(_journal.state(chain))
         _journal.save_state(state)
 
 def _save_state(state):
@@ -89,6 +92,7 @@ def rpc_urls(chain):
         "base": "BASE_RPC_URL",
         "bsc": "BSC_RPC_URL",
         "robinhood": "ROBINHOOD_RPC_URL",
+        "eth": "ETH_RPC_URL",
     }[chain]
     configured = [url.strip() for url in os.environ.get(env, "").split(",") if url.strip()]
     return list(dict.fromkeys((*configured, DEFAULT_RPC[chain])))
@@ -101,10 +105,13 @@ def rpc_url(chain):
 
 def wss_urls(chain):
     """Ordered WSS pool: explicit overrides first, derived HTTP endpoints second."""
+    if chain in _env_chains("EVM_WSS_DISABLED_CHAINS"):
+        return []
     env = {
         "base": "BASE_WSS_URL",
         "bsc": "BSC_WSS_URL",
         "robinhood": "ROBINHOOD_WSS_URL",
+        "eth": "ETH_WSS_URL",
     }[chain]
     configured = [url.strip() for url in os.environ.get(env, "").split(",") if url.strip()]
     if configured:
@@ -123,13 +130,20 @@ def wss_url(chain):
     return urls[0] if urls else None
 
 
+def _trace_disabled(chain):
+    return chain in _env_chains("EVM_TRACE_DISABLED_CHAINS")
+
+
 def _trace_urls(chain, endpoint=None):
+    if _trace_disabled(chain):
+        return []
     if endpoint:
         return [url.strip() for url in endpoint.split(",") if url.strip()]
     env = {
         "base": "BASE_TRACE_RPC_URL",
         "bsc": "BSC_TRACE_RPC_URL",
         "robinhood": "ROBINHOOD_TRACE_RPC_URL",
+        "eth": "ETH_TRACE_RPC_URL",
     }[chain]
     configured = [url.strip() for url in os.environ.get(env, "").split(",") if url.strip()]
     return configured or rpc_urls(chain)
@@ -169,6 +183,8 @@ class TraceMethodUnavailable(RuntimeError):
 
 def trace_rpc(chain, method, params, endpoint=None):
     """Use trace-capable endpoints with the shared cooldown and capability cache."""
+    if _trace_disabled(chain):
+        raise TraceMethodUnavailable(f"trace disabled for {chain}")
     endpoints = _trace_urls(chain, endpoint)
     try:
         return rpc.call(chain, method, params, endpoints, tries=len(endpoints), timeout=30)
@@ -186,10 +202,13 @@ def trace_rpc(chain, method, params, endpoint=None):
 
 def trace_filter_candidates(chain, start, end, wallets):
     """Find transactions with a tracked address as a nested CALL from/to."""
+    if _trace_disabled(chain):
+        return {}
     env = {
         "base": "BASE_TRACE_INDEX_RPC_URL",
         "bsc": "BSC_TRACE_INDEX_RPC_URL",
         "robinhood": "ROBINHOOD_TRACE_INDEX_RPC_URL",
+        "eth": "ETH_TRACE_INDEX_RPC_URL",
     }[chain]
     endpoint = os.environ.get(env, "").strip()
     if not endpoint:
@@ -642,6 +661,26 @@ def _drain_candidates_locked(chain, wallets, confirmed_through):
         except Exception as exc:
             key = (chain, candidate["tx"])
             now = time.time()
+            trace_blocked = isinstance(exc, TraceMethodUnavailable) or (
+                getattr(exc, "category", None) == "trace"
+            )
+            if trace_blocked and _trace_disabled(chain):
+                if chain not in _trace_defer_logged:
+                    print(
+                        f"  # trace disabled for {chain}: pending candidates "
+                        "deferred without trace RPC calls",
+                        file=sys.stderr,
+                    )
+                    _trace_defer_logged.add(chain)
+                _journal.defer_candidate(
+                    chain,
+                    candidate["tx"],
+                    block,
+                    candidate.get("blockHash") or "",
+                    now + 3600.0,
+                    increment_attempts=False,
+                )
+                continue
             if now - _candidate_errors.get(key, 0) >= 60:
                 print(
                     f"  ! pending candidate {chain}:{candidate['tx'][:12]} "
@@ -730,8 +769,21 @@ def scan_block_transactions(chain, block, wallets, trace_candidates=None):
             )
     return candidates
 
+def _env_chains(name):
+    return {
+        value.strip().lower()
+        for value in os.environ.get(name, "").split(",")
+        if value.strip()
+    }
+
+
 def backfill_transaction_blocks(chain, wallets, st, chain_state, end, opts):
     """Discover candidates in bounded blocks, then durably advance each block."""
+    if chain in _env_chains("EVM_TX_SCAN_DISABLED_CHAINS"):
+        if chain_state.get("last_tx_block") != end:
+            chain_state["last_tx_block"] = end
+            _save_state(st)
+        return True
     if not wallets:
         return True
     if _journal is not None:
@@ -740,7 +792,19 @@ def backfill_transaction_blocks(chain, wallets, st, chain_state, end, opts):
     start = min(int(chain_state.get("last_block") or end), end) if cursor is None else int(cursor) + 1
     if start > end:
         return True
-    limit = max(1, int(opts.get("max_tx_blocks", 4)))
+    raw_limit = os.environ.get(f"EVM_MAX_TX_BLOCKS_{chain.upper()}")
+    limit_name = f"EVM_MAX_TX_BLOCKS_{chain.upper()}"
+    if raw_limit is None:
+        raw_limit = os.environ.get("EVM_MAX_TX_BLOCKS")
+        limit_name = "EVM_MAX_TX_BLOCKS"
+    if raw_limit is None:
+        limit = int(opts.get("max_tx_blocks", 4))
+    else:
+        try:
+            limit = int(raw_limit)
+        except ValueError as exc:
+            raise ValueError(f"{limit_name} must be an integer") from exc
+    limit = max(1, limit)
     stop = min(end, start + limit - 1)
     trace_candidates = trace_filter_candidates(chain, start, stop, wallets)
     for block in range(start, stop + 1):
@@ -758,13 +822,48 @@ def backfill_transaction_blocks(chain, wallets, st, chain_state, end, opts):
 # ---------- backfill ----------
 
 
+def _startup_backfill_limit():
+    """Seconds of downtime still replayed at startup; 0 = always jump to latest."""
+    raw = os.environ.get("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("EVM_MAX_STARTUP_BACKFILL_SECONDS must be an integer") from exc
+    return max(0, value)
+
+
+def _chain_chunk_cap(chain):
+    raw = os.environ.get("EVM_CHUNK_CAPS", "")
+    for item in raw.split(","):
+        key, _, value = item.partition("=")
+        if key.strip() != chain:
+            continue
+        try:
+            return max(1, int(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def _chain_confirmations(chain, opts):
+    raw = os.environ.get(f"EVM_CONFIRMATIONS_{chain.upper()}")
+    if raw is None:
+        return int(opts["conf"])
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            f"EVM_CONFIRMATIONS_{chain.upper()} must be an integer"
+        ) from exc
+
+
 def _backfill_locked(chain, wallets, st, opts):
     """Reconcile confirmed logs, journaling every event before committing its range."""
 
     if _journal is not None and _journal.halted(chain):
         return False
     latest = block_number(chain)
-    end = latest - opts["conf"] + 1
+    end = latest - _chain_confirmations(chain, opts) + 1
     if end < 0:
         return True
     cs = st.setdefault("evm", {}).setdefault(chain, {})
@@ -775,9 +874,38 @@ def _backfill_locked(chain, wallets, st, opts):
         previous = int(cs.get("last_block") or end)
         cs["last_tx_block"] = previous - 1
         _save_state(st)
+    if chain not in _startup_checked:
+        _startup_checked.add(chain)
+        last = int(cs.get("last_block") or 0)
+        updated = cs.get("updated_at")
+        if last and updated is not None and end > last:
+            idle = time.time() - float(updated)
+            if idle > _startup_backfill_limit():
+                cs["last_block"] = end
+                cs["last_tx_block"] = end
+                cs["chunk_ok"] = 0
+                cs["updated_at"] = int(time.time())
+                if _journal is not None:
+                    _journal.advance_cursor(chain, "last_block", end)
+                    _journal.advance_cursor(chain, "last_tx_block", end)
+                _save_state(st)
+                print(
+                    f"# skip backlog {chain}: idle {int(idle)}s, "
+                    f"{end - last} block → latest {end}",
+                    flush=True,
+                )
     start = int(cs.get("last_block") or 0) + 1
     if not cs.get("last_block") and not cs.get("recovery"):
         start = end
+    disabled_logs = _env_chains("EVM_LOGS_DISABLED_CHAINS")
+    if chain in disabled_logs:
+        if cs.get("last_block") != end:
+            cs["last_block"] = end
+            cs["updated_at"] = int(time.time())
+            if _journal is not None:
+                _journal.advance_cursor(chain, "last_block", end)
+            _save_state(st)
+        return backfill_transaction_blocks(chain, wallets, st, cs, end, opts)
     if start > end:
         if _journal is not None:
             _drain_candidates(chain, set(wallets), end)
@@ -785,10 +913,34 @@ def _backfill_locked(chain, wallets, st, opts):
     wl = set(wallets)
     endpoint = rpc_url(chain)
     endpoint_id = rpc.endpoint_key(endpoint)
-    cached_span = cs.get("chunk_span") if cs.get("chunk_endpoint_id") in (None, endpoint_id) else None
-    span = max(1, int(cached_span or opts["span"]))
+    same_endpoint = cs.get("chunk_endpoint_id") in (None, endpoint_id)
+    cached_span = cs.get("chunk_span") if same_endpoint else None
+    caps = cs.get("chunk_caps")
+    if not isinstance(caps, dict):
+        caps = {}
+        legacy_cap = cs.pop("chunk_cap", None)
+        if isinstance(legacy_cap, int) and legacy_cap > 0:
+            caps[cs.get("chunk_endpoint_id") or endpoint_id] = legacy_cap
+        cs["chunk_caps"] = caps
+    target_span = max(1, int(opts["span"]))
+    forced_cap = _chain_chunk_cap(chain)
+    if forced_cap:
+        target_span = min(target_span, forced_cap)
+    cap = caps.get(endpoint_id)
+    if isinstance(cap, int) and cap > 0:
+        target_span = min(target_span, cap)
+    span = min(max(1, int(cached_span or target_span)), target_span)
+    if cs.get("chunk_span") != span:
+        cs["chunk_span"] = span
+        _save_state(st)
     cs["chunk_endpoint_id"] = endpoint_id
     cs.pop("chunk_rpc", None)
+    if span < target_span and int(cs.get("chunk_ok") or 0) >= CHUNK_RECOVER_AFTER:
+        span = min(target_span, span * 2)
+        cs["chunk_span"] = span
+        cs["chunk_ok"] = 0
+        _save_state(st)
+        print(f"# getLogs {chain} chê range → recover chunk {span}", flush=True)
     print(
         f"# backfill {chain}: block {start}..{end} (latest {latest}, conf {opts['conf']}, chunk {span})",
         flush=True,
@@ -803,7 +955,14 @@ def _backfill_locked(chain, wallets, st, opts):
             message = str(exc).lower()
             rate_limited = any(
                 marker in message
-                for marker in ("capacity", "quota", "rate limit", "429")
+                for marker in (
+                    "capacity",
+                    "quota",
+                    "rate limit",
+                    "request limit",
+                    "too many requests",
+                    "429",
+                )
             )
             if b > a and not rate_limited and any(
                 marker in message
@@ -817,7 +976,23 @@ def _backfill_locked(chain, wallets, st, opts):
                 )
             ):
                 span = max(1, (b - a + 1) // 2)
+                err_key = getattr(exc, "endpoint_key", None) or endpoint_id
+                cap_match = re.search(r"up to (?:a )?(\d+) block range", message)
+                if cap_match is None:
+                    cap_match = re.search(
+                        r"limited to 0 - (\d+) blocks? range", message
+                    )
+                if cap_match:
+                    cap = max(1, int(cap_match.group(1)))
+                    caps[err_key] = cap
+                    if err_key == endpoint_id:
+                        span = min(span, cap)
+                if err_key != endpoint_id:
+                    # Fallback provider chê range: giữ nguyên span của endpoint chính.
+                    _save_state(st)
+                    raise
                 cs["chunk_span"] = span
+                cs["chunk_ok"] = 0
                 _save_state(st)
                 todo, i = cl.chunk_ranges(a, end, span), 0
                 print(
@@ -828,7 +1003,9 @@ def _backfill_locked(chain, wallets, st, opts):
             raise
         for log in _sort_logs(logs):
             _queue_log(chain, log, wl)
+        cs["chunk_ok"] = int(cs.get("chunk_ok") or 0) + 1
         cs["last_block"] = b
+        cs["updated_at"] = int(time.time())
         if _journal is not None:
             _journal.advance_cursor(chain, "last_block", b)
             cs.pop("recovery", None)
@@ -1079,7 +1256,7 @@ async def _consume_ws_logs(ws, chain, wallets, opts, pending, st=None, head_stat
             if head_state is not None:
                 head_state["fallback_height"] = latest
                 head_state["next_poll"] = now + opts.get("head_poll_interval", 5.0)
-    confirmed_through = latest - opts["conf"] + 1
+    confirmed_through = latest - _chain_confirmations(chain, opts) + 1
     keep = {}
     for key, log in pending.items():
         block = int(log.get("blockNumber") or "0x0", 16)
@@ -1095,6 +1272,20 @@ async def _consume_ws_logs(ws, chain, wallets, opts, pending, st=None, head_stat
     return keep
 
 
+def _reconcile_delay(chain, complete, opts):
+    """Keep tx-scan chains continuous; log chains may idle between reconciles."""
+    backlog = float(opts.get("backlog_sleep", 0.5))
+    if not complete:
+        return backlog
+    tx_scan = (
+        chain in _env_chains("EVM_LOGS_DISABLED_CHAINS")
+        and chain not in _env_chains("EVM_TX_SCAN_DISABLED_CHAINS")
+    )
+    if tx_scan:
+        return backlog
+    return float(opts.get("reconcile_interval", 30.0))
+
+
 async def _reconcile_ws_chain(chain, wallets, per, st, opts):
     poll_opts = {
         **opts,
@@ -1106,7 +1297,7 @@ async def _reconcile_ws_chain(chain, wallets, per, st, opts):
             refresh(per)
         try:
             complete = await asyncio.to_thread(backfill, chain, wallets, st, poll_opts)
-            delay = opts.get("reconcile_interval", 60.0) if complete else opts.get("backlog_sleep", 0.5)
+            delay = _reconcile_delay(chain, complete, opts)
         except Exception as exc:
             print(f"  ! reconcile {chain}: {type(exc).__name__}: {str(exc)[:80]}", file=sys.stderr)
             delay = max(opts.get("sleep", 3.0), float(getattr(exc, "retry_after", 0.0)))

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import nullcontext
 import hashlib
+import json
 import math
 import os
 import threading
@@ -41,6 +43,46 @@ _cooldowns: dict[tuple[str, str], float] = {}
 _unavailable: set[tuple[str, str]] = set()
 _rate_locks: dict[str, threading.RLock] = {}
 _next_request: dict[str, float] = {}
+_rpc_counts: Counter[tuple[str, str, str]] = Counter()
+_rpc_errors: Counter[tuple[str, str, str]] = Counter()
+_rpc_counts_prev: Counter[tuple[str, str, str]] = Counter()
+_rpc_errors_prev: Counter[tuple[str, str, str]] = Counter()
+_rpc_meter_next = 0.0
+_rpc_meter_clock = time.monotonic
+
+
+def _meter(chain: str, method: str, url: str, error: bool = False) -> None:
+    """Count attempts per chain/method/host; log rolling 60s totals."""
+    global _rpc_meter_next
+    host = urlsplit(url).hostname or "?"
+    key = (str(chain), str(method), host)
+    with _lock:
+        _rpc_counts[key] += 1
+        if error:
+            _rpc_errors[key] += 1
+        now = _rpc_meter_clock()
+        if now < _rpc_meter_next:
+            return
+        _rpc_meter_next = now + 60.0
+        delta = _rpc_counts - _rpc_counts_prev
+        err_delta = _rpc_errors - _rpc_errors_prev
+        _rpc_counts_prev.clear()
+        _rpc_counts_prev.update(_rpc_counts)
+        _rpc_errors_prev.clear()
+        _rpc_errors_prev.update(_rpc_errors)
+    if not delta:
+        return
+    parts = " ".join(
+        f"{chain}:{method}:{host}={count}"
+        for (chain, method, host), count in delta.most_common()
+    )
+    errs = ""
+    if err_delta:
+        errs = " err=" + ",".join(
+            f"{chain}:{method}:{host}={count}"
+            for (chain, method, host), count in err_delta.most_common()
+        )
+    print(f"# rpc/60s total={sum(delta.values())} {parts}{errs}", flush=True)
 
 
 def endpoint_key(url: str) -> str:
@@ -96,9 +138,37 @@ def _mark_method_unavailable(key, method):
         _unavailable.add((key, method))
 
 
+def _http_error_payload(exc):
+    """Return the JSON-RPC error object carried by a non-2xx response."""
+    try:
+        raw = exc.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        payload = json.loads(raw)
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return error if isinstance(error, dict) else None
+    except Exception:
+        return None
+
+
 def _handle_http_error(url, method, exc):
     now = _clock()
     status = exc.code
+    error = _http_error_payload(exc)
+    if error is not None:
+        category = _error_category(error)
+        if category == "range":
+            raise _PermanentRpcError(
+                str(error.get("message") or "provider range/results limit exceeded"),
+                endpoint_key(url),
+            ) from None
+        if category == "method":
+            _mark_method_unavailable(endpoint_key(url), method)
+            raise MethodUnavailable(f"RPC method unavailable: {method}") from None
+        if category in ("quota", "permission"):
+            raise _publish_failure(
+                url, method, category, _retry_after(exc, now)
+            ) from None
     category = (
         "quota" if status == 429 else
         "permission" if status in (401, 403) else
@@ -116,7 +186,7 @@ def _handle_transport_error(url, method, key, exc):
         raise MethodUnavailable(f"RPC method unavailable: {method}") from None
     if category == "range":
         raise _PermanentRpcError(
-            "provider range/results limit exceeded"
+            "provider range/results limit exceeded", key
         ) from None
     if category not in ("quota", "permission"):
         category = "transport"
@@ -130,10 +200,10 @@ def _handle_rpc_error(url, method, key, error):
         raise MethodUnavailable(f"RPC method unavailable: {method}")
     if category == "range":
         raise _PermanentRpcError(
-            str(error.get("message") or "provider range/results limit exceeded")
+            str(error.get("message") or "provider range/results limit exceeded"), key
         )
     if category == "rpc":
-        raise _PermanentRpcError("RPC response error")
+        raise _PermanentRpcError("RPC response error", key)
     raise _publish_failure(url, method, category)
 
 
@@ -217,10 +287,16 @@ def succeeded(url, method="wss"):
             _cooldowns.pop((endpoint_key(url), method), None)
 
 def reset():
+    global _rpc_meter_next
     with _lock:
         _cooldowns.clear()
         _unavailable.clear()
         _next_request.clear()
+        _rpc_counts.clear()
+        _rpc_errors.clear()
+        _rpc_counts_prev.clear()
+        _rpc_errors_prev.clear()
+        _rpc_meter_next = 0.0
 
 
 def _retry_after(error, now):
@@ -252,18 +328,19 @@ def _error_category(error):
     code = error.get("code") if isinstance(error, dict) else None
     if code == -32601 or any(term in message for term in ("method not found", "not available", "does not exist")):
         return "method"
-    if any(term in message for term in ("429", "monthly capacity", "quota", "rate limit", "too many requests")):
+    if any(term in message for term in ("429", "capacity", "quota", "rate limit", "too many requests", "request limit")):
         return "quota"
-    if any(term in message for term in ("401", "403", "unauthorized", "forbidden", "permission")):
+    if any(term in message for term in ("401", "403", "unauthorized", "forbidden", "permission", "specify an address", "archive requests require")):
         return "permission"
-    if any(term in message for term in ("exceed", "range", "too many", "results", "limit", "specify an address")):
+    if any(term in message for term in ("exceed", "range", "too many", "results", "limit")):
         return "range"
     return "rpc"
 class _PermanentRpcError(RuntimeError):
-    pass
+    def __init__(self, message: str, endpoint: str | None = None):
+        super().__init__(message)
+        self.endpoint_key = endpoint
 def call(chain, method, params, endpoints, tries=3, timeout=20):
     """Call eligible providers once each, rechecking cooldown under endpoint lock."""
-    del chain  # Endpoint health is shared across chains for the same provider URL.
     urls = _unique(endpoints)
     candidates = ready_urls(urls, method)
     if not candidates:
@@ -277,19 +354,27 @@ def call(chain, method, params, endpoints, tries=3, timeout=20):
         raise RpcUnavailable(f"RPC unavailable for {method}", "cooldown", retry)
 
     failures = []
+    permanent = None
     missing = 0
     for url in candidates[:max(0, tries)]:
         try:
-            return _request(url, method, params, timeout)
+            result = _request(url, method, params, timeout)
+            _meter(chain, method, url)
+            return result
         except MethodUnavailable:
+            _meter(chain, method, url, error=True)
             missing += 1
-        except _PermanentRpcError:
-            raise
+        except _PermanentRpcError as exc:
+            _meter(chain, method, url, error=True)
+            permanent = permanent or exc
         except _ProviderFailure as exc:
+            _meter(chain, method, url, error=True)
             failures.append((exc.category, exc.retry_after))
 
     if missing == len(candidates):
         raise MethodUnavailable(f"RPC method unavailable: {method}")
+    if permanent is not None:
+        raise permanent
     category, delay = min(failures, key=lambda failure: failure[1]) if failures else ("cooldown", 0.0)
     labels = {
         "quota": "provider capacity/rate limit",

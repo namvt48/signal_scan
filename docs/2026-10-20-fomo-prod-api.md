@@ -286,7 +286,7 @@ body = r.json()["responseObject"]
 | Dữ liệu cần | Nguồn | Ghi chú |
 |---|---|---|
 | Bal / holdings | `/v2/users/{id}/balances` | `balances[]` lồng `balance`, `userToken`, `valuation`; amount token là nguồn, USD tính theo giá hiện tại |
-| Position active/closed | `/v2/users/{id}/balances` | `balances[]` là nguồn holding hiện tại; pair vắng mặt trong response đầy đủ ⇒ đóng về 0 qua `syncFomoPositionsSnapshot` |
+| Position active/closed | `/v2/users/{id}/balances` + `/trades?userId={id}&orderBy=closedAt` + `/trades/{tradeId}` | `/trades` **requires `x-supported-chains`**; without it prod-api returns only Solana `activeTrades` (measured: 20 vs 33 active rows for one user). `/balances` is still authoritative for transfer-in positions, which `/trades` omits; union both sources. Pair vắng mặt trong response đầy đủ **không đủ** để đóng: FOMO có thể bỏ sót position cross-chain còn mở (FLOAT, 2026-10-22). Chỉ đóng sau khi trade detail xác nhận `closedAt`/amount 0; partial SELL còn mở thì cập nhật amount còn lại, không zero. Chỉ đọc trade detail khi có sell sau buy gần nhất (hoặc alert BUY thiếu balance) để hạn chế request |
 | Từng fill | `/v2/users/{id}/swaps` | Map → `FomoSwap`; watcher poll 60s và POST alert; xử lý `inNetworkId`/`outNetworkId` |
 | Equity/PnL history | `/v2/userTokens/aggregatedSnapshot` | `snapshotId`, `pnl`, `equity` |
 | Alert candidate | `/feed/token` | `swap_buy`/`swap_sell`, `usdAmount`, `tradeId`, `userId`; nhưng token-centric + threshold |
@@ -329,8 +329,10 @@ hoặc market cap chưa biết, giữ `null`/`undefined` — không zero-fill; a
 
 ### 8.2 Buy $/Sell $ cho EVM của FOMO user
 
-`/v2/users/{id}/swaps` chỉ trả Solana. EVM của FOMO user lấy từ token feed, không
-phải từ wallet watch:
+Các response `/v2/users/{id}/swaps` đã capture chỉ có Solana, nhưng watcher
+không giả định điều đó: mọi `networkId` được hỗ trợ đều được map và ingest bình
+thường. `networkId=1` (Ethereum) được map thành chain `eth` (2026-10-23). EVM
+của FOMO user cũng có thể lấy từ token feed, không phải từ wallet watch:
 
 ```text
 GET /feed/token?tokenAddress={ca}&networkId={id}
@@ -342,8 +344,9 @@ GET /trades/{tradeId}
 
 Khi watcher thấy một feed item mới của user trong watch list, nó gọi
 `/trades/{tradeId}` và ingest **toàn bộ** swap của trade đó (cả buy trước đó và
-sell vừa xảy ra, kể cả leg cross-chain). Event id dùng `fomo-feed:<swap id>` —
-trùng với feed id cũ nên không nhân đôi dữ liệu đã ingest. `trade_usd` của buy
+sell vừa xảy ra, kể cả leg cross-chain). Event id dùng `fomo-swap:<swap id>` cho
+cả `/swaps` lẫn feed (feed id = swap id) — một fill xuất hiện ở cả hai đường chỉ
+được ingest một lần. `trade_usd` của buy
 lấy `humanUsdAmountIn`, của sell lấy `humanUsdAmountOut`.
 
 Ví dụ đo được (`tradeId 8c589c0d-…`, CA `0x30de7ae4…`, network 4663):

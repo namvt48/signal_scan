@@ -148,6 +148,7 @@ export const config = {
   baseRpcUrl: str('BASE_RPC_URL', ''),
   bscRpcUrl: str('BSC_RPC_URL', ''),
   robinhoodRpcUrl: str('ROBINHOOD_RPC_URL', ''),
+  ethRpcUrl: str('ETH_RPC_URL', ''),
 
   // Pacing: spread each sweep's requests evenly across SWEEP_PACE_FACTOR of its
   // interval (0.8 = dùng 80% chu kỳ, nghỉ 20%). Scale = tăng interval hoặc thêm
@@ -203,6 +204,8 @@ export const config = {
   publicApiExportToken: str('PUBLIC_API_EXPORT_TOKEN', ''),
   publicApiPort: num('PUBLIC_API_PORT', 3010),
   publicApiInternalUrl: str('PUBLIC_API_INTERNAL_URL', ''),
+  /** FOMO dashboard instance (B) API base for /api/v1/fomo routes; empty disables them. */
+  publicApiFomoInternalUrl: str('PUBLIC_API_FOMO_INTERNAL_URL', ''),
   /** DEV ONLY (temporary): `AUTH_DISABLED=1` short-circuits the auth middleware
    * and grants every request the admin principal — no Bearer token needed. Set
    * it inline at process start; NEVER in a deployed env. Default '' = off. */

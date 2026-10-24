@@ -20,8 +20,9 @@ function balanceRow(ca: string, amount: string, tradeId: string): unknown {
   };
 }
 
-function swapRow(ca: string, at: number, tradeId: string, usd: number): unknown {
+function swapRow(ca: string, at: number, tradeId: string, usd: number, id = `swap-${ca}-${at}`): unknown {
   return {
+    id,
     inTokenAddress: 'USDC',
     outTokenAddress: ca,
     humanUsdAmountIn: usd,
@@ -335,15 +336,17 @@ test('FOMO alert batch refreshes every tracked user position from one response',
     await fomoHoldingsIdle();
     assert.equal(paths.filter((path) => path.endsWith('/balances')).length, 1);
     assert.equal(paths.filter((path) => path.includes('/swaps?')).length, 1);
+    assert.equal(paths.some((path) => path.includes('/trades/')), false,
+      'a buy-only omission must not spend a trade-detail request');
     assert.equal(paths.some((path) => path.includes('/v2/users/stable-fomo-id/balances')), true);
     assert.equal(getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('batch-buy-a')?.trade_usd, 25);
     assert.equal(getDb().prepare('SELECT trade_usd FROM fomo_trades WHERE event_id = ?').get('batch-buy-b')?.trade_usd, 31);
     assert.equal(getDb().prepare('SELECT amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caA)?.amount, 11);
     assert.equal(getDb().prepare('SELECT amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caB)?.amount, 22);
-    assert.deepEqual(
-      getDb().prepare('SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caC),
-      { amount: 0, status: 'closed' },
-      'a previously tracked CA omitted from the complete positions page is recorded as no current holding',
+    assert.equal(
+      getDb().prepare('SELECT 1 FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, caC),
+      undefined,
+      'a buy-only CA omitted from balances is not closed on omission alone (no sell evidence)',
     );
     assert.equal(getDb().prepare('SELECT 1 FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?').get(user.id, unrelatedCa), undefined);
   } finally {
@@ -351,6 +354,166 @@ test('FOMO alert batch refreshes every tracked user position from one response',
     config.fomoProdUrl = oldUrl;
   }
 });
+test('FOMO alert batch keeps an open position omitted from balances via its trade detail', async () => {
+  const oldUrl = config.fomoProdUrl;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-fallback', user_id: 'fallback-stable-id', name: 'Positions fallback' });
+  const ca = 'FOMO-FALLBACK-CA';
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  const ts = Date.now() - 1_000;
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'fallback-buy', ca, chain: 'sol', type: 'buy', ts });
+  config.fomoProdUrl = 'https://fomo-fallback.test';
+  const paths: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    paths.push(path);
+    if (path.endsWith('/health')) return fomoHealthResponse();
+    if (path.endsWith('/balances')) {
+      return new Response(JSON.stringify({ success: true, responseObject: { balances: [] } }), { status: 200 });
+    }
+    if (path.includes('/swaps?')) {
+      return new Response(JSON.stringify({
+        success: true,
+        responseObject: { swaps: [swapRow(ca, ts + 50, 'fallback-trade', 10, 'fallback-buy')] },
+      }), { status: 200 });
+    }
+    if (path.includes('/trades/fallback-trade')) {
+      return new Response(JSON.stringify({
+        success: true,
+        responseObject: {
+          trade: {
+            id: 'fallback-trade',
+            tokenAddress: ca,
+            networkId: 1399811149,
+            humanTokenAmount: '123.5',
+            avgEntryPrice: 2,
+            realizedPnlUsd: 0,
+            closedAt: null,
+          },
+        },
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected URL ${path}`);
+  }) as typeof fetch;
+  try {
+    kickFomoPositions(user.id, user.handle, 'fallback-buy', user.user_id ?? undefined);
+    await fomoHoldingsIdle();
+    assert.deepEqual(
+      getDb().prepare(
+        `SELECT trade_id, status, amount, cost_basis_usd, avg_entry_price, price_usd
+           FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?`,
+      ).get(user.id, ca),
+      {
+        trade_id: 'fallback-trade',
+        status: 'active',
+        amount: 123.5,
+        cost_basis_usd: 247,
+        avg_entry_price: 2,
+        price_usd: null,
+      },
+      'the trade detail, not the balances omission, must define an open position',
+    );
+    assert.equal(
+      getDb().prepare('SELECT 1 FROM zero_holdings WHERE member_type = ? AND member_id = ? AND ca = ?').get('fomo', user.id, ca),
+      undefined,
+      'a recovered open position must not be marked as a zero holding',
+    );
+    assert.equal(paths.filter((path) => path.includes('/trades/fallback-trade')).length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoProdUrl = oldUrl;
+  }
+});
+
+test('FOMO omission: a partial SELL keeps the open remainder, a closed trade closes', async () => {
+  const oldUrl = config.fomoProdUrl;
+  const oldFetch = globalThis.fetch;
+  const user = insertFomoUser({ handle: 'positions-evidence', user_id: 'evidence-stable-id', name: 'Positions evidence' });
+  const partialCa = 'FOMO-EVIDENCE-PARTIAL';
+  const closedCa = 'FOMO-EVIDENCE-CLOSED';
+  for (const ca of [partialCa, closedCa]) insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  const now = Date.now();
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'partial-buy', ca: partialCa, chain: 'sol', type: 'buy', ts: now - 10_000, trade_usd: 10 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'partial-sell', ca: partialCa, chain: 'sol', type: 'sell', ts: now - 5_000, trade_usd: 6 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'closed-buy', ca: closedCa, chain: 'sol', type: 'buy', ts: now - 10_000, trade_usd: 10 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'closed-sell', ca: closedCa, chain: 'sol', type: 'sell', ts: now - 5_000, trade_usd: 11 });
+  for (const [ca, tradeId, amount] of [[partialCa, 'partial-trade', 100], [closedCa, 'closed-trade', 50]] as const) {
+    upsertFomoPosition({
+      fomo_user_id: user.id,
+      ca,
+      chain: 'sol',
+      trade_id: tradeId,
+      status: 'active',
+      amount,
+      cost_basis_usd: 20,
+      avg_entry_price: 2,
+      price_usd: 1,
+      realized_pnl_usd: null,
+      unrealized_pnl_usd: null,
+      fetched_at: now - 5_000,
+    });
+  }
+  config.fomoProdUrl = 'https://fomo-evidence.test';
+  const tradePaths: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const path = String(input);
+    if (path.endsWith('/health')) return fomoHealthResponse();
+    if (path.endsWith('/balances')) {
+      return new Response(JSON.stringify({ success: true, responseObject: { balances: [] } }), { status: 200 });
+    }
+    if (path.includes('/trades/')) {
+      tradePaths.push(path);
+      const partial = path.includes('/trades/partial-trade');
+      return new Response(JSON.stringify({
+        success: true,
+        responseObject: {
+          trade: {
+            id: partial ? 'partial-trade' : 'closed-trade',
+            tokenAddress: partial ? partialCa : closedCa,
+            networkId: 1399811149,
+            humanTokenAmount: partial ? '40' : '0',
+            avgEntryPrice: 2,
+            closedAt: partial ? null : '2026-10-22T15:00:00Z',
+          },
+        },
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected URL ${path}`);
+  }) as typeof fetch;
+  try {
+    kickFomoPositions(user.id, user.handle, 'partial-sell', user.user_id ?? undefined);
+    kickFomoPositions(user.id, user.handle, 'closed-sell', user.user_id ?? undefined);
+    await fomoHoldingsIdle();
+    assert.deepEqual(
+      getDb().prepare(
+        'SELECT trade_id, status, amount, price_usd FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?',
+      ).get(user.id, partialCa),
+      { trade_id: 'partial-trade', status: 'active', amount: 40, price_usd: null },
+      'a partial SELL must update to the remaining amount, not zero the position',
+    );
+    assert.equal(
+      getDb().prepare('SELECT 1 FROM zero_holdings WHERE member_type = ? AND member_id = ? AND ca = ?').get('fomo', user.id, partialCa),
+      undefined,
+    );
+    assert.deepEqual(
+      getDb().prepare(
+        'SELECT trade_id, status, amount FROM fomo_positions WHERE fomo_user_id = ? AND ca = ?',
+      ).get(user.id, closedCa),
+      { trade_id: 'closed-trade', status: 'closed', amount: 0 },
+      'a trade detail with closedAt/zero amount is affirmative closure evidence',
+    );
+    assert.notEqual(
+      getDb().prepare('SELECT 1 FROM zero_holdings WHERE member_type = ? AND member_id = ? AND ca = ?').get('fomo', user.id, closedCa),
+      undefined,
+    );
+    assert.equal(tradePaths.filter((path) => path.includes('/trades/partial-trade')).length, 1);
+    assert.equal(tradePaths.filter((path) => path.includes('/trades/closed-trade')).length, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    config.fomoProdUrl = oldUrl;
+  }
+});
+
 test('FOMO unavailable positions preserves last good amount and persists alert-trigger backoff', async () => {
   const oldUrl = config.fomoProdUrl;
   const oldFetch = globalThis.fetch;

@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 
 
-CHAINS = ("base", "bsc", "robinhood")
+CHAINS = ("base", "bsc", "robinhood", "eth")
 
 
 class DeepReorgError(RuntimeError):
@@ -238,13 +238,22 @@ class Journal:
             for row in rows
         ]
 
-    def defer_candidate(self, chain, tx_hash, block, block_hash, next_at):
+    def defer_candidate(
+        self, chain, tx_hash, block, block_hash, next_at, increment_attempts=True
+    ):
         with self._transaction() as db:
-            db.execute(
-                """UPDATE candidates SET attempts=attempts+1,next_at=?
-                   WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
-                (float(next_at), chain, tx_hash, self._number(block), block_hash or ""),
-            )
+            if increment_attempts:
+                db.execute(
+                    """UPDATE candidates SET attempts=attempts+1,next_at=?
+                       WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
+                    (float(next_at), chain, tx_hash, self._number(block), block_hash or ""),
+                )
+            else:
+                db.execute(
+                    """UPDATE candidates SET next_at=?
+                       WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
+                    (float(next_at), chain, tx_hash, self._number(block), block_hash or ""),
+                )
 
     def complete_candidate(self, chain, tx_hash, block, block_hash=""):
         with self._transaction() as db:

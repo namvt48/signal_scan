@@ -13,14 +13,21 @@ Polling trades freshness for latency (-~1 minute) but keeps the alert contract:
   tradeUsd -> USD spent/received on the quote leg when the API reports it
   userId/trader -> from the watch list; token/price are optional
 
-The first poll for a user only records a cursor, so deploying this watcher does
-not replay existing swaps as alerts. Later polls page backwards from the newest
-swap (`lastSwapIdV2`) until they reach that cursor, then emit every buy and sell
-newer than it. A detected watched-user BUY also triggers a one-time backfill of
-that user's full buy/sell history for the same (chain, CA), so Buy $ / Sell $
-have complete inputs instead of only the fills seen since the watcher started.
-The cursor advances only after a successful ingest, so a failed POST is retried
-on the next cycle.
+Both routes are chain-agnostic: a fill from per-user `/swaps` or from
+`/feed/token` (and its `/trades/{tradeId}` detail) uses the same
+`fomo-swap:<swap id>` event id, so an EVM fill seen on both is ingested once.
+Observed `/swaps` responses have been Solana-only, but no code path assumes
+that; any supported `networkId` is mapped normally.
+
+Each user's crawl window starts at the previous successful poll. A poll pages
+backwards from the newest swap (`lastSwapIdV2`) only until that wall-clock
+bound, then emits every buy and sell inside the window; an inactive user costs
+one page instead of walking a stale swap cursor. The first window is the
+watcher deploy time (or first sight, for a user added later), so deploying this
+watcher does not replay existing swaps as alerts. The bound advances only after
+a complete read and ingest; a failed request or POST retries the same window
+next cycle. The same walk emits every fill in the window, so a new CA needs no
+second crawl; Buy $ / Sell $ are complete for the fills this watcher has seen.
 
 State/heartbeat use FOMO-specific files (`fomo_state.json` / `fomo_heartbeat`)
 so a second daemon cannot mask this watcher's liveness.
@@ -53,8 +60,6 @@ FOMO_PROD_URL = os.environ.get("FOMO_PROD_URL", "http://127.0.0.1:8131").rstrip(
 FOMO_POLL_INTERVAL_S = max(10, int(os.environ.get("FOMO_POLL_INTERVAL_S", "60")))
 FOMO_SWAPS_LIMIT = min(100, max(1, int(os.environ.get("FOMO_SWAPS_LIMIT", "100"))))
 FOMO_SWAPS_MAX_PAGES = min(200, max(1, int(os.environ.get("FOMO_SWAPS_MAX_PAGES", "50"))))
-FOMO_BACKFILL_MAX_PAGES = min(500, max(1, int(os.environ.get("FOMO_BACKFILL_MAX_PAGES", "200"))))
-FOMO_BACKFILL_TTL_S = max(3600, int(os.environ.get("FOMO_BACKFILL_TTL_S", "604800")))
 FOMO_EVM_FEED = os.environ.get("FOMO_EVM_FEED", "on").strip().lower() not in ("0", "off", "false", "no")
 FOMO_EVM_FEED_LIMIT = min(100, max(1, int(os.environ.get("FOMO_EVM_FEED_LIMIT", "100"))))
 FOMO_EVM_BOOTSTRAP_LOOKBACK_S = max(0, int(os.environ.get("FOMO_EVM_BOOTSTRAP_LOOKBACK_S", "900")))
@@ -67,32 +72,136 @@ _CHAIN_BY_NETWORK = {
     8453: "base",
     56: "bsc",
     4663: "robinhood",
+    1: "eth",
 }
 _NETWORK_BY_CHAIN = {chain: nid for nid, chain in _CHAIN_BY_NETWORK.items() if chain != "sol"}
 
 # A swap into one of these assets is a sell, not a buy. EVM addresses are
-# compared case-insensitively. Robinhood includes both USDG deployments the
-# chain explorer reports plus wrapped ETH.
+# compared case-insensitively. These are wrapped-native plus USD/EUR pegs,
+# verified on-chain (symbol/decimals) 2026-10-23; Robinhood's canonical
+# WETH/USDG are from https://docs.robinhood.com/chain/contracts/ (the
+# 0x4200…0006 predeploy has no code on Robinhood, so it is not listed here).
 _QUOTE_ASSETS: dict[str, set[str]] = {
     "sol": {
-        "So11111111111111111111111111111111111111112",
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "So11111111111111111111111111111111111111112",  # WSOL
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        "EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCWNWqxWV4J6o",  # DAI
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",  # PYUSD
+        "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",  # USDS
+        "DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT",  # USDe
+        "9zNQRsGLjNKwCUU5Gq5LR8beUCPzQMVMqKAi3SSZh54u",  # FDUSD
+        "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",  # USD1
+        "ousd2mJsPEckLHcSCDxyKD7NDGARZcfLbDZkKiatYHB",  # OUSD
     },
     "base": {
-        "0x4200000000000000000000000000000000000006",
-        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+        "0x4200000000000000000000000000000000000006",  # WETH
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+        "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
+        "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",  # USDT
+        "0x820c137fa70c8691f0e44dc420a5e53c168921dc",  # USDS
+        "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34",  # USDe
+        "0x211cc4dd073734da055fbf44a2b4667d5e5fe5d2",  # sUSDe
+        "0x417ac0e078398c154edfadd9ef675d30be60af93",  # crvUSD
+        "0x368181499736d0c0cc614dbb145e2ec1ac86b8c6",  # LUSD
+        "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",  # EURC
+        "0xb2000000000000000000002feb517dfec7415344",  # OUSD
+        "0x03569cc076654f82679c4ba2124d64774781b01d",  # BOLD
+        "0x00000000efe302beaa2b3e6e1b18d08d69a9012a",  # AUSD
+        "0xd993935e13851dd7517af10687ec7e5022127228",  # apxUSD
+        "0x26c358f7c5fedb20a6ddef108cd91efb6b8da0cb",  # USDSM
     },
     "bsc": {
-        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
-        "0x55d398326f99059ff775485246999027b3197955",
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+        "0x55d398326f99059ff775485246999027b3197955",  # USDT
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+        "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3",  # DAI
+        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",  # FDUSD
+        "0x40af3827f39d0eacbf4a168f8d4ee67c121d11c9",  # TUSD
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d",  # USD1
+        "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34",  # USDe
+        "0x211cc4dd073734da055fbf44a2b4667d5e5fe5d2",  # sUSDe
+        "0x45e51bc23d592eb2dba86da3985299f7895d66ba",  # USDD
+        "0x90c97f71e18723b0cf0dfa30ee176ab653e89f40",  # FRAX
+        "0xe2fb3f127f5450dee44afe054385d74c392bdef4",  # crvUSD
+        "0x0782b6d8c4551b9760e74c0545a9bcd90bdc41e5",  # lisUSD
+        "0x4268b8f0b87b6eae5d897996e6b845ddbd99adf3",  # axlUSDC
+        "0x12f31b73d812c6bb0d735a218c086d44d5fe5f89",  # EURA
+        "0x23e8a70534308a4aaf76fb8c32ec13d17a3bd89e",  # lUSD
+        "0x07663837218a003e66310a01596af4bf4e44623d",  # rUSD
+        "0x323665443cef804a3b5206103304bd4872ea4253",  # USDV
+        "0x524bc91dc82d6b90ef29f76a3ecaabafffd490bc",  # wxUSDT
+        "0xf3527ef8de265eaa3716fb312c12847bfba66cef",  # USDX
+        "0x7788a3538c5fc7f9c7c8a74eac4c898fc8d87d92",  # sUSDX
+        "0x9356086146be5158e98ad827e21b5cf944699894",  # USDa
+        "0x73a325103935b0b5e7aa3aca6dba74ad22f82b03",  # sUSDa
+        "0xf81ac2e1a0373dde1bce01e2fe694a9b7e3bfcb9",  # XUSD
+        "0x5a110fc00474038f6c02e89c707d638602ea44b5",  # USDF
+        "0x917af46b3c3c6e1bb7286b9f59637fb7c65851fb",  # asUSDF
+        "0xaf44a1e76f56ee12adbb7ba8acd3cbd474888122",  # DUSD
+        "0x64748ea3e31d0b7916f0ff91b017b9f404ded8ef",  # cUSDO
+        "0xb4818bb69478730ef4e33cc068dd94278e2766cb",  # satUSD
+        "0x4f2760b32720f013e900dc92f65480137391199b",  # sUSD1+
+        "0xb3b02e4a9fb2bd28cc2ff97b0ab3f6b3ec1ee9d2",  # USDf
+        "0x5519a479da8ce3af7f373c16f14870bbeafda265",  # bnbUSD
+        "0xd896bf804c01c4c0fa5c42bf6a4b15c465009481",  # SCUSD1
+        "0xdd73ea766b80417c0607a3f08e34a0c415d89d56",  # WEUSD
+        "0x4772d2e014f9fc3a820c444e3313968e9a5c8121",  # yUSD
+        "0x392004bee213f1ff580c867359c246924f21e6ad",  # USDD
+        "0x8ba9da757d1d66c58b1ae7e2ed6c04087348a82d",  # sUSDD
+        "0xea953ea6634d55dac6697c436b1e81a679db5882",  # USDu
+        "0x385c279445581a186a4182a5503094ebb652ec71",  # sUSDu
+        "0x61a10e8556bed032ea176330e7f17d6a12a10000",  # UUSD
+        "0x0bb150dfa86ea5d7742f07fefcd8e8eda81d64ef",  # USDat
+        "0x9cd57d3685e6868cacaa8bdcaaf52cbdebf4fa25",  # sUSDat
+        "0xa14556f13516c53ff035858ffd21e1625e7eadfd",  # apyUSD
+        "0x6b3788fd6604bbf03c5378d24e57bb334baad4af",  # apxUSD
     },
     "robinhood": {
-        "0x4200000000000000000000000000000000000006",
-        "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
-        "0xdb81a12de6c0aebeddf2d85d531dd50cac7366ef",
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73",  # WETH (canonical)
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168",  # USDG (canonical)
+        "0xdb81a12de6c0aebeddf2d85d531dd50cac7366ef",  # USDG (18-dec deployment)
+        "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34",  # USDe
+    },
+    "eth": {
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+        "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+        "0xdc035d45d973e3ec169d2276ddab16f1e407384f",  # USDS
+        "0x4c9edd5852cd905f086c759e8383e09bff1e68b3",  # USDe
+        "0x9d39a5de30e57443bff2a8307a4256c8797a3497",  # sUSDe
+        "0x6c3ea9036406852006290770bedfcaba0e23a0e8",  # PYUSD
+        "0x8292bb45bf1ee4d140127049757c2e0ff06317ed",  # RLUSD
+        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",  # FDUSD
+        "0x0000000000085d4780b73119b644ae5ecd22b376",  # TUSD
+        "0x4f8e5de400de08b164e7421b3ee387f461becd1a",  # USDD
+        "0x853d955acef822db058eb8505911ed77f175b99e",  # FRAX
+        "0xf939e0a03fb07f59a73314e73794be0e57ac1b4e",  # crvUSD
+        "0x5f98805a4e8be255a32880fdec7f6728c6568ba0",  # LUSD
+        "0x40d16fc0246ad3160ccc09b8d0d3a2cd28ae6c2f",  # GHO
+        "0x865377367054516e17014ccded1e7d814edc9ce4",  # DOLA
+        "0x8e870d67f660d95d5be530380d0ec0bd388289e1",  # USDP
+        "0x9f6f3991d525015a6f8caf062c83b62fd3ac4436",  # OUSD
+        "0x4fabb145d64652a948d72533023f6e7a623c7c53",  # BUSD
+        "0x1abaea1f7c830bd89acc67ec4af516284b1bc33c",  # EURC
+        "0x1a7e4e63778b4f12a199c062f3efdd288afcbce8",  # EURA (ex-agEUR)
+        "0x056fd409e1d7a124bd7017459dfea2f387b6d5cd",  # GUSD
+        "0x99d8a9c45b2eca8864373a26d1459e3dff1e17f3",  # MIM
+        "0x57ab1ec28d129707052df4df418d58a2d46d5f51",  # sUSD
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d",  # USD1
+        "0x00000000efe302beaa2b3e6e1b18d08d69a9012a",  # AUSD
+        "0x98a878b1cd98131b271883b390f68d2c90674665",  # apxUSD
+        "0x888883b5f5d21fb10dfeb70e8f9722b9fb0e5e51",  # EUROP
+        "0x8df723295214ea6f21026eeeb4382d475f146f9f",  # EURQ
+        "0x50753cfaf86c094925bf976f218d043f8791e408",  # EURR
+        "0xe2f2a5c287993345a840db3b0845fbc70f5935a5",  # mUSD
+        "0xc83e27f270cce0a3a3a29521173a83f402c1768b",  # USDQ
+        "0x7b43e3875440b44613dc3bc08e7763e6da63c8f8",  # USDR
+        "0xe343167631d89b6ffc58b88d6b7fb0228795491d",  # USDG
+        "0x399b29975cbe313c56269cd5097f5ae097fa2741",  # USDSM
     },
 }
 _SEEN_MAX = 4096
@@ -101,6 +210,11 @@ _HTTP_MAX_ATTEMPTS = 3
 _PROD_TIMEOUT_S = max(5, int(os.environ.get("FOMO_PROD_TIMEOUT_S", "40")))
 _INGEST_TIMEOUT_S = 5
 _RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+
+# Process start is the deploy-time proxy for the first crawl window after a
+# fresh or migrated state. It is only used when `deployed_at` is absent.
+_PROCESS_STARTED_MS = int(time.time() * 1000)
+_deploy_window_ms: int | None = None
 
 DIAGNOSTIC_LOG_PATH = Path(HERE) / "logs" / "fomo-poll.jsonl"
 _DIAGNOSTIC_MAX_BYTES = 16 * 1024 * 1024
@@ -331,9 +445,11 @@ _seen: set[str] = set()
 # Watch list loaded from GET /api/fomo-users; refreshed every ~300s so UI changes
 # take effect without a restart.
 _wl: dict[str, Any] = {"users": [], "next": 0.0, "skipped": 0}
-# Attached EVM chains have no per-user swap route on the free API; their
-# activity is only exposed by the token-scoped feed. Refresh the tracked
-# EVM CAs from the API so the feed pass follows the dashboard state.
+# EVM activity is exposed per token by /feed/token. Per-user /swaps is handled
+# chain-agnostically too, so an EVM fill that appears there is ingested
+# normally; both routes share the `fomo-swap:<id>` event id, so a fill seen on
+# both is ingested once. Refresh the tracked EVM CAs from the API so the feed
+# pass follows the dashboard state.
 _evm: dict[str, Any] = {"cas": [], "next": 0.0}
 
 
@@ -345,18 +461,46 @@ def _beat() -> None:
             pass
 
 
+def _canonical_event_id(value: str) -> str:
+    """Map legacy event ids to the one swap-id namespace.
+
+    The feed used to write `fomo-feed:<swap id>`; it now shares
+    `fomo-swap:<swap id>` with /swaps. Very old state files may also hold the
+    bare swap id. Normalize all three forms so a cutover cannot replay a fill.
+    """
+    prefix = "fomo-feed:"
+    if value.startswith(prefix):
+        return f"fomo-swap:{value[len(prefix):]}"
+    if value.startswith("fomo-swap:"):
+        return value
+    return f"fomo-swap:{value}"
+
+
 def load_state() -> dict[str, Any]:
-    """{emitted, last_ts, seen[], cursors{}} — corrupt/missing file => empty state."""
-    global _seen
+    """{emitted, last_ts, seen[], deployed_at, crawl_at{}, first_seen_at{}} —
+    corrupt/missing file => empty state."""
+    global _seen, _deploy_window_ms
     try:
         st = json.load(open(STATE_PATH))
         if not isinstance(st, dict):
             st = {}
     except Exception:
         st = {}
-    _seen = {e for e in (st.get("seen") or []) if isinstance(e, str)}
-    if not isinstance(st.get("cursors"), dict):
-        st["cursors"] = {}
+    # Canonicalize event ids written before /swaps and the feed shared one
+    # namespace. Without this, `fomo-feed:<swap id>` would look unseen when the
+    # feed re-reads its cursor item or expands a trade's older fills.
+    _seen = {_canonical_event_id(e) for e in (st.get("seen") or []) if isinstance(e, str)}
+    # A missing deploy stamp means this is the first run of the window crawler
+    # (fresh install or upgrade): anchor the first window here instead of
+    # replaying history the old swap cursor pointed at.
+    if _num(st.get("deployed_at")) is None:
+        st["deployed_at"] = _PROCESS_STARTED_MS
+        _deploy_window_ms = _PROCESS_STARTED_MS
+    st.pop("cursors", None)
+    st.pop("backfills", None)
+    for key in ("crawl_at", "first_seen_at"):
+        if not isinstance(st.get(key), dict):
+            st[key] = {}
     return st
 
 
@@ -385,8 +529,14 @@ def save_state(st: dict[str, Any]) -> None:
             pass
 
 
-def refresh_watch_list(force: bool = False) -> None:
-    """GET {api}/api/fomo-users → identities. Fail-soft: keep the previous list."""
+def refresh_watch_list(st: dict[str, Any], force: bool = False) -> None:
+    """GET {api}/api/fomo-users → identities. Fail-soft: keep the previous list.
+
+    An identity's first sight anchors its first crawl window. When this process
+    just initialized `deployed_at`, every user on the initial list starts at
+    deploy time instead of at a slightly later refresh timestamp.
+    """
+    global _deploy_window_ms
     if not force and time.time() < _wl["next"]:
         return
     _wl["next"] = time.time() + _CFG_REFRESH_S
@@ -412,11 +562,25 @@ def refresh_watch_list(force: bool = False) -> None:
                 continue
             seen.add(uid)
             users.append({"identity": uid, "userId": uid, "handle": handle})
+        first_seen = st.setdefault("first_seen_at", {})
+        seed_ms = (
+            _deploy_window_ms
+            if _deploy_window_ms is not None
+            else int(time.time() * 1000)
+        )
+        added = False
+        for user in users:
+            if user["identity"] not in first_seen:
+                first_seen[user["identity"]] = seed_ms
+                added = True
+        if added:
+            save_state(st)
         if users != _wl["users"] or skipped != _wl.get("skipped"):
             suffix = f", skipped {skipped} without userId" if skipped else ""
             print(f"# fomo watch list: {len(users)} user(s){suffix}", flush=True)
         _wl["users"] = users
         _wl["skipped"] = skipped
+        _deploy_window_ms = None
     except Exception as ex:
         print(f"  ! fomo-users: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
 
@@ -579,7 +743,7 @@ def _feed_body(
     usd = _num(item.get("usdAmount"))
     price = _num(item.get("price"))
     body: dict[str, Any] = {
-        "eventId": f"fomo-feed:{feed_id}",
+        "eventId": f"fomo-swap:{feed_id}",
         "type": "buy" if kind == "swap_buy" else "sell",
         "tokenAddress": ca,
         "chain": chain,
@@ -608,9 +772,9 @@ def _trade_swap_body(
     """Map one swap inside a FOMO trade detail to an EVM feed body.
 
     The trade detail returns every fill that built the position, including the
-    buy before a sell. Feed ids and swap ids are the same UUID, so keeping the
-    `fomo-feed:<id>` namespace dedupes against fills already ingested from the
-    token feed.
+    buy before a sell. A feed item's id is the swap id, so every fill uses the
+    same `fomo-swap:<id>` event id as the per-user /swaps route; a fill seen on
+    both routes is ingested once.
     """
     swap_id = _str(swap.get("id"))
     if swap_id is None:
@@ -621,7 +785,7 @@ def _trade_swap_body(
         return None, reason
     if body["chain"] != chain or not _same_token(body["tokenAddress"], ca, chain):
         return None, "other_token"
-    body["eventId"] = f"fomo-feed:{swap_id}"
+    body["eventId"] = f"fomo-swap:{swap_id}"
     if body["type"] == "buy" and "tradeUsd" in body:
         body["usdValue"] = body["tradeUsd"]
     return body, None
@@ -797,7 +961,7 @@ def _poll_evm_ca(
             event_id = candidate["eventId"]
             if event_id in _seen:
                 continue
-            if not post_fomo_trade(candidate, cycle_id=cycle_id):
+            if not post_fomo_trade(candidate, cycle_id=cycle_id, st=st):
                 _diagnostic(
                     "evm_feed_decision",
                     cycle_id=cycle_id,
@@ -886,6 +1050,7 @@ def _poll_evm_feed(st: dict[str, Any], cycle_id: str) -> int:
 
 def _dedupe(event_id: str) -> bool:
     """True = first sighting. Bounded like the other watchers: clear-all at cap."""
+    event_id = _canonical_event_id(event_id)
     if event_id in _seen:
         return False
     if len(_seen) > _SEEN_MAX:
@@ -897,6 +1062,7 @@ def _dedupe(event_id: str) -> bool:
 def post_fomo_trade(
     body: dict[str, Any],
     *,
+    st: dict[str, Any],
     cycle_id: str | None = None,
 ) -> bool:
     """POST one idempotent event and log each attempt without auth headers."""
@@ -931,7 +1097,7 @@ def post_fomo_trade(
                 " — watch list stale, refresh",
                 file=sys.stderr,
             )
-            refresh_watch_list(force=True)
+            refresh_watch_list(st, force=True)
         else:
             print(f"  ! fomo-trade HTTP {ex.code}", file=sys.stderr)
         return False
@@ -1045,88 +1211,26 @@ def _same_token(left: str, right: str, chain: str) -> bool:
     return chain != "sol" and left.lower() == right.lower()
 
 
-def _backfill_user_ca(
-    user: dict[str, str],
-    chain: str,
-    ca: str,
-    st: dict[str, Any],
-    cycle_id: str,
-) -> int:
-    """Backfill one user's full buy/sell history for one (chain, CA), once.
-
-    The rolling poll only sees swaps after its cursor. Buy $ and Sell $ need the
-    whole position's fills, so a newly detected BUY triggers this one-shot walk.
-    The marker is written only after a complete read; a failed read retries on
-    the next BUY detection for the same pair.
-    """
-    identity = user["identity"]
-    key = f"{identity}|{chain}:{ca.lower() if chain != 'sol' else ca}"
-    done = st.setdefault("backfills", {})
-    now_ms = int(time.time() * 1000)
-    last = _num(done.get(key))
-    if last is not None and now_ms - last < FOMO_BACKFILL_TTL_S * 1000:
-        return 0
-
-    fetched = _fetch_swaps(
-        identity,
-        cycle_id,
-        stop_at_ms=None,
-        max_pages=FOMO_BACKFILL_MAX_PAGES,
-    )
-    if fetched is None:
-        return 0
-    swaps, truncated = fetched
-
-    posted = 0
-    for swap in swaps:
-        body, _reason = _swap_body(swap, user)
-        if body is None or body["chain"] != chain:
-            continue
-        if not _same_token(body["tokenAddress"], ca, chain):
-            continue
-        event_id = body["eventId"]
-        if event_id in _seen:
-            continue
-        if not post_fomo_trade(body, cycle_id=cycle_id):
-            _diagnostic(
-                "swap_backfill_failure",
-                cycle_id=cycle_id,
-                identity=identity,
-                chain=chain,
-                ca=ca,
-                event_id=event_id,
-            )
-            return posted
-        _dedupe(event_id)
-        posted += 1
-
-    if not truncated:
-        done[key] = now_ms
-        save_state(st)
-    _diagnostic(
-        "swap_backfill",
-        cycle_id=cycle_id,
-        identity=identity,
-        chain=chain,
-        ca=ca,
-        swaps=len(swaps),
-        posted=posted,
-        truncated=truncated,
-    )
-    return posted
+def _user_bound_ms(identity: str, st: dict[str, Any]) -> int:
+    """Start of this user's current crawl window."""
+    for key in ("crawl_at", "first_seen_at"):
+        value = _num((st.get(key) or {}).get(identity))
+        if value is not None:
+            return int(value)
+    deployed = _num(st.get("deployed_at"))
+    return int(deployed) if deployed is not None else _PROCESS_STARTED_MS
 
 
 def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
-    """Poll one user's swaps back to the stored cursor. Returns ingested events."""
+    """Poll one user's swaps for the window since the previous crawl."""
     identity = user["identity"]
-    cursors = st.setdefault("cursors", {})
-    cursor = _num(cursors.get(identity))
-    bootstrap = cursor is None
+    started_ms = int(time.time() * 1000)
+    since_ms = _user_bound_ms(identity, st)
     fetched = _fetch_swaps(
         identity,
         cycle_id,
-        stop_at_ms=None if bootstrap else cursor,
-        max_pages=1 if bootstrap else FOMO_SWAPS_MAX_PAGES,
+        stop_at_ms=since_ms,
+        max_pages=FOMO_SWAPS_MAX_PAGES,
     )
     if fetched is None:
         return 0
@@ -1139,42 +1243,27 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
             page.append((at, swap))
     page.sort(key=lambda item: item[0])
 
-    if bootstrap:
-        # Bootstrap: record the newest swap and emit nothing. This prevents a
-        # deploy or a newly watched user from replaying existing history.
-        # One millisecond past the newest existing swap, so every fill already
-        # on the first page (including same-millisecond fills) stays historical.
-        cursor = float(page[-1][0] + 1) if page else float(int(time.time() * 1000))
-        cursors[identity] = cursor
-        save_state(st)
-        _diagnostic("poll_bootstrap", cycle_id=cycle_id, identity=identity, cursor=int(cursor))
-        return 0
-
     if truncated:
-        # Do not advance past swaps we did not read. The next cycle retries with
-        # the same cursor; a partial ingest would silently lose old fills.
+        # Do not advance past swaps we did not read. The next cycle retries the
+        # same window; a partial ingest would silently lose old fills.
         _diagnostic(
             "swaps_truncated",
             cycle_id=cycle_id,
             identity=identity,
-            cursor=int(cursor),
+            window_ms=since_ms,
             pages=max(1, FOMO_SWAPS_MAX_PAGES),
         )
         return 0
 
     emitted = 0
-    changed = False
-    buys: set[tuple[str, str]] = set()
+    complete = True
     for at, swap in page:
-        # Revisit the boundary timestamp: several fills can share one
-        # millisecond. `_seen` skips acknowledged ones, while a failed POST at
-        # the cursor is retried instead of being stranded behind it.
-        if at < cursor:
+        # Inclusive lower bound: several fills can share one millisecond, and the
+        # previous poll also started at this instant. `_seen` skips duplicates.
+        if at < since_ms:
             continue
         body, reason = _swap_body(swap, user)
         if body is None:
-            cursor = float(at)
-            changed = True
             _diagnostic(
                 "swap_decision",
                 cycle_id=cycle_id,
@@ -1186,10 +1275,8 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
             continue
         event_id = body["eventId"]
         if event_id in _seen:
-            cursor = float(at)
-            changed = True
             continue
-        if not post_fomo_trade(body, cycle_id=cycle_id):
+        if not post_fomo_trade(body, cycle_id=cycle_id, st=st):
             _diagnostic(
                 "swap_decision",
                 cycle_id=cycle_id,
@@ -1198,13 +1285,10 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
                 reason="ingest_failed",
                 event_id=event_id,
             )
-            break  # keep the cursor so this swap and later ones retry next cycle
+            complete = False
+            break  # keep this window so the failed swap and later ones retry
         _dedupe(event_id)
-        cursor = float(at)
-        changed = True
         emitted += 1
-        if body["type"] == "buy":
-            buys.add((body["chain"], body["tokenAddress"]))
         st["last_ts"] = max(st.get("last_ts") or 0, at)
         st["emitted"] = int(st.get("emitted") or 0) + 1
         save_state(st)
@@ -1223,12 +1307,10 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
             flush=True,
         )
 
-    if changed:
-        cursors[identity] = cursor
+    if complete:
+        st.setdefault("crawl_at", {})[identity] = started_ms
         save_state(st)
 
-    for chain, ca in sorted(buys):
-        _backfill_user_ca(user, chain, ca, st, cycle_id)
     return emitted
 
 
@@ -1242,7 +1324,7 @@ async def _poll_loop(st: dict[str, Any], once: bool) -> None:
     first = True
     while True:
         try:
-            refresh_watch_list(force=first)
+            refresh_watch_list(st, force=first)
             users = list(_wl["users"])
             cycle_id = _new_cycle_id()
             _diagnostic(

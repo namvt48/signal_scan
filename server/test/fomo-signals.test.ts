@@ -633,10 +633,11 @@ test('FOMO positions retain token amounts across unchanged snapshots and value B
   assert.equal(fomoUserStatsByCa(NOW + 2_000).get(`base:${ca}`)?.[0]?.balUsd, 300);
 });
 
-test('a possibly truncated balance page updates holdings without closing missing positions', () => {
+test('an omitted position is not closed by the snapshot alone', () => {
   const ca = 'fomo-position-partial-023b';
   const user = insertFomoUser({ handle: '@position-partial' });
   insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
+  insertFomoTrade({ fomo_user_id: user.id, event_id: 'position-partial-buy', ca, chain: 'base', type: 'buy', ts: NOW - 1_000 });
   const position = (amount: number, fetched_at: number) => ({
     fomo_user_id: user.id,
     ca,
@@ -652,12 +653,17 @@ test('a possibly truncated balance page updates holdings without closing missing
     fetched_at,
   });
   syncFomoPositionsSnapshot(user.id, [position(100, NOW)], NOW);
-  syncFomoPositionsSnapshot(user.id, [], NOW + 1_000, false);
+  syncFomoPositionsSnapshot(user.id, [], NOW + 1_000);
   const retained = getDb().prepare(
     'SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
   ).get(user.id, ca, 'base') as { amount: number; status: string };
   assert.deepEqual(retained, { amount: 100, status: 'open' });
-  syncFomoPositionsSnapshot(user.id, [], NOW + 2_000, true);
+  // Closure must arrive as an explicit row, after trade-detail evidence.
+  syncFomoPositionsSnapshot(user.id, [{
+    ...position(0, NOW + 2_000),
+    status: 'closed',
+    price_usd: null,
+  }], NOW + 2_000);
   const closed = getDb().prepare(
     'SELECT amount, status FROM fomo_positions WHERE fomo_user_id = ? AND ca = ? AND chain = ?',
   ).get(user.id, ca, 'base') as { amount: number; status: string };

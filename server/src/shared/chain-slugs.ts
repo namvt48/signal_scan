@@ -7,6 +7,9 @@
 //   robinhood → gmgn `robinhood`, nansen `robinhood`, dexscreener `robinhood`,
 //               chainId 4663, native ETH (nansen docs list `robinhood` for
 //               netflow/dex/holdings/flows; dexscreener verified live 2026-09-30)
+//   eth  → gmgn `eth` (docs/gmgn-social-links.md), nansen `ethereum`
+//          (api.nansen.ai openapi chain enum), dexscreener `ethereum` (live
+//          probe 2026-10-23), chainId 1, native ETH
 
 import type { Chain } from './chain.js';
 
@@ -51,6 +54,14 @@ export const CHAIN_SLUGS: Record<Chain, ChainSlugs> = {
     chainId: 4663,
     nativeSymbol: 'ETH',
     explorer: (ca) => `https://robinhoodchain.blockscout.com/token/${ca}`,
+  },
+  eth: {
+    gmgn: 'eth',
+    nansen: 'ethereum',
+    dexscreener: 'ethereum',
+    chainId: 1,
+    nativeSymbol: 'ETH',
+    explorer: (ca) => `https://etherscan.io/token/${ca}`,
   },
 };
 

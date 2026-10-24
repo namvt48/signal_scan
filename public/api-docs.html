@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Signal Scan public read-only API v1 reference: every endpoint, parameter, response field, error code, and live inflow stream.">
+  <title>Public API · Signal Scan</title>
+  <link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/api-docs.html" aria-label="Signal Scan developer docs home"><span class="brand-mark" aria-hidden="true"><span>∿</span></span><span class="brand-name">SIGNAL / SCAN<span class="brand-sub">Developer field guide</span></span></a>
+      <nav class="topnav" aria-label="Developer documentation">
+        <a href="/api-docs.html" aria-current="page">API reference</a>
+        <a href="/feature-history.html">Features &amp; releases</a>
+        <a href="https://signal-scan.duckdns.org" target="_blank" rel="noreferrer">Dashboard ↗</a>
+      </nav>
+    </header>
+    <section class="hero" aria-labelledby="page-title">
+      <div><div class="eyebrow">Public API · v1 · read-only</div><h1 id="page-title">Market data, one request at a time.</h1><p>Eighteen REST routes and one WebSocket over data Signal Scan currently stores: token snapshots, market and metric breakdowns, holder distribution, balance series, wallet-watch activity, alert history, FOMO watch-list data, and live inflows.</p></div>
+      <div class="basebox"><span class="label">Base URL</span><code>https://signal-scan.duckdns.org/api/v1</code><span class="privacy">No client auth · read-only · no write routes</span></div>
+    </section>
+    <div class="layout">
+      <nav class="rail" aria-label="API sections">
+        <div class="rail-group"><span class="rail-title">Start here</span><a href="#quickstart">Quick start</a><a href="#conventions">Conventions</a></div>
+        <div class="rail-group"><span class="rail-title">Service</span><a href="#status">/status</a><a href="#chains">/chains</a><a href="#tiers">/tiers</a></div>
+        <div class="rail-group"><span class="rail-title">Tokens</span><a href="#tokens-list">List tokens</a><a href="#token">Token by address</a><a href="#subresources">Subresources</a><a href="#detail">Holder detail</a><a href="#balance-chart">Balance chart</a><a href="#activity">Activity</a></div>
+        <div class="rail-group"><span class="rail-title">Alerts</span><a href="#alerts">Alert history</a><a href="#ws">Live inflow WS</a></div>
+        <div class="rail-group"><span class="rail-title">Wallets</span><a href="#wallets">Wallet list</a><a href="#trades">Trades</a></div>
+        <div class="rail-group"><span class="rail-title">FOMO</span><a href="#fomo-tokens">Token table</a><a href="#fomo-users">Watch-list</a><a href="#fomo-stats">Token stats</a><a href="#fomo-trades">Trades</a><a href="#fomo-positions">Positions</a><a href="#fomo-alerts">Alerts &amp; wallets</a></div>
+        <div class="rail-group"><span class="rail-title">Operate safely</span><a href="#pagination">Pagination &amp; quotas</a><a href="#errors">Errors &amp; close codes</a><a href="#browser">Browser access</a><a href="#privacy">Data exposure</a></div>
+      </nav>
+      <main class="content">
+
+        <section class="section" id="quickstart">
+          <div class="section-head"><h2>Quick start</h2><p>HTTPS · JSON · GET</p></div>
+          <p class="intro">No account, API key, or <code>Authorization</code> header is needed. Do not send dashboard login credentials to these routes. The status call proves the public process answers; it does not prove stored data is available.</p>
+          <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/status'
+# {"status":"ok","version":"v1"}
+
+curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens?limit=10&amp;offset=0'</pre>
+          <div class="callout"><strong>Stored data only.</strong> Responses reflect what Signal Scan currently retains. Expired or pruned source history is not reconstructed, and REST cursors report <code>gap: true</code> when rows were pruned.</div>
+        </section>
+
+        <section class="section" id="conventions">
+          <div class="section-head"><h2>Conventions</h2><p>Applies to every endpoint below</p></div>
+          <table class="param-table">
+            <thead><tr><th>Rule</th><th>Value</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>Base URL</td><td class="mono">https://signal-scan.duckdns.org/api/v1</td><td>REST paths below are relative to it.</td></tr>
+              <tr><td>WebSocket</td><td class="mono">wss://signal-scan.duckdns.org/api/v1/ws<br>wss://signal-scan.duckdns.org/api/v1/fomo/ws</td><td>Server-to-client only; no commands. The second path streams FOMO-instance alerts.</td></tr>
+              <tr><td>Auth</td><td>None</td><td>Every caller shares the same public surface.</td></tr>
+              <tr><td>Content type</td><td class="mono">application/json</td><td>GET only; no request bodies.</td></tr>
+              <tr><td>Timestamps</td><td>Unix epoch <strong>milliseconds</strong></td><td>Stored history, window bounds, and alert times.</td></tr>
+              <tr><td>Time ranges</td><td>Half-open <code>[from, to)</code></td><td>Must be positive and no longer than 31 days.</td></tr>
+              <tr><td>Field casing</td><td><code>camelCase</code></td><td>Query parameters use snake_case (<code>after_id</code>).</td></tr>
+              <tr><td>Missing values</td><td><code>null</code> or <code>[]</code></td><td>Do not treat <code>null</code> as zero unless that is the documented meaning.</td></tr>
+              <tr><td>Lists</td><td>Offset or ID cursor</td><td>Token, wallet, FOMO-token, FOMO-wallet, and FOMO-user lists use <code>offset</code>; alerts and trades use <code>after_id</code>.</td></tr>
+              <tr><td>Replica model</td><td>One public API process</td><td>Quota, cache, and in-flight limits are process-local.</td></tr>
+            </tbody>
+          </table>
+          <div class="pill-row"><span class="pill">chains: sol · base · bsc · robinhood</span><span class="pill">fomo stats: + eth</span><span class="pill">tiers: S+ · S · A+ · A · B+ · B · P</span><span class="pill">limit 1–100</span><span class="pill">offset ≤ 1,000,000</span></div>
+        </section>
+
+        <section class="section" id="service">
+          <div class="section-head"><h2>Service &amp; catalog</h2><p>Connectivity, not data health</p></div>
+
+          <details class="endpoint" id="status" open><summary><span class="method">GET</span><span class="path">/status</span><span class="summary-desc">Process status and API version</span></summary><div class="endpoint-body">
+            <p>Confirms the public API process is responding. Data endpoints may still return <code>502</code> when the private export source is unavailable.</p>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>status</td><td>string</td><td>Always <code>"ok"</code> when the process answers.</td></tr>
+              <tr><td>version</td><td>string</td><td>Public contract version: <code>"v1"</code>.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/status'
+{"status":"ok","version":"v1"}</pre>
+          </div></details>
+
+          <details class="endpoint" id="chains"><summary><span class="method">GET</span><span class="path">/chains</span><span class="summary-desc">Supported chain path values</span></summary><div class="endpoint-body">
+            <p>Returns the values accepted in the <code>{chain}</code> path segment. Any other value returns <code>400</code>.</p>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>data</td><td>string[]</td><td><code>["sol","base","bsc","robinhood"]</code>.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/chains'
+{"data":["sol","base","bsc","robinhood"]}</pre>
+          </div></details>
+
+          <details class="endpoint" id="tiers"><summary><span class="method">GET</span><span class="path">/tiers</span><span class="summary-desc">Supported signal tier labels</span></summary><div class="endpoint-body">
+            <p>Returns the tier labels used on token records, strongest first. This is a catalog, not a filter endpoint.</p>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>data</td><td>string[]</td><td><code>["S+","S","A+","A","B+","B","P"]</code>.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tiers'
+{"data":["S+","S","A+","A","B+","B","P"]}</pre>
+          </div></details>
+        </section>
+
+        <section class="section" id="tokens">
+          <div class="section-head"><h2>Tokens &amp; market data</h2><p>Snapshot → subresources → holders → activity</p></div>
+
+          <details class="endpoint" id="tokens-list" open><summary><span class="method">GET</span><span class="path">/tokens</span><span class="summary-desc">Paginated token snapshot</span></summary><div class="endpoint-body">
+            <h3 class="sub">Parameters</h3>
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum token records in the page.</td></tr>
+              <tr><td>offset</td><td>0</td><td>0–1,000,000</td><td>Position in the current token list.</td></tr>
+            </tbody></table>
+            <h3 class="sub">Response</h3>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>generatedAt</td><td>number</td><td>Epoch milliseconds when the snapshot was assembled.</td></tr>
+              <tr><td>data</td><td>token[]</td><td>Token records; schema below.</td></tr>
+              <tr><td>nextOffset</td><td>number | null</td><td>Offset for the next page; <code>null</code> when the page reaches the end.</td></tr>
+            </tbody></table>
+            <h3 class="sub">Token object</h3>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>id</td><td>string</td><td>Stable token record ID.</td></tr>
+              <tr><td>ca</td><td>string</td><td>Contract address.</td></tr>
+              <tr><td>chain</td><td>string</td><td>One of the supported chains.</td></tr>
+              <tr><td>symbol</td><td>string</td><td>Token ticker.</td></tr>
+              <tr><td>tier</td><td>string</td><td>Signal tier label from <code>/tiers</code>.</td></tr>
+              <tr><td>iconUrl</td><td>string</td><td>Path relative to the API origin; the dashboard serves <code>/api/token-avatar/...</code> publicly.</td></tr>
+              <tr><td>xHandle</td><td>string | null</td><td>Token X/Twitter handle when known.</td></tr>
+              <tr><td>market</td><td>object</td><td>Market fields, table below.</td></tr>
+              <tr><td>metrics</td><td>object</td><td>Signal fields, table below.</td></tr>
+              <tr><td>balanceRange</td><td>object | null</td><td><code>null</code> until balance snapshots exist.</td></tr>
+              <tr><td>history</td><td>object</td><td>Stored series, table below.</td></tr>
+            </tbody></table>
+            <div class="split">
+              <article class="note-card"><h3>market</h3><p><code>price</code>, <code>marketCap</code>, <code>holders</code>, <code>volume24h</code>, <code>volume1h</code>, <code>buyVol24h</code>, <code>sellVol24h</code>, and <code>dataUpdatedAt: { marketCap, volume24h, holders, fresh, symbol, icon }</code> — per-field freshness in epoch ms.</p></article>
+              <article class="note-card"><h3>metrics</h3><p><code>score</code>; <code>pass:{fresh,t100,lf}</code>; <code>fresh</code> (gated, <code>null</code> when hidden); <code>rawFresh</code> (ungated); <code>freshCurrent</code>; <code>freshUpdatedAt</code>; <code>t100:{pct,multiple}</code>; <code>lf</code>; <code>trackedHolding</code> (% of supply, <code>0</code> when supply unknown); <code>trackedInflow</code> (net USD, 24h, may be negative); <code>trackedActivityAt</code> (<code>0</code> when none).</p></article>
+              <article class="note-card"><h3>balanceRange</h3><p><code>d1</code>, <code>d7</code>, <code>d30</code>, each <code>{peak, trough}</code> or <code>null</code>. Windows are independent: one can be <code>null</code> while another has data.</p></article>
+              <article class="note-card"><h3>history</h3><p><code>marketCap[]</code>, <code>holders[]</code>, <code>fresh[]</code>, <code>t100[]</code>. Every point is <code>{t, value}</code>; <code>t100</code> points may also carry stored <code>peakBalance</code> / <code>troughBalance</code>.</p></article>
+            </div>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens?limit=50&amp;offset=0'
+
+{
+  "generatedAt": 1700000000000,
+  "data": [{
+    "id": "sol:token-address",
+    "ca": "token-address",
+    "chain": "sol",
+    "symbol": "TICKER",
+    "tier": "A",
+    "iconUrl": "/api/token-avatar/sol/token-address",
+    "xHandle": "token_x",
+    "market": {
+      "price": 0.001, "marketCap": 1000000, "holders": 1200,
+      "volume24h": 250000, "volume1h": 12000, "buyVol24h": 140000, "sellVol24h": 110000,
+      "dataUpdatedAt": {
+        "marketCap": 1700000000000, "volume24h": 1700000000000, "holders": 1700000000000,
+        "fresh": 1700000000000, "symbol": 1700000000000, "icon": 1700000000000
+      }
+    },
+    "metrics": {
+      "score": 3, "pass": {"fresh": true, "t100": true, "lf": false},
+      "fresh": 24.7, "rawFresh": 24.7, "freshCurrent": true, "freshUpdatedAt": 1700000000000,
+      "t100": {"pct": 25, "multiple": 1.25}, "lf": 69000000,
+      "trackedHolding": 4.2, "trackedInflow": 1250, "trackedActivityAt": 1700000000000
+    },
+    "balanceRange": {"d1": {"peak": 1200, "trough": 900}, "d7": null, "d30": null},
+    "history": {
+      "marketCap": [{"t": 1700000000000, "value": 1000000}],
+      "holders": [], "fresh": [],
+      "t100": [{"t": 1700000000000, "value": 25, "peakBalance": 69000000, "troughBalance": 52000000}]
+    }
+  }],
+  "nextOffset": 50
+}</pre>
+            <p>Offset pagination can shift when the token list changes between requests. Prefer the ID-cursor endpoints when you must resume exactly.</p>
+          </div></details>
+
+          <details class="endpoint" id="token"><summary><span class="method">GET</span><span class="path">/tokens/{chain}/{address}</span><span class="summary-desc">One token with market, metrics, history</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Path parameter</th><th>Rule</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>chain</td><td>enum</td><td><code>sol</code>, <code>base</code>, <code>bsc</code>, <code>robinhood</code>.</td></tr>
+              <tr><td>address</td><td>1–128 chars</td><td>Contract address. Longer or empty returns <code>400</code>.</td></tr>
+            </tbody></table>
+            <p>Returns a token object directly — the same schema as the list item above, with no envelope. <code>404</code> means the token has no stored state; <code>502</code> means the private backend is unavailable.</p>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112'</pre>
+          </div></details>
+
+          <details class="endpoint" id="subresources"><summary><span class="method">GET</span><span class="path">/tokens/{chain}/{address}/market · /metrics · /history</span><span class="summary-desc">Single section of the token object</span></summary><div class="endpoint-body">
+            <p>Each subresource returns <code>{ "data": ... }</code> containing exactly one section of the token object. Use them to keep payloads small when you only need one group of fields. Same path validation and <code>404</code> behavior as the token endpoint.</p>
+            <table class="param-table"><thead><tr><th>Subresource</th><th>data contents</th><th>Typical use</th></tr></thead><tbody>
+              <tr><td>/market</td><td><code>market</code> object</td><td>Price, market cap, volume split, holders, field freshness.</td></tr>
+              <tr><td>/metrics</td><td><code>metrics</code> object</td><td>Score, pass gates, Fresh, T100, LF, tracked-wallet measures.</td></tr>
+              <tr><td>/history</td><td><code>history</code> object</td><td>Stored series for charts; no backfill.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112/market'
+{"data":{"price":0.001,"marketCap":1000000,"holders":1200,"volume24h":250000,"volume1h":12000,"buyVol24h":140000,"sellVol24h":110000,"dataUpdatedAt":{"marketCap":1700000000000,"volume24h":1700000000000,"holders":1700000000000,"fresh":1700000000000,"symbol":1700000000000,"icon":1700000000000}}}</pre>
+          </div></details>
+
+          <details class="endpoint" id="detail"><summary><span class="method">GET</span><span class="path">/tokens/{chain}/{address}/detail</span><span class="summary-desc">Distribution metrics + top-100 holders</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>ca</td><td>string</td><td>Contract address.</td></tr>
+              <tr><td>chain</td><td>string</td><td>Supported chain value.</td></tr>
+              <tr><td>price</td><td>number | null</td><td>Price at snapshot time.</td></tr>
+              <tr><td>supply</td><td>number | null</td><td>Token supply used for percentage math.</td></tr>
+              <tr><td>holders</td><td>number | null</td><td>Holder count at snapshot time.</td></tr>
+              <tr><td>freshSupplyPct</td><td>number | null</td><td>Fresh-wallet share of supply.</td></tr>
+              <tr><td>top100SupplyPct</td><td>number | null</td><td>Top-100 share of supply.</td></tr>
+              <tr><td>medianHolderAmount</td><td>number | null</td><td>Median holder balance in token units.</td></tr>
+              <tr><td>medianHolderUsd</td><td>number | null</td><td>Median holder balance in USD.</td></tr>
+              <tr><td>top100</td><td>holder[]</td><td>Empty when no stored snapshot exists.</td></tr>
+              <tr><td>snapshotAt</td><td>number | null</td><td>Epoch ms of the stored snapshot.</td></tr>
+            </tbody></table>
+            <h3 class="sub">top100[] row</h3>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>address</td><td>string</td><td>Holder address (public on-chain data).</td></tr>
+              <tr><td>percentOwnership</td><td>number</td><td>Share of supply held.</td></tr>
+              <tr><td>balance</td><td>number</td><td>Holding in token units.</td></tr>
+              <tr><td>balanceUsd</td><td>number | null</td><td>Holding in USD when price was known.</td></tr>
+              <tr><td>addrType</td><td>1 | 2</td><td>Source classification: <code>1</code> wallet, <code>2</code> exchange.</td></tr>
+              <tr><td>isNew</td><td>boolean</td><td>Newly appearing holder per the source.</td></tr>
+              <tr><td>chg24h</td><td>number | null</td><td>24-hour balance change, when provided.</td></tr>
+              <tr><td>name</td><td>string | null</td><td>Entity label from the public source.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112/detail'
+
+{
+  "ca": "token-address", "chain": "sol", "price": 0.001, "supply": 1000000000, "holders": 1200,
+  "freshSupplyPct": 24.7, "top100SupplyPct": 25, "medianHolderAmount": 500000, "medianHolderUsd": 500,
+  "top100": [{
+    "address": "holder-address", "percentOwnership": 5, "balance": 50000000, "balanceUsd": 50000,
+    "addrType": 1, "isNew": false, "chg24h": 1.5, "name": "entity-label"
+  }],
+  "snapshotAt": 1700000000000
+}</pre>
+            <div class="callout"><strong>Privacy:</strong> top-100 addresses and labels are public on-chain data, but they reveal wallet correlation across tokens. Handle them accordingly.</div>
+          </div></details>
+
+          <details class="endpoint" id="balance-chart"><summary><span class="method">GET</span><span class="path">/tokens/{chain}/{address}/balance-chart</span><span class="summary-desc">Top-100 cohort total balance series</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Allowed</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>window</td><td>day</td><td>day · week · month</td><td>Series window. Any other value returns <code>400</code>.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>source</td><td>enum</td><td><code>nansen</code> for a cached Nansen series; <code>snapshots</code> for the local snapshot fallback.</td></tr>
+              <tr><td>points</td><td>point[]</td><td><code>{t, total, totalUsd, holders, inflow}</code>; optional values are <code>null</code> when the source did not provide them.</td></tr>
+              <tr><td>cachedAt</td><td>number</td><td>Epoch ms when the served series was cached.</td></tr>
+            </tbody></table>
+            <p><code>t</code> is normalized to epoch milliseconds. The endpoint never performs a synchronous upstream fetch: it serves cache or snapshots, and a stale cached series may trigger a background refresh.</p>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112/balance-chart?window=week'
+
+{
+  "source": "nansen",
+  "points": [{"t": 1700000000000, "total": 69000000, "totalUsd": 69000, "holders": 100, "inflow": 1200}],
+  "cachedAt": 1700000000000
+}</pre>
+          </div></details>
+
+          <details class="endpoint" id="activity"><summary><span class="method">GET</span><span class="path">/tokens/{chain}/{address}/activity</span><span class="summary-desc">Tracked-wallet activity aggregates</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>from</td><td>now − 24 h</td><td>≥ 0, in epoch ms</td><td>Inclusive start of <code>[from, to)</code>.</td></tr>
+              <tr><td>to</td><td>now</td><td>&gt; from, ≤ 31 days span</td><td>Exclusive end of the interval.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>chain</td><td>string</td><td>Echo of the path chain.</td></tr>
+              <tr><td>ca</td><td>string</td><td>Echo of the path address.</td></tr>
+              <tr><td>from</td><td>number</td><td>Effective inclusive start (epoch ms).</td></tr>
+              <tr><td>to</td><td>number</td><td>Effective exclusive end (epoch ms).</td></tr>
+              <tr><td>buys</td><td>number</td><td>Tracked-wallet buy count.</td></tr>
+              <tr><td>sells</td><td>number</td><td>Tracked-wallet sell count.</td></tr>
+              <tr><td>buyUsd</td><td>number</td><td>USD bought in the interval.</td></tr>
+              <tr><td>sellUsd</td><td>number</td><td>USD sold in the interval.</td></tr>
+              <tr><td>netInflowUsd</td><td>number</td><td><code>buyUsd − sellUsd</code>; negative means net outflow.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/tokens/sol/So11111111111111111111111111111111111111112/activity?from=1700000000000&amp;to=1700086400000'
+
+{"chain":"sol","ca":"token-address","from":1700000000000,"to":1700086400000,"buys":3,"sells":1,"buyUsd":1200,"sellUsd":300,"netInflowUsd":900}</pre>
+            <p>Aggregates use stored wallet-watch trades, not FOMO activity. Invalid or over-long ranges return <code>400</code>.</p>
+          </div></details>
+        </section>
+
+        <section class="section" id="alerts">
+          <div class="section-head"><h2>Alerts &amp; live inflow</h2><p>Cursor history + push stream</p></div>
+
+          <details class="endpoint" id="alerts"><summary><span class="method">GET</span><span class="path">/alerts</span><span class="summary-desc">Alert observations ordered by ID</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>after_id</td><td>0</td><td>non-negative integer</td><td>Return alerts whose ID is greater than this cursor.</td></tr>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum alerts in the page.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>data</td><td>alert[]</td><td>Alerts above the supplied cursor, ordered by ID.</td></tr>
+              <tr><td>nextId</td><td>number</td><td>Cursor for the next request; stays at the supplied cursor when nothing newer exists.</td></tr>
+              <tr><td>oldestAvailableId</td><td>number | null</td><td>Oldest retained alert ID; <code>null</code> when no alerts are stored.</td></tr>
+              <tr><td>gap</td><td>boolean</td><td><code>true</code> when the supplied cursor predates the retained range (rows were pruned).</td></tr>
+            </tbody></table>
+            <h3 class="sub">alert</h3>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>id</td><td>number</td><td>Monotonic alert ID and cursor value.</td></tr>
+              <tr><td>ca</td><td>string</td><td>Token contract address.</td></tr>
+              <tr><td>chain</td><td>string</td><td>Supported chain value.</td></tr>
+              <tr><td>metric</td><td>enum</td><td><code>fresh</code>, <code>t100</code>, or <code>trackerBuy</code>. REST returns all three.</td></tr>
+              <tr><td>value</td><td>number</td><td>Metric value stored with the alert; for <code>trackerBuy</code> it is the trade's USD value.</td></tr>
+              <tr><td>responseAt</td><td>number</td><td>Epoch ms of the stored observation (for inflow: the trade event time).</td></tr>
+              <tr><td>snapshot</td><td>object</td><td>Token state captured when the alert was stored.</td></tr>
+            </tbody></table>
+            <h3 class="sub">snapshot</h3>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>capturedAt</td><td>number</td><td>When the snapshot was captured.</td></tr>
+              <tr><td>symbol</td><td>string | null</td><td>Token ticker at capture time.</td></tr>
+              <tr><td>marketCap</td><td>number | null</td><td>Market cap at capture time.</td></tr>
+              <tr><td>marketCapAt</td><td>number | null</td><td>When that market cap was observed.</td></tr>
+              <tr><td>freshPct</td><td>number | null</td><td>Fresh-wallet percentage.</td></tr>
+              <tr><td>t100Multiple</td><td>number | null</td><td>Top-100 multiple.</td></tr>
+              <tr><td>lf</td><td>number | null</td><td>Liquidity figure stored with the alert.</td></tr>
+              <tr><td>trackedHoldingPct</td><td>number | null</td><td>Tracked-wallet holding as % of supply at capture (<code>null</code> when no token state was available).</td></tr>
+              <tr><td>iconUrl</td><td>string | null</td><td>Path relative to the API origin.</td></tr>
+              <tr><td>xHandle</td><td>string | null</td><td>Token X/Twitter handle.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/alerts?after_id=0&amp;limit=50'
+
+{
+  "data": [{
+    "id": 42, "ca": "token-address", "chain": "sol", "metric": "trackerBuy",
+    "value": 250, "responseAt": 1700000000000,
+    "snapshot": {
+      "capturedAt": 1700000000000, "symbol": "TICKER", "marketCap": 1000000,
+      "marketCapAt": 1700000000000, "freshPct": 24.7, "t100Multiple": 1.25, "lf": 69000000,
+      "trackedHoldingPct": 4.2,
+      "iconUrl": "/api/token-avatar/sol/token-address",
+      "xHandle": "token_x"
+    }
+  }],
+  "nextId": 42,
+  "oldestAvailableId": 1,
+  "gap": false
+}</pre>
+            <p>Alert DTOs exclude buyer identities, FOMO metadata, and dashboard notes. When <code>gap</code> is <code>true</code>, pruned rows cannot be recovered: continue from the retained range and record that a gap occurred.</p>
+          </div></details>
+
+          <details class="endpoint" id="ws"><summary><span class="method ws">WS</span><span class="path">/ws</span><span class="summary-desc">Live tracker-buy inflow stream</span></summary><div class="endpoint-body">
+            <p>Connect to <code>wss://signal-scan.duckdns.org/api/v1/ws</code>. No API key or header. The stream is server-to-client only; the server closes connections that send messages with code <code>1008</code>.</p>
+            <p>The FOMO instance exposes <code>wss://signal-scan.duckdns.org/api/v1/fomo/ws</code> with the same protocol and filters. Catch up with <code>GET /fomo/alerts?after_id=</code>. Both paths share the 64-connection limit but poll their own upstream; an unavailable upstream closes only its stream with code <code>1011</code>.</p>
+            <table class="param-table"><thead><tr><th>Message</th><th>Fields</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>ready</td><td><code>{type:"ready", afterId}</code></td><td>Sent once after setup. <code>afterId</code> is the latest stored alert ID at connection time.</td></tr>
+              <tr><td>inflow</td><td><code>{type:"inflow", data:&lt;alert&gt;}</code></td><td>Sent for each newly stored <code>trackerBuy</code> alert, using the same alert schema as REST.</td></tr>
+            </tbody></table>
+            <h3 class="sub">Delivery rules</h3>
+            <table class="param-table"><thead><tr><th>Behavior</th><th>Detail</th></tr></thead><tbody>
+              <tr><td>No replay</td><td>Only alerts stored after the connection are streamed. Catch up with <code>GET /alerts?after_id=</code>.</td></tr>
+              <tr><td>Scope</td><td><code>trackerBuy</code> only. <code>fresh</code>, <code>t100</code>, and sells are never streamed.</td></tr>
+              <tr><td>Stored first</td><td>An inflow is sent only after the alert is stored; deduplicated duplicate trades produce no event.</td></tr>
+              <tr><td>Not exactly-once</td><td>Deduplicate by <code>data.id</code> and advance your cursor only after processing succeeds.</td></tr>
+              <tr><td>Heartbeat</td><td>Ping about every 25 s; clients that miss pong are removed. Proxy read-idle timeout is 75 s.</td></tr>
+              <tr><td>Capacity</td><td>64 concurrent connections per process; excess handshakes receive HTTP <code>503</code>. Alerts are polled once per process and shared.</td></tr>
+              <tr><td>Backpressure</td><td>Slow consumers may be closed so one client cannot exhaust process memory.</td></tr>
+            </tbody></table>
+            <pre>const ws = new WebSocket('wss://signal-scan.duckdns.org/api/v1/ws');
+
+ws.addEventListener('message', ({ data }) =&gt; {
+  const message = JSON.parse(data);
+  if (message.type === 'ready') console.log('cursor', message.afterId);
+  if (message.type === 'inflow') console.log('inflow', message.data); // dedupe by data.id
+});
+
+ws.addEventListener('close', (event) =&gt; console.log('closed', event.code, event.reason));</pre>
+            <h3 class="sub">Server-side consumer: reconnect + REST catch-up</h3>
+            <p>Node 20+ reference consumer from the user guide. It uses the <code>ws</code> package plus Node's built-in <code>fetch</code> (<code>npm install ws</code>). A single promise queue serializes messages, so catch-up and live inflows never interleave and the cursor only advances after processing succeeds.</p>
+            <pre>import { WebSocket } from 'ws';
+
+const API = 'https://signal-scan.duckdns.org/api/v1';
+const WS_URL = `${API.replace('https:', 'wss:')}/ws`;
+let lastProcessedId = null; // Replace with durable storage if restart recovery is required.
+let queue = Promise.resolve();
+let retryDelayMs = 1000;
+
+async function catchUp(afterId, throughId) {
+  let cursor = afterId;
+  while (cursor &lt; throughId) {
+    const url = new URL(`${API}/alerts`);
+    url.searchParams.set('after_id', String(cursor));
+    url.searchParams.set('limit', '100');
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Alert catch-up failed: HTTP ${response.status}`);
+    const page = await response.json();
+    if (page.gap) console.warn('Alert history gap: older rows have been pruned.');
+
+    for (const alert of page.data) {
+      if (alert.id &gt; throughId) break;
+      if (alert.metric === 'trackerBuy') await handleInflow(alert);
+      // Advance past every alert type; REST returns more than inflow events.
+      lastProcessedId = alert.id;
+    }
+
+    if (page.nextId &lt;= cursor) break;
+    cursor = Math.min(page.nextId, throughId);
+    lastProcessedId = Math.max(lastProcessedId, cursor);
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  ws.on('message', (raw) =&gt; {
+    queue = queue.then(async () =&gt; {
+      const message = JSON.parse(raw.toString());
+      if (message.type === 'ready') {
+        if (lastProcessedId === null) {
+          // First connection: start live at the server-provided cursor, no history replay.
+          lastProcessedId = message.afterId;
+        } else {
+          // Reconnect: recover stored inflows up to the new connection's ready cursor.
+          await catchUp(lastProcessedId, message.afterId);
+        }
+        return;
+      }
+
+      if (message.type === 'inflow' &amp;&amp; message.data.id &gt; lastProcessedId) {
+        await handleInflow(message.data);
+        lastProcessedId = message.data.id;
+      }
+    }).catch((error) =&gt; console.error('Signal Scan consumer error:', error));
+  });
+
+  ws.on('open', () =&gt; { retryDelayMs = 1000; });
+  ws.on('close', () =&gt; {
+    setTimeout(connect, retryDelayMs);
+    retryDelayMs = Math.min(retryDelayMs * 2, 30000);
+  });
+  ws.on('error', (error) =&gt; console.error('Signal Scan WebSocket error:', error.message));
+}
+
+async function handleInflow(alert) {
+  // Replace with application logic. Persist/commit by alert.id for idempotency.
+  console.log(alert.chain, alert.ca, alert.value, alert.id);
+}
+
+connect();</pre>
+            <p>This example keeps its cursor in memory; persist <code>lastProcessedId</code> durably if the consumer must recover after a process restart. If a fetch or handler throws, the queue rejects, the cursor stops advancing, and the error surfaces — define your own retry/durable-commit policy for production.</p>
+            <p>Browser pages on another origin can open the WebSocket, but cannot run REST catch-up directly because CORS is disabled — perform catch-up in your backend.</p>
+          </div></details>
+        </section>
+
+        <section class="section" id="wallets">
+          <div class="section-head"><h2>Wallets &amp; trades</h2><p>Public wallet-watch records</p></div>
+
+          <details class="endpoint" id="wallets"><summary><span class="method">GET</span><span class="path">/wallets</span><span class="summary-desc">Paginated tracked-wallet records</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum wallet records in the page.</td></tr>
+              <tr><td>offset</td><td>0</td><td>0–1,000,000</td><td>Position in the current wallet list.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>data[].id</td><td>string</td><td>Wallet record ID used by the trades route.</td></tr>
+              <tr><td>data[].address</td><td>string</td><td>Public wallet address.</td></tr>
+              <tr><td>data[].chain</td><td>string</td><td>Chain the wallet is tracked on.</td></tr>
+              <tr><td>data[].name</td><td>string | null</td><td>Display name.</td></tr>
+              <tr><td>data[].tags</td><td>string[]</td><td>Labels such as <code>whale</code>.</td></tr>
+              <tr><td>data[].clan</td><td>string | null</td><td>Clan label when the source provides one.</td></tr>
+              <tr><td>nextOffset</td><td>number | null</td><td>Offset for the next page; <code>null</code> at the end.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/wallets?limit=50&amp;offset=0'
+
+{"data":[{"id":"wallet-id","address":"wallet-address","chain":"sol","name":"Wallet","tags":["whale"],"clan":null}],"nextOffset":50}</pre>
+            <p>Offset pages can shift when the tracked wallet list changes.</p>
+          </div></details>
+
+          <details class="endpoint" id="trades"><summary><span class="method">GET</span><span class="path">/wallets/{id}/trades</span><span class="summary-desc">Time-bounded wallet-watch trades</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>from</td><td>now − 24 h</td><td>epoch ms</td><td>Inclusive start of <code>[from, to)</code>.</td></tr>
+              <tr><td>to</td><td>now</td><td>epoch ms</td><td>Exclusive end; span ≤ 31 days.</td></tr>
+              <tr><td>after_id</td><td>0</td><td>non-negative integer</td><td>Trade ID cursor.</td></tr>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum rows in a page.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>id</td><td>number</td><td>Trade ID and cursor value.</td></tr>
+              <tr><td>walletId</td><td>string</td><td>Owning wallet record.</td></tr>
+              <tr><td>ca</td><td>string</td><td>Token contract address traded.</td></tr>
+              <tr><td>chain</td><td>string</td><td>Chain of the trade.</td></tr>
+              <tr><td>ts</td><td>number</td><td>Trade timestamp, epoch ms.</td></tr>
+              <tr><td>side</td><td>enum</td><td><code>buy</code> or <code>sell</code>.</td></tr>
+              <tr><td>amountUsd</td><td>number</td><td>USD notional of the trade.</td></tr>
+              <tr><td>price</td><td>number | null</td><td>Execution price when known.</td></tr>
+              <tr><td>tx</td><td>string | null</td><td>Transaction identifier.</td></tr>
+              <tr><td>nextId</td><td>number | null</td><td>Pass as the next <code>after_id</code>; <code>null</code> means no further rows.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/wallets/wallet-id/trades?from=1700000000000&amp;to=1700086400000&amp;after_id=0&amp;limit=50'
+
+{
+  "data": [{
+    "id": 17, "walletId": "wallet-id", "ca": "token-address", "chain": "sol",
+    "ts": 1700000000000, "side": "buy", "amountUsd": 250, "price": 0.001, "tx": "transaction-id"
+  }],
+  "nextId": 17
+}</pre>
+            <p>Only stored <code>source=watch</code> trades are returned; trades outside the interval are excluded. Invalid <code>id</code>, range, or pagination returns <code>400</code>.</p>
+            <div class="callout"><strong>Public data:</strong> wallet addresses, profiles, and wallet-watch trades are visible to every caller.</div>
+          </div></details>
+        </section>
+
+        <section class="section" id="fomo">
+          <div class="section-head"><h2>FOMO watch-list &amp; activity</h2><p>Backed by the separate FOMO dashboard instance</p></div>
+          <p class="intro">These routes read the FOMO dashboard instance through a second private export upstream. They return <code>502</code> when that upstream is disabled or unreachable, while the rest of the API keeps working. FOMO token routes also accept <code>eth</code>.</p>
+
+          <details class="endpoint" id="fomo-tokens"><summary><span class="method">GET</span><span class="path">/fomo/tokens</span><span class="summary-desc">FOMO dashboard token table</span></summary><div class="endpoint-body">
+            <p>Returns the FOMO dashboard's tracked tokens. Each entry has the same payload as <a href="#tokens-list">/tokens</a> plus <code>fomoUsers</code> — the rows the dashboard's FOMO sub-table renders. <code>GET /fomo/tokens/{chain}/{address}</code> returns one entry with the same shape and <code>404</code> when the instance does not track it; <code>eth</code> is accepted.</p>
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum token rows in the page.</td></tr>
+              <tr><td>offset</td><td>0</td><td>0–1,000,000</td><td>Position in the FOMO token table.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/tokens?limit=50&amp;offset=0'
+
+{"generatedAt":1700000000000,"data":[{"id":"base:0xtoken","ca":"0xtoken","chain":"base","fomoUsers":[{"handle":"@trader","buyUsd":1250,"sellUsd":400,"buys":3,"sells":1,"trades":4,"lastTs":1700000000000,"balUsd":5000}]}],"nextOffset":null}</pre>
+          </div></details>
+
+          <details class="endpoint" id="fomo-alerts"><summary><span class="method">GET</span><span class="path">/fomo/alerts</span><span class="summary-desc">FOMO-instance alerts, wallets and trades</span></summary><div class="endpoint-body">
+            <p><code>/fomo/alerts</code> mirrors <a href="#alerts">/alerts</a> — same DTO, <code>after_id</code>/<code>limit</code>, <code>nextId</code>, and <code>gap</code> semantics — read from the FOMO instance. <code>/fomo/wallets</code> and <code>/fomo/wallets/{id}/trades</code> mirror <a href="#wallets">/wallets</a> and <a href="#trades">/wallets/{id}/trades</a> against that instance's wallet watch.</p>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/alerts?after_id=0&amp;limit=50'
+curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/wallets?limit=50&amp;offset=0'</pre>
+          </div></details>
+
+          <details class="endpoint" id="fomo-users"><summary><span class="method">GET</span><span class="path">/fomo/users</span><span class="summary-desc">Paginated FOMO watch-list</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Parameter</th><th>Default</th><th>Bounds</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>limit</td><td>50</td><td>1–100</td><td>Maximum watch-list rows in the page.</td></tr>
+              <tr><td>offset</td><td>0</td><td>0–1,000,000</td><td>Position in the current watch-list.</td></tr>
+            </tbody></table>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>data[].id</td><td>string</td><td>Stable FOMO user ID used by the trade and position routes.</td></tr>
+              <tr><td>data[].handle</td><td>string</td><td>FOMO handle matched by the alert stream.</td></tr>
+              <tr><td>data[].name</td><td>string</td><td>Display name; falls back to the handle.</td></tr>
+              <tr><td>data[].tags</td><td>string[]</td><td>Display chips.</td></tr>
+              <tr><td>data[].clan</td><td>string | null</td><td>Clan label when set.</td></tr>
+              <tr><td>data[].userId</td><td>string | null</td><td>Learned FOMO user ID; absent for handle-only rows.</td></tr>
+              <tr><td>data[].walletSolana</td><td>string | null</td><td>Seeded Solana wallet when known.</td></tr>
+              <tr><td>data[].walletEvm</td><td>string | null</td><td>Seeded EVM wallet when known.</td></tr>
+              <tr><td>data[].source</td><td>string</td><td>Row origin (<code>manual</code>, CSV import, and so on).</td></tr>
+              <tr><td>nextOffset</td><td>number | null</td><td>Offset for the next page; <code>null</code> at the end.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/users?limit=50&amp;offset=0'
+
+{"data":[{"id":"fomo-user-id","handle":"@trader","name":"Trader","tags":["clan-a"],"clan":"a","userId":"fomo-user-id","walletSolana":null,"walletEvm":"0x...","source":"manual"}],"nextOffset":null}</pre>
+          </div></details>
+
+          <details class="endpoint" id="fomo-stats"><summary><span class="method">GET</span><span class="path">/fomo/tokens/{chain}/{address}/users</span><span class="summary-desc">Per-token FOMO user stats</span></summary><div class="endpoint-body">
+            <p>Returns the same per-user aggregation the dashboard's FOMO table renders. Chains: <code>sol</code>, <code>base</code>, <code>bsc</code>, <code>robinhood</code>, <code>eth</code>; anything else returns <code>400</code>.</p>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>handle</td><td>string</td><td>FOMO handle.</td></tr>
+              <tr><td>name</td><td>string?</td><td>Omitted when empty.</td></tr>
+              <tr><td>tags</td><td>string[]?</td><td>Omitted when the user has none.</td></tr>
+              <tr><td>clan</td><td>string?</td><td>Omitted when unlabelled.</td></tr>
+              <tr><td>buyUsd</td><td>number | null</td><td>Trailing-24h BUY spend; <code>null</code> when any in-window amount is unresolved.</td></tr>
+              <tr><td>sellUsd</td><td>number | null</td><td>Trailing-24h SELL gross proceeds; same unknown rule. Never netted with buys.</td></tr>
+              <tr><td>buys / sells / trades</td><td>number</td><td>In-window trade counts.</td></tr>
+              <tr><td>lastTs</td><td>number</td><td>Newest trade timestamp; <code>0</code> when membership comes only from a stored position or holding.</td></tr>
+              <tr><td>holdingAmount</td><td>number?</td><td>Omitted until measured.</td></tr>
+              <tr><td>holdingPct</td><td>number?</td><td>Position value ÷ market cap × 100; omitted when either is unknown.</td></tr>
+              <tr><td>balUsd</td><td>number?</td><td>Current position value; omitted when price is unknown.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/tokens/base/0xtoken/users'
+
+{"data":[{"handle":"@trader","name":"Trader","tags":["clan-a"],"clan":"a","buyUsd":1250,"sellUsd":400,"buys":3,"sells":1,"trades":4,"lastTs":1700000000000,"holdingAmount":5000000,"holdingPct":0.5,"balUsd":5000}]}</pre>
+          </div></details>
+
+          <details class="endpoint" id="fomo-trades"><summary><span class="method">GET</span><span class="path">/fomo/users/{id}/trades</span><span class="summary-desc">Time-bounded FOMO buy/sell alerts</span></summary><div class="endpoint-body">
+            <p>Same parameters and pagination as <a href="#trades">wallet trades</a>: <code>from</code>/<code>to</code> default to the last 24 hours, <code>after_id</code> defaults to <code>0</code>, <code>limit</code> defaults to <code>50</code>.</p>
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>id</td><td>number</td><td>Trade ID and cursor value.</td></tr>
+              <tr><td>userId / handle</td><td>string</td><td>Owning FOMO user.</td></tr>
+              <tr><td>eventId</td><td>string</td><td>Idempotency key of the upstream alert.</td></tr>
+              <tr><td>ca / chain</td><td>string</td><td>Token and chain traded.</td></tr>
+              <tr><td>side</td><td>enum</td><td><code>buy</code> or <code>sell</code>.</td></tr>
+              <tr><td>usdValue</td><td>number | null</td><td>Type-dependent: post-fill value for a buy, signed realised PnL for a sell.</td></tr>
+              <tr><td>tradeUsd</td><td>number | null</td><td>USD actually traded — the only field suitable for spend/proceeds sums.</td></tr>
+              <tr><td>price</td><td>number | null</td><td>Execution price when known.</td></tr>
+              <tr><td>token</td><td>string | null</td><td>Token symbol captured with the alert.</td></tr>
+              <tr><td>ts</td><td>number</td><td>Trade timestamp, epoch ms.</td></tr>
+              <tr><td>source</td><td>string</td><td>Ingest source.</td></tr>
+              <tr><td>nextId</td><td>number | null</td><td>Pass as the next <code>after_id</code>; <code>null</code> means no further rows.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/users/fomo-user-id/trades?from=1700000000000&amp;to=1700086400000&amp;after_id=0&amp;limit=50'
+
+{"data":[{"id":17,"userId":"fomo-user-id","handle":"@trader","eventId":"fomo-swap:...","ca":"token-address","chain":"base","side":"buy","usdValue":200,"tradeUsd":100,"price":0.001,"token":"TICKER","ts":1700000000000,"source":"fomo"}],"nextId":17}</pre>
+          </div></details>
+
+          <details class="endpoint" id="fomo-positions"><summary><span class="method">GET</span><span class="path">/fomo/users/{id}/positions</span><span class="summary-desc">Stored positions and balance measurements</span></summary><div class="endpoint-body">
+            <table class="param-table"><thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead><tbody>
+              <tr><td>ca / chain</td><td>string</td><td>Token identity.</td></tr>
+              <tr><td>tradeId / status</td><td>string | null</td><td>Upstream position identifiers.</td></tr>
+              <tr><td>amount</td><td>number | null</td><td>Token units held, from the same call as the cost basis.</td></tr>
+              <tr><td>costBasisUsd</td><td>number | null</td><td>Money actually spent, not the alert's mark-to-market value.</td></tr>
+              <tr><td>avgEntryPrice / priceUsd</td><td>number | null</td><td>Entry and current price as stored.</td></tr>
+              <tr><td>realizedPnlUsd / unrealizedPnlUsd</td><td>number | null</td><td>Stored PnL fields.</td></tr>
+              <tr><td>fetchedAt</td><td>number</td><td>Position fetch time; <code>0</code> for a holdings-only entry.</td></tr>
+              <tr><td>holdings[]</td><td>array</td><td>Measurements for the same user/CA/chain: <code>source</code> (<code>api</code> or <code>rpc</code>), <code>amount</code>, <code>pct</code>, <code>capturedAt</code>, and <code>wallet</code> for RPC rows.</td></tr>
+              <tr><td>freshness.balances</td><td>object | null</td><td>Last FOMO API balance refresh: <code>checkedAt</code>, <code>capturedAt</code>, <code>complete</code>, <code>truncated</code>, <code>available</code>. <code>null</code> when never refreshed.</td></tr>
+              <tr><td>freshness.positions</td><td>object | null</td><td>Last position refresh (<code>checkedAt</code>); <code>null</code> when never refreshed.</td></tr>
+            </tbody></table>
+            <pre>curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/users/fomo-user-id/positions'
+
+{"data":[{"ca":"token-address","chain":"base","tradeId":"trade-id","status":"open","amount":1000,"costBasisUsd":100,"avgEntryPrice":0.1,"priceUsd":0.2,"realizedPnlUsd":0,"unrealizedPnlUsd":100,"fetchedAt":1700000000000,"holdings":[{"source":"rpc","amount":1000,"pct":0.01,"capturedAt":1700000000000,"wallet":"0x..."}]}],"freshness":{"balances":{"checkedAt":1700000000000,"capturedAt":1699999999000,"complete":true,"truncated":false,"available":true},"positions":{"checkedAt":1700000000000}}}</pre>
+            <p>A CA with a measured holding but no stored position appears with <code>null</code> position fields and <code>fetchedAt: 0</code>. Unknown users return an empty <code>data</code> array, not <code>404</code>. <code>freshness</code> reports the last upstream refresh, not the age of individual rows; <code>complete</code>, <code>truncated</code>, and <code>available</code> flag a partial, row-capped, or unreadable balance list.</p>
+            <div class="callout"><strong>Public data:</strong> FOMO handles, trades, positions, and measured holdings are visible to every caller.</div>
+          </div></details>
+        </section>
+
+        <section class="section" id="pagination">
+          <div class="section-head"><h2>Pagination &amp; quotas</h2><p>Shared per service process</p></div>
+          <table class="param-table"><thead><tr><th>Control</th><th>Default</th><th>Bounds</th><th>Used by</th></tr></thead><tbody>
+            <tr><td>limit</td><td>50</td><td>1–100</td><td>Token, wallet, FOMO-token, FOMO-wallet, FOMO-user, trade, and alert lists.</td></tr>
+            <tr><td>offset</td><td>0</td><td>0–1,000,000</td><td><code>/tokens</code>, <code>/wallets</code>, <code>/fomo/tokens</code>, <code>/fomo/wallets</code>, <code>/fomo/users</code>.</td></tr>
+            <tr><td>after_id</td><td>0</td><td>non-negative integer</td><td><code>/alerts</code>, <code>/wallets/{id}/trades</code>, <code>/fomo/alerts</code>, <code>/fomo/wallets/{id}/trades</code>, <code>/fomo/users/{id}/trades</code>.</td></tr>
+            <tr><td>from / to</td><td>last 24 h</td><td>positive span ≤ 31 days</td><td>Token activity, wallet trades, FOMO trades.</td></tr>
+          </tbody></table>
+          <div class="split">
+            <article class="note-card"><h3>HTTP quota</h3><p>120 requests/minute per process, shared by all callers. At most 16 concurrent requests; excess receives <code>503</code>. Identical in-flight export requests share work and successful exports are cached for 500 ms in a bounded cache.</p></article>
+            <article class="note-card"><h3>WebSocket capacity</h3><p>64 connections per process, independent of the HTTP quota. The stream is polled once per process and shared across clients.</p></article>
+          </div>
+          <p class="intro">Quotas and caches are process-local, so the service runs one public replica. Do not assume limits scale with replicas.</p>
+        </section>
+
+        <section class="section" id="errors">
+          <div class="section-head"><h2>Errors &amp; close codes</h2><p>What to retry, what to fix</p></div>
+          <table class="param-table"><thead><tr><th>Status / code</th><th>Cause</th><th>Consumer action</th></tr></thead><tbody>
+            <tr><td>400</td><td>Invalid chain/address, pagination, window, or time range.</td><td>Fix the request; do not retry unchanged.</td></tr>
+            <tr><td>404</td><td>Token has no stored state.</td><td>Treat as unknown token; do not loop.</td></tr>
+            <tr><td>429</td><td>HTTP quota exceeded.</td><td>Wait at least <code>Retry-After</code> seconds, then back off.</td></tr>
+            <tr><td>502</td><td>Private export backend unavailable, unconfigured, or timed out (10 s).</td><td>Retry with backoff; avoid tight loops.</td></tr>
+            <tr><td>503</td><td>Concurrency cap, or WebSocket connection cap at upgrade.</td><td>Retry later; wait before reconnecting the socket.</td></tr>
+            <tr><td>WS 1008</td><td>Client sent a message to a server-to-client stream.</td><td>Stop sending; reconnect only if you need events.</td></tr>
+            <tr><td>WS 1011</td><td>Backend data source unavailable during setup or polling.</td><td>Reconnect with backoff; verify <code>/status</code>.</td></tr>
+            <tr><td>WS 1013</td><td>Consumer too slow (buffered data cap).</td><td>Speed up processing, reconnect, catch up via REST.</td></tr>
+          </tbody></table>
+          <pre>{"error":"invalid pagination"}
+{"error":"data source unavailable"}
+{"error":"rate limit exceeded"}</pre>
+          <p class="intro">Network or proxy failures may not return JSON. A successful <code>/status</code> does not guarantee every data route is ready.</p>
+        </section>
+
+        <section class="section" id="browser">
+          <div class="section-head"><h2>Browser access</h2><p>REST CORS is disabled</p></div>
+          <p class="intro">REST responses carry no <code>Access-Control-Allow-Origin</code>, so a page on another origin cannot call these endpoints with browser <code>fetch</code>. Verified against the deployed endpoint.</p>
+          <table class="param-table"><thead><tr><th>Pattern</th><th>How</th><th>Limits</th></tr></thead><tbody>
+            <tr><td>Same-origin page</td><td>Serve the page from <code>signal-scan.duckdns.org</code> and use relative URLs such as <code>/api/v1/alerts</code>.</td><td>Requires hosting on this origin.</td></tr>
+            <tr><td>Your backend</td><td>Call the public API server-side and expose only the fields your frontend needs.</td><td>Do not add an unrestricted CORS proxy.</td></tr>
+            <tr><td>Live WebSocket</td><td>Any origin may connect to the public WSS stream.</td><td>REST catch-up after reconnect stays server-side unless same-origin.</td></tr>
+          </tbody></table>
+          <p class="intro"><code>curl</code>, Node.js, and other server-side HTTP clients are not subject to browser CORS.</p>
+        </section>
+
+        <section class="section" id="privacy">
+          <div class="section-head"><h2>Data exposure</h2><p>Know what is public</p></div>
+          <div class="callout"><strong>There is no caller identity.</strong> This is a read-only export, not the authenticated dashboard API. It intentionally omits tracked-buyer details and internal dashboard notes. Wallet addresses, wallet profiles, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO-instance tokens, FOMO-instance alerts, FOMO-instance wallets, measured holdings, and top-100 holder records are public to every caller.</div>
+          <table class="param-table"><thead><tr><th>Exposed</th><th>Not exposed</th></tr></thead><tbody>
+            <tr><td>Token snapshots, holder tables, alert history, wallet records, wallet-watch trades, FOMO users/trades/positions, FOMO-instance tokens/alerts/wallets.</td><td>Buyer identities, dashboard writes, login, internal notes.</td></tr>
+            <tr><td>Public on-chain addresses and entity labels from the source.</td><td><code>PUBLIC_API_EXPORT_TOKEN</code> or any backend credential — never send it to these routes.</td></tr>
+          </tbody></table>
+          <p class="intro">Only retained, stored data is returned. Historical backfill is not performed, and pruned alerts cannot be recovered.</p>
+        </section>
+      </main>
+    </div>
+    <footer class="footer"><span>Signal Scan · Public API v1</span><span><a href="/feature-history.html">Feature &amp; release history ↗</a> · <a href="https://signal-scan.duckdns.org/api/v1/status">Live status ↗</a></span></footer>
+  </div>
+  <script>
+    document.querySelectorAll('pre').forEach((pre) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'codewrap';
+      pre.parentNode.insertBefore(wrap, pre);
+      wrap.appendChild(pre);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy';
+      button.textContent = 'Copy';
+      button.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(pre.textContent);
+          button.textContent = 'Copied';
+        } catch {
+          button.textContent = 'Select manually';
+        }
+        setTimeout(() => { button.textContent = 'Copy'; }, 1600);
+      });
+      wrap.insertBefore(button, pre);
+    });
+    document.querySelectorAll('table.param-table').forEach((table) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'tablewrap';
+      table.parentNode.insertBefore(wrap, table);
+      wrap.appendChild(table);
+    });
+    const openHashTarget = () => {
+      const id = decodeURIComponent(location.hash.slice(1));
+      const target = id ? document.getElementById(id) : null;
+      if (!target) return;
+      if (target.tagName === 'DETAILS') target.open = true;
+      // Timers (not rAF) so background tabs still land on the target after layout.
+      setTimeout(() => {
+        const root = document.documentElement;
+        const previous = root.style.scrollBehavior;
+        root.style.scrollBehavior = 'auto';
+        window.scrollTo(0, Math.max(0, target.getBoundingClientRect().top + window.scrollY - 16));
+        root.style.scrollBehavior = previous;
+      }, 0);
+    };
+    if (location.hash) openHashTarget();
+    addEventListener('hashchange', openHashTarget);
+    document.querySelectorAll('a[href^="#"]').forEach((link) => {
+      link.addEventListener('click', (event) => {
+        const id = link.getAttribute('href').slice(1);
+        if (!document.getElementById(id)) return;
+        event.preventDefault();
+        history.replaceState(null, '', '#' + id);
+        openHashTarget();
+      });
+    });
+  </script>
+</body>
+</html>

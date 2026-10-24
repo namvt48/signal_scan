@@ -1,5 +1,6 @@
-export const CHAINS = ['sol', 'base', 'bsc', 'robinhood'] as const;
+export const CHAINS = ['sol', 'base', 'bsc', 'robinhood', 'eth'] as const;
 export type Chain = (typeof CHAINS)[number];
+// Wallet-group import networks; `eth` is a supported FOMO chain but is not auto-added to a group.
 export const EVM_CHAINS = ['base', 'bsc', 'robinhood'] as const satisfies readonly Chain[];
 export type WalletScope = Chain | 'evm';
 

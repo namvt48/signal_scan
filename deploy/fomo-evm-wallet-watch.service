@@ -1,5 +1,5 @@
 [Unit]
-Description=FOMO EVM wallet trade watcher (Base, BSC, Robinhood)
+Description=FOMO EVM wallet trade watcher (Base, BSC, Robinhood, Ethereum)
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -8,11 +8,22 @@ Type=simple
 User=root
 WorkingDirectory=/opt/fomo-wallet-watch
 EnvironmentFile=/opt/fomo-watch/fomo.env
-EnvironmentFile=-/root/signal-scan-monitor/alchemy-rpc.env
 Environment=WATCH_HOME=/opt/fomo-wallet-watch/data
 Environment=MONITOR_HEARTBEAT_PATH=/root/signal-scan-monitor/heartbeats/fomo-evm-wallet
-Environment=EVM_RPC_MIN_INTERVAL_SECONDS=0.5
-ExecStart=/opt/wallet-watch/venv/bin/python -m watchers.evm --chains base,bsc,robinhood --feed hybrid --no-min-usd-gate --api-url http://127.0.0.1:8125 --confirmations 8 --chunk 500 --poll-sleep 3
+Environment=BASE_RPC_URL=https://base.drpc.org,https://base-mainnet.public.blastapi.io,https://mainnet.base.org
+Environment=BSC_RPC_URL=https://bsc-rpc.publicnode.com,https://bsc-dataseed1.binance.org
+Environment=ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+Environment=ETH_RPC_URL=https://rpc.mevblocker.io,https://rpc.flashbots.net,https://ethereum-rpc.publicnode.com
+Environment=EVM_RPC_MIN_INTERVAL_SECONDS=0.3
+Environment=EVM_CHUNK_CAPS=base=20
+Environment=EVM_CONFIRMATIONS_ETH=4
+Environment=EVM_MAX_TX_BLOCKS=16
+Environment=EVM_MAX_STARTUP_BACKFILL_SECONDS=900
+Environment=EVM_WSS_DISABLED_CHAINS=base,bsc,eth
+Environment=EVM_TRACE_DISABLED_CHAINS=base,bsc,robinhood,eth
+Environment=EVM_LOGS_DISABLED_CHAINS=bsc
+Environment=EVM_TX_SCAN_DISABLED_CHAINS=robinhood
+ExecStart=/opt/wallet-watch/venv/bin/python -m watchers.evm --chains base,bsc,robinhood,eth --feed hybrid --no-min-usd-gate --api-url http://127.0.0.1:8125 --confirmations 8 --chunk 500 --poll-sleep 3
 Restart=always
 RestartSec=5
 

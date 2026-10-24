@@ -70,7 +70,7 @@ def refresh_cfg(per):
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="EVM wallet swap watcher — Base, BSC and Robinhood"
+        description="EVM wallet swap watcher — Base, BSC, Robinhood and Ethereum"
     )
     ap.add_argument("--wallets", default=os.path.join(HERE, "wallets.txt"))
     ap.add_argument(
@@ -87,7 +87,7 @@ def main() -> None:
     ap.add_argument(
         "--chains",
         default=",".join(cl.DEFAULT_EVM_CHAINS),
-        help="comma-separated chain list (default: base,bsc; FOMO: base,bsc,robinhood)",
+        help="comma-separated chain list (default: base,bsc; FOMO: base,bsc,robinhood,eth)",
     )
     ap.add_argument("--min-usd", type=float, default=0.5)
     ap.add_argument(

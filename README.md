@@ -82,7 +82,7 @@ Components never touch localStorage directly; they only call `dataStore` from `s
 
 Configure a random `PUBLIC_API_EXPORT_TOKEN` in the backend's `server/.env` and the same value in `server/public-api.env` (copied from `server/public-api.env.example`). This credential is private between the public API service and the backend; external clients do not use or receive it. Keep both files secret.
 
-`PUBLIC_API_INTERNAL_URL` selects the private dashboard API (Compose defaults to instance A); `PUBLIC_API_PORT` defaults to `3010`. External callers do not need an API key or Bearer token.
+`PUBLIC_API_INTERNAL_URL` selects the private dashboard API (Compose defaults to instance A); `PUBLIC_API_FOMO_INTERNAL_URL` in `server/public-api.env` selects the FOMO dashboard (the example sets instance B) for `/api/v1/fomo/*`. Set the same `PUBLIC_API_EXPORT_TOKEN` in the FOMO instance's `server/.env`; leaving the FOMO URL empty returns `502` on FOMO routes only. `PUBLIC_API_PORT` defaults to `3010`. External callers do not need an API key or Bearer token.
 
 Generate the internal credential with `openssl rand -hex 32`.
 
@@ -97,11 +97,18 @@ make public-api-up            # re-enable without restarting the dashboard
 ```
 
 The service binds `127.0.0.1:3010`; instance A's Nginx routes `/api/v1/` over the private Docker network and the existing HTTPS domain. First deployment rebuilds/recreates the backend and web proxy to install the private export route. Later `public-api-down` only stops the standalone service, so dashboard API/login remains active while public API requests return `502` until the service starts again.
-Endpoints: `GET /api/v1/tokens`, `/tokens/{chain}/{address}`, token `/market`, `/metrics`, `/history`, `/detail`, `/balance-chart`, `/activity`, `/api/v1/alerts`, `/api/v1/wallets`, `/wallets/{id}/trades`, `/api/v1/chains`, `/api/v1/tiers`, `/api/v1/status`. All endpoints are unauthenticated. There are no FOMO endpoints or FOMO fields in export DTOs. Alerts report retention gaps because the internal feed may prune acknowledged rows. Token and wallet lists use offset pagination; trades and alerts use IDs. The service applies one shared per-process limit of 120 requests per minute and a 16-request concurrency cap.
+Endpoints: `GET /api/v1/tokens`, `/tokens/{chain}/{address}`, token `/market`, `/metrics`, `/history`, `/detail`, `/balance-chart`, `/activity`, `/api/v1/alerts`, `/api/v1/wallets`, `/wallets/{id}/trades`, `/api/v1/fomo/tokens`, `/fomo/tokens/{chain}/{address}`, `/fomo/tokens/{chain}/{address}/users`, `/fomo/alerts`, `/fomo/users`, `/fomo/users/{id}/trades`, `/fomo/users/{id}/positions`, `/fomo/wallets`, `/fomo/wallets/{id}/trades`, `/api/v1/chains`, `/api/v1/tiers`, `/api/v1/status`, plus WebSocket streams at `/api/v1/ws` and `/api/v1/fomo/ws`. All endpoints are unauthenticated. Alerts report retention gaps because the internal feed may prune acknowledged rows. Token, wallet, FOMO-token, FOMO-wallet, and FOMO-user lists use offset pagination; trades and alerts use IDs. The service applies one shared per-process limit of 120 requests per minute and a 16-request concurrency cap.
 
-This service exposes wallet addresses and wallet-watch trades publicly. It uses the existing HTTPS proxy and binds its container port to loopback by default. Historical data is limited to what the existing backend stores; no historical backfill is performed.
+This service exposes wallet addresses, wallet-watch trades, FOMO users, FOMO tokens, FOMO alerts, FOMO wallets, FOMO trades, positions, and measured holdings publicly. It uses the existing HTTPS proxy and binds its container port to loopback by default. Historical data is limited to what the existing backend stores; no historical backfill is performed.
 
 See [`docs/public-api.md`](docs/public-api.md) for endpoint parameters, response schemas, pagination and error handling.
+
+Browsable pages are served by the same web container:
+
+- <https://signal-scan.duckdns.org/api-docs.html> — endpoint reference.
+- <https://signal-scan.duckdns.org/feature-history.html> — public API feature milestones (commit dates; the repo has no formal release tags).
+
+Their sources are `public/api-docs.html`, `public/feature-history.html`, and `public/docs.css`. Publish them with `make docs-deploy` (instance A only; rebuilds/recreates `web` only, leaving `api` and `public-api` untouched).
 
 ## Tunables
 
@@ -193,4 +200,5 @@ See [`docs/public-api.md`](docs/public-api.md) for endpoint parameters, response
 
 - `docs/framework01-spec.md` - signal table column spec
 - `docs/public-api.md` - standalone read-only Public API v1 reference
+- `public/api-docs.html`, `public/feature-history.html` - browsable API reference and feature milestones
 - `docs/alpha-engine-brief.md` - data science engine that will feed the dashboard later

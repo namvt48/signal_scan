@@ -8,8 +8,11 @@ import json
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
@@ -154,9 +157,11 @@ class FakeEvm:
 def _isolate(monkeypatch, tmp_path):
     """Cache module sạch + state/heartbeat trỏ tmp + sleep/price stub (offline)."""
     feed._seen_tx.clear()
+    feed._startup_checked.clear()
     feed._decimals.clear()
     feed._block_ts.clear()
     feed._tracked.clear()
+    feed._trace_defer_logged.clear()
     feed.rpc_health_reset()
     monkeypatch.setattr(st_mod, "STATE_PATH", str(tmp_path / "evm_state.json"))
     monkeypatch.setattr(st_mod, "HEARTBEAT", str(tmp_path / "hb_evm"))
@@ -301,6 +306,28 @@ def test_rpc_falls_back_to_public_endpoint_after_primary_failures(monkeypatch):
     assert calls == ["https://alchemy.example/base", feed.DEFAULT_RPC["base"]]
 
 
+def test_http_range_error_carries_endpoint_identity():
+    url = "https://alchemy.example/robinhood"
+    body = BytesIO(
+        json.dumps(
+            {
+                "error": {
+                    "code": -32600,
+                    "message": (
+                        "Under the Free tier plan, you can make eth_getLogs "
+                        "requests with up to a 10 block range."
+                    ),
+                }
+            }
+        ).encode()
+    )
+    exc = HTTPError(url, 400, "Bad Request", {}, body)
+    with pytest.raises(feed.rpc._PermanentRpcError) as info:
+        feed.rpc._handle_http_error(url, "eth_getLogs", exc)
+    assert info.value.endpoint_key == feed.rpc.endpoint_key(url)
+    assert "10 block range" in str(info.value)
+
+
 def test_mask_redacts_path_tokens_and_query_credentials():
     path_url = "https://base-mainnet.g.alchemy.com/v2/sensitive"
     query_url = "https://rpc.example/rpc?api-key=sensitive"
@@ -367,6 +394,53 @@ def test_backfill_confirmation_gate(monkeypatch, trades):
     assert all(b <= 1000 for _, a, b in fake.getlogs_calls)
 
 
+def test_startup_skips_large_backlog(monkeypatch, trades):
+    fake = FakeEvm(latest=1000, logs=[])
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
+    st = {
+        "evm": {
+            "base": {
+                "last_block": 1,
+                "last_tx_block": 1,
+                "updated_at": time.time() - 3600,
+            }
+        }
+    }
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    base = st["evm"]["base"]
+    assert base["last_block"] == 1000
+    assert base["last_tx_block"] == 1000
+    assert fake.getlogs_calls == []
+
+
+def test_startup_replays_small_backlog(monkeypatch, trades):
+    fake = FakeEvm(latest=1000, logs=[])
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
+    st = {
+        "evm": {
+            "base": {
+                "last_block": 900,
+                "last_tx_block": 900,
+                "updated_at": time.time() - 10,
+            }
+        }
+    }
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    assert st["evm"]["base"]["last_block"] == 1000
+    assert fake.getlogs_calls
+
+
+def test_startup_without_timestamp_still_backfills(monkeypatch, trades):
+    fake = FakeEvm(latest=1000, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 1}}}
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    assert st["evm"]["base"]["last_block"] == 1000
+    assert fake.getlogs_calls
+
+
 def test_backfill_chunk_halving_on_range_error(monkeypatch, trades):
     fake = FakeEvm(latest=1000, logs=[], max_span=100)  # provider chỉ nhận chunk ≤100
     use_fake(monkeypatch, fake)
@@ -380,7 +454,181 @@ def test_backfill_chunk_halving_on_range_error(monkeypatch, trades):
     for (a1, b1), (a2, _) in zip(ok, ok[1:]):
         assert a2 == b1 + 1  # …không hở khúc nào (R1)
 
-def test_backfill_halves_when_provider_requires_contract_address(monkeypatch, trades):
+
+def test_backfill_recovers_chunk_span_after_successes(monkeypatch, trades):
+    """Range hẹp do lỗi tạm thời không được kẹt vĩnh viễn: span phải nới lại."""
+    fake = FakeEvm(latest=1000, logs=[])
+    use_fake(monkeypatch, fake)
+    monkeypatch.setattr(feed, "CHUNK_RECOVER_AFTER", 2)
+    endpoint_id = feed.rpc.endpoint_key(feed.rpc_url("base"))
+    st = {
+        "evm": {
+            "base": {
+                "last_block": 1,
+                "chunk_span": 5,
+                "chunk_ok": 2,
+                "chunk_endpoint_id": endpoint_id,
+            }
+        }
+    }
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500, "max_chunks": 16})
+    assert st["evm"]["base"]["chunk_span"] == 10
+    assert {b - a + 1 for _, a, b in fake.getlogs_calls} == {10}
+
+    # Lần kế tiếp: đủ successes ⇒ nới tiếp 10 → 20
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500, "max_chunks": 16})
+    assert st["evm"]["base"]["chunk_span"] == 20
+
+
+def test_backfill_honors_provider_block_range_cap(monkeypatch, trades):
+    """Alchemy free tier cap 10 block: halve về đúng cap và không nới quá cap."""
+    fake = FakeEvm(
+        latest=1000,
+        logs=[],
+        max_span=10,
+        range_error_message=(
+            "Under the Free tier plan, you can make eth_getLogs requests "
+            "with up to a 10 block range."
+        ),
+    )
+    use_fake(monkeypatch, fake)
+    monkeypatch.setattr(feed, "CHUNK_RECOVER_AFTER", 2)
+    endpoint_key = feed.rpc.endpoint_key(feed.rpc_url("base"))
+    st = {"evm": {"base": {"last_block": 1}}}
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    base = st["evm"]["base"]
+    assert base["chunk_span"] == 10
+    assert base["chunk_caps"] == {endpoint_key: 10}
+    assert base["last_block"] == 1000
+    widths = [b - a + 1 for _, a, b in fake.getlogs_calls[1:]]
+    assert max(widths) == 10 and min(widths) >= 1
+
+    st2 = {
+        "evm": {
+            "base": {
+                "last_block": 1,
+                "chunk_span": 10,
+                "chunk_caps": {endpoint_key: 10},
+                "chunk_ok": 99,
+            }
+        }
+    }
+    feed.backfill("base", [WALLET], st2, {"conf": 1, "span": 500})
+    assert st2["evm"]["base"]["chunk_span"] == 10
+
+
+def test_fallback_range_cap_does_not_poison_active_span(monkeypatch):
+    """Public 429 → Alchemy cap 10: cap thuộc Alchemy, không ghi đè span public."""
+    primary = "https://public.example/robinhood"
+    fallback = "https://alchemy.example/robinhood"
+    monkeypatch.setenv("ROBINHOOD_RPC_URL", f"{primary},{fallback}")
+    monkeypatch.setenv("EVM_TX_SCAN_DISABLED_CHAINS", "robinhood")
+    monkeypatch.setattr(feed, "CHUNK_RECOVER_AFTER", 2)
+    recovered = {"value": False}
+    calls: list[tuple[str, int, int]] = []
+
+    def fake(url, payload=None, timeout=20, headers=None):
+        assert payload is not None
+        method = payload["method"]
+        if method == "eth_blockNumber":
+            return {"jsonrpc": "2.0", "id": 1, "result": hex(1000)}
+        assert method == "eth_getLogs"
+        query = payload["params"][0]
+        calls.append((url, int(query["fromBlock"], 16), int(query["toBlock"], 16)))
+        if url == primary and not recovered["value"]:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 429, "message": "Too Many Requests"},
+            }
+        if url == primary:
+            return {"jsonrpc": "2.0", "id": 1, "result": []}
+        if url == fallback:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32600,
+                    "message": (
+                        "Under the Free tier plan, you can make eth_getLogs "
+                        "requests with up to a 10 block range."
+                    ),
+                },
+            }
+        raise OSError("public endpoint unavailable")
+
+    monkeypatch.setattr(config, "http_json", fake)
+    primary_key = feed.rpc.endpoint_key(primary)
+    fallback_key = feed.rpc.endpoint_key(fallback)
+    st = {
+        "evm": {
+            "robinhood": {
+                "last_block": 1,
+                "chunk_span": 500,
+                "chunk_endpoint_id": primary_key,
+            }
+        }
+    }
+    with pytest.raises(RuntimeError):
+        feed.backfill("robinhood", [WALLET], st, {"conf": 1, "span": 500})
+    base = st["evm"]["robinhood"]
+    assert base["chunk_span"] == 500
+    assert base["chunk_caps"] == {fallback_key: 10}
+
+    recovered["value"] = True
+    feed.rpc_health_reset()
+    feed.backfill("robinhood", [WALLET], st, {"conf": 1, "span": 500})
+    assert base["last_block"] == 1000
+    assert base["chunk_span"] == 500
+    assert any(
+        url == primary and b - a + 1 == 500 for url, a, b in calls
+    )
+
+
+def test_chain_chunk_cap_override(monkeypatch, trades):
+    monkeypatch.setenv("EVM_CHUNK_CAPS", "base=10, bsc=50")
+    assert feed._chain_chunk_cap("base") == 10
+    assert feed._chain_chunk_cap("bsc") == 50
+    assert feed._chain_chunk_cap("robinhood") is None
+
+    fake = FakeEvm(latest=25, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 1, "chunk_span": 500}}}
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    assert st["evm"]["base"]["last_block"] == 25
+    assert st["evm"]["base"]["chunk_span"] == 10
+
+
+def test_backfill_does_not_halve_on_rate_limit(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=1000,
+        logs=[],
+        max_span=1,
+        range_error_message="HTTP 429: Too Many Requests",
+    )
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 1, "chunk_span": 5}}}
+    with pytest.raises(RuntimeError):
+        feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    assert st["evm"]["base"]["chunk_span"] == 5
+    assert st["evm"]["base"]["last_block"] == 1
+
+def test_backfill_does_not_halve_on_request_limit(monkeypatch, trades):
+    fake = FakeEvm(
+        latest=1000,
+        logs=[],
+        max_span=1,
+        range_error_message="request limit reached",
+    )
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 1, "chunk_span": 5}}}
+    with pytest.raises(RuntimeError):
+        feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    assert st["evm"]["base"]["chunk_span"] == 5
+    assert st["evm"]["base"]["last_block"] == 1
+
+
+def test_address_less_logs_do_not_halve_or_advance(monkeypatch, trades):
     fake = FakeEvm(
         latest=20,
         max_span=1,
@@ -389,16 +637,10 @@ def test_backfill_halves_when_provider_requires_contract_address(monkeypatch, tr
     use_fake(monkeypatch, fake)
     monkeypatch.setenv("BSC_RPC_URL", "https://bsc-rpc.publicnode.com")
     st = {"evm": {"bsc": {"last_block": 1}}}
-    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
-    assert st["evm"]["bsc"]["last_block"] == 20
-    assert fake.range_errors == 4  # both topics rejected across two halved ranges
-    successful = [(a, b) for chain, a, b in fake.getlogs_calls if chain == "bsc" and a == b]
-    assert successful == [(block, block) for block in range(2, 21) for _ in range(2)]
-    first_range_errors = fake.range_errors
-    fake.latest = 22
-    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
-    assert st["evm"]["bsc"]["last_block"] == 22
-    assert fake.range_errors == first_range_errors
+    with pytest.raises(RuntimeError, match="authorization/permission"):
+        feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["bsc"]["last_block"] == 1
+    assert fake.range_errors == 1
 
 
 def test_address_required_logs_error_skips_retries(monkeypatch):
@@ -408,7 +650,7 @@ def test_address_required_logs_error_skips_retries(monkeypatch):
         range_error_message="Please specify an address in your request",
     )
     use_fake(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match="Please specify an address"):
+    with pytest.raises(RuntimeError, match="authorization/permission"):
         feed.get_logs("bsc", 2, 3, feed.cl.sub_topics([WALLET])[0])
     assert fake.range_errors == 1
 
@@ -460,11 +702,33 @@ def test_bsc_fetches_transfer_directions_concurrently(monkeypatch, trades):
     assert fake.getlogs_calls == [("bsc", 10, 10)] * 2
 
 
+def test_disabled_logs_chain_uses_full_block_without_getlogs(monkeypatch, trades):
+    fake = FakeEvm(latest=10)
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("EVM_LOGS_DISABLED_CHAINS", "bsc")
+    st = {"evm": {"bsc": {"last_block": 1, "last_tx_block": 9}}}
+    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert fake.getlogs_calls == []
+    assert fake.block_calls == [10]
+    assert st["evm"]["bsc"]["last_block"] == 10
+    assert st["evm"]["bsc"]["last_tx_block"] == 10
+
+
+def test_disabled_tx_scan_chain_advances_without_block_calls(monkeypatch):
+    fake = FakeEvm(latest=10)
+    use_fake(monkeypatch, fake)
+    monkeypatch.setenv("EVM_TX_SCAN_DISABLED_CHAINS", "robinhood")
+    st = {"evm": {"robinhood": {"last_block": 9, "last_tx_block": 5}}}
+    feed.backfill("robinhood", [WALLET], st, {"conf": 1, "span": 4})
+    assert fake.block_calls == []
+    assert st["evm"]["robinhood"]["last_tx_block"] == 10
+
+
 def test_poll_feed_bounds_backfill_for_each_chain(monkeypatch, trades):
     fake = FakeEvm(
         latest=100,
         max_span=1,
-        range_error_message="Please specify an address in your request",
+        range_error_message="block range exceeds limit",
     )
     use_fake(monkeypatch, fake)
     monkeypatch.setenv("BSC_RPC_URL", "https://bsc-rpc.publicnode.com")
@@ -486,6 +750,109 @@ def test_poll_feed_bounds_backfill_for_each_chain(monkeypatch, trades):
             if name == chain and start == end
         }
         assert successful == {2, 3}
+
+
+def test_backfill_parses_1rpc_block_range_cap(monkeypatch, trades):
+    """1rpc: 'limited to 0 - 50 blocks range' phải lưu cap, không halve mù."""
+    fake = FakeEvm(
+        latest=1000,
+        logs=[],
+        max_span=50,
+        range_error_message="eth_getLogs is limited to 0 - 50 blocks range",
+    )
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 1}}}
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
+    base = st["evm"]["base"]
+    endpoint_key = feed.rpc.endpoint_key(feed.rpc_url("base"))
+    assert base["chunk_span"] == 50
+    assert base["chunk_caps"] == {endpoint_key: 50}
+    assert base["last_block"] == 1000
+
+
+def test_backfill_tx_scan_limit_from_env(monkeypatch, trades):
+    monkeypatch.setenv("EVM_LOGS_DISABLED_CHAINS", "bsc")
+    monkeypatch.setenv("EVM_MAX_TX_BLOCKS", "16")
+    monkeypatch.delenv("BSC_TRACE_INDEX_RPC_URL", raising=False)
+    fake = FakeEvm(latest=100, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"bsc": {"last_block": 100, "last_tx_block": 0}}}
+    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["bsc"]["last_tx_block"] == 16
+    assert fake.block_calls == list(range(1, 17))
+
+
+def test_backfill_tx_scan_limit_per_chain_overrides_global(monkeypatch, trades):
+    monkeypatch.setenv("EVM_MAX_TX_BLOCKS", "16")
+    monkeypatch.setenv("EVM_MAX_TX_BLOCKS_BASE", "4")
+    fake = FakeEvm(latest=100, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"base": {"last_block": 100, "last_tx_block": 0}}}
+    feed.backfill("base", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["base"]["last_tx_block"] == 4
+    assert fake.block_calls == [1, 2, 3, 4]
+
+
+def test_backfill_tx_scan_limit_defaults_to_four(monkeypatch, trades):
+    monkeypatch.setenv("EVM_LOGS_DISABLED_CHAINS", "bsc")
+    monkeypatch.delenv("EVM_MAX_TX_BLOCKS", raising=False)
+    monkeypatch.delenv("BSC_TRACE_INDEX_RPC_URL", raising=False)
+    fake = FakeEvm(latest=100, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"bsc": {"last_block": 100, "last_tx_block": 0}}}
+    feed.backfill("bsc", [WALLET], st, {"conf": 1, "span": 4})
+    assert st["evm"]["bsc"]["last_tx_block"] == 4
+    assert fake.block_calls == [1, 2, 3, 4]
+
+
+def test_reconcile_delay_keeps_tx_scan_continuous(monkeypatch):
+    monkeypatch.setenv("EVM_LOGS_DISABLED_CHAINS", "bsc")
+    monkeypatch.setenv("EVM_TX_SCAN_DISABLED_CHAINS", "robinhood")
+    assert feed._reconcile_delay("bsc", True, {}) == 0.5
+    assert feed._reconcile_delay("bsc", False, {}) == 0.5
+    assert feed._reconcile_delay("base", True, {}) == 30.0
+    assert feed._reconcile_delay("base", False, {}) == 0.5
+
+
+def test_trace_rpc_disabled_never_hits_network(monkeypatch):
+    monkeypatch.setenv("EVM_TRACE_DISABLED_CHAINS", "base")
+    monkeypatch.setattr(
+        feed.rpc, "call", lambda *args, **kwargs: pytest.fail("unexpected trace RPC")
+    )
+    with pytest.raises(feed.TraceMethodUnavailable):
+        feed.trace_rpc("base", "debug_traceTransaction", ["0x"])
+    assert feed.trace_filter_candidates("base", 1, 2, {WALLET}) == {}
+
+
+def test_trace_disabled_defers_pending_without_archiving(monkeypatch, tmp_path):
+    monkeypatch.setenv("EVM_TRACE_DISABLED_CHAINS", "base")
+    store = Journal(str(tmp_path / "trace-defer.sqlite"))
+    feed.configure_journal(store)
+    try:
+        store.enqueue_candidate("base", TX, 10, "hash")
+
+        def unavailable(*args, **kwargs):
+            raise feed.RpcFeedError("trace unavailable", "trace", 0)
+
+        monkeypatch.setattr(feed, "process_tx", unavailable)
+        feed._drain_candidates("base", {WALLET}, confirmed_through=20)
+        now = time.time()
+        assert store.pending_candidates("base", now=now) == []
+        due = store.pending_candidates("base", now=now + 3700)
+        assert [item["tx"] for item in due] == [TX]
+        assert due[0]["attempts"] == 0
+
+        # Trace provider available again: candidate vẫn còn pending và xử lý được.
+        monkeypatch.delenv("EVM_TRACE_DISABLED_CHAINS")
+        store.defer_candidate(
+            "base", TX, 10, "hash", 0, increment_attempts=False
+        )
+        monkeypatch.setattr(feed, "process_tx", lambda *args, **kwargs: [])
+        feed._drain_candidates("base", {WALLET}, confirmed_through=20)
+        assert store.pending_candidates("base", now=time.time() + 1) == []
+    finally:
+        feed.configure_journal(None)
+        store.close()
 
 
 def test_backfill_cold_start_at_tip(monkeypatch, trades):
@@ -720,6 +1087,18 @@ def test_robinhood_rpc_defaults_and_explicit_wss(monkeypatch):
     assert feed.wss_url("robinhood") == "wss://rpc.example/rh"
 
 
+def test_wss_disabled_forces_poll_for_all_chains(monkeypatch):
+    monkeypatch.setenv("EVM_WSS_DISABLED_CHAINS", "base,bsc")
+    for name in ("BASE_WSS_URL", "BSC_WSS_URL", "ROBINHOOD_WSS_URL"):
+        monkeypatch.delenv(name, raising=False)
+    assert feed.wss_urls("base") == []
+    assert feed.wss_urls("bsc") == []
+    per = {chain: [WALLET] for chain in ("base", "bsc", "robinhood")}
+    ws_chains, poll_chains = feed.hybrid_feed_plan(per)
+    assert ws_chains == {}
+    assert set(poll_chains) == {"base", "bsc", "robinhood"}
+
+
 def test_hybrid_feed_plan_uses_ws_and_polls_missing_chain(monkeypatch):
     for name in (
         "BASE_RPC_URL",
@@ -840,6 +1219,50 @@ def test_ws_processing_error_keeps_uncommitted_log(monkeypatch):
         )
     assert pending == {(TX, "0x1"): log}
 
+
+
+def test_eth_rpc_defaults_and_confirmation_override(monkeypatch, trades):
+    assert feed.rpc_url("eth") == "https://ethereum-rpc.publicnode.com"
+    monkeypatch.setenv("ETH_RPC_URL", "https://rpc.example/eth")
+    assert feed.rpc_url("eth") == "https://rpc.example/eth"
+    monkeypatch.setenv("EVM_CONFIRMATIONS_ETH", "4")
+    assert feed._chain_confirmations("eth", {"conf": 8}) == 4
+    assert feed._chain_confirmations("base", {"conf": 8}) == 8
+
+    fake = FakeEvm(latest=100, logs=[])
+    use_fake(monkeypatch, fake)
+    st = {"evm": {"eth": {"last_block": 50}}}
+    feed.backfill("eth", [WALLET], st, {"conf": 8, "span": 4})
+    assert st["evm"]["eth"]["last_block"] == 97
+
+
+def test_eth_wss_disabled_keeps_eth_on_poll(monkeypatch):
+    monkeypatch.setenv("EVM_WSS_DISABLED_CHAINS", "base,bsc,eth")
+    assert feed.wss_urls("eth") == []
+    ws_chains, poll_chains = feed.hybrid_feed_plan({"eth": [WALLET]})
+    assert ws_chains == {}
+    assert poll_chains == {"eth": [WALLET]}
+
+
+def test_rpc_permanent_range_error_fails_over_to_next_endpoint(monkeypatch):
+    primary = "https://rpc.primary"
+    secondary = "https://rpc.secondary"
+    monkeypatch.setenv("BASE_RPC_URL", f"{primary},{secondary}")
+    calls = []
+
+    def fake(url, payload=None, timeout=20, headers=None):
+        calls.append(url)
+        if url == primary:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32602, "message": "exceed maximum block range: 500"},
+            }
+        return {"jsonrpc": "2.0", "id": 1, "result": []}
+
+    monkeypatch.setattr(config, "http_json", fake)
+    assert feed.get_logs("base", 10, 10, []) == []
+    assert calls == [primary, secondary]
 
 
 def test_bsc_publicnode_http_default_and_override(monkeypatch):

@@ -32,8 +32,11 @@ accessor.
 
 ## 0. Coverage limit - read this before trusting any number
 
-The polling watcher sees the user's latest 100 swaps per cycle, not a complete
-history. Swaps older than the first page after an outage are dropped, so the `FOMO by`
+The polling watcher keeps a per-user wall-clock window that starts at the previous
+successful poll (the deploy time on the first run, or first sight for a user added
+later). A poll pages back only to that bound, so an inactive user costs one page and
+history is never replayed. Every fill in the window is emitted by the same walk. Fills older
+than the window are not fetched, so the `FOMO by`
 column is inherently a partial view. FOMO's own documentation says, and this repo repeats it in
 the column tooltip:
 
@@ -175,19 +178,31 @@ Solana alerts are dropped by the daemon before any ingest POST. The FOMO instanc
 rejects Solana events and CA/wallet writes at the API boundary, hides historical
 Solana CA and wallet rows from dashboard lists, and deactivates previously active
 Solana CAs at startup without deleting their trade history or shared market data.
-`ethereum`, `hyperliquid`, and perp chainId `1337` are unsupported too.
+`ethereum` (networkId 1) is supported as chain `eth`; `hyperliquid` and perp chainId `1337` are unsupported.
 
 
 > **robinhood added 2026-10-01** (EVM, chainId 4663): the fomo dashboard now tracks
 > robinhood CAs end-to-end. The gateway's `CHAIN_SLUGS` must carry `robinhood` too
 > (`server/src/shared/chain-slugs.ts`), or every `gmgn/token-info` call for the chain
 > is denied `400 bad_request` and the CA never leaves the dashboard's score filter.
+>
+> **Ethereum added 2026-10-23** (EVM, networkId/chainId 1): `eth` is in `CHAINS` and
+> `CHAIN_SLUGS` (gmgn `eth`, nansen/dexscreener `ethereum`), and both FOMO API parsers
+> map networkId 1. The bridge default `FOMO_SUPPORTED_CHAINS` already includes 1.
 
 **Dedupe by `eventId`.** `fomo_trades` has a UNIQUE index on `event_id`, and the insert
 is `INSERT INTO fomo_trades (...) ON CONFLICT(event_id) DO NOTHING`. Re-POSTing the same
 event changes nothing: the second call returns 2xx and inserts zero rows. Reconnects and
 replayed frames therefore cannot double-count. The daemon also keeps a bounded in-memory
 seen-set and persists it in `fomo_state.json` so a restart does not re-POST.
+
+Event ids share one namespace, `fomo-swap:<swap id>`. State written before the
+cutover may hold `fomo-feed:<swap id>` or a bare swap id; `load_state()` rewrites
+them, the ingest route canonicalizes a legacy `fomo-feed:` id, and a startup
+migration rewrites stored `fomo_trades.event_id` values (dropping an existing
+`fomo-swap:` twin of the same swap). Without that normalization the feed
+re-reading its cursor item (`at == cursor`) or expanding a trade's older
+`swaps[]` would insert an already-ingested fill under a second key.
 
 ---
 
@@ -290,11 +305,19 @@ python3 -m watchers.fomo --once --api-url http://127.0.0.1:8125
 ```
 
 Every ~60 seconds the daemon refreshes the watch list from `GET /api/fomo-users`, asks
-the bridge for each user's newest swaps page, maps buys/sells against the quote-asset
-list, dedupes by swap id, and POSTs each survivor individually to
-`/api/fomo-watch/trades`. The first poll for a user only records a cursor, so deploying
-the watcher does not replay the last page. The cursor advances only after a successful
-POST; a failed ingest retries next cycle. GET and POST retry transient network errors and HTTP 429/500/502/503/504
+the bridge for each user's swaps pages back to that user's window start, maps buys/sells
+against the quote-asset list, dedupes by swap id, and POSTs each survivor individually to
+`/api/fomo-watch/trades`. The window starts at the user's previous successful poll; on a
+fresh or migrated state it starts at the watcher deploy time, and a user first seen later
+starts at first sight, so deploying the watcher does not replay history. Unlike the old
+swap cursor, the wall-clock window advances even when the user made no trades, so an
+inactive user costs one page. The window advances only after a complete read and ingest;
+a failed GET/POST retries the same window next cycle. `/swaps` is mapped
+chain-agnostically; captured responses have been Solana-only, so EVM normally
+arrives via `/feed/token`. Both routes use the same `fomo-swap:<swap id>` event
+id (a feed item's id is the swap id), so a fill seen on both is ingested once.
+Every fill in the window is emitted
+by the same walk, so no second per-CA crawl. GET and POST retry transient network errors and HTTP 429/500/502/503/504
 up to three attempts total, with bounded exponential backoff (0.5s, 1s; numeric
 `Retry-After` is capped at 2s). Other HTTP errors are not retried. A failed POST is not marked
 deduped or persisted, so a replayed alert can be tried again; a successful POST is acknowledged

@@ -4,7 +4,7 @@
 // provider per sweep would double the leaky buckets.
 
 import { CA_INFLOW_WINDOW_MS, SNAPSHOT_RETENTION_MS, TRACKED_BY_WINDOW_MS, config } from './config.js';
-import type { Chain } from './shared/chain.js';
+import { canonicalCa, type Chain } from './shared/chain.js';
 import {
   deleteSnapshotsBefore,
   deactivateTrackedCasByIds,
@@ -25,26 +25,31 @@ import {
   listCaTargetsMissingSymbol,
   listCaTargetsMissingIcon,
   getFomoApiRequestState,
+  getFomoPositionEvidence,
+  clearFomoPositionPrice,
   saveFomoApiRequestState,
   getFomoTradeEnrichmentTarget,
   getFomoPositionSnapshot,
+  listFomoPositionTargets,
   listTrackedCas,
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
   updateFomoTradeUsd,
   syncFomoPositionsSnapshot,
+  upsertFomoPosition,
   upsertNansenSeries,
   watchedCasForWallet,
   type CaScoreGateRow,
   type CaTarget,
   type FomoApiRequestEndpoint,
+  type FomoPositionInput,
   type MetricPollReservation,
   type TokenStateRow,
   type WalletRow,
 } from './db.js';
 import { replaceWalletBalances, restoreTokenLf, updateNansenHolders, updateTokenAnalytics, updateTokenMetrics, updateTokenIconIfMissing, upsertTokenInfo, clearCurrentMarketQuote, recomputeMarketCap } from './ingest.js';
-import { fetchFomoBalances, fetchFomoSwaps, matchFomoBuySwaps, recordFomoApiDeferred } from './fomo-api.js';
+import { fetchFomoBalances, fetchFomoSwaps, fetchFomoTradeDetail, matchFomoBuySwaps, recordFomoApiDeferred } from './fomo-api.js';
 import type { FomoApiOutcome, FomoPosition, FomoSwap } from './fomo-api.js';
 import type { BalancePoint } from './crawl.js';
 import {
@@ -1651,27 +1656,99 @@ async function refreshFomoBalances(
   const result = await fetchFomoBalances(apiUserId ?? handle);
   saveFomoApiOutcome(fomoUserId, 'balances', result.outcome, result.retryAfterMs, Date.now());
   if (result.outcome !== 'success' || result.value === null) return null;
-  syncFomoPositionsSnapshot(
-    fomoUserId,
-    result.value.map((p) => ({
-      fomo_user_id: fomoUserId,
-      ca: p.ca,
-      chain: p.chain,
-      trade_id: p.tradeId,
-      status: p.status,
-      amount: p.amount,
-      cost_basis_usd: p.costBasisUsd,
-      avg_entry_price: p.avgEntryPrice,
-      price_usd: p.priceUsd,
-      realized_pnl_usd: p.realizedPnlUsd,
-      unrealized_pnl_usd: p.unrealizedPnlUsd,
-      fetched_at: fetchedAt,
-    })),
-    fetchedAt,
-    result.complete,
-  );
+  const positions = result.value;
+  const resolved: FomoPositionInput[] = positions.map((p) => ({
+    fomo_user_id: fomoUserId,
+    ca: p.ca,
+    chain: p.chain,
+    trade_id: p.tradeId,
+    status: p.status,
+    amount: p.amount,
+    cost_basis_usd: p.costBasisUsd,
+    avg_entry_price: p.avgEntryPrice,
+    price_usd: p.priceUsd,
+    realized_pnl_usd: p.realizedPnlUsd,
+    unrealized_pnl_usd: p.unrealizedPnlUsd,
+    fetched_at: fetchedAt,
+  }));
+  const recovered: FomoPosition[] = [];
+  const closed: { ca: string; chain: Chain }[] = [];
+  // Omission is only a reason to ask the trade detail, never proof of closure.
+  // A partial SELL still leaves an open remainder; a later sell timestamp alone
+  // must not zero it. Only a trade detail that is closed/zero closes here.
+  if (result.complete) {
+    const live = new Set(positions.map((p) => `${p.chain}:${canonicalCa(p.ca, p.chain)}`));
+    const dashboard = new Set(listTrackedCas().map((c) => `${c.chain}:${canonicalCa(c.address, c.chain)}`));
+    const checkedTrades = new Set<string>();
+    for (const target of listFomoPositionTargets(fomoUserId, fetchedAt)) {
+      const ca = canonicalCa(target.ca, target.chain);
+      const key = `${target.chain}:${ca}`;
+      if (!dashboard.has(key) || live.has(key)) continue;
+      const evidence = getFomoPositionEvidence(fomoUserId, ca, target.chain);
+      // No later sell means no closure is even plausible; skip the extra read.
+      const laterSell = evidence.sell_ts !== null
+        && (evidence.buy_ts === null || evidence.sell_ts >= evidence.buy_ts);
+      if (!laterSell || evidence.trade_id === null || checkedTrades.has(evidence.trade_id)) continue;
+      checkedTrades.add(evidence.trade_id);
+      const detail = await fetchFomoTradeDetail(evidence.trade_id);
+      if (
+        detail === null ||
+        detail.chain !== target.chain ||
+        canonicalCa(detail.ca, detail.chain) !== ca
+      ) continue;
+      if (detail.closed || detail.amount <= 0) {
+        closed.push({ ca, chain: target.chain });
+        resolved.push({
+          fomo_user_id: fomoUserId,
+          ca,
+          chain: target.chain,
+          trade_id: evidence.trade_id,
+          status: 'closed',
+          amount: 0,
+          cost_basis_usd: null,
+          avg_entry_price: null,
+          price_usd: null,
+          realized_pnl_usd: null,
+          unrealized_pnl_usd: null,
+          fetched_at: fetchedAt,
+        });
+        continue;
+      }
+      const position: FomoPosition = {
+        ca,
+        chain: target.chain,
+        tradeId: evidence.trade_id,
+        status: 'active',
+        amount: detail.amount,
+        costBasisUsd: detail.costBasisUsd,
+        avgEntryPrice: detail.avgEntryPrice,
+        priceUsd: null,
+        realizedPnlUsd: detail.realizedPnlUsd,
+        unrealizedPnlUsd: null,
+      };
+      recovered.push(position);
+      resolved.push({
+        fomo_user_id: fomoUserId,
+        ca,
+        chain: target.chain,
+        trade_id: evidence.trade_id,
+        status: 'active',
+        amount: detail.amount,
+        cost_basis_usd: detail.costBasisUsd,
+        avg_entry_price: detail.avgEntryPrice,
+        price_usd: null,
+        realized_pnl_usd: detail.realizedPnlUsd,
+        unrealized_pnl_usd: null,
+        fetched_at: fetchedAt,
+      });
+    }
+  }
+  syncFomoPositionsSnapshot(fomoUserId, resolved, fetchedAt);
+  for (const position of [...recovered, ...closed]) {
+    clearFomoPositionPrice(fomoUserId, position.ca, position.chain);
+  }
   cancelFomoPositionCooldownRefresh(fomoUserId);
-  return result.value;
+  return [...positions, ...recovered];
 }
 
 async function refreshFomoSwaps(fomoUserId: string, identity: string): Promise<FomoSwap[] | null> {
@@ -1692,20 +1769,81 @@ async function refreshFomoPositionAlertBatch(
 ): Promise<void> {
   const identity = batch.apiUserId ?? batch.handle;
   const positions = await refreshFomoBalances(fomoUserId, batch.handle, batch.apiUserId);
-  const targets: { eventId: string; ca: string; chain: Chain; ts: number; tradeId: string | null }[] = [];
+  type BuyTarget = {
+    eventId: string;
+    ca: string;
+    chain: Chain;
+    ts: number;
+    tradeId: string | null;
+    tradeUsd: number | null;
+  };
+  const buys: BuyTarget[] = [];
   for (const eventId of batch.eventIds) {
     const trade = getFomoTradeEnrichmentTarget(fomoUserId, eventId);
-    if (trade === undefined || trade.type !== 'buy' || trade.trade_usd !== null) continue;
+    if (trade === undefined || trade.type !== 'buy') continue;
     const position = positions?.find((p) => p.ca === trade.ca && p.chain === trade.chain);
-    targets.push({ eventId, ca: trade.ca, chain: trade.chain, ts: trade.ts, tradeId: position?.tradeId ?? null });
+    buys.push({
+      eventId,
+      ca: trade.ca,
+      chain: trade.chain,
+      ts: trade.ts,
+      tradeId: position?.tradeId ?? null,
+      tradeUsd: trade.trade_usd,
+    });
   }
-  if (targets.length === 0) return;
+  if (buys.length === 0) return;
+  const targets = buys.filter((buy) => buy.tradeUsd === null);
+  // A BUY whose position is absent (or zero) from the balances page needs the
+  // trade detail before we trust the omission: FOMO's balances page can omit an
+  // open cross-chain position (FLOAT, 2026-10-22), and syncFomoPositionsSnapshot
+  // must not leave the dashboard without a Bal.
+  const missing = buys.filter((buy) =>
+    !positions?.some((p) =>
+      p.chain === buy.chain &&
+      canonicalCa(p.ca, p.chain) === canonicalCa(buy.ca, buy.chain) &&
+      p.amount != null && p.amount > 0,
+    ),
+  );
+  if (targets.length === 0 && missing.length === 0) return;
   const swaps = await refreshFomoSwaps(fomoUserId, identity);
   if (swaps === null) return;
-  const amounts = matchFomoBuySwaps(targets, swaps);
-  for (let i = 0; i < targets.length; i++) {
-    const amount = amounts[i];
-    if (amount !== null && amount !== undefined) updateFomoTradeUsd(fomoUserId, targets[i]!.eventId, amount);
+  if (targets.length > 0) {
+    const amounts = matchFomoBuySwaps(targets, swaps);
+    for (let i = 0; i < targets.length; i++) {
+      const amount = amounts[i];
+      if (amount !== null && amount !== undefined) updateFomoTradeUsd(fomoUserId, targets[i]!.eventId, amount);
+    }
+  }
+  const checkedTrades = new Set<string>();
+  for (const buy of missing) {
+    const swapId = buy.eventId.startsWith('fomo-swap:')
+      ? buy.eventId.slice('fomo-swap:'.length)
+      : buy.eventId;
+    const swap = swaps.find((s) => s.id === swapId);
+    if (swap?.tradeIdOut == null || checkedTrades.has(swap.tradeIdOut)) continue;
+    checkedTrades.add(swap.tradeIdOut);
+    const detail = await fetchFomoTradeDetail(swap.tradeIdOut);
+    if (detail === null || detail.closed || detail.amount <= 0) continue;
+    if (
+      detail.chain !== buy.chain ||
+      canonicalCa(detail.ca, detail.chain) !== canonicalCa(buy.ca, buy.chain)
+    ) continue;
+    upsertFomoPosition({
+      fomo_user_id: fomoUserId,
+      ca: buy.ca,
+      chain: buy.chain,
+      trade_id: swap.tradeIdOut,
+      status: 'active',
+      amount: detail.amount,
+      cost_basis_usd: detail.costBasisUsd,
+      avg_entry_price: detail.avgEntryPrice,
+      // A mark, not a fill price: live token_state must drive Bal.
+      price_usd: null,
+      realized_pnl_usd: detail.realizedPnlUsd,
+      unrealized_pnl_usd: null,
+      fetched_at: Date.now(),
+    });
+    clearFomoPositionPrice(fomoUserId, buy.ca, buy.chain);
   }
 }
 

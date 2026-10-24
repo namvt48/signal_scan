@@ -704,7 +704,7 @@ export class NansenMarketProvider implements MarketDataProvider {
    * needs that 0 to delete the stale row.
    *
    * No `cas` → every tracked CA on the wallet's chain (the broad legacy call).
-   * Non-sol (base/bsc/robinhood) → EVM JSON-RPC (providers/evm.ts): ONE
+   * Non-sol (base/bsc/robinhood/eth) → EVM JSON-RPC (providers/evm.ts): ONE
    * Multicall3 eth_call batches balanceOf and uncached decimals() calls, credit-free.
    * Successful zero balances are preserved; reverted/nonstandard calls are omitted
    * so the writer retains the last known value (the Nansen credit door currentBalance

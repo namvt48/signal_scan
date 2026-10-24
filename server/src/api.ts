@@ -89,7 +89,7 @@ import { getSetupFreshnessStats, kickCAs, kickFomoHoldings, kickFomoPositions, k
 import { cohortLabelIndex } from './cohort-labels.js';
 import { getPeriodicScanSettings, updatePeriodicScanSettings } from './periodic-scan-settings.js';
 import { selectPeriodicScanSignals, toPeriodicScanItem } from './periodic-scan.js';
-import { exportActivity, exportAlerts, exportBalanceSeries, exportSnapshot, exportToken, exportTokenDetail, exportTrades, exportWallets } from './public-export.js';
+import { exportActivity, exportAlerts, exportBalanceSeries, exportFomoPositions, exportFomoToken, exportFomoTokens, exportFomoTokenStats, exportFomoTrades, exportFomoUsers, exportSnapshot, exportToken, exportTokenDetail, exportTrades, exportWallets } from './public-export.js';
 
 interface WalletJson {
   id: string;
@@ -384,6 +384,12 @@ interface FomoWatchTrade {
   txHash?: string;
 }
 
+/** One namespace for a fill: the feed used to post `fomo-feed:<swap id>`. */
+function canonicalFomoEventId(eventId: string): string {
+  const legacy = 'fomo-feed:';
+  return eventId.startsWith(legacy) ? `fomo-swap:${eventId.slice(legacy.length)}` : eventId;
+}
+
 /**
  * `eventId` is the idempotency key (UNIQUE on fomo_trades). At least one
  * identity (`userId` or `trader` handle) must be present. `type` accepts ONLY
@@ -398,8 +404,9 @@ interface FomoWatchTrade {
 function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
   if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
   const b = body as Record<string, unknown>;
-  const eventId = strField(b, 'eventId');
-  if (!eventId) return { error: 'eventId is required' };
+  const rawEventId = strField(b, 'eventId');
+  if (!rawEventId) return { error: 'eventId is required' };
+  const eventId = canonicalFomoEventId(rawEventId);
   const userId = strField(b, 'userId');
   const trader = strField(b, 'trader');
   if (!userId && !trader) return { error: 'userId or trader is required' };
@@ -751,6 +758,54 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
         res.status(400).json({ error: 'invalid trade query' }); return;
       }
       res.json(exportTrades(walletId, afterId, limit, from, to));
+      return;
+    }
+    if (resource === 'fomoUsers') {
+      const data = exportFomoUsers();
+      res.json({ data: data.slice(afterId, afterId + limit), nextOffset: afterId + limit < data.length ? afterId + limit : null });
+      return;
+    }
+    if (resource === 'fomoTokens') {
+      const snapshot = exportFomoTokens();
+      const offset = afterId;
+      res.json({ generatedAt: snapshot.generatedAt, data: snapshot.tokens.slice(offset, offset + limit), nextOffset: offset + limit < snapshot.tokens.length ? offset + limit : null });
+      return;
+    }
+    if (resource === 'fomoToken') {
+      const chain = req.query.chain;
+      const ca = req.query.ca;
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
+        res.status(400).json({ error: 'invalid token identity' }); return;
+      }
+      const token = exportFomoToken(chain as Chain, canonicalCa(ca, chain as Chain));
+      if (!token) { res.status(404).json({ error: 'token not found' }); return; }
+      res.json(token);
+      return;
+    }
+    if (resource === 'fomoTokenStats') {
+      const chain = req.query.chain; const ca = req.query.ca;
+      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
+        res.status(400).json({ error: 'invalid token identity' }); return;
+      }
+      res.json({ data: exportFomoTokenStats(chain as Chain, canonicalCa(ca, chain as Chain)) });
+      return;
+    }
+    if (resource === 'fomoTrades') {
+      const userId = req.query.userId;
+      const from = Number(req.query.from); const to = Number(req.query.to);
+      if (typeof userId !== 'string' || userId.length < 1 || userId.length > 128 || !Number.isSafeInteger(from) ||
+          !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
+        res.status(400).json({ error: 'invalid fomo trade query' }); return;
+      }
+      res.json(exportFomoTrades(userId, afterId, limit, from, to));
+      return;
+    }
+    if (resource === 'fomoPositions') {
+      const userId = req.query.userId;
+      if (typeof userId !== 'string' || userId.length < 1 || userId.length > 128) {
+        res.status(400).json({ error: 'invalid fomo user id' }); return;
+      }
+      res.json(exportFomoPositions(userId));
       return;
     }
     res.status(400).json({ error: 'unknown resource' });

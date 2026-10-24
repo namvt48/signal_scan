@@ -30,6 +30,15 @@ before(async () => {
     }
     else if (req.query.resource === 'balance') res.json({ source: 'snapshots', points: [] });
     else if (req.query.resource === 'trades') res.json({ data: [], nextId: null });
+    else if (req.query.resource === 'fomoUsers') res.json({ data: [{ id: 'u1', handle: '@u1' }], nextOffset: null });
+    else if (req.query.resource === 'fomoTokens') res.json({ generatedAt: 123, data: [{ id: 'sol:CA', ca: 'CA', chain: 'sol', fomoUsers: [{ handle: '@u1' }] }], nextOffset: null });
+    else if (req.query.resource === 'fomoToken') {
+      if (req.query.ca === 'missing') { res.status(404).end(); return; }
+      res.json({ id: 'sol:CA', ca: 'CA', chain: 'sol', fomoUsers: [{ handle: '@u1' }] });
+    }
+    else if (req.query.resource === 'fomoTrades') res.json({ data: [], nextId: null });
+    else if (req.query.resource === 'fomoTokenStats') res.json({ data: [] });
+    else if (req.query.resource === 'fomoPositions') res.json({ data: [], freshness: { balances: null, positions: null } });
     else res.status(400).end();
   });
   source = sourceApp.listen(0);
@@ -38,6 +47,7 @@ before(async () => {
   const app = createPublicApiApp({
     internalUrl: sourceUrl,
     internalToken: 'internal-secret',
+    fomoInternalUrl: sourceUrl,
   });
   service = app.listen(0);
   await new Promise((resolve) => service.once('listening', resolve));
@@ -82,6 +92,44 @@ test('validates bounds and serves alerts, activity, wallets and trades', async (
   assert.equal((await get('/api/v1/tokens/sol/CA/balance-chart?window=year')).status, 400);
   assert.equal((await get('/api/v1/wallets')).status, 200);
   assert.equal((await get('/api/v1/wallets/id/trades')).status, 200);
+});
+
+test('serves FOMO dashboard data through its own upstream', async () => {
+  assert.equal((await get('/api/v1/fomo/users?limit=10')).status, 200);
+  const users = await (await get('/api/v1/fomo/users')).json() as { data: Array<{ handle: string }> };
+  assert.equal(users.data[0]?.handle, '@u1');
+  assert.equal((await get('/api/v1/fomo/users/u1/trades')).status, 200);
+  assert.equal((await get('/api/v1/fomo/users/u1/positions')).status, 200);
+  assert.equal((await get('/api/v1/fomo/tokens/base/0xabc/users')).status, 200);
+  assert.equal((await get('/api/v1/fomo/tokens/eth/0xabc/users')).status, 200);
+  assert.equal((await get('/api/v1/fomo/tokens/dog/0xabc/users')).status, 400);
+  assert.equal((await get('/api/v1/fomo/tokens?limit=101')).status, 400);
+  const table = await (await get('/api/v1/fomo/tokens')).json() as { data: Array<{ ca: string; fomoUsers: Array<{ handle: string }> }> };
+  assert.equal(table.data[0]?.fomoUsers[0]?.handle, '@u1');
+  assert.equal((await get('/api/v1/fomo/tokens/sol/CA')).status, 200);
+  assert.equal((await get('/api/v1/fomo/tokens/sol/missing')).status, 404);
+  assert.equal((await get('/api/v1/fomo/tokens/eth/0xabc')).status, 200);
+  assert.equal((await get('/api/v1/fomo/tokens/dog/0xabc')).status, 400);
+  assert.equal((await get('/api/v1/fomo/alerts')).status, 200);
+  assert.equal((await get('/api/v1/fomo/alerts?after_id=-1')).status, 400);
+  assert.equal((await get('/api/v1/fomo/wallets')).status, 200);
+  assert.equal((await get('/api/v1/fomo/wallets/id/trades')).status, 200);
+  assert.equal((await get('/api/v1/fomo/wallets/id/trades?limit=101')).status, 400);
+  assert.equal((await get(`/api/v1/fomo/users/${'x'.repeat(129)}/positions`)).status, 400);
+  assert.equal((await get('/api/v1/fomo/users/u1/trades?limit=101')).status, 400);
+});
+
+test('FOMO routes return 502 when no FOMO upstream is configured', async () => {
+  const local = createPublicApiApp({ internalUrl: sourceUrl, internalToken: 'internal-secret', fomoInternalUrl: '' }).listen(0);
+  await new Promise((resolve) => local.once('listening', resolve));
+  const base = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;
+  try {
+    assert.equal((await fetch(`${base}/api/v1/fomo/users`)).status, 502);
+    assert.equal((await fetch(`${base}/api/v1/fomo/tokens`)).status, 502);
+    assert.equal((await fetch(`${base}/api/v1/fomo/alerts`)).status, 502);
+    assert.equal((await fetch(`${base}/api/v1/fomo/wallets`)).status, 502);
+    assert.equal((await fetch(`${base}/api/v1/tokens`)).status, 200);
+  } finally { local.close(); }
 });
 
 test('preserves backend 404 for missing tokens and detail', async () => {

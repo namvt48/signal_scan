@@ -3,6 +3,8 @@
 Chạy: python3 -m pytest scripts/test_evm_classify.py -q
 """
 
+import re
+
 import pytest
 
 from watchers.evm import classify as cl
@@ -63,6 +65,13 @@ def test_pad_address_rejects_junk():
     for bad in ("", "0x123", "11" * 20, "0x" + "z" * 40, WALLET + "!"):
         with pytest.raises(ValueError):
             cl.pad_address(bad)
+
+
+def test_quote_token_addresses_are_well_formed():
+    """A truncated/wrong-case literal silently stops matching on-chain transfers."""
+    for chain, tokens in cl.QUOTE_TOKENS.items():
+        for address, symbol in tokens.items():
+            assert re.fullmatch(r"0x[0-9a-f]{40}", address), f"{chain}:{symbol}:{address}"
 
 
 def test_sub_topics_shape():
@@ -235,7 +244,7 @@ def test_router_name_case_insensitive():
 
 
 def test_robinhood_chain_official_router_and_quotes():
-    assert cl.EVM_CHAINS == ("base", "bsc", "robinhood")
+    assert cl.EVM_CHAINS == ("base", "bsc", "robinhood", "eth")
     assert cl.DEFAULT_EVM_CHAINS == ("base", "bsc")
     router = "0xcaf681a66d020601342297493863e78c959e5cb2"
     universal = "0x8876789976decbfcbbbe364623c63652db8c0904"
@@ -244,7 +253,10 @@ def test_robinhood_chain_official_router_and_quotes():
     assert cl.router_name("robinhood", router.upper()) == "uniswap-v3"
     assert cl.router_name("robinhood", universal) == "uniswap-universal"
     assert cl.router_name("base", router) is None
-    assert cl.QUOTE_TOKENS["robinhood"] == {weth: "WETH", usdg: "USDG"}
+    assert cl.QUOTE_TOKENS["robinhood"][weth] == "WETH"
+    assert cl.QUOTE_TOKENS["robinhood"][usdg] == "USDG"
+    assert cl.QUOTE_TOKENS["robinhood"]["0xdb81a12de6c0aebeddf2d85d531dd50cac7366ef"] == "USDG"
+    assert cl.QUOTE_TOKENS["robinhood"]["0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34"] == "USDe"
     buy_events = cl.classify_swaps(
         "robinhood", WALLET,
         mktx(router, [xfer(WALLET, POOL, 10**18, ca=weth),
@@ -262,6 +274,35 @@ def test_robinhood_chain_official_router_and_quotes():
     assert len(sell_events) == 1
     sell = sell_events[0]
     assert sell["side"] == "SELL" and sell["quote_sym"] == "USDG"
+
+
+def test_eth_chain_router_quotes_and_swap():
+    weth = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    usdc = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    router = "0x7a250d5630b4cf539739df2c5dacb4c659f2488d"
+    assert cl.WRAPPED_NATIVE["eth"] == weth
+    assert cl.EXPLORER_TX["eth"] == "https://etherscan.io/tx/"
+    assert cl.router_name("eth", router.upper()) == "uniswap-v2"
+    assert cl.router_name("eth", "0x1111111254eeb25477b68fb85ed929f73a960582") == "1inch-v5"
+    assert cl.QUOTE_TOKENS["eth"][weth] == "WETH"
+    assert cl.QUOTE_TOKENS["eth"][usdc] == "USDC"
+    buy_events = cl.classify_swaps(
+        "eth",
+        WALLET,
+        mktx(
+            router,
+            [
+                xfer(WALLET, POOL, 10**18, ca=weth),
+                xfer(POOL, WALLET, 10**6, ca=TOKEN),
+            ],
+        ),
+    )
+    assert len(buy_events) == 1
+    buy = buy_events[0]
+    assert buy["chain"] == "eth" and buy["side"] == "BUY"
+    assert buy["quote_sym"] == "WETH"
+
+
 def test_buy_quote_for_token():
     events = cl.classify_swaps(
         "base",
@@ -284,6 +325,35 @@ def test_buy_quote_for_token():
     assert ev["token_in_ca"] == WETH and ev["token_out_ca"] == TOKEN
     assert ev["chain"] == "base" and ev["wallet"] == WALLET
     assert ev["type"] == "SWAP"
+
+
+@pytest.mark.parametrize(
+    ("chain", "quote", "sym"),
+    [
+        ("base", "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", "USDT"),
+        ("base", "0x820c137fa70c8691f0e44dc420a5e53c168921dc", "USDS"),
+        ("bsc", "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409", "FDUSD"),
+        ("bsc", "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d", "USD1"),
+        ("robinhood", "0xdb81a12de6c0aebeddf2d85d531dd50cac7366ef", "USDG"),
+        ("robinhood", "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34", "USDe"),
+    ],
+)
+def test_stable_quote_is_not_a_ca(chain, quote, sym):
+    """Stable leg must be quote, never emitted as the tracked wallet's CA."""
+    events = cl.classify_swaps(
+        chain,
+        WALLET,
+        mktx(
+            UNISWAP,
+            [
+                xfer(WALLET, POOL, 1000 * 10**6, ca=quote),
+                xfer(POOL, WALLET, 1000 * 10**6, ca=TOKEN),
+            ],
+        ),
+    )
+    assert len(events) == 1
+    assert events[0]["side"] == "BUY" and events[0]["ca"] == TOKEN
+    assert events[0]["quote_sym"] == sym
 
 
 def test_sell_token_for_quote():

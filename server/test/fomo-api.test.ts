@@ -4,6 +4,7 @@ import { config } from '../src/config.js';
 import {
   fetchFomoBalances,
   fetchFomoSwaps,
+  fetchFomoTradeDetail,
   getFomoApiUsageSnapshot,
   matchFomoBuySwap,
   matchFomoBuySwaps,
@@ -15,9 +16,13 @@ const TRADE_ID = 'a09f56a5-975b-45e2-b71e-17c7080c8b0f';
 const TS = Date.parse('2026-10-08T06:47:35.000Z');
 const NET_SOL = 1399811149;
 const NET_BASE = 8453;
+const NET_ETH = 1;
+const ETH_CA = '0x2000000000000000000000000000000000000002';
+const ETH_USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 
 function swap(overrides: Partial<FomoSwap> = {}): FomoSwap {
   return {
+    id: 'swap-1',
     chain: 'sol',
     at: TS,
     tradeIdOut: TRADE_ID,
@@ -109,13 +114,23 @@ test('fetchFomoSwaps parses the prod envelope and flat swap shape', async () => 
           networkId: NET_SOL,
           outNetworkId: NET_SOL,
         }, {
+          id: 'swap-eth',
+          inTokenAddress: ETH_USDC,
+          outTokenAddress: ETH_CA,
+          humanUsdAmountIn: 50,
+          humanUsdAmountOut: 50,
+          createdAt: TS,
+          outTradeId: 'eth-trade',
+          networkId: NET_ETH,
+          outNetworkId: NET_ETH,
+        }, {
           id: 'swap-unsupported',
           inTokenAddress: '0xusdc',
           outTokenAddress: '0xother',
           humanUsdAmountIn: 1,
           humanUsdAmountOut: 1,
           createdAt: TS,
-          outNetworkId: 1,
+          outNetworkId: 137,
         }],
         hasNextPage: false,
       },
@@ -127,10 +142,85 @@ test('fetchFomoSwaps parses the prod envelope and flat swap shape', async () => 
     assert.equal(authorization, null);
     assert.equal(result.outcome, 'success');
     assert.equal(result.attempts, 1);
-    assert.deepEqual(result.value, [swap()]);
+    assert.deepEqual(result.value, [swap(), swap({
+      id: 'swap-eth',
+      chain: 'eth',
+      tradeIdOut: 'eth-trade',
+      tokenIn: { address: ETH_USDC, usd: 50 },
+      tokenOut: { address: ETH_CA, usd: 50 },
+    })]);
     const swappedAfter = getFomoApiUsageSnapshot().endpoints.find((item) => item.endpoint === 'swaps')!;
     assert.equal(swappedAfter.operations - swappedBefore.operations, 1);
     assert.equal(swappedAfter.successes - swappedBefore.successes, 1);
+  });
+});
+
+test('fetchFomoTradeDetail reads an open aggregated position', async () => {
+  let requestUrl = '';
+  await withBridge((url) => {
+    requestUrl = url;
+    return new Response(JSON.stringify({
+      success: true,
+      responseObject: {
+        trade: {
+          id: TRADE_ID,
+          tokenAddress: CA,
+          networkId: NET_SOL,
+          humanTokenAmount: '28624504.17',
+          avgEntryPrice: 0.00061,
+          realizedPnlUsd: 12,
+          closedAt: null,
+        },
+      },
+    }), { status: 200 });
+  }, async () => {
+    const detail = await fetchFomoTradeDetail(TRADE_ID);
+    assert.match(requestUrl, new RegExp(`/trades/${TRADE_ID}$`));
+    assert.deepEqual(detail, {
+      tradeId: TRADE_ID,
+      ca: CA,
+      chain: 'sol',
+      amount: 28624504.17,
+      costBasisUsd: 28624504.17 * 0.00061,
+      avgEntryPrice: 0.00061,
+      realizedPnlUsd: 12,
+      closed: false,
+    });
+  });
+});
+
+test('fetchFomoTradeDetail treats a closed trade or a zero amount as closed', async () => {
+  await withBridge(() => new Response(JSON.stringify({
+    success: true,
+    responseObject: {
+      trade: {
+        id: TRADE_ID,
+        tokenAddress: CA,
+        networkId: NET_SOL,
+        humanTokenAmount: '10',
+        avgEntryPrice: 0.5,
+        closedAt: '2026-10-22T15:11:50Z',
+      },
+    },
+  }), { status: 200 }), async () => {
+    const detail = await fetchFomoTradeDetail(TRADE_ID);
+    assert.equal(detail?.closed, true);
+  });
+  await withBridge(() => new Response(JSON.stringify({
+    success: true,
+    responseObject: {
+      trade: {
+        id: TRADE_ID,
+        tokenAddress: CA,
+        networkId: NET_SOL,
+        humanTokenAmount: '0',
+        closedAt: null,
+      },
+    },
+  }), { status: 200 }), async () => {
+    const detail = await fetchFomoTradeDetail(TRADE_ID);
+    assert.equal(detail?.closed, true);
+    assert.equal(detail?.amount, 0);
   });
 });
 
@@ -174,7 +264,13 @@ test('fetchFomoBalances maps prod balances to active positions', async () => {
         },
         userToken: { humanAmountRemaining: '7', currentCostBasisUsd: 7 },
       }, {
-        tokenFilterResult: { token: { address: '0xunsupported', networkId: 1 } },
+        tokenFilterResult: {
+          priceUSD: '1',
+          token: { address: ETH_CA, networkId: NET_ETH },
+        },
+        userToken: { humanAmountRemaining: '2' },
+      }, {
+        tokenFilterResult: { token: { address: '0xunsupported', networkId: 137 } },
         userToken: { humanAmountRemaining: '1' },
       }],
     },
@@ -199,6 +295,17 @@ test('fetchFomoBalances maps prod balances to active positions', async () => {
       status: 'active',
       amount: 7,
       costBasisUsd: 7,
+      avgEntryPrice: null,
+      priceUsd: 1,
+      realizedPnlUsd: null,
+      unrealizedPnlUsd: null,
+    }, {
+      ca: ETH_CA,
+      chain: 'eth',
+      tradeId: null,
+      status: 'active',
+      amount: 2,
+      costBasisUsd: null,
       avgEntryPrice: null,
       priceUsd: 1,
       realizedPnlUsd: null,

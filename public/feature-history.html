@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Verified Signal Scan public API release and feature milestones.">
+  <title>Features &amp; releases · Signal Scan</title>
+  <link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/api-docs.html" aria-label="Signal Scan developer docs home"><span class="brand-mark" aria-hidden="true"><span>∿</span></span><span class="brand-name">SIGNAL / SCAN<span class="brand-sub">Developer field guide</span></span></a>
+      <nav class="topnav" aria-label="Developer documentation">
+        <a href="/api-docs.html">API reference</a>
+        <a href="/feature-history.html" aria-current="page">Features &amp; releases</a>
+        <a href="https://signal-scan.duckdns.org" target="_blank" rel="noreferrer">Dashboard ↗</a>
+      </nav>
+    </header>
+    <section class="hero" aria-labelledby="page-title">
+      <div><div class="eyebrow">Change record · Public API</div><h1 id="page-title">What shipped, and when.</h1><p>A dated record of public API milestones, separated from formal version labels. Dates below are source-control commit dates, not claims of production release dates.</p></div>
+      <div class="basebox"><span class="label">Current contract</span><code>Public API v1 · read-only</code><span class="privacy">Live contract: <a href="/api-docs.html">open endpoint reference ↗</a></span></div>
+    </section>
+    <main class="content" style="padding:34px 0 72px">
+      <section class="section" aria-labelledby="release-title">
+        <div class="section-head"><h2 id="release-title">Current published contract</h2><p>What external consumers can use</p></div>
+        <article class="release-card"><div class="release-version">v1<small>Current API contract<br>Read-only / public</small></div><div><h3>Signal Scan Public API</h3><p>Public unauthenticated REST data export and a server-to-client WebSocket for new tracker-buy inflows. The repository contains no Git release tags, so this page does not present commit milestones as formal versioned releases. See the <a href="/api-docs.html">API reference</a> for exact routes, parameters, limits, and data exposure notes.</p></div></article>
+      </section>
+      <section class="section" aria-labelledby="timeline-title">
+        <div class="section-head"><h2 id="timeline-title">Feature milestones</h2><p>Chronological · repository history and clearly marked unreleased work</p></div>
+        <p class="intro">These entries summarize API-related commits and the matching documentation/code changes, plus any clearly marked unreleased working-tree changes. Commit dates identify when changes entered source history; they do not independently verify when production deployment completed.</p>
+        <div class="timeline">
+          <article class="event">
+            <div class="event-meta"><time datetime="2026-10-20">2026-10-20</time><span>API foundation</span><span>Commit 7f6d758</span></div>
+            <h3>Introduced the standalone public API</h3>
+            <p>Added the separately operated public API service and its consumer guide. The initial implementation established an external read-only surface while keeping dashboard exports behind a private service credential.</p>
+            <ul><li>Documented the public API base URL and unauthenticated access model.</li><li>Added a standalone service lifecycle and routing through the HTTPS host.</li><li>Kept the dashboard login and private export endpoint separate from public callers.</li></ul>
+          </article>
+          <article class="event">
+            <div class="event-meta"><time datetime="2026-10-22">2026-10-22</time><span>API expansion</span><span>Commit 14d1758</span></div>
+            <h3>Expanded token data and holder analytics</h3>
+            <p>Updated the API routes, export DTOs, contract tests, and consumer docs to expose additional stored analytics without exposing dashboard write operations.</p>
+            <ul><li>Added token distribution detail and top-100 holder data.</li><li>Added cached top-100 balance-chart windows: day, week, and month.</li><li>Expanded token/alert response fields, including tracked-wallet aggregates and public token metadata.</li><li>Documented the supported data boundaries, missing-value behavior, and privacy implications.</li></ul>
+          </article>
+          <article class="event">
+            <div class="event-meta"><time datetime="2026-10-23">2026-10-23</time><span>API expansion</span></div>
+            <h3>Added FOMO dashboard data</h3>
+            <p>Extended the public API with a second private export upstream so the FOMO dashboard instance can be read without exposing its write routes.</p>
+            <ul><li>Added the FOMO token table (token payload plus per-token <code>fomoUsers</code>) and single-token lookup.</li><li>Added FOMO watch-list, per-token FOMO user stats, per-user trades, and positions/holdings routes.</li><li>Added FOMO-instance alerts, wallets, wallet trades, and a dedicated <code>/api/v1/fomo/ws</code> tracker-buy stream.</li><li>Positions now include refresh <code>freshness</code> (complete, truncated, available, checked/captured times).</li><li>Kept non-FOMO token, alert, and wallet data on the existing instance-A upstream.</li><li>Documented that FOMO tokens, identities, alerts, wallets, trades, positions, and holdings are public to every caller.</li><li>FOMO routes return <code>502</code> when the second upstream is not configured.</li></ul>
+          </article>
+        </div>
+      </section>
+      <section class="section" aria-labelledby="boundaries-title">
+        <div class="section-head"><h2 id="boundaries-title">Contract boundaries</h2><p>What stays private</p></div>
+        <div class="split"><article class="note-card"><h3>Public surface</h3><p>Read-only data only. No caller authentication, no dashboard login, and no write endpoints. Token, alert, and wallet data come from instance A; FOMO tokens, alerts, wallets, and watch-list data come from instance B through a second private export upstream.</p></article><article class="note-card"><h3>Private service boundary</h3><p>The public service uses a backend-only export credential to fetch data. That credential is not part of the public contract and must never be placed in this page or consumer requests.</p></article></div>
+      </section>
+    </main>
+    <footer class="footer"><span>Feature milestones from repository commits · not formal release announcements</span><span><a href="/api-docs.html">API reference ↗</a> · <a href="https://signal-scan.duckdns.org/api/v1/status">Live status ↗</a></span></footer>
+  </div>
+</body>
+</html>

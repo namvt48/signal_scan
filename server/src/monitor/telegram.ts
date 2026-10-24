@@ -4,7 +4,7 @@ import type { AlertTrackedMetadata } from '../alert-feed.js';
 import type { PeriodicScanItem } from '../periodic-scan.js';
 export type TelegramAlert = {
   alertId: string;
-  chain: 'sol' | 'base' | 'bsc' | 'robinhood';
+  chain: Chain;
   ca: string;
   symbol?: string;
   marketCap?: number;

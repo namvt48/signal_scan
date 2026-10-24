@@ -86,6 +86,7 @@ const CHAIN_BY_NETWORK_ID: Record<number, Chain> = {
   8453: 'base',
   56: 'bsc',
   4663: 'robinhood',
+  1: 'eth',
 };
 
 export interface FomoSwapLeg {
@@ -96,11 +97,24 @@ export interface FomoSwapLeg {
 /** One on-chain fill from `/v2/users/{id}/swaps`; unlike trades, this is an
  *  individual swap, not an aggregated position. */
 export interface FomoSwap {
+  id: string | null;
   chain: Chain;
   at: number;
   tradeIdOut: string | null;
   tokenIn: FomoSwapLeg;
   tokenOut: FomoSwapLeg;
+}
+
+/** One open/closed aggregated position from `/trades/{tradeId}`. */
+export interface FomoTradeDetail {
+  tradeId: string;
+  ca: string;
+  chain: Chain;
+  amount: number;
+  costBasisUsd: number | null;
+  avgEntryPrice: number | null;
+  realizedPnlUsd: number | null;
+  closed: boolean;
 }
 
 export interface FomoBuySwapTarget {
@@ -132,6 +146,7 @@ function toSwap(value: unknown): FomoSwap | null | undefined {
   const tokenOut = toSwapLeg(raw.outTokenAddress, raw.humanUsdAmountOut);
   if (at === null || tokenIn === null || tokenOut === null) return null;
   return {
+    id: strOrNull(raw.id),
     chain,
     at,
     tradeIdOut: strOrNull(raw.outTradeId ?? raw.tradeIdOut),
@@ -194,6 +209,47 @@ export async function fetchFomoSwaps(identity: string): Promise<FomoApiResult<Fo
     if (swap !== undefined) swaps.push(swap);
   }
   return finishFomoResult('swaps', request, 'success', swaps);
+}
+
+/** Read one aggregated position. FOMO's balances page can omit a position that
+ *  is still open, so a missing balance row is not proof of closure; the trade
+ *  detail is the independent evidence used to keep such a position open. */
+export async function fetchFomoTradeDetail(tradeId: string): Promise<FomoTradeDetail | null> {
+  if (config.fomoProdUrl === '' || !/^[A-Za-z0-9_-]{1,64}$/.test(tradeId)) return null;
+  let response: Response;
+  try {
+    response = await fetch(
+      new URL(`${config.fomoProdUrl}/trades/${encodeURIComponent(tradeId)}`),
+      { signal: AbortSignal.timeout(TIMEOUT_MS) },
+    );
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return null;
+  }
+  const envelope = unwrapEnvelope(body);
+  if (envelope === null || !isRecord(envelope.trade)) return null;
+  const trade = envelope.trade;
+  const chain = chainFromNetworkId(trade.networkId);
+  const ca = strOrNull(trade.tokenAddress);
+  const amount = numFrom(trade.humanTokenAmount);
+  if (chain === undefined || ca === null || amount === null || amount < 0) return null;
+  const avgEntryPrice = numFrom(trade.avgEntryPrice) ?? numFrom(trade.displayAvgEntryPriceUsd);
+  return {
+    tradeId,
+    ca,
+    chain,
+    amount,
+    costBasisUsd: amount > 0 && avgEntryPrice !== null ? amount * avgEntryPrice : numFrom(trade.totalCostBasisUsd),
+    avgEntryPrice,
+    realizedPnlUsd: numFrom(trade.realizedPnlUsd),
+    closed: (trade.closedAt !== null && trade.closedAt !== undefined) || amount <= 0,
+  };
 }
 
 const timestampMs = (value: unknown): number | null => {
@@ -571,7 +627,7 @@ function toBalance(raw: unknown): FomoPosition | null | undefined {
 }
 
 /** One page contains every open balance; a tracked pair absent from the page is
- *  closed by syncFomoPositionsSnapshot. */
+ *  verified against its trade detail before it can be closed. */
 export async function fetchFomoBalances(identity: string): Promise<FomoApiResult<FomoPosition[]>> {
   const request = await requestFomoEndpoint('balances', identity);
   if (request.outcome !== 'success') return finishFomoResult<FomoPosition[]>('balances', request, request.outcome, null);

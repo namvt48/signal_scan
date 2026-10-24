@@ -1,11 +1,12 @@
-import { getDb, getAlertMetricObservations, getTokenState, listWallets } from './db.js';
+import { getDb, getAlertMetricObservations, getFomoApiBalanceSnapshot, getFomoPositionSnapshot, getTokenState, listFomoHoldingsForUser, listFomoPositionsForUser, listFomoTradesForUser, listFomoUsers, listWallets } from './db.js';
 import { buildTokenDetail } from './detail.js';
 import { balanceSeries } from './crawl.js';
-import { assembleSignals, type TokenSignal } from './signals.js';
+import { assembleSignals, fomoUserStats, type TokenSignal } from './signals.js';
 import type { Chain } from './shared/chain.js';
 import type {
-  PublicActivity, PublicAlert, PublicBalancePoint, PublicBalanceSeries, PublicSnapshot, PublicToken,
-  PublicTokenDetail, PublicTrade, PublicWallet, T100HistoryPoint,
+  PublicActivity, PublicAlert, PublicBalancePoint, PublicBalanceSeries, PublicFomoFreshness, PublicFomoHolding, PublicFomoPosition,
+  PublicFomoPositionsPage, PublicFomoToken, PublicFomoTrade, PublicFomoUser, PublicFomoUserStat, PublicSnapshot, PublicToken, PublicTokenDetail, PublicTrade,
+  PublicWallet, T100HistoryPoint,
 } from './public-api-contract.js';
 
 function points(raw: string | undefined): Array<{ t: number; value: number }> {
@@ -101,6 +102,21 @@ export function exportToken(chain: Chain, ca: string, now = Date.now()): PublicT
   return found ? toPublicToken(found) : undefined;
 }
 
+function toPublicFomoToken(signal: TokenSignal): PublicFomoToken {
+  return { ...toPublicToken(signal), fomoUsers: signal.fomoUsers };
+}
+
+/** FOMO-instance token table: same token payload as `exportSnapshot`, plus
+ *  each token's FOMO watch-list rows (the dashboard's main table). */
+export function exportFomoTokens(now = Date.now()): { generatedAt: number; tokens: PublicFomoToken[] } {
+  return { generatedAt: now, tokens: assembleSignals(now, true).map(toPublicFomoToken) };
+}
+
+export function exportFomoToken(chain: Chain, ca: string, now = Date.now()): PublicFomoToken | undefined {
+  const found = assembleSignals(now, true).find((item) => item.chain === chain && item.ca === ca);
+  return found ? toPublicFomoToken(found) : undefined;
+}
+
 export function exportTokenDetail(chain: Chain, ca: string): PublicTokenDetail | undefined {
   const detail = buildTokenDetail(ca, chain);
   if (!detail) return undefined;
@@ -174,6 +190,82 @@ export function exportActivity(chain: Chain, ca: string, from: number, to: numbe
   const buyUsd = row.buy_usd ?? 0;
   const sellUsd = row.sell_usd ?? 0;
   return { chain, ca, from, to, buys: row.buys ?? 0, sells: row.sells ?? 0, buyUsd, sellUsd, netInflowUsd: buyUsd - sellUsd };
+}
+
+export function exportFomoUsers(): PublicFomoUser[] {
+  return listFomoUsers().map((user) => ({
+    id: user.id, handle: user.handle, name: user.name, tags: parseTags(user.tags),
+    clan: user.clan ?? null, userId: user.user_id ?? null,
+    walletSolana: user.wallet_solana ?? null, walletEvm: user.wallet_evm ?? null,
+    source: user.source,
+  }));
+}
+
+/** Per-token FOMO watch-list stats — the same aggregation the dashboard's FOMO
+ *  table renders (24h buy/sell flow plus the measured holding). */
+export function exportFomoTokenStats(chain: Chain, ca: string, now = Date.now()): PublicFomoUserStat[] {
+  return fomoUserStats(ca, chain, now);
+}
+
+export function exportFomoTrades(userId: string, afterId: number, limit: number, from: number, to: number): { data: PublicFomoTrade[]; nextId: number | null } {
+  const rows = listFomoTradesForUser(userId, afterId, limit, from, to);
+  const page = rows.slice(0, limit);
+  return {
+    data: page.map((row) => ({
+      id: row.id, userId: row.fomo_user_id, handle: row.handle, eventId: row.event_id,
+      ca: row.ca, chain: row.chain, side: row.type, usdValue: row.usd_value,
+      tradeUsd: row.trade_usd, price: row.price, token: row.token, ts: row.ts, source: row.source,
+    })),
+    nextId: rows.length > limit ? page.at(-1)?.id ?? null : null,
+  };
+}
+
+/** Stored positions plus every balance measurement for the user. A user can
+ *  have a measured holding without a position row (a buy whose alert never
+ *  arrived), so those CAs appear with null position fields and fetchedAt 0.
+ *  `freshness` reports when the upstream balance/position refresh last ran. */
+export function exportFomoPositions(userId: string): PublicFomoPositionsPage {
+  const positions = listFomoPositionsForUser(userId);
+  const holdingsByCa = new Map<string, { ca: string; chain: Chain; holdings: PublicFomoHolding[] }>();
+  for (const row of listFomoHoldingsForUser(userId)) {
+    const key = `${row.chain}:${row.ca}`;
+    const entry = holdingsByCa.get(key) ?? { ca: row.ca, chain: row.chain, holdings: [] };
+    entry.holdings.push({
+      source: row.source, amount: row.amount, pct: row.pct, capturedAt: row.captured_at,
+      ...(row.wallet !== null ? { wallet: row.wallet } : {}),
+    });
+    holdingsByCa.set(key, entry);
+  }
+  const out: PublicFomoPosition[] = positions.map((row) => ({
+    ca: row.ca, chain: row.chain, tradeId: row.trade_id, status: row.status, amount: row.amount,
+    costBasisUsd: row.cost_basis_usd, avgEntryPrice: row.avg_entry_price, priceUsd: row.price_usd,
+    realizedPnlUsd: row.realized_pnl_usd, unrealizedPnlUsd: row.unrealized_pnl_usd,
+    fetchedAt: row.fetched_at, holdings: holdingsByCa.get(`${row.chain}:${row.ca}`)?.holdings ?? [],
+  }));
+  const positioned = new Set(positions.map((row) => `${row.chain}:${row.ca}`));
+  for (const [key, entry] of holdingsByCa) {
+    if (positioned.has(key)) continue;
+    out.push({
+      ca: entry.ca, chain: entry.chain, tradeId: null, status: null, amount: null,
+      costBasisUsd: null, avgEntryPrice: null, priceUsd: null, realizedPnlUsd: null,
+      unrealizedPnlUsd: null, fetchedAt: 0, holdings: entry.holdings,
+    });
+  }
+  return { data: out.sort((a, b) => a.chain.localeCompare(b.chain) || a.ca.localeCompare(b.ca)), freshness: exportFomoFreshness(userId) };
+}
+
+/** Refresh metadata for a FOMO user: when balances/positions were last read and
+ *  whether the upstream returned a complete, untruncated balance list. */
+export function exportFomoFreshness(userId: string): PublicFomoFreshness {
+  const balance = getFomoApiBalanceSnapshot(userId);
+  const position = getFomoPositionSnapshot(userId);
+  return {
+    balances: balance === undefined ? null : {
+      checkedAt: balance.checked_at, capturedAt: balance.captured_at,
+      complete: balance.complete === 1, truncated: balance.truncated === 1, available: balance.available === 1,
+    },
+    positions: position === undefined ? null : { checkedAt: position.checked_at },
+  };
 }
 
 export function exportAlerts(afterId: number, limit: number): { data: PublicAlert[]; nextId: number; oldestAvailableId: number | null; gap: boolean } {

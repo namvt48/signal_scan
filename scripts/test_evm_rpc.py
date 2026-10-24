@@ -70,6 +70,36 @@ class RpcTests(unittest.TestCase):
             rpc.call("base", "eth_getLogs", [], [self.urls[0]])
         self.assertEqual(rpc.ready_urls([self.urls[0]], "eth_getLogs"), [self.urls[0]])
 
+    def test_http_400_range_body_is_permanent_not_transport(self):
+        import io
+        import json as _json
+        body = _json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32600,
+                "message": "Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range.",
+            },
+        }).encode()
+        def request(url, payload, timeout=20):
+            raise HTTPError(url, 400, "bad request", Message(), io.BytesIO(body))
+        config.http_json = request
+        with self.assertRaisesRegex(RuntimeError, "10 block range"):
+            rpc.call("bsc", "eth_getLogs", [], [self.urls[0]])
+        self.assertEqual(rpc.ready_urls([self.urls[0]], "eth_getLogs"), [self.urls[0]])
+
+    def test_address_less_logs_are_permission_not_range(self):
+        calls = []
+        def request(url, payload, timeout=20):
+            calls.append(url)
+            if "one.example" in url:
+                return {"error": {"code": -32600, "message": "Please specify an address in your request"}}
+            return {"result": []}
+        config.http_json = request
+        self.assertEqual(rpc.call("bsc", "eth_getLogs", [], self.urls), [])
+        self.assertEqual(calls, self.urls)
+        self.assertEqual(rpc.ready_urls([self.urls[0]], "eth_getLogs"), [])
+
     def test_method_not_found_text_is_cached(self):
         calls = []
         def request(url, payload, timeout=20):
@@ -86,6 +116,23 @@ class RpcTests(unittest.TestCase):
         websocket_url = self.urls[0].replace("https://", "wss://")
         rpc.failed(self.urls[0], "quota", 30, method="eth_getLogs")
         self.assertEqual(rpc.ready_urls([websocket_url], "wss"), [])
+
+    def test_request_limit_message_is_quota(self):
+        self.assertEqual(
+            rpc._error_category({"message": "request limit reached"}), "quota"
+        )
+        self.assertEqual(
+            rpc._error_category(
+                {"message": "Your app has exceeded its compute units per second capacity"}
+            ),
+            "quota",
+        )
+        self.assertEqual(
+            rpc._error_category(
+                {"message": "Archive requests require a personal token"}
+            ),
+            "permission",
+        )
 
     def test_transport_exception_quota_markers_are_categorized(self):
         calls = []

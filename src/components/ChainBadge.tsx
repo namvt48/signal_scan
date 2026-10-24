@@ -1,5 +1,6 @@
 import baseLogo from '../assets/chains/base.png';
 import bscLogo from '../assets/chains/bsc.png';
+import ethLogo from '../assets/chains/eth.svg';
 import robinhoodLogo from '../assets/chains/robinhood.svg';
 import solLogo from '../assets/chains/sol.png';
 import type { Chain } from '../types';
@@ -10,6 +11,7 @@ const CHAIN_LOGO: Record<Chain, { src: string; name: string }> = {
   base: { src: baseLogo, name: 'Base' },
   bsc: { src: bscLogo, name: 'BSC' },
   robinhood: { src: robinhoodLogo, name: 'Robinhood' },
+  eth: { src: ethLogo, name: 'Ethereum' },
 };
 
 /** Small chain logo rendered under a token avatar on the FOMO dashboard. */

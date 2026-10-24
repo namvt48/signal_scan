@@ -74,6 +74,12 @@ TIER_A = {
     USDC,  # EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v — fixture row 1 quote_token.token_address
     USDT,  # Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB — mainnet constant, NOT in the 29-row fixture
     "EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCWNWqxWV4J6o",  # DAI — mainnet constant, NOT in the 29-row fixture
+    "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",  # PYUSD
+    "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",  # USDS
+    "DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT",  # USDe
+    "9zNQRsGLjNKwCUU5Gq5LR8beUCPzQMVMqKAi3SSZh54u",  # FDUSD
+    "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",  # USD1
+    "ousd2mJsPEckLHcSCDxyKD7NDGARZcfLbDZkKiatYHB",  # OUSD
 }
 TIER_B = {
     "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  # WBTC — fixture row 22 quote_token.token_address

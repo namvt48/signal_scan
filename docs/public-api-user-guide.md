@@ -2,12 +2,12 @@
 
 **API version:** v1  
 **Base URL:** `https://signal-scan.duckdns.org/api/v1`  
-**WebSocket URL:** `wss://signal-scan.duckdns.org/api/v1/ws`  
+**WebSocket URL:** `wss://signal-scan.duckdns.org/api/v1/ws` (A) · `wss://signal-scan.duckdns.org/api/v1/fomo/ws` (FOMO instance)  
 **API type:** Read-only. Responses are built from data currently stored by Signal Scan.
 
 This guide is for API consumers. Public endpoints do not require an account, API key, or `Authorization` header.
 
-> **Privacy notice:** The API does not identify callers. Wallet addresses, wallet profiles, and wallet-watch trades are publicly accessible. Do not send internal credentials or user login credentials to these endpoints.
+> **Privacy notice:** The API does not identify callers. Wallet addresses, wallet profiles, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO-instance tokens, FOMO-instance alerts, and FOMO-instance wallets are publicly accessible. Do not send internal credentials or user login credentials to these endpoints.
 
 ## Quick start
 
@@ -55,7 +55,7 @@ ws.addEventListener('close', (event) => {
 - Responses are JSON with `camelCase` fields, except for the `after_id` query parameter.
 - Timestamps are Unix epoch time in **milliseconds**.
 - Missing values may be `null` or an empty array, depending on the field. Do not treat `null` as zero unless that matches your application’s semantics.
-- Supported chains: `sol`, `base`, `bsc`, `robinhood`.
+- Supported chains: `sol`, `base`, `bsc`, `robinhood`. FOMO token-stats routes also accept `eth`.
 - Responses represent stored state and stored history. The API does not reconstruct expired source data or backfill missing history.
 - This API is read-only. It does not provide dashboard write operations.
 
@@ -89,7 +89,17 @@ Use one of these patterns:
 | `GET` | `/alerts` | Alert observations ordered by ID. |
 | `GET` | `/wallets` | Paginated tracked-wallet records. |
 | `GET` | `/wallets/{id}/trades` | Time-bounded wallet-watch trades ordered by ID. |
-| `WS` | `/ws` | Live stream of new `trackerBuy` inflow alerts. |
+| `GET` | `/fomo/tokens` | Paginated FOMO-instance token table with `fomoUsers`. |
+| `GET` | `/fomo/tokens/{chain}/{address}` | One FOMO-instance token with `fomoUsers`. |
+| `GET` | `/fomo/tokens/{chain}/{address}/users` | Per-token FOMO user stats. |
+| `GET` | `/fomo/alerts` | FOMO-instance alert observations ordered by ID. |
+| `GET` | `/fomo/users` | Paginated FOMO watch-list. |
+| `GET` | `/fomo/users/{id}/trades` | Time-bounded FOMO buy/sell alerts ordered by ID. |
+| `GET` | `/fomo/users/{id}/positions` | Stored FOMO positions, balance measurements, and refresh metadata. |
+| `GET` | `/fomo/wallets` | Paginated FOMO-instance tracked wallets. |
+| `GET` | `/fomo/wallets/{id}/trades` | Time-bounded FOMO-instance wallet watch trades. |
+| `WS` | `/ws` | Live stream of new A-instance `trackerBuy` inflow alerts. |
+| `WS` | `/fomo/ws` | Live stream of new FOMO-instance `trackerBuy` alerts. |
 
 Append each path to the Base URL. For example, `/tokens/sol/So111...` becomes `https://signal-scan.duckdns.org/api/v1/tokens/sol/So111...`.
 
@@ -339,6 +349,8 @@ wss://signal-scan.duckdns.org/api/v1/ws
 
 No API key is required. The stream is server-to-client; clients must not send commands or subscription messages.
 
+The FOMO instance has an equivalent stream at `wss://signal-scan.duckdns.org/api/v1/fomo/ws`. It uses the same protocol and only streams that instance's `trackerBuy` alerts; recover with `GET /fomo/alerts?after_id=<id>`. Both paths share the per-process connection limit but poll their own upstream.
+
 The server sends one `ready` message after connection setup:
 
 ```json
@@ -542,11 +554,108 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/wallets/wallet-id/trades?from=1
 
 `nextId` is the last row ID to use as the next `after_id`; `null` means there is no next page for the current query. Trades outside the selected time range are excluded.
 
+## FOMO watch-list and activity
+
+FOMO routes read the separate FOMO dashboard instance. They return `502` when that upstream is not configured or unreachable. FOMO token routes accept `eth` in addition to `sol`, `base`, `bsc`, and `robinhood`.
+
+### Token table — `GET /fomo/tokens`
+
+Returns the FOMO dashboard's tracked tokens. Each entry is the same payload as `GET /tokens` plus `fomoUsers`, the rows the dashboard's FOMO sub-table renders:
+
+```bash
+curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/tokens?limit=50&offset=0'
+```
+
+```json
+{
+  "generatedAt": 1700000000000,
+  "data": [
+    {"id":"base:0xtoken","ca":"0xtoken","chain":"base","fomoUsers":[{"handle":"@trader","buyUsd":1250,"sellUsd":400,"buys":3,"sells":1,"trades":4,"lastTs":1700000000000,"balUsd":5000}]}
+  ],
+  "nextOffset": null
+}
+```
+
+`GET /fomo/tokens/{chain}/{address}` returns one entry with the same shape, or `404` when the FOMO instance does not track that token.
+
+### Alerts and wallets — `GET /fomo/alerts`, `/fomo/wallets`
+
+`GET /fomo/alerts?after_id=<id>&limit=<n>` mirrors `/alerts`: same DTO, `nextId`, and `gap` semantics, read from the FOMO instance. `GET /fomo/wallets` and `GET /fomo/wallets/{id}/trades` mirror `/wallets` and `/wallets/{id}/trades` against the FOMO instance's wallet watch.
+
+### FOMO users — `GET /fomo/users`
+
+```bash
+curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/users?limit=50&offset=0'
+```
+
+```json
+{
+  "data": [
+    {"id":"fomo-user-id","handle":"@trader","name":"Trader","tags":["clan-a"],"clan":"a","userId":"fomo-user-id","walletSolana":null,"walletEvm":"0x...","source":"manual"}
+  ],
+  "nextOffset": null
+}
+```
+
+`limit` defaults to `50`; `offset` defaults to `0`. Optional identity fields are `null` when unset.
+
+### Token stats — `GET /fomo/tokens/{chain}/{address}/users`
+
+Returns the same per-user aggregation the dashboard's FOMO table renders:
+
+```json
+{
+  "data": [
+    {"handle":"@trader","name":"Trader","tags":["clan-a"],"clan":"a","buyUsd":1250,"sellUsd":400,"buys":3,"sells":1,"trades":4,"lastTs":1700000000000,"holdingAmount":5000000,"holdingPct":0.5,"balUsd":5000}
+  ]
+}
+```
+
+`buyUsd` and `sellUsd` cover the trailing 24 hours and are never netted; each is `null` when any in-window amount is unresolved. `lastTs` is `0` for a user whose membership comes only from a stored position or measured holding. Holding fields are omitted when the amount, price, or market cap is unknown.
+
+### Trades — `GET /fomo/users/{id}/trades`
+
+Same parameters and pagination as wallet trades: `from`/`to` default to the last 24 hours, `after_id` defaults to `0`, and `limit` defaults to `50`.
+
+```json
+{
+  "data": [
+    {"id":17,"userId":"fomo-user-id","handle":"@trader","eventId":"fomo-swap:...","ca":"token-address","chain":"base","side":"buy","usdValue":200,"tradeUsd":100,"price":0.001,"token":"TICKER","ts":1700000000000,"source":"fomo"}
+  ],
+  "nextId": 17
+}
+```
+
+`usdValue` is type-dependent (post-fill value for a buy, signed realised PnL for a sell). Use `tradeUsd` for spend/proceeds; it is the USD actually traded.
+
+### Positions — `GET /fomo/users/{id}/positions`
+
+```json
+{
+  "data": [
+    {
+      "ca":"token-address","chain":"base","tradeId":"trade-id","status":"open",
+      "amount":1000,"costBasisUsd":100,"avgEntryPrice":0.1,"priceUsd":0.2,
+      "realizedPnlUsd":0,"unrealizedPnlUsd":100,"fetchedAt":1700000000000,
+      "holdings":[{"source":"rpc","amount":1000,"pct":0.01,"capturedAt":1700000000000,"wallet":"0x..."}]
+    }
+  ],
+  "freshness": {
+    "balances":{"checkedAt":1700000000000,"capturedAt":1699999999000,"complete":true,"truncated":false,"available":true},
+    "positions":{"checkedAt":1700000000000}
+  }
+}
+```
+
+`costBasisUsd` is money actually spent, not the alert's mark-to-market value. `holdings[].source` is `api` (FOMO balances) or `rpc` (wallet-balance measurement); `wallet` appears only for `rpc`. A CA with a measured holding but no position row has `null` position fields and `fetchedAt: 0`. Unknown users return an empty `data` array.
+
+`freshness` reports the last upstream refresh: `checkedAt` is when the refresh ran, `capturedAt` when the balance snapshot was taken, and `complete`/`truncated`/`available` whether the balance list was partial, row-capped, or unreadable. Either entry is `null` when never refreshed.
+
 ## Pagination and request limits
 
-- `limit` defaults to `50` and is bounded to `1–100` for token, wallet, trade, and alert lists.
-- `offset` is used for token and wallet lists and is bounded to `1000000`.
-- `after_id` is used for alerts and trades and must be a non-negative integer.
+- `limit` defaults to `50` and is bounded to `1–100` for token, wallet, FOMO-token, FOMO-wallet, FOMO-user, trade, and alert lists.
+- `offset` is used for token, wallet, FOMO-token, FOMO-wallet, and FOMO-user lists and is bounded to `1000000`.
+- `after_id` is used for alerts, wallet trades, FOMO alerts, and FOMO trades and must be a non-negative integer.
 - Activity and trade time ranges use epoch milliseconds and the half-open interval `[from, to)`, with a maximum span of 31 days.
 - The HTTP quota is shared by all callers: 120 requests per minute per process. A `429` response includes `Retry-After` in seconds.
 - At most 16 HTTP requests are processed concurrently; excess requests may receive `503`.
@@ -575,8 +684,7 @@ Network/proxy failures may not return JSON. A successful `GET /status` does not 
 ## Data and security notes
 
 - The API is public and read-only; it has no caller identity or API keys.
-- Wallet addresses, wallet profiles, and wallet-watch trades are public to all callers.
-- Alert responses omit buyer identities and FOMO metadata; the API cannot be used to retrieve buyer identities.
+- Wallet addresses, wallet profiles, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, and measured holdings are public to all callers.
 - Only retained, stored data is returned. REST cursors can report `gap` after older rows have been pruned.
 - Never put `PUBLIC_API_EXPORT_TOKEN` in a client, browser bundle, URL, or request to a public endpoint. That credential is only for service-to-service access to the private backend export.
-- The API does not expose dashboard write operations, login, FOMO data, or internal dashboard notes.
+- The API does not expose dashboard write operations, login, tracked-buyer details, or internal dashboard notes.

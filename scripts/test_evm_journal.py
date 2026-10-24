@@ -133,5 +133,14 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(self.journal.pending_candidates("base", now=99), [])
         item = self.journal.pending_candidates("base", now=100)[0]
         self.assertEqual(item["attempts"], 1)
+
+    def test_soft_defer_preserves_attempts_and_pending_status(self):
+        self.journal.enqueue_candidate("base", "tx", 20, "hash")
+        self.journal.defer_candidate(
+            "base", "tx", 20, "hash", 100, increment_attempts=False
+        )
+        self.assertEqual(self.journal.pending_candidates("base", now=99), [])
+        item = self.journal.pending_candidates("base", now=100)[0]
+        self.assertEqual(item["attempts"], 0)
 if __name__ == "__main__":
     unittest.main()

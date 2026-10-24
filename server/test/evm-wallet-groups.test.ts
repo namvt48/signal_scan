@@ -130,7 +130,7 @@ test('generic EVM is disabled outside the FOMO API instance', async () => {
   const response = await req('POST', '/api/wallets', { address: ADDRESS_A, name: 'A-only', chain: 'evm' });
   config.showFomo = true;
   assert.equal(response.status, 400);
-  assert.deepEqual(response.json, { error: 'invalid chain (expected one of sol, base, bsc, robinhood)' });
+  assert.deepEqual(response.json, { error: 'invalid chain (expected one of sol, base, bsc, robinhood, eth)' });
 });
 
 test('opening the FOMO DB backfills each existing EVM wallet to the other chains', () => {
