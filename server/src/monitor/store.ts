@@ -464,9 +464,13 @@ export class MonitorStore {
     observations: readonly AlertMetricObservation[],
     rules: TelegramAlertRules = DEFAULT_TELEGRAM_ALERT_RULES,
     fomoRules: TelegramAlertRules = rules,
+    throughId?: number,
   ): number {
     const transaction = this.db.transaction((rows: readonly AlertMetricObservation[]) => {
       let cursor = this.alertCursor(source);
+      const skippedHighId = Number.isSafeInteger(throughId) && (throughId as number) > cursor
+        ? throughId as number
+        : cursor;
       const previousValue = this.db.prepare(`
         SELECT value, previous_value FROM alert_baselines
         WHERE source = ? AND chain = ? AND ca = ? AND metric = ?
@@ -566,6 +570,7 @@ export class MonitorStore {
         }
         cursor = observation.id;
       }
+      cursor = Math.max(cursor, skippedHighId);
       this.db.prepare(`
         INSERT INTO alert_cursors (source, observation_id) VALUES (?, ?)
         ON CONFLICT(source) DO UPDATE SET observation_id = excluded.observation_id

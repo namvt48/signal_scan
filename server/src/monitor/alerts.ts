@@ -193,15 +193,33 @@ export class MonitorAlerts {
       if (!response.ok || !Array.isArray(rawObservations)) throw new Error(`feed_http_${response.status}`);
       const observations: AlertMetricObservation[] = [];
       let previousId = cursor;
+      let pageHighId = cursor;
+      let skipped = 0;
       for (const raw of rawObservations) {
+        const rawId = field(raw, 'id');
+        if (Number.isSafeInteger(rawId) && (rawId as number) > pageHighId) pageHighId = rawId as number;
         const observation = parseObservation(raw);
-        if (observation === null || observation.id <= previousId) throw new Error('invalid_alert_observation');
+        if (observation === null) {
+          skipped += 1;
+          console.error(`[monitor] alert feed ${source} skipped malformed observation id=${String(rawId)}`);
+          continue;
+        }
+        if (observation.id <= previousId) {
+          skipped += 1;
+          console.error(`[monitor] alert feed ${source} skipped out-of-order observation id=${observation.id} after ${previousId}`);
+          continue;
+        }
         observations.push(observation);
         previousId = observation.id;
       }
+      if (skipped > 0) {
+        console.error(`[monitor] alert feed ${source} skipped ${skipped} observation(s) through id ${pageHighId}`);
+      }
       this.rules[source] = parseRules(field(body, 'telegramAlertRules')) ?? this.rules[source];
       this.fomoRules[source] = parseRules(field(body, 'fomoTelegramAlertRules')) ?? this.rules[source];
-      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules[source], this.fomoRules[source]);
+      const committedCursor = this.store.commitAlertObservations(
+        source, observations, this.rules[source], this.fomoRules[source], pageHighId,
+      );
       await this.acknowledgeSource(baseUrl, committedCursor);
     } catch (error) {
       console.error(`[monitor] alert feed ${source} failed: ${responseKind(error)}`);
