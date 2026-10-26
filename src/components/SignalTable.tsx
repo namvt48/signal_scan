@@ -8,7 +8,7 @@ import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type
 import { ago, compact, formatTimestamp, pct, shortAddr, tokenAmount, usd } from '../lib/format';
 import { sortTrackedWalletsByBalance, type WalletBalanceSort } from '../lib/walletSort';
 import { freshDisplayValue, freshPercentageInRange, holderCountClass, percentageInRange, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
-import { compareFomoUserActivity } from '../lib/fomoSort';
+import { compareTrackedActivity } from '../lib/activitySort';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
 import { T100Chart } from './T100Chart';
@@ -840,9 +840,9 @@ export default function SignalTable({
     const ap = a.tier === 'P' ? 1 : 0;
     const bp = b.tier === 'P' ? 1 : 0;
     if (ap !== bp) return ap - bp;
-    // Default FOMO order uses the latest FOMO-user trade in the same 24h window as Age.
+    // Merged FOMO view orders both source types by their newest 24h activity.
     if (!sort) return SHOW_FOMO
-      ? compareFomoUserActivity(a, b)
+      ? compareTrackedActivity(a, b)
       : b.trackedActivityAt - a.trackedActivityAt;
     const av = sortVal(a, sort.key);
     const bv = sortVal(b, sort.key);

@@ -106,7 +106,7 @@ FOMO_RELEASE_FILES := \
 	server/public/monitor.html
 
 # Keep Telegram presentation deploy isolated from alert-state and API changes.
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-chain-sync gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-chain-sync gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy frontend-deploy
 .PHONY: wallet-watch-deploy
 
 # Standalone partner API lifecycle on the selected production host.
@@ -144,6 +144,13 @@ docs-deploy:
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate web; fi"
 	@sleep 2
 	@for page in api-docs.html feature-history.html docs.css; do curl -fsS -o /dev/null -w "== HTTP %{http_code} — $(BASE)/$$page\n" "$(BASE)/$$page"; done
+
+# Sync the frontend source and recreate only the web container (keeps API and WIP services untouched).
+frontend-deploy:
+	@test "$(INSTANCE)" = a || { echo 'frontend-deploy is restricted to INSTANCE=a'; exit 1; }
+	rsync -azc -e "$(RSYNC_SSH)" src $(HOST):$(REMOTE_DIR)/
+	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate web; fi"
+	$(SSH) "curl -fsS http://127.0.0.1:8124/api/health >/dev/null && echo 'instance A API health OK'"
 
 routing-smoke:
 	$(SSH) 'bash -s' < scripts/test_instance_routing.sh
