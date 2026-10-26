@@ -77,21 +77,20 @@ def merge_wallets(conn: sqlite3.Connection) -> Dict[str, str]:
 
 
 def merge_wallet_child_tables(conn: sqlite3.Connection, id_map: Dict[str, str]) -> None:
-    # 1. wallet_token_state
-    b_states = conn.execute("SELECT wallet_id, ca, chain, token_amount, fetched_at FROM b.wallet_token_state").fetchall()
-    inserted_states = 0
-    for w_id, ca, chain, amount, fetched_at in b_states:
+    # 1. wallet_token_state (production schema: no fetched_at column)
+    b_states = conn.execute(
+        "SELECT wallet_id, ca, chain, token_amount, balance_usd FROM b.wallet_token_state"
+    ).fetchall()
+    for w_id, ca, chain, amount, balance_usd in b_states:
         canon_id = id_map.get(w_id, w_id)
-        res = conn.execute(
-            """INSERT INTO main.wallet_token_state (wallet_id, ca, chain, token_amount, fetched_at)
+        conn.execute(
+            """INSERT INTO main.wallet_token_state (wallet_id, ca, chain, token_amount, balance_usd)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(wallet_id, ca, chain) DO UPDATE SET
                    token_amount = excluded.token_amount,
-                   fetched_at = MAX(wallet_token_state.fetched_at, excluded.fetched_at)""",
-            (canon_id, ca, chain, amount, fetched_at)
+                   balance_usd = excluded.balance_usd""",
+            (canon_id, ca, chain, amount, balance_usd)
         )
-        if res.rowcount:
-            inserted_states += 1
     print(f"  [wallet_token_state] merged: {len(b_states)}")
 
     # 2. wallet_trades

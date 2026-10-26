@@ -246,6 +246,93 @@ test('invalid optional dashboard metadata does not discard a valid alert observa
     store.close();
   }
 });
+
+test('malformed or out-of-order observation does not permanently stall feed and advances cursor', async () => {
+  const store = new MonitorStore(':memory:');
+  const configuration = readMonitorConfig({
+    MONITOR_API_TOKEN: 'feed-token',
+    MONITOR_API_A_URL: 'http://api-a',
+    MONITOR_API_B_URL: 'http://api-b',
+  });
+  const valid1 = observation(1, 'fresh', 20, 'SKIP-TEST', 'SkipTestMint111111111111111111111111111111111');
+  const malformed = {
+    id: 2,
+    ca: valid1.ca,
+    chain: 'sol',
+    metric: 'fresh',
+    value: 22,
+    responseAt: 1_700_000_000_002,
+    snapshot: {},
+  };
+  const valid3 = observation(3, 'fresh', 28, 'SKIP-TEST', valid1.ca);
+  const rows = [valid1, malformed, valid3];
+  const ackedThrough: Record<string, number> = {};
+  const fetcher: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/ack')) {
+      const body = JSON.parse(String(init?.body)) as { throughId: number };
+      ackedThrough[url.hostname] = body.throughId;
+      return new Response(null, { status: 204 });
+    }
+    const afterId = Number(url.searchParams.get('afterId'));
+    return new Response(JSON.stringify({
+      observations: url.hostname === 'api-a' ? rows.filter((r) => r.id > afterId) : [],
+      telegramAlertRules: { fwGrowthPct: 30, minFwPct: 15, t100GrowthPct: 30, minMcK: -1, maxMcK: -1, trackerBuyingK: 0 },
+    }), { status: 200 });
+  };
+  const delivered: string[] = [];
+  const bot = new TelegramBot('test-token', 'test-chat', async (_url, init) => {
+    const payload = telegramPayload(init);
+    delivered.push(String(payload.caption ?? payload.text ?? ''));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  try {
+    await new MonitorAlerts(store, configuration, bot, fetcher, () => 1_700_000_001_000).tick();
+    assert.equal(store.alertCursor('A'), 3, 'cursor advanced past malformed observation 2 to 3');
+    assert.equal(ackedThrough['api-a'], 3, 'ack was sent through observation 3 for source A');
+    assert.equal(delivered.length, 1, 'valid observation 3 still triggered growth alert against baseline 1');
+    assert.match(delivered[0] ?? '', /SKIP-TEST/);
+    assert.match(delivered[0] ?? '', /\+40%/);
+  } finally {
+    store.close();
+  }
+});
+test('feed body read failure leaves cursor and ack unchanged for retry', async () => {
+  const store = new MonitorStore(':memory:');
+  const configuration = readMonitorConfig({
+    MONITOR_API_TOKEN: 'feed-token',
+    MONITOR_API_A_URL: 'http://api-a',
+    MONITOR_API_B_URL: 'http://api-b',
+  });
+  let ackedA = false;
+  const fetcher: typeof fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/ack')) {
+      if (url.hostname === 'api-a') ackedA = true;
+      return new Response(null, { status: 204 });
+    }
+    // Source A returns non-JSON body simulating stream truncation or server error page
+    if (url.hostname === 'api-a') {
+      return new Response('<html>502 Bad Gateway</html>', { status: 200 });
+    }
+    return new Response(JSON.stringify({ observations: [] }), { status: 200 });
+  };
+  const delivered: string[] = [];
+  const bot = new TelegramBot('test-token', 'test-chat', async (_url, init) => {
+    const payload = telegramPayload(init);
+    delivered.push(String(payload.caption ?? payload.text ?? ''));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  try {
+    await new MonitorAlerts(store, configuration, bot, fetcher, () => 1_700_000_001_000).tick();
+    assert.equal(store.alertCursor('A'), 0, 'cursor remains at 0 when body read fails');
+    assert.equal(ackedA, false, 'ack was not sent for source A on body read failure');
+    assert.equal(delivered.length, 0, 'no alert enqueued or delivered');
+    assert.deepEqual(store.pendingTelegramAlerts(1_700_000_002_000, 10), []);
+  } finally {
+    store.close();
+  }
+});
 test('T100 alerts require strictly more than 30% growth from a positive prior baseline', () => {
   const store = new MonitorStore(':memory:');
   const ca = 'T100IncreaseMint11111111111111111111111';

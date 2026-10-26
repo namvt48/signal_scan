@@ -42,8 +42,8 @@ class TestMergeInstanceData(unittest.TestCase):
                 wallet_id TEXT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
                 ca TEXT NOT NULL,
                 chain TEXT NOT NULL,
-                token_amount REAL NOT NULL,
-                fetched_at INTEGER NOT NULL,
+                token_amount REAL NOT NULL DEFAULT 0,
+                balance_usd REAL,
                 PRIMARY KEY (wallet_id, ca, chain)
             );
             CREATE TABLE wallet_trades (
@@ -130,6 +130,9 @@ class TestMergeInstanceData(unittest.TestCase):
             "INSERT INTO wallets VALUES ('w_evm_common', '0x1111111111111111111111111111111111111111', 'EVM A', '[\"whale\"]', 'base', 'test', '')"
         )
         conn_a.execute(
+            "INSERT INTO wallet_token_state VALUES ('w_evm_common', '0xca-state', 'base', 1.0, 100)"
+        )
+        conn_a.execute(
             "INSERT INTO tracked_cas VALUES (1, 'SolMint1111', 'sol', '2026-10-01', 'note-a', NULL, 100, 'active')"
         )
         conn_a.execute(
@@ -154,6 +157,14 @@ class TestMergeInstanceData(unittest.TestCase):
         # B has a new BSC wallet
         conn_b.execute(
             "INSERT INTO wallets VALUES ('w_bsc_b', '0x2222222222222222222222222222222222222222', 'BSC Wallet', '[\"smart\"]', 'bsc', 'test', '')"
+        )
+        # Holdings on an existing wallet exercise conflict-upsert precedence.
+        conn_b.execute(
+            "INSERT INTO wallet_token_state VALUES ('w_evm_b_id', '0xca-state', 'base', 2.5, 200)"
+        )
+        # A new wallet's holding exercises the child FK remap path.
+        conn_b.execute(
+            "INSERT INTO wallet_token_state VALUES ('w_bsc_b', '0xca-state-bsc', 'bsc', 7.0, 700)"
         )
         # Trade on B linked to w_evm_b_id
         conn_b.execute(
@@ -214,6 +225,14 @@ class TestMergeInstanceData(unittest.TestCase):
         trades = conn.execute("SELECT wallet_id, tx, ca FROM wallet_trades").fetchall()
         self.assertEqual(len(trades), 1)
         self.assertEqual(trades[0][0], "w_evm_common")  # remapped from w_evm_b_id
+        holdings = conn.execute(
+            "SELECT wallet_id, ca, token_amount, balance_usd FROM wallet_token_state ORDER BY wallet_id"
+        ).fetchall()
+        self.assertEqual(holdings, [
+            ("w_bsc_b", "0xca-state-bsc", 7.0, 700.0),
+            ("w_evm_common", "0xca-state", 2.5, 200.0),
+        ])
+
 
         # 3. FOMO users and trades
         fomo_users = conn.execute("SELECT handle FROM fomo_users").fetchall()

@@ -181,7 +181,8 @@ def _api_wallets(chain="sol"):
                 if isinstance(w, dict)
                 and isinstance(w.get("address"), str)
                 and w["address"]
-                and (chain is None or w.get("chain") == chain or (chain == "sol" and not w["address"].startswith("0x")))
+                and (chain is None or w.get("chain") == chain)
+                and not (chain == "sol" and w["address"].startswith("0x"))
             ]
     except Exception as ex:
         print(f"  ! api wallets: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)

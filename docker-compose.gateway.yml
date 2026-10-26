@@ -36,6 +36,8 @@ services:
         required: false
     environment:
       GATEWAY_PORT: "8130"
+      # No B caller is deployed; preserve the full shared credit budget for A.
+      GATEWAY_TOKEN_B: ""
       DB_PATH: /market-data/market.db
       MODE: "${MARKET_DATA_MODE:-gmgn}"
       NANSEN_CRAWL: "on"

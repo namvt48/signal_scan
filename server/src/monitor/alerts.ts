@@ -129,6 +129,26 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
 function responseKind(error: unknown): string {
   return error instanceof Error ? error.name : 'UnknownError';
 }
+
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  const causeText = cause instanceof Error
+    ? `${cause.name}: ${cause.message}`
+    : cause === undefined
+      ? ''
+      : String(cause);
+  return `${error.name}: ${error.message}${causeText ? ` cause=${causeText}` : ''}`;
+}
+
+function bodyPreview(body: unknown, limit = 500): string {
+  try {
+    const text = typeof body === 'string' ? body : JSON.stringify(body);
+    return text.length > limit ? `${text.slice(0, limit)}…` : text;
+  } catch {
+    return '<unstringifiable>';
+  }
+}
 function parseRules(raw: unknown): TelegramAlertRules | null {
   const fwGrowthPct = field(raw, 'fwGrowthPct');
   const minFwPct = field(raw, 'minFwPct');
@@ -183,14 +203,24 @@ export class MonitorAlerts {
     const endpoint = new URL('/api/monitor/alerts', baseUrl);
     endpoint.searchParams.set('afterId', String(cursor));
     endpoint.searchParams.set('limit', String(PAGE_SIZE));
+    let stage = 'fetch';
     try {
       const response = await this.fetcher(endpoint, {
         headers: { Authorization: `Bearer ${this.config.apiToken}` },
         signal: AbortSignal.timeout(5_000),
       });
-      const body: unknown = await response.json().catch(() => null);
+      stage = 'body';
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch (error) {
+        throw new Error(`feed_body_status_${response.status}: ${describeError(error)}`, { cause: error });
+      }
       const rawObservations = field(body, 'observations');
-      if (!response.ok || !Array.isArray(rawObservations)) throw new Error(`feed_http_${response.status}`);
+      if (!response.ok || !Array.isArray(rawObservations)) {
+        throw new Error(`feed_http_${response.status}: ${bodyPreview(body)}`);
+      }
+      stage = 'validate';
       const observations: AlertMetricObservation[] = [];
       let previousId = cursor;
       let pageHighId = cursor;
@@ -201,12 +231,23 @@ export class MonitorAlerts {
         const observation = parseObservation(raw);
         if (observation === null) {
           skipped += 1;
-          console.error(`[monitor] alert feed ${source} skipped malformed observation id=${String(rawId)}`);
+          const snapshot = field(raw, 'snapshot');
+          const keys = typeof snapshot === 'object' && snapshot !== null
+            ? Object.keys(snapshot).slice(0, 12).join(',')
+            : typeof snapshot;
+          console.error(
+            `[monitor] alert feed ${source} skipped malformed observation id=${String(rawId)}` +
+            ` ca=${String(field(raw, 'ca')).slice(0, 24)} metric=${String(field(raw, 'metric'))}` +
+            ` snapshotKeys=${keys} raw=${bodyPreview(raw, 300)}`,
+          );
           continue;
         }
         if (observation.id <= previousId) {
           skipped += 1;
-          console.error(`[monitor] alert feed ${source} skipped out-of-order observation id=${observation.id} after ${previousId}`);
+          console.error(
+            `[monitor] alert feed ${source} skipped out-of-order observation id=${observation.id}` +
+            ` after=${previousId}`,
+          );
           continue;
         }
         observations.push(observation);
@@ -217,12 +258,14 @@ export class MonitorAlerts {
       }
       this.rules[source] = parseRules(field(body, 'telegramAlertRules')) ?? this.rules[source];
       this.fomoRules[source] = parseRules(field(body, 'fomoTelegramAlertRules')) ?? this.rules[source];
+      stage = 'commit';
       const committedCursor = this.store.commitAlertObservations(
         source, observations, this.rules[source], this.fomoRules[source], pageHighId,
       );
+      stage = 'ack';
       await this.acknowledgeSource(baseUrl, committedCursor);
     } catch (error) {
-      console.error(`[monitor] alert feed ${source} failed: ${responseKind(error)}`);
+      console.error(`[monitor] alert feed ${source} failed stage=${stage} error=${describeError(error)}`);
     }
   }
 

@@ -1,6 +1,6 @@
 # Signal Scan Public API v1
 
-Read-only API for external consumers of the Signal Scan dashboard data. The standalone service serves `/api/v1/*`; it does not expose dashboard write operations or user authentication. Token, alert, balance, and wallet data come from instance A; FOMO watch-list, FOMO token, FOMO alert, and FOMO wallet data come from the FOMO dashboard instance (B) through a second private export upstream. Returned data comes from the backend's currently stored state; this API does not backfill history.
+Read-only API for external consumers of the Signal Scan dashboard data. The standalone service serves `/api/v1/*`; it does not expose dashboard write operations or user authentication. All routes read from one merged dashboard database. `/api/v1/alerts` and `/api/v1/ws` cover `market` and `wallet` alert origins; `/api/v1/fomo/*` routes and `/api/v1/fomo/ws` cover `fomo` alerts and FOMO user data. Returned data is the backend's currently stored state; this API does not backfill history.
 
 Browsable pages served by the same web container:
 
@@ -19,7 +19,7 @@ The standalone service still authenticates its requests to the dashboard's priva
 curl https://signal-scan.duckdns.org/api/v1/status
 ```
 
-Because there is no caller identity, wallet addresses and wallet-watch trades are public to all API consumers. FOMO handles, FOMO trades, FOMO positions, FOMO-instance tokens, FOMO-instance alerts, and measured holdings are likewise public. Do not enable this service unless that disclosure is acceptable.
+Because there is no caller identity, wallet addresses and wallet-watch trades are public to all API consumers. FOMO handles, trades, positions, tokens, alerts, wallets, and measured holdings are likewise public. Do not enable this service unless that disclosure is acceptable.
 
 ## Endpoints
 
@@ -198,15 +198,15 @@ Timestamps are Unix epoch milliseconds. Both bounds are optional; defaults are t
 }
 ```
 
-`after_id` defaults to `0`; `limit` defaults to `50`. `gap` indicates that a nonzero cursor predates the oldest retained observation; acknowledged rows may be pruned. Alert DTOs exclude buyer identities and FOMO metadata.
+`after_id` defaults to `0`; `limit` defaults to `50`. The main feed includes market (`fresh`, `t100`) and tracked-wallet (`trackerBuy`) observations. FOMO-user `trackerBuy` observations are available only through `/api/v1/fomo/alerts` and the FOMO WebSocket. `gap` indicates that a nonzero cursor predates the oldest retained observation; acknowledged rows may be pruned. The feed migration reassigned former B alert IDs, so consumers holding pre-merge cursors must reset them.
 
 ### Live inflow stream
 
-The deployed endpoint is `wss://signal-scan.duckdns.org/api/v1/ws`. It is a public, server-to-client WebSocket; no client authentication is required, matching the REST API. On connection the server sends `{ "type": "ready", "afterId": <latest alert ID> }`; it then sends `{ "type": "inflow", "data": <alert> }` for each newly stored `trackerBuy` alert. Fresh/T100 alerts and sells are not streamed. The alert payload omits buyer identity and internal metadata.
+The deployed main endpoint is `wss://signal-scan.duckdns.org/api/v1/ws`. It is public and server-to-client. On connection, the server sends `{ "type": "ready", "afterId": <latest main alert ID> }`; it then sends `{ "type": "inflow", "data": <alert> }` for each new `wallet`-origin `trackerBuy`. `market` alerts and sells are not streamed. Alert payloads omit buyer identity and internal metadata.
 
-The stream starts at the latest stored alert when the connection is established; it does not replay prior inflows. Use `GET /api/v1/alerts?after_id=<id>` for cursor-based recovery after disconnect. The server sends WebSocket ping frames every 25 seconds and removes clients that do not answer pong. The HTTPS proxy allows 75 seconds of read idle time. At most 64 concurrent WebSocket connections are accepted per process; excess upgrades receive `503`. Alerts are polled once per process and shared with connected clients. Slow consumers are closed; reconnect and resume with the last processed alert ID using the REST endpoint.
+The main stream starts at its current cursor; it does not replay prior inflows. Use `GET /api/v1/alerts?after_id=<id>` to recover across disconnects. After the one-time merge, discard any cursor saved from former instance B and start from the new feed. Ping/pong, connection limits, and slow-consumer handling are unchanged.
 
-The FOMO instance exposes a second stream at `wss://signal-scan.duckdns.org/api/v1/fomo/ws` with the same protocol, filters, and replay semantics for FOMO-instance `trackerBuy` alerts. Recover with `GET /api/v1/fomo/alerts?after_id=<id>`. Both paths share the 64-connection budget but poll their own upstream; an unavailable upstream closes only its own stream with code `1011`.
+The FOMO endpoint `wss://signal-scan.duckdns.org/api/v1/fomo/ws` has the same protocol and streams only `fomo`-origin `trackerBuy` alerts. Recover with `GET /api/v1/fomo/alerts?after_id=<id>`. Both paths share the 64-connection budget and read the same merged backend; an unavailable stream closes only its own connection with code `1011`.
 
 ### Wallets
 
@@ -239,23 +239,23 @@ The FOMO instance exposes a second stream at `wss://signal-scan.duckdns.org/api/
 
 ### FOMO watch-list and activity
 
-FOMO routes read the separate FOMO dashboard instance through a second private export upstream. They return `502` when that upstream is not configured or unreachable. FOMO token stats accept `eth` in addition to `sol`, `base`, `bsc`, and `robinhood`; other values return `400`.
+FOMO routes read FOMO users, trades, positions, and holdings from the merged dashboard database. They return `502` when the private upstream is unavailable. FOMO token stats accept `eth` in addition to `sol`, `base`, `bsc`, and `robinhood`; other values return `400`.
 
 | Method and path | Response |
 | --- | --- |
-| `GET /api/v1/fomo/tokens` | Paginated FOMO-instance token table (token payload plus `fomoUsers`). |
-| `GET /api/v1/fomo/tokens/{chain}/{address}` | One FOMO-instance token, including `fomoUsers`. |
+| `GET /api/v1/fomo/tokens` | Paginated token table (token payload plus `fomoUsers`). |
+| `GET /api/v1/fomo/tokens/{chain}/{address}` | One token, including `fomoUsers`. |
 | `GET /api/v1/fomo/tokens/{chain}/{address}/users` | Per-token FOMO user stats. |
-| `GET /api/v1/fomo/alerts` | FOMO-instance alert observations. |
+| `GET /api/v1/fomo/alerts` | FOMO-user (`fomo` origin) alert observations. |
 | `GET /api/v1/fomo/users` | Paginated FOMO watch-list. |
 | `GET /api/v1/fomo/users/{id}/trades` | One user's stored FOMO buy/sell alerts. |
 | `GET /api/v1/fomo/users/{id}/positions` | Stored positions plus balance measurements and refresh metadata. |
-| `GET /api/v1/fomo/wallets` | Paginated FOMO-instance tracked wallets. |
-| `GET /api/v1/fomo/wallets/{id}/trades` | One FOMO-instance wallet's watch trades. |
+| `GET /api/v1/fomo/wallets` | Paginated tracked wallets. |
+| `GET /api/v1/fomo/wallets/{id}/trades` | One FOMO wallet's watch trades. |
 
 #### FOMO token table
 
-`GET /api/v1/fomo/tokens?limit=<n>&offset=<n>` returns the FOMO dashboard's
+`GET /api/v1/fomo/tokens?limit=<n>&offset=<n>` returns the merged dashboard's
 tracked token list. Each entry is the same payload as `GET /api/v1/tokens` plus
 `fomoUsers` — the rows the dashboard's FOMO sub-table renders:
 
@@ -274,16 +274,16 @@ tracked token list. Each entry is the same payload as `GET /api/v1/tokens` plus
 ```
 
 `GET /api/v1/fomo/tokens/{chain}/{address}` returns one entry with the same
-shape and `404` when the FOMO instance does not track that token. `eth` is
+shape and `404` when the merged dashboard does not track that token. `eth` is
 accepted here as well as on the per-token stats route.
 
 #### FOMO alerts and wallets
 
-`GET /api/v1/fomo/alerts?after_id=<id>&limit=<n>` returns the FOMO instance's
-alert observations with the same DTO, `nextId`, and `gap` semantics as
-`GET /api/v1/alerts`. `GET /api/v1/fomo/wallets` and
-`GET /api/v1/fomo/wallets/{id}/trades` mirror `/api/v1/wallets` and
-`/api/v1/wallets/{id}/trades` against the FOMO instance's wallet watch.
+`GET /api/v1/fomo/alerts?after_id=<id>&limit=<n>` returns only FOMO-user
+`trackerBuy` observations, with the same DTO, `nextId`, and `gap` semantics as
+`GET /api/v1/alerts`. `/api/v1/alerts` contains market and tracked-wallet
+origins. FOMO wallets and their watch trades are also sourced from the merged
+dashboard database.
 
 #### FOMO users
 
@@ -394,20 +394,18 @@ Configuration used by the standalone container:
 | --- | --- |
 | `PUBLIC_API_EXPORT_TOKEN` | Private credential shared with the backend's `server/.env`; required for backend export requests. |
 | `PUBLIC_API_PORT` | Internal listen port; Compose uses `3010`. |
-| `PUBLIC_API_INTERNAL_URL` | Private dashboard API base URL; Compose selects the instance-specific API alias. |
-| `PUBLIC_API_FOMO_INTERNAL_URL` | Private FOMO dashboard API base URL (instance B). Uses the same `PUBLIC_API_EXPORT_TOKEN`; empty disables `/api/v1/fomo/*` with `502`. |
+| `PUBLIC_API_INTERNAL_URL` | Private dashboard API base URL; deployed main and FOMO routes use the merged instance A API. |
+| `PUBLIC_API_FOMO_INTERNAL_URL` | Private FOMO route upstream; set to the same merged A API and share `PUBLIC_API_EXPORT_TOKEN`. |
 
 Set `PUBLIC_API_RUN=1` only in the standalone container to start the service process; the ordinary dashboard API does not enable this listener.
 
-1. Set a long random `PUBLIC_API_EXPORT_TOKEN` in the backend's `server/.env`. Set the same value in the FOMO instance's `server/.env` so `/api/v1/fomo/*` can read it.
-2. Copy `server/public-api.env.example` to `server/public-api.env`; set the same `PUBLIC_API_EXPORT_TOKEN`. Keep both secret files private and do not commit them.
-3. Create/deploy the standalone API with `make public-api-deploy` (initial deployment is instance A). Check it with `make public-api-status` and `make public-api-logs`.
+1. Set a long random `PUBLIC_API_EXPORT_TOKEN` in the backend's `server/.env`.
+2. Copy `server/public-api.env.example` to `server/public-api.env`; set the same `PUBLIC_API_EXPORT_TOKEN` and point both internal API URLs to `http://signal-scan-api-a:3001`. Keep both secret files private and do not commit them.
+3. Create/deploy the standalone API with `make public-api-deploy` (instance A). Check it with `make public-api-status` and `make public-api-logs`.
 4. Stop or start only the standalone service with `make public-api-down` / `make public-api-up`. `make public-api-build` rebuilds its image. The dashboard API and login remain available when the public service is stopped.
-
-`PUBLIC_API_FOMO_INTERNAL_URL` is owned by `server/public-api.env` (the example sets `http://signal-scan-api-b:3001`), not by Compose. The public-api container and the FOMO API share the `signal-scan-gateway` network, so no host port or Caddy entry is needed. Leave the variable empty to disable FOMO routes; every FOMO route then returns `502` while the rest of the API keeps working.
 
 The service is configured to publish only on loopback (`127.0.0.1:3010`) and is exposed externally through the existing HTTPS Nginx route. The initial deployment also installs the backend export route and Nginx proxy configuration; it rebuilds/recreates the backend and web proxy. Later on/off actions affect only the public API container. Keep one replica because the request quota, cache, and in-flight limits are process-local.
 
 ## Data exposure
 
-This is a read-only data export, not a general dashboard API. The DTOs omit tracked-buyer details and internal dashboard notes. Wallet addresses, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO-instance tokens, FOMO-instance alerts, and measured holdings are public without authentication; do not expose this service if that disclosure is unacceptable. Only stored source history is returned; unavailable/expired source data is not reconstructed.
+This is a read-only data export, not a general dashboard API. The DTOs omit tracked-buyer details and internal dashboard notes. Wallet addresses, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO tokens, FOMO alerts, and measured holdings are public without authentication; do not expose this service if that disclosure is unacceptable. Only stored source history is returned; unavailable/expired source data is not reconstructed.
