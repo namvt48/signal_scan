@@ -51,7 +51,6 @@ services:
       - /root/signal-scan-gateway/gateway.env:/run/gateway.env:ro
       - signal-scan-market-data:/market-data
       - /root/signal_scan/data:/legacy-a:ro
-      - /root/signal_scan_b/data-b:/legacy-b:ro
     ports:
       # Loopback ONLY — host watchers need it, the public internet must not see it.
       - "127.0.0.1:8130:8130"

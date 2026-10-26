@@ -148,27 +148,29 @@ export class MonitorCollector {
 
   async collect(): Promise<void> {
     const ts = this.now();
-    const services = await Promise.all([
+    const serviceProbes = [
       this.probe('monitor', 'Monitor service', 'Monitor', `http://127.0.0.1:${this.config.port}/healthz`, true),
       this.probe('api-a', 'Instance A API', 'API', `${this.config.apiAUrl}/api/health`, true),
-      this.probe('api-b', 'Instance B API', 'API', `${this.config.apiBUrl}/api/health`, true),
+      ...(this.config.apiBUrl ? [this.probe('api-b', 'Instance B API', 'API', `${this.config.apiBUrl}/api/health`, true)] : []),
       this.probe('web-a', 'Instance A web', 'Web', this.config.webAUrl, false),
-      this.probe('web-b', 'Instance B web', 'Web', this.config.webBUrl, false),
+      ...(this.config.webBUrl ? [this.probe('web-b', 'Instance B web', 'Web', this.config.webBUrl, false)] : []),
       this.probe('gateway', 'Request gateway', 'Gateway', `${this.config.gatewayUrl}/health`, true),
       this.probe('chrome-a', 'Instance A browser', 'Browser', this.config.chromeAUrl, false),
-      this.probe('chrome-b', 'Instance B browser', 'Browser', this.config.chromeBUrl, false),
+      ...(this.config.chromeBUrl ? [this.probe('chrome-b', 'Instance B browser', 'Browser', this.config.chromeBUrl, false)] : []),
       this.probe('gateway-chrome', 'Gateway browser', 'Browser', this.config.gatewayChromeUrl, false),
       this.probe('public-https', 'Public HTTPS / Caddy', 'Ingress', this.config.publicSiteUrl, false),
       this.heartbeat('fomo-watch', 'FOMO watcher', this.config.fomoHeartbeatPath, 90_000, ts),
       this.heartbeat('wallet-watch', 'Wallet watcher', this.config.walletHeartbeatPath, 300_000, ts),
-    ]);
+    ];
+    const services = await Promise.all(serviceProbes);
     services.push(...await this.nansenServices(ts));
 
-    const telemetry = await Promise.all([
+    const telemetryProbes = [
       this.fetchPrivateMetrics('api-a-telemetry', 'Instance A telemetry', `${this.config.apiAUrl}/api/monitor/metrics`),
-      this.fetchPrivateMetrics('api-b-telemetry', 'Instance B telemetry', `${this.config.apiBUrl}/api/monitor/metrics`),
+      ...(this.config.apiBUrl ? [this.fetchPrivateMetrics('api-b-telemetry', 'Instance B telemetry', `${this.config.apiBUrl}/api/monitor/metrics`)] : []),
       this.fetchPrivateMetrics('gateway-telemetry', 'Gateway telemetry', `${this.config.gatewayUrl}/monitor/metrics`),
-    ]);
+    ];
+    const telemetry = await Promise.all(telemetryProbes);
     const collected = telemetry.flatMap((result) => result.metrics);
     const fomoApiSamples = telemetry.flatMap((result) => result.fomoApiSamples);
     const metrics = this.aggregateSolanaMetrics(this.aggregateHeliusMetrics(collected));

@@ -87,12 +87,13 @@ export class PeriodicScanRunner {
   async tick(): Promise<void> {
     const slot = periodicScanSlotUtc7(this.now(), 1);
     if (slot === null) return;
-    const [a, b] = await Promise.all([
-      this.scanSource('A', this.config.apiAUrl, slot),
-      this.scanSource('B', this.config.apiBUrl, slot),
-    ]);
-    if (a === null || b === null) return;
-    const dueSources = [a, b].filter((scan) => scan.due);
+    const scans = [this.scanSource('A', this.config.apiAUrl, slot)];
+    if (this.config.apiBUrl && this.config.apiBUrl !== this.config.apiAUrl) {
+      scans.push(this.scanSource('B', this.config.apiBUrl, slot));
+    }
+    const results = await Promise.all(scans);
+    if (results.some((r) => r === null)) return;
+    const dueSources = results.filter((scan): scan is NonNullable<typeof scan> => scan !== null && scan.due);
     const entries = dueSources.flatMap((scan) => scan.entries);
     if (dueSources.length === 0 || entries.length === 0) return;
     const sourceKey = dueSources.map((scan) => scan.source).join('+');

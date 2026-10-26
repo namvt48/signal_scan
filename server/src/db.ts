@@ -10,7 +10,7 @@ import { CHAINS, EVM_ADDRESS, EVM_CHAINS, canonicalCa, isSolanaAddress, type Cha
 import { type Tier } from './shared/tier.js';
 import { config } from './config.js';
 import { MOCK_CA_POOL } from './providers/mock.js';
-import type { AlertMetric, AlertMetricObservation, AlertMetricSnapshot } from './alert-feed.js';
+import type { AlertMetric, AlertMetricObservation, AlertMetricSnapshot, AlertOrigin } from './alert-feed.js';
 
 export interface WalletRow {
   id: string;
@@ -224,7 +224,8 @@ CREATE TABLE IF NOT EXISTS alert_metric_observations (
   metric TEXT NOT NULL CHECK(metric IN ('fresh', 't100', 'trackerBuy')),
   value REAL NOT NULL,
   response_at INTEGER NOT NULL,
-  snapshot_json TEXT NOT NULL
+  snapshot_json TEXT NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'market'
 );
 CREATE INDEX IF NOT EXISTS idx_alert_metric_observations_feed ON alert_metric_observations(id);
 CREATE TABLE IF NOT EXISTS alert_metric_feed_state (
@@ -319,6 +320,26 @@ CREATE TABLE IF NOT EXISTS fomo_users (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fomo_users_handle ON fomo_users(handle);
 CREATE INDEX IF NOT EXISTS idx_fomo_users_user_id ON fomo_users(user_id);
+
+-- Alita following sync state. One row per owner; missing users need TWO
+-- consecutive complete snapshots before removal so a truncated page can never
+-- delete a watched user.
+CREATE TABLE IF NOT EXISTS fomo_follow_sync (
+  owner_user_id TEXT PRIMARY KEY,
+  owner_handle TEXT NOT NULL,
+  last_attempt_at INTEGER,
+  last_success_at INTEGER,
+  last_error TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_count INTEGER,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fomo_follow_missing (
+  owner_user_id TEXT NOT NULL,
+  target_user_id TEXT NOT NULL,
+  first_missing_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_user_id, target_user_id)
+);
 
 -- FOMO buy/sell alerts. event_id is the idempotency key (unique across the
 -- 102-alert capture). ca is CANONICALIZED (canonicalCa) so \${chain}:\${ca} keys line up
@@ -555,6 +576,20 @@ export function open(path: string, sharedMarketPath = ''): void {
     });
     migrateAlertMetric();
   }
+  const alertCols = (instance.pragma('table_info(alert_metric_observations)') as { name: string }[]).map((c) => c.name);
+  if (!alertCols.includes('origin')) {
+    instance.exec("ALTER TABLE alert_metric_observations ADD COLUMN origin TEXT NOT NULL DEFAULT 'market'");
+  }
+  if (getSetting('alertOriginBackfill') !== '1') {
+    instance.exec(`
+      UPDATE alert_metric_observations SET origin = CASE
+        WHEN metric IN ('fresh', 't100') THEN 'market'
+        WHEN json_extract(snapshot_json, '$.trackerBuyer.address') IS NOT NULL OR chain = 'sol' THEN 'wallet'
+        ELSE 'fomo'
+      END
+    `);
+    setSetting('alertOriginBackfill', '1');
+  }
   // Migration for DBs created before the balance-range columns (idempotent).
   const cols = (instance.pragma('table_info(token_state)') as { name: string }[]).map((c) => c.name);
   for (const col of ['vol_1h', 'vol_24h_prev', 'bal_peak_24h', 'bal_trough_24h', 'bal_peak_7d', 'bal_trough_7d', 'bal_peak_30d', 'bal_trough_30d', 'fresh_rate', 'nansen_holders', 'nansen_fresh_pct', 'nansen_t100_pct', 'nansen_median_usd', 't100_multiple', 'genesis_bal']) {
@@ -755,11 +790,7 @@ export function open(path: string, sharedMarketPath = ''): void {
   // never overwritten: settings survives restarts AND table resets, so the
   // cadence phase is stable across both.
   if (getSetting('systemDeployAt') === undefined) setSetting('systemDeployAt', String(Date.now()));
-  if (config.showFomo) {
-    // Keep historical rows, but permanently stop them entering B's active CA queue.
-    instance.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE chain = 'sol' AND status != 'inactive'").run();
-    backfillFomoEvmWalletGroups(instance);
-  }
+  if (config.showFomo) backfillFomoEvmWalletGroups(instance);
   if (sharedMarketPath !== '') {
     instance.prepare('ATTACH DATABASE ? AS market_data').run(sharedMarketPath);
     instance.exec(`
@@ -816,10 +847,7 @@ export interface WalletInput {
 }
 
 export function listWallets(): WalletRow[] {
-  const sql = config.showFomo
-    ? "SELECT * FROM wallets WHERE chain != 'sol' ORDER BY name"
-    : 'SELECT * FROM wallets ORDER BY name';
-  return getDb().prepare(sql).all() as WalletRow[];
+  return getDb().prepare('SELECT * FROM wallets ORDER BY name').all() as WalletRow[];
 }
 
 /**
@@ -1016,10 +1044,6 @@ export function importWallets(
   const run = db.transaction((items: readonly ImportCandidate[]) => {
     items.forEach((r, i) => {
       const address = r.address.trim();
-      if (config.showFomo && r.chain === 'sol') {
-        skipped.push({ row: i, reason: 'Solana wallets are disabled on FOMO instance' });
-        return;
-      }
       if (!address) {
         skipped.push({ row: i, reason: 'address is empty' });
         return;
@@ -1080,10 +1104,6 @@ export interface TrackedCaInput {
 }
 
 export function listTrackedCas(includeInactive = false): TrackedCaRow[] {
-  if (config.showFomo) {
-    const activeFilter = includeInactive ? '' : " AND status != 'inactive'";
-    return getDb().prepare(`SELECT * FROM tracked_cas WHERE chain != 'sol'${activeFilter} ORDER BY added_at DESC`).all() as TrackedCaRow[];
-  }
   if (includeInactive) {
     return getDb().prepare('SELECT * FROM tracked_cas ORDER BY added_at DESC').all() as TrackedCaRow[];
   }
@@ -1291,7 +1311,6 @@ export function reactivateTrackedCa(
   entryUsd?: number,
 ): TrackedCaRow | undefined {
   const db = getDb();
-  if (config.showFomo && chain === 'sol') return undefined;
   const canon = canonicalCa(address, chain);
   const now = new Date().toISOString();
   db.prepare(`
@@ -1816,6 +1835,7 @@ export function appendAlertMetricObservation(
   value: number,
   responseAt: number,
   trackerBuyer?: { name: string; address?: string },
+  forcedOrigin?: AlertOrigin,
 ): void {
   const canonical = canonicalCa(ca, chain);
   const state = db.prepare(`
@@ -1903,22 +1923,34 @@ export function appendAlertMetricObservation(
       }
       : {}),
   };
+  const origin: AlertOrigin = forcedOrigin ?? (metric === 'trackerBuy' ? (trackerBuyer?.address || chain === 'sol' || !trackerBuyer ? 'wallet' : 'fomo') : 'market');
   db.prepare(`
-    INSERT INTO alert_metric_observations (ca, chain, metric, value, response_at, snapshot_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(canonical, chain, metric, value, responseAt, JSON.stringify(snapshot));
+    INSERT INTO alert_metric_observations (ca, chain, metric, value, response_at, snapshot_json, origin)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(canonical, chain, metric, value, responseAt, JSON.stringify(snapshot), origin);
 }
 
 export function getLatestAlertMetricObservationId(): number {
   const row = getDb().prepare('SELECT COALESCE(MAX(id), 0) AS id FROM alert_metric_observations').get() as { id: number };
   return row.id;
 }
-/** Ordered, durable metric observations consumed by the central Monitor. */
-export function getAlertMetricObservations(afterId: number, limit: number): AlertMetricObservation[] {
-  const rows = getDb().prepare(`
-    SELECT id, ca, chain, metric, value, response_at, snapshot_json
-    FROM alert_metric_observations WHERE id > ? ORDER BY id LIMIT ?
-  `).all(afterId, limit) as {
+/** Ordered, durable metric observations consumed by the central Monitor or Public API. */
+export function getAlertMetricObservations(
+  afterId: number,
+  limit: number,
+  origins?: readonly AlertOrigin[],
+): AlertMetricObservation[] {
+  const query = origins && origins.length > 0
+    ? `SELECT id, ca, chain, metric, value, response_at, snapshot_json, origin
+       FROM alert_metric_observations
+       WHERE id > ? AND origin IN (${origins.map(() => '?').join(',')})
+       ORDER BY id LIMIT ?`
+    : `SELECT id, ca, chain, metric, value, response_at, snapshot_json, origin
+       FROM alert_metric_observations WHERE id > ? ORDER BY id LIMIT ?`;
+  const params = origins && origins.length > 0
+    ? [afterId, ...origins, limit]
+    : [afterId, limit];
+  const rows = getDb().prepare(query).all(...params) as {
     id: number;
     ca: string;
     chain: Chain;
@@ -1926,6 +1958,7 @@ export function getAlertMetricObservations(afterId: number, limit: number): Aler
     value: number;
     response_at: number;
     snapshot_json: string;
+    origin: string;
   }[];
   return rows.map((row) => ({
     id: row.id,
@@ -1935,6 +1968,7 @@ export function getAlertMetricObservations(afterId: number, limit: number): Aler
     value: row.value,
     responseAt: row.response_at,
     snapshot: JSON.parse(row.snapshot_json) as AlertMetricSnapshot,
+    origin: (row.origin as AlertOrigin) || (row.metric === 'trackerBuy' ? (row.snapshot_json.includes('"address"') ? 'wallet' : 'fomo') : 'market'),
   }));
 }
 
@@ -2005,10 +2039,7 @@ export function acknowledgeMarketAlertDelivery(caller: MarketAlertCaller, throug
     db.prepare(
       'UPDATE market_alert_delivery_cursors SET acknowledged_id = ? WHERE caller = ?',
     ).run(throughId, caller);
-    const minimum = db.prepare(
-      'SELECT MIN(acknowledged_id) AS id FROM market_alert_delivery_cursors',
-    ).get() as { id: number };
-    db.prepare('DELETE FROM alert_metric_observations WHERE id <= ?').run(minimum.id);
+    db.prepare('DELETE FROM alert_metric_observations WHERE id <= ?').run(throughId);
     return true;
   })();
 }
@@ -2189,6 +2220,23 @@ export interface FomoUserRow {
   created_at: number;
 }
 
+export interface FomoFollowSyncRow {
+  owner_user_id: string;
+  owner_handle: string;
+  last_attempt_at: number | null;
+  last_success_at: number | null;
+  last_error: string | null;
+  consecutive_failures: number;
+  last_count: number | null;
+  updated_at: number;
+}
+
+export interface FomoFollowMissingRow {
+  owner_user_id: string;
+  target_user_id: string;
+  first_missing_at: number;
+}
+
 export interface FomoUserInput {
   handle: string;
   user_id?: string | null;
@@ -2287,6 +2335,103 @@ export function updateFomoUser(id: string, next: Partial<FomoUserInput>): FomoUs
 export function deleteFomoUser(id: string): void {
   // FK ON DELETE CASCADE cleans fomo_trades.
   getDb().prepare('DELETE FROM fomo_users WHERE id = ?').run(id);
+}
+
+function parseFomoUserTags(raw: string): string[] {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return Array.isArray(value) ? value.filter((t): t is string => typeof t === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+export function addFomoUserTag(id: string, tag: string): boolean {
+  const row = getDb().prepare('SELECT tags FROM fomo_users WHERE id = ?').get(id) as { tags: string } | undefined;
+  if (!row) return false;
+  const tags = parseFomoUserTags(row.tags);
+  if (tags.includes(tag)) return false;
+  getDb().prepare('UPDATE fomo_users SET tags = ? WHERE id = ?').run(JSON.stringify([...tags, tag]), id);
+  return true;
+}
+
+export function removeFomoUserTag(id: string, tag: string): boolean {
+  const row = getDb().prepare('SELECT tags FROM fomo_users WHERE id = ?').get(id) as { tags: string } | undefined;
+  if (!row) return false;
+  const tags = parseFomoUserTags(row.tags);
+  const next = tags.filter((t) => t !== tag);
+  if (next.length === tags.length) return false;
+  getDb().prepare('UPDATE fomo_users SET tags = ? WHERE id = ?').run(JSON.stringify(next), id);
+  return true;
+}
+
+export function findFomoUserByHandleCI(handle: string): FomoUserRow | undefined {
+  return getDb().prepare('SELECT * FROM fomo_users WHERE handle = ? COLLATE NOCASE').get(handle) as FomoUserRow | undefined;
+}
+
+export function getFomoFollowSync(ownerUserId: string): FomoFollowSyncRow | undefined {
+  return getDb().prepare('SELECT * FROM fomo_follow_sync WHERE owner_user_id = ?').get(ownerUserId) as FomoFollowSyncRow | undefined;
+}
+
+export function recordFomoFollowSyncAttempt(ownerUserId: string, ownerHandle: string, at: number): void {
+  getDb()
+    .prepare(
+      `INSERT INTO fomo_follow_sync (owner_user_id, owner_handle, last_attempt_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(owner_user_id) DO UPDATE SET
+         owner_handle = excluded.owner_handle,
+         last_attempt_at = excluded.last_attempt_at,
+         updated_at = excluded.updated_at`,
+    )
+    .run(ownerUserId, ownerHandle, at, at);
+}
+
+export function recordFomoFollowSyncSuccess(ownerUserId: string, at: number, count: number): void {
+  getDb()
+    .prepare(
+      `UPDATE fomo_follow_sync
+          SET last_success_at = ?,
+              last_error = NULL,
+              consecutive_failures = 0,
+              last_count = ?,
+              updated_at = ?
+        WHERE owner_user_id = ?`,
+    )
+    .run(at, count, at, ownerUserId);
+}
+
+export function recordFomoFollowSyncFailure(ownerUserId: string, at: number, error: string): void {
+  getDb()
+    .prepare(
+      `UPDATE fomo_follow_sync
+          SET last_error = ?,
+              consecutive_failures = consecutive_failures + 1,
+              updated_at = ?
+        WHERE owner_user_id = ?`,
+    )
+    .run(error, at, ownerUserId);
+}
+
+export function listFomoFollowMissing(ownerUserId: string): Map<string, number> {
+  const rows = getDb()
+    .prepare('SELECT target_user_id, first_missing_at FROM fomo_follow_missing WHERE owner_user_id = ?')
+    .all(ownerUserId) as Array<{ target_user_id: string; first_missing_at: number }>;
+  return new Map(rows.map((r) => [r.target_user_id, r.first_missing_at]));
+}
+
+export function markFomoFollowMissing(ownerUserId: string, targetUserId: string, at: number): void {
+  getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO fomo_follow_missing (owner_user_id, target_user_id, first_missing_at)
+       VALUES (?, ?, ?)`,
+    )
+    .run(ownerUserId, targetUserId, at);
+}
+
+export function clearFomoFollowMissing(ownerUserId: string, targetUserId: string): void {
+  getDb()
+    .prepare('DELETE FROM fomo_follow_missing WHERE owner_user_id = ? AND target_user_id = ?')
+    .run(ownerUserId, targetUserId);
 }
 
 /** Shared import report. `updated` is ADDITIVE: only the fomo upsert import sets
@@ -2887,7 +3032,6 @@ const SEED_WALLETS: WalletInput[] = [
  */
 export function seedIfEmpty(): void {
   if (config.mode !== 'mock') return;
-  if (config.showFomo) return;
   const db = getDb();
   const walletCount = (db.prepare('SELECT COUNT(*) AS n FROM wallets').get() as { n: number }).n;
   const caCount = (db.prepare('SELECT COUNT(*) AS n FROM tracked_cas').get() as { n: number }).n;

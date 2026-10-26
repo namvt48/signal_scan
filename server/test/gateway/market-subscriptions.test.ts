@@ -58,7 +58,7 @@ test('A/B maintain a gateway union and non-dashboard callers cannot register tar
   assert.equal((getDb().prepare('SELECT COUNT(*) AS n FROM market_subscriptions').get() as { n: number }).n, 3);
 });
 
-test('shared alert source is compacted only after both dashboard delivery cursors advance', async () => {
+test('shared alert source is compacted immediately by acknowledged throughId on single caller', async () => {
   appendAlertMetricObservation(getDb(), '11111111111111111111111111111111', 'sol', 'fresh', 42, 1_900_000_000_000);
   const row = getAlertMetricObservations(0, 1)[0];
   assert.ok(row);
@@ -71,7 +71,6 @@ test('shared alert source is compacted only after both dashboard delivery cursor
   assert.equal((await ack(tokens.watcher, row.id)).status, 403);
   assert.equal((await ack(tokens.a, row.id + 1)).status, 409);
   assert.equal((await ack(tokens.a, row.id)).status, 200);
-  assert.equal(getAlertMetricObservations(0, 10).length, 1, 'A acknowledgement must retain the source for B');
-  assert.equal((await ack(tokens.b, row.id)).status, 200);
-  assert.deepEqual(getAlertMetricObservations(0, 10), []);
+  assert.deepEqual(getAlertMetricObservations(0, 10), [], 'throughId immediately compacts shared observations');
+  assert.equal((await ack(tokens.a, row.id)).status, 200, 're-acknowledging current throughId succeeds idempotently');
 });

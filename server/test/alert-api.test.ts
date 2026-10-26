@@ -93,7 +93,9 @@ test('FOMO Telegram rules are persisted independently from instance A rules', as
       const fomoFeed = await fetch(`${baseUrl}/api/monitor/alerts`, {
         headers: { authorization: 'Bearer monitor-feed-secret' },
       });
-      assert.deepEqual((await fomoFeed.json() as { telegramAlertRules: unknown }).telegramAlertRules, fomoRules);
+      const feedBody = await fomoFeed.json() as { telegramAlertRules: unknown; fomoTelegramAlertRules: unknown };
+      assert.deepEqual(feedBody.telegramAlertRules, aRules);
+      assert.deepEqual(feedBody.fomoTelegramAlertRules, fomoRules);
       const invalidFomoUpdate = await fetch(`${baseUrl}/api/fomo/telegram-alert-rules`, {
         method: 'PUT',
         headers: { ...authHeaders, 'Content-Type': 'application/json' },
@@ -103,7 +105,8 @@ test('FOMO Telegram rules are persisted independently from instance A rules', as
       const fomoReadAfterReject = await fetch(`${baseUrl}/api/fomo/telegram-alert-rules`, { headers: authHeaders });
       assert.deepEqual(await fomoReadAfterReject.json(), fomoRules);
 
-      assert.equal((await fetch(`${baseUrl}/api/telegram-alert-rules`, { headers: authHeaders })).status, 404);
+      const aReadWhenFomo = await fetch(`${baseUrl}/api/telegram-alert-rules`, { headers: authHeaders });
+      assert.deepEqual(await aReadWhenFomo.json(), aRules);
 
       config.showFomo = false;
       const aRead = await fetch(`${baseUrl}/api/telegram-alert-rules`, { headers: authHeaders });
@@ -138,6 +141,16 @@ test('alert feed is monitor-authenticated, ordered, paginated, and ack is bounde
       observations: [first],
       nextId: first.id,
       telegramAlertRules: {
+        fwGrowthPct: 30,
+        minFwPct: 15,
+        t100GrowthPct: 30,
+        minMcK: -1,
+        maxMcK: -1,
+        minHolders: -1,
+        maxHolders: -1,
+        trackerBuyingK: 0,
+      },
+      fomoTelegramAlertRules: {
         fwGrowthPct: 30,
         minFwPct: 15,
         t100GrowthPct: 30,

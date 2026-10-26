@@ -176,7 +176,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   const tokens = deps.tokens ?? callerTokensFromConfig();
   const cache = deps.cache ?? new GatewayCache();
   const gmgnSingleFlight = deps.gmgnSingleFlight ?? new GmgnTokenInfoSingleFlight();
-  const credits = deps.credits ?? new CreditAccountant();
+  const credits = deps.credits ?? new CreditAccountant({ split: Boolean(tokens.b) && tokens.b !== '' });
   const app = express();
 
   // Request log — same shape as api.ts. NEVER logs headers, so no token leaks.

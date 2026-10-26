@@ -184,7 +184,7 @@ test('missingGatewayEnv lists blank required keys, never values', () => {
       gatewayTokenB: '',
       gatewayTokenWatcher: '',
     }),
-    ['nansenApiKey', 'gmgnApiKey', 'gatewayTokenA', 'gatewayTokenB', 'gatewayTokenWatcher'],
+    ['nansenApiKey', 'gmgnApiKey', 'gatewayTokenA', 'gatewayTokenWatcher'],
   );
   assert.deepEqual(
     missingGatewayEnv({

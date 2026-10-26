@@ -51,36 +51,16 @@ POLL_SETUP_MS ?= 10800000
 # Instance selector: `make deploy INSTANCE=b` = second parallel deployment with its
 # own dir/port/DB. Default `a` = primary deployment.
 INSTANCE  ?= a
-ifeq ($(INSTANCE),a)
 REMOTE_DIR ?= /root/signal_scan
 PORT      ?= 8124
 DATA_DIR  ?= data
 PROJECT   ?= signal_scan
-SHOW_CLAN ?= off
+SHOW_CLAN ?= on
 TITLE     ?= signal_scan
-# Web bind loopback: Caddy + daemon đều ở host nên vẫn vào bình thường; IP:8124
-# từ ngoài bị chặn, chỉ còn https://$(DOMAIN).
+SHOW_FOMO ?= on
 BIND      ?= 127.0.0.1
 DOMAIN    ?= signal-scan.duckdns.org
-else
-REMOTE_DIR ?= /root/signal_scan_$(INSTANCE)
-PORT      ?= 8125
-DATA_DIR  ?= data-$(INSTANCE)
-PROJECT   ?= signal_scan_$(INSTANCE)
-SHOW_CLAN ?= on
-TITLE     ?= fomo
-SHOW_FOMO ?= on
-# Instance b không có entry Caddy → giữ publish công khai như cũ.
-BIND      ?= 0.0.0.0
-DOMAIN    ?=
-endif
-
-# One published bridge port per compose project; only B's host watcher uses it.
-ifeq ($(INSTANCE),a)
-FOMO_BRIDGE_PORT ?= 8130
-else
 FOMO_BRIDGE_PORT ?= 8131
-endif
 
 # URL mà `make test` dùng để kiểm tra TỪ MÁY LOCAL.
 ifeq ($(DOMAIN),)
@@ -194,8 +174,7 @@ fomo-api-deploy:
 # Apply the monitor's B/Solana suppression before restarting either API.
 fomo-release-deploy:
 	@$(MAKE) monitor-alerts-deploy
-	@$(MAKE) fomo-api-deploy INSTANCE=a
-	@$(MAKE) fomo-api-deploy INSTANCE=b
+	@$(MAKE) fomo-api-deploy
 
 
 wallet-watch-deploy:
@@ -204,7 +183,7 @@ wallet-watch-deploy:
 	$(SSH) "set -eu; /opt/wallet-watch/venv/bin/python -m py_compile /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/classify.py; systemctl restart wallet-watch.service; systemctl is-active --quiet wallet-watch.service; systemctl show wallet-watch.service -p ActiveState -p MainPID"
 
 fomo-evm-watch-deploy:
-	$(SSH) "set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -m 0750 /opt/fomo-wallet-watch/watchers/common /opt/fomo-wallet-watch/watchers/evm /opt/fomo-wallet-watch/data /root/signal-scan-monitor/heartbeats"
+	$(SSH) "set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -m 0750 /opt/fomo-wallet-watch/watchers/common /opt/fomo-wallet-watch/watchers/evm /opt/fomo-wallet-watch/data /root/signal-scan-monitor/heartbeats"
 	rsync -azc --delete --exclude '__pycache__' -e "$(RSYNC_SSH)" watchers/common/ $(HOST):/opt/fomo-wallet-watch/watchers/common/
 	rsync -azc --delete --exclude '__pycache__' -e "$(RSYNC_SSH)" watchers/evm/ $(HOST):/opt/fomo-wallet-watch/watchers/evm/
 	$(SCP) watchers/__init__.py $(HOST):/opt/fomo-wallet-watch/watchers/__init__.py
@@ -214,25 +193,24 @@ fomo-evm-watch-deploy:
 # Build/restart only the read-only prod bridge. Credentials live in
 # $(DATA_DIR)/fomo-prod-credentials and are never copied by a Makefile.
 fomo-prod-deploy:
-	@test "$(INSTANCE)" = b || { echo 'fomo-prod-deploy currently targets the FOMO instance (INSTANCE=b)'; exit 1; }
 	rsync -azcR --exclude '__pycache__' -e "$(RSYNC_SSH)" server/fomo-prod $(HOST):$(REMOTE_DIR)/
 	$(SSH) "set -eu; cd $(REMOTE_DIR); install -d -m 0700 $(DATA_DIR)/fomo-prod-credentials; if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build fomo-prod && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate fomo-prod; else $(COMPOSE_ENV) docker compose build fomo-prod && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate fomo-prod; fi"
 	$(SSH) "curl -sS --max-time 10 http://127.0.0.1:$(FOMO_BRIDGE_PORT)/health"
 
 fomo-watch-deploy:
-	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs"
+	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs"
 	$(SCP) watchers/fomo/feed.py watchers/fomo/main.py $(HOST):/opt/fomo-watch/watchers/fomo/
 	$(SSH) "set -eu; /opt/fomo-watch/venv/bin/python -m py_compile /opt/fomo-watch/watchers/fomo/feed.py /opt/fomo-watch/watchers/fomo/main.py; systemctl restart fomo-watch.service; systemctl is-active --quiet fomo-watch.service; systemctl --no-pager --full status fomo-watch.service"
 
 fomo-rpc-apply:
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --force-recreate api; else $(COMPOSE_ENV) docker compose up -d --force-recreate api; fi"
 	sleep 3
-	$(SSH) "curl -fsS http://127.0.0.1:8125/api/health >/dev/null"
-	@$(MAKE) fomo-evm-watch-deploy INSTANCE=b
+	$(SSH) "curl -fsS http://127.0.0.1:8124/api/health >/dev/null"
+	@$(MAKE) fomo-evm-watch-deploy
 
 # Start the three provisioned host watchers only after both APIs are ready.
 watchers-up:
-	$(SSH) "set -eu; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; curl -fsS http://127.0.0.1:8125/api/health >/dev/null; test -f /etc/cron.d/wallet-watch-watchdog; systemctl daemon-reload; systemctl enable --now wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service; systemctl is-active wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service"
+	$(SSH) "set -eu; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; test -f /etc/cron.d/wallet-watch-watchdog; systemctl daemon-reload; systemctl enable --now wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service; systemctl is-active wallet-watch.service fomo-watch.service fomo-evm-wallet-watch.service"
 
 # Bring up the staged cohort-label source privately; source/data are migrated once from 250.
 cohort-labels-api-up:
@@ -302,13 +280,11 @@ monitor-deploy:
 	$(SCP) watchers/fomo/feed.py watchers/fomo/main.py $(HOST):/opt/fomo-watch/watchers/fomo/
 	$(SCP) watchers/common/state.py $(HOST):/opt/wallet-watch/watchers/common/state.py
 	$(SSH) "systemctl restart fomo-watch.service wallet-watch.service"
-	@$(MAKE) deploy INSTANCE=a
-	@$(MAKE) deploy INSTANCE=b
+	@$(MAKE) deploy
 	$(SSH) "docker network create signal-scan-gateway || true"
 	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
 	$(SSH) "cd /root/signal_scan && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d"
-	@$(MAKE) up INSTANCE=a
-	@$(MAKE) up INSTANCE=b
+	@$(MAKE) up
 	@$(MAKE) routing-smoke
 	$(SCP) monitor.caddy $(HOST):/root/signal-scan-monitor/monitor.caddy
 	$(SSH) "set -eu; backup_dir=\$$(mktemp -d /root/signal-scan-monitor/caddy-backup.XXXXXX); cp -a /etc/caddy/Caddyfile \"\$$backup_dir/Caddyfile\"; if [ -f /etc/caddy/monitor.caddy ]; then cp -a /etc/caddy/monitor.caddy \"\$$backup_dir/monitor.caddy\"; else touch \"\$$backup_dir/no-monitor-snippet\"; fi; install -m 0644 /root/signal-scan-monitor/monitor.caddy /etc/caddy/monitor.caddy; if ! grep -Fqx 'import /etc/caddy/monitor.caddy' /etc/caddy/Caddyfile; then printf '\\nimport /etc/caddy/monitor.caddy\\n' >> /etc/caddy/Caddyfile; fi; if ! caddy validate --config /etc/caddy/Caddyfile; then cp -a \"\$$backup_dir/Caddyfile\" /etc/caddy/Caddyfile; if [ -f \"\$$backup_dir/monitor.caddy\" ]; then cp -a \"\$$backup_dir/monitor.caddy\" /etc/caddy/monitor.caddy; else rm -f /etc/caddy/monitor.caddy; fi; exit 1; fi; ufw allow 8443/tcp; systemctl reload caddy"
@@ -327,7 +303,6 @@ monitor-alerts-deploy:
 	$(SCP) server/src/monitor/alerts.ts $(HOST):/root/signal_scan/server/src/monitor/alerts.ts
 	$(SCP) server/src/telegram-alert-settings.ts $(HOST):/root/signal_scan/server/src/telegram-alert-settings.ts
 	$(SCP) server/src/alert-feed.ts $(HOST):/root/signal_scan/server/src/alert-feed.ts
-	$(SCP) server/src/monitor/alert-policy.ts $(HOST):/root/signal_scan/server/src/monitor/alert-policy.ts
 	$(SCP) server/src/monitor/collector.ts $(HOST):/root/signal_scan/server/src/monitor/collector.ts
 	$(SCP) server/src/monitor/types.ts $(HOST):/root/signal_scan/server/src/monitor/types.ts
 	$(SCP) server/public/monitor.html $(HOST):/root/signal_scan/server/public/monitor.html

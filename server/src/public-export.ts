@@ -2,6 +2,7 @@ import { getDb, getAlertMetricObservations, getFomoApiBalanceSnapshot, getFomoPo
 import { buildTokenDetail } from './detail.js';
 import { balanceSeries } from './crawl.js';
 import { assembleSignals, fomoUserStats, type TokenSignal } from './signals.js';
+import type { AlertOrigin } from './alert-feed.js';
 import type { Chain } from './shared/chain.js';
 import type {
   PublicActivity, PublicAlert, PublicBalancePoint, PublicBalanceSeries, PublicFomoFreshness, PublicFomoHolding, PublicFomoPosition,
@@ -268,10 +269,17 @@ export function exportFomoFreshness(userId: string): PublicFomoFreshness {
   };
 }
 
-export function exportAlerts(afterId: number, limit: number): { data: PublicAlert[]; nextId: number; oldestAvailableId: number | null; gap: boolean } {
+export function exportAlerts(
+  afterId: number,
+  limit: number,
+  originFilter: 'main' | 'fomo' = 'main',
+): { data: PublicAlert[]; nextId: number; oldestAvailableId: number | null; gap: boolean } {
   const db = getDb();
-  const oldest = db.prepare('SELECT MIN(id) AS id FROM alert_metric_observations').get() as { id: number | null };
-  const items = getAlertMetricObservations(afterId, limit + 1);
+  const origins: readonly AlertOrigin[] = originFilter === 'fomo' ? ['fomo'] : ['market', 'wallet'];
+  const oldest = db.prepare(
+    `SELECT MIN(id) AS id FROM alert_metric_observations WHERE origin IN (${origins.map(() => '?').join(',')})`,
+  ).get(...origins) as { id: number | null };
+  const items = getAlertMetricObservations(afterId, limit + 1, origins);
   const page = items.slice(0, limit).map((item) => {
     const state = getTokenState(item.ca, item.chain);
     return {

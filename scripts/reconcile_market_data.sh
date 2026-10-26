@@ -13,7 +13,7 @@ else
   }
 fi
 
-for container in signal_scan-api-1 signal_scan_b-api-1; do
+for container in signal_scan-api-1; do
   env=$(docker inspect --format '{{json .Config.Env}}' "$container")
   case "$env" in
     *'MARKET_DB_PATH=/market-data/market.db'*) ;;
@@ -26,7 +26,6 @@ for container in signal_scan-api-1 signal_scan_b-api-1; do
 done
 
 curl -fsS http://127.0.0.1:8124/api/health >/dev/null
-curl -fsS http://127.0.0.1:8125/api/health >/dev/null
 
 gateway_compose stop gateway
 trap 'gateway_compose up -d --no-deps gateway >/dev/null 2>&1' EXIT
@@ -36,7 +35,7 @@ trap - EXIT
 
 for attempt in {1..30}; do
   if curl -fsS http://127.0.0.1:8130/health >/dev/null; then
-    echo 'gateway health OK; legacy public market data reconciled and A/B setup caches merged'
+    echo 'gateway health OK; legacy public market data reconciled and setup cache merged'
     exit 0
   fi
   sleep 1

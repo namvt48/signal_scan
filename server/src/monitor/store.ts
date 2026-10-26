@@ -4,7 +4,6 @@ import { dirname } from 'node:path';
 import type { AlertMetricObservation } from '../alert-feed.js';
 import { DEFAULT_TELEGRAM_ALERT_RULES, type TelegramAlertRules } from '../telegram-alert-settings.js';
 import type { TelegramAlert } from './telegram.js';
-import { isSuppressedTelegramAlert } from './alert-policy.js';
 import type { FomoApiSample, HistorySeries, MetricSample, MonitorSnapshot, ServiceSample } from './types.js';
 
 
@@ -460,7 +459,12 @@ export class MonitorStore {
     return row?.observation_id ?? 0;
   }
 
-  commitAlertObservations(source: 'A' | 'B', observations: readonly AlertMetricObservation[], rules: TelegramAlertRules = DEFAULT_TELEGRAM_ALERT_RULES): number {
+  commitAlertObservations(
+    source: 'A' | 'B',
+    observations: readonly AlertMetricObservation[],
+    rules: TelegramAlertRules = DEFAULT_TELEGRAM_ALERT_RULES,
+    fomoRules: TelegramAlertRules = rules,
+  ): number {
     const transaction = this.db.transaction((rows: readonly AlertMetricObservation[]) => {
       let cursor = this.alertCursor(source);
       const previousValue = this.db.prepare(`
@@ -481,6 +485,7 @@ export class MonitorStore {
       `);
       for (const observation of rows) {
         if (observation.id <= cursor) continue;
+        const activeRules = observation.origin === 'fomo' ? fomoRules : rules;
         const baseline = observation.metric === 'trackerBuy' ? undefined :
           previousValue.get(source, observation.chain, observation.ca, observation.metric) as
             | { value: number; previous_value: number | null }
@@ -488,22 +493,22 @@ export class MonitorStore {
         const current = observation.value;
         const freshPctForAlert = observation.metric === 'fresh' ? current : observation.snapshot.freshPct;
         const marketCapK = observation.snapshot.marketCap === null ? null : observation.snapshot.marketCap / 1000;
-        const marketCapAllowed = (rules.minMcK === -1 && rules.maxMcK === -1) ||
+        const marketCapAllowed = (activeRules.minMcK === -1 && activeRules.maxMcK === -1) ||
           (marketCapK !== null && Number.isFinite(marketCapK) &&
-            (rules.minMcK === -1 || marketCapK >= rules.minMcK) &&
-            (rules.maxMcK === -1 || marketCapK <= rules.maxMcK));
-        const minHolders = rules.minHolders ?? -1;
-        const maxHolders = rules.maxHolders ?? -1;
+            (activeRules.minMcK === -1 || marketCapK >= activeRules.minMcK) &&
+            (activeRules.maxMcK === -1 || marketCapK <= activeRules.maxMcK));
+        const minHolders = activeRules.minHolders ?? -1;
+        const maxHolders = activeRules.maxHolders ?? -1;
         const holders = observation.snapshot.holders;
         const holdersAllowed = (minHolders === -1 && maxHolders === -1) ||
           (typeof holders === 'number' && Number.isFinite(holders) &&
             (minHolders === -1 || holders >= minHolders) &&
             (maxHolders === -1 || holders <= maxHolders));
-        const growthThreshold = observation.metric === 'fresh' ? rules.fwGrowthPct : rules.t100GrowthPct;
+        const growthThreshold = observation.metric === 'fresh' ? activeRules.fwGrowthPct : activeRules.t100GrowthPct;
         const freshAllowed = observation.metric !== 'fresh' ||
           (freshPctForAlert !== null &&
             Number.isFinite(freshPctForAlert) &&
-            freshPctForAlert >= rules.minFwPct);
+            freshPctForAlert >= activeRules.minFwPct);
         const firstT100 = observation.metric === 't100' &&
           typeof observation.snapshot.t100First === 'number' &&
           Number.isFinite(observation.snapshot.t100First) &&
@@ -520,9 +525,9 @@ export class MonitorStore {
               candidate > 0 &&
               current > candidate * (1 + growthThreshold / 100));
         const shouldAlert = marketCapAllowed && holdersAllowed && (observation.metric === 'trackerBuy'
-          ? rules.trackerBuyingK > 0 &&
+          ? activeRules.trackerBuyingK > 0 &&
             observation.snapshot.trackerBuyer !== undefined &&
-            current > rules.trackerBuyingK * 1000
+            current > activeRules.trackerBuyingK * 1000
           : qualifyingBaseline !== undefined);
         if (shouldAlert) {
           const snapshot = observation.snapshot;
@@ -553,9 +558,7 @@ export class MonitorStore {
             ...(snapshot.tracked ? { tracked: snapshot.tracked } : {}),
             source,
           };
-          if (!isSuppressedTelegramAlert(alert)) {
-            enqueue.run(alert.alertId, JSON.stringify(alert), snapshot.capturedAt, snapshot.capturedAt);
-          }
+          enqueue.run(alert.alertId, JSON.stringify(alert), snapshot.capturedAt, snapshot.capturedAt);
         }
         if (observation.metric !== 'trackerBuy') {
           // Advance even outside the MC range; otherwise entering range could replay old growth.

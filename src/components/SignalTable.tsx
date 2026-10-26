@@ -7,7 +7,7 @@ import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
 import { ago, compact, formatTimestamp, pct, shortAddr, tokenAmount, usd } from '../lib/format';
 import { sortTrackedWalletsByBalance, type WalletBalanceSort } from '../lib/walletSort';
-import { freshDisplayValue, freshPercentageInRange, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
+import { freshDisplayValue, freshPercentageInRange, holderCountClass, percentageInRange, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
 import { compareFomoUserActivity } from '../lib/fomoSort';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
@@ -69,14 +69,9 @@ const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
  * traded this CA; their names remain separate in the breakdown so identities
  * are not conflated.
  */
-const rowInflow = (s: TokenSignal): number | null => (SHOW_FOMO
-  ? sumKnownUsd(s.fomoUsers.map((u) => u.buyUsd))
-  : s.trackedInflow);
-const rowHolding = (s: TokenSignal): number | undefined => (SHOW_FOMO
-  ? sumKnownPercentages(s.fomoUsers.map((u) => u.holdingPct))
-  : s.trackedHolding);
-const rowHoldingPartial = (s: TokenSignal): boolean => SHOW_FOMO
-  && s.fomoUsers.some((user) => user.holdingPct === undefined);
+const rowInflow = (s: TokenSignal): number | null => s.trackedInflow;
+const rowHolding = (s: TokenSignal): number | undefined => s.trackedHolding;
+const rowHoldingPartial = (_s: TokenSignal): boolean => false;
 const rowTrackedIn = (s: TokenSignal): number =>
   SHOW_FOMO ? s.fomoUsers.length + s.trackedWallets.length : s.trackedWallets.length;
 

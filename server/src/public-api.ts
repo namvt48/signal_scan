@@ -22,6 +22,7 @@ type InternalResponse = unknown | null | typeof NOT_FOUND;
 interface AlertStream {
   path: string;
   baseUrl: string | undefined;
+  origin: 'main' | 'fomo';
   clients: Map<WebSocket, { cursor: number; alive: boolean }>;
   polling: boolean;
 }
@@ -45,8 +46,8 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024, perMessageDeflate: false });
   const token = options.internalToken ?? config.publicApiExportToken;
   const streams: Record<string, AlertStream> = {
-    '/api/v1/ws': { path: '/api/v1/ws', baseUrl: options.internalUrl ?? config.publicApiInternalUrl, clients: new Map(), polling: false },
-    '/api/v1/fomo/ws': { path: '/api/v1/fomo/ws', baseUrl: options.fomoInternalUrl ?? config.publicApiFomoInternalUrl, clients: new Map(), polling: false },
+    '/api/v1/ws': { path: '/api/v1/ws', baseUrl: options.internalUrl ?? config.publicApiInternalUrl, origin: 'main', clients: new Map(), polling: false },
+    '/api/v1/fomo/ws': { path: '/api/v1/fomo/ws', baseUrl: options.fomoInternalUrl ?? config.publicApiFomoInternalUrl, origin: 'fomo', clients: new Map(), polling: false },
   };
   let reservedConnections = 0;
 
@@ -124,7 +125,7 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
     if (clients.size === 0) return;
     let afterId = Math.min(...Array.from(clients.values(), (state) => state.cursor));
     for (;;) {
-      const page = await fetchAlerts(stream.baseUrl, { resource: 'alerts', afterId, limit: WS_PAGE_SIZE });
+      const page = await fetchAlerts(stream.baseUrl, { resource: 'alerts', afterId, limit: WS_PAGE_SIZE, origin: stream.origin });
       if (page === null) {
         for (const ws of clients.keys()) ws.close(1011, 'data source unavailable');
         clients.clear();
@@ -148,7 +149,7 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
     }
   }
 
-  async function fetchAlerts(base: string | undefined, query: { resource: string; afterId: number; limit: number }): Promise<{ data: PublicAlert[]; nextId: number } | null> {
+  async function fetchAlerts(base: string | undefined, query: { resource: string; afterId: number; limit: number; origin?: string }): Promise<{ data: PublicAlert[]; nextId: number } | null> {
     if (!base || !token) return null;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), INTERNAL_TIMEOUT_MS);
@@ -157,6 +158,7 @@ export function createPublicApiServer(options: { internalUrl?: string; internalT
       url.searchParams.set('resource', query.resource);
       url.searchParams.set('afterId', String(query.afterId));
       url.searchParams.set('limit', String(query.limit));
+      if (query.origin) url.searchParams.set('origin', query.origin);
       const response = await fetch(url, { headers: { authorization: `Bearer ${token}` }, signal: controller.signal, redirect: 'error' });
       if (!response.ok) return null;
       return await response.json() as { data: PublicAlert[]; nextId: number };
@@ -238,7 +240,7 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
   app.get('/api/v1/alerts', async (req, res) => {
     const afterId = parsePage(req.query.after_id, 0); const limit = parsePage(req.query.limit, 50);
     if (afterId === null || afterId < 0 || limit === null || limit < 1 || limit > MAX_PAGE) { res.status(400).json({ error: 'invalid pagination' }); return; }
-    const data = await internal({ resource: 'alerts', afterId, limit });
+    const data = await internal({ resource: 'alerts', afterId, limit, origin: 'main' });
     if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     res.json(data);
   });
@@ -296,7 +298,7 @@ export function createPublicApiApp(options: { internalUrl?: string; internalToke
   app.get('/api/v1/fomo/alerts', async (req, res) => {
     const afterId = parsePage(req.query.after_id, 0); const limit = parsePage(req.query.limit, 50);
     if (afterId === null || afterId < 0 || limit === null || limit < 1 || limit > MAX_PAGE) { res.status(400).json({ error: 'invalid pagination' }); return; }
-    const data = await fomoInternal({ resource: 'alerts', afterId, limit });
+    const data = await fomoInternal({ resource: 'alerts', afterId, limit, origin: 'fomo' });
     if (data === null) { res.status(502).json({ error: 'data source unavailable' }); return; }
     res.json(data);
   });

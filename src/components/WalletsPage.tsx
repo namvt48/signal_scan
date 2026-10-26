@@ -19,8 +19,12 @@ type DisplayWallet = Omit<Wallet, 'chain'> & { chain: WalletScope };
 function displayWallets(rows: Wallet[]): DisplayWallet[] {
   if (!SHOW_FOMO) return rows;
   const evmGroups = new Map<string, Wallet[]>();
+  const solWallets: DisplayWallet[] = [];
   for (const wallet of rows) {
-    if (wallet.chain === 'sol') continue;
+    if (wallet.chain === 'sol') {
+      solWallets.push(wallet);
+      continue;
+    }
     const key = wallet.address.toLowerCase();
     evmGroups.set(key, [...(evmGroups.get(key) ?? []), wallet]);
   }
@@ -31,10 +35,10 @@ function displayWallets(rows: Wallet[]): DisplayWallet[] {
     if (!preferred) throw new Error('cannot display an empty EVM wallet group');
     return { ...preferred, chain: 'evm' as const };
   });
-  return evm.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return [...solWallets, ...evm].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
 
-const EMPTY_DRAFT: Draft = { address: '', name: '', chain: SHOW_FOMO ? 'evm' : 'sol', source: '', clan: '' };
+const EMPTY_DRAFT: Draft = { address: '', name: '', chain: 'sol', source: '', clan: '' };
 
 function toMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -109,10 +113,10 @@ function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | nu
           <label className="block w-40">
             <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Network</span>
             <Select value={draft.chain} onChange={(e) => setDraft({ ...draft, chain: e.target.value as WalletScope })} className="w-full font-mono uppercase">
-              {(initial && SHOW_FOMO
+              {(initial
                 ? [initial.chain]
                 : SHOW_FOMO
-                  ? ['evm'] as WalletScope[]
+                  ? [...CHAINS, 'evm'] as WalletScope[]
                   : CHAINS
               ).map((chain) => (
                 <option key={chain} value={chain}>

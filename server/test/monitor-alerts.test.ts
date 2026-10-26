@@ -706,7 +706,7 @@ test('Telegram failures stay queued and retry after persisted backoff', async ()
   }
 });
 
-test('suppresses source B Solana alerts at enqueue and drains legacy pending alerts without blocking other chains', async () => {
+test('allows Solana alerts across all sources without legacy suppression', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'signal-scan-monitor-b-sol-suppression-'));
   const dbPath = join(directory, 'monitor.sqlite3');
   const store = new MonitorStore(dbPath);
@@ -760,11 +760,12 @@ test('suppresses source B Solana alerts at enqueue and drains legacy pending ale
   }), bot, fetcher, () => now);
   try {
     await alerts.tick();
-    assert.equal(store.alertCursor('B'), 2, 'suppressed observations still advance the source cursor');
-    assert.equal(messages.length, 2);
-    assert.ok(messages.some((text) => text.includes('$A_SOL')));
-    assert.ok(messages.some((text) => text.includes('$B_BASE')));
-    assert.ok(messages.every((text) => !text.includes('B_SOL') && !text.includes('LEGACY_SOL')));
+    assert.equal(store.alertCursor('B'), 2);
+    assert.equal(messages.length, 4);
+    assert.ok(messages.some((text) => text.includes('A_SOL')));
+    assert.ok(messages.some((text) => text.includes('B_BASE')));
+    assert.ok(messages.some((text) => text.includes('B_SOL')));
+    assert.ok(messages.some((text) => text.includes('LEGACY_SOL')));
 
     const outbox = new Database(dbPath, { readonly: true });
     try {
@@ -772,8 +773,9 @@ test('suppresses source B Solana alerts at enqueue and drains legacy pending ale
         SELECT alert_id, delivery_state FROM telegram_alert_outbox ORDER BY alert_id
       `).all(), [
         { alert_id: 'A:1', delivery_state: 'sent' },
+        { alert_id: 'B:1', delivery_state: 'sent' },
         { alert_id: 'B:2', delivery_state: 'sent' },
-        { alert_id: 'B:legacy-sol', delivery_state: 'suppressed' },
+        { alert_id: 'B:legacy-sol', delivery_state: 'sent' },
       ]);
     } finally {
       outbox.close();

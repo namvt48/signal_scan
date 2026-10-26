@@ -43,10 +43,12 @@ export const BUDGET_EXCEEDED = 'exceeded';
 type BillableCaller = 'a' | 'b';
 
 export interface CreditAccountantOptions {
-  /** Credits per DAY, split equally. Defaults to `config.nansenDailyCreditBudget`. */
+  /** Credits per DAY. Defaults to `config.nansenDailyCreditBudget`. */
   budget?: number;
   /** Injected clock (tests); defaults to `Date.now`. */
   now?: () => number;
+  /** Whether to split budget equally across callers. Defaults to true. */
+  split?: boolean;
 }
 
 export interface CreditSnapshot {
@@ -103,10 +105,12 @@ export class CreditAccountant {
   private readonly now: () => number;
   private day: string;
   private readonly used: { a: number; b: number } = { a: 0, b: 0 };
+  private readonly split: boolean;
 
   constructor(opts: CreditAccountantOptions = {}) {
     this.budget = opts.budget ?? config.nansenDailyCreditBudget;
     this.now = opts.now ?? Date.now;
+    this.split = opts.split ?? true;
     this.day = dayKey(this.now());
   }
 
@@ -159,7 +163,7 @@ export class CreditAccountant {
   }
 
   private half(): number {
-    return this.budget / 2;
+    return this.split ? this.budget / 2 : this.budget;
   }
 
   private billable(caller: Caller): caller is BillableCaller {

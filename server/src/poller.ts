@@ -1609,7 +1609,6 @@ async function withFomoPositionSlot(run: () => Promise<void>): Promise<void> {
  *  response, never rejects (trackFomoWalletFromTx swallows every failure). */
 export function kickFomoHoldings(fomoUserId: string, chain: Chain, ca: string, txHash: string): void {
   if (txHash === '') return;
-  if (config.showFomo && chain === 'sol') return;
   fomoKickDrain = fomoKickDrain.then(() => trackFomoWalletFromTx(fomoUserId, chain, ca, txHash));
 }
 

@@ -167,7 +167,7 @@ def _api_min_usd():
     return None
 
 
-def _api_wallets():
+def _api_wallets(chain="sol"):
     """GET {api}/api/wallets → list địa chỉ `address` (str không rỗng) của từng
     item. TAB WALLET LÀ NGUỒN DUY NHẤT nên [] là câu trả lời HỢP LỆ (tab rỗng =
     không ví nào để watch) — None CHỈ khi lỗi mạng/body sai shape, để caller giữ
@@ -181,6 +181,7 @@ def _api_wallets():
                 if isinstance(w, dict)
                 and isinstance(w.get("address"), str)
                 and w["address"]
+                and (chain is None or w.get("chain") == chain or (chain == "sol" and not w["address"].startswith("0x")))
             ]
     except Exception as ex:
         print(f"  ! api wallets: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)

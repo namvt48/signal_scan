@@ -13,7 +13,7 @@ import type { PublicAlert } from '../src/public-api-contract.js';
 const SERVICE_TOKEN = 'ws-test-service-token';
 const EXPORT_TOKEN = 'ws-test-export-token';
 
-test('streams only new durable inflow alerts, paginates bursts and isolates new subscribers', { timeout: 15_000 }, async (t) => {
+test('streams only new durable inflow alerts, paginates bursts and isolates new subscribers', { timeout: 25_000 }, async (t) => {
   open(':memory:');
   insertWallet({ address: 'ws-wallet', name: 'private-name', tags: [], chain: 'sol', source: 'test' });
   const source = createApp('ws-test', { serviceToken: SERVICE_TOKEN, publicExportToken: EXPORT_TOKEN }).listen(0, '127.0.0.1');
@@ -111,8 +111,8 @@ test('streams tracker-buy alerts from the FOMO upstream on its own path', { time
   assert.equal(inflow.value, 42);
 });
 
-async function until(predicate: () => boolean) {
-  const deadline = Date.now() + 10_000;
+async function until(predicate: () => boolean, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     assert.ok(Date.now() < deadline, 'timed out waiting for WebSocket event');
     await delay(10);

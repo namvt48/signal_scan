@@ -41,7 +41,6 @@ const REQUIRED_GATEWAY_ENV: readonly (keyof GatewayEnv)[] = [
   'nansenApiKey',
   'gmgnApiKey',
   'gatewayTokenA',
-  'gatewayTokenB',
   'gatewayTokenWatcher',
 ];
 

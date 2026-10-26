@@ -2,6 +2,8 @@ import type { Chain } from './shared/chain.js';
 
 export type AlertMetric = 'fresh' | 't100' | 'trackerBuy';
 
+export type AlertOrigin = 'market' | 'wallet' | 'fomo';
+
 export interface AlertTrackedGroup {
   names: string[];
   total: number;
@@ -42,4 +44,5 @@ export interface AlertMetricObservation {
   value: number;
   responseAt: number;
   snapshot: AlertMetricSnapshot;
+  origin: AlertOrigin;
 }

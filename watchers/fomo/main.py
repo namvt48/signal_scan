@@ -17,7 +17,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--api-url",
-        default="http://127.0.0.1:8125",
+        default="http://127.0.0.1:8124",
         help="base URL API instance b (GET /api/fomo-users, POST /api/fomo-watch/trades)",
     )
     ap.add_argument(

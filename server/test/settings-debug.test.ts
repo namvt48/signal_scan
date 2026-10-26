@@ -53,7 +53,7 @@ after(() => {
   server.close();
 });
 
-test('Telegram alert rules persist, validate, and stay unavailable on instance B', async () => {
+test('Telegram alert rules persist, validate, and remain available when showFomo is enabled', async () => {
   config.showFomo = false;
   const initial = await getTelegramRules();
   assert.equal(initial.status, 200);
@@ -109,8 +109,8 @@ test('Telegram alert rules persist, validate, and stay unavailable on instance B
   );
 
   config.showFomo = true;
-  assert.equal((await getTelegramRules()).status, 404);
-  assert.equal((await putTelegramRules({ trackerBuyingK: 1 })).status, 404);
+  assert.equal((await getTelegramRules()).status, 200);
+  assert.equal((await putTelegramRules({ trackerBuyingK: 1 })).status, 200);
   config.showFomo = false;
   await putTelegramRules({
     fwGrowthPct: 30,

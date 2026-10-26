@@ -191,7 +191,6 @@ function parseWalletBody(body: unknown): ParseResult<WalletBody> {
   const b = body as Record<string, unknown>;
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
-  if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
   if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
   if (b.chain === 'evm' && !EVM_ADDRESS.test(address)) {
     return { error: 'invalid EVM address (expected 0x + 40 hex characters)' };
@@ -211,7 +210,6 @@ function parseWalletPatch(body: unknown): ParseResult<Partial<WalletBody>> {
   }
   if (b.chain !== undefined) {
     if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
-    if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
     patch.chain = b.chain;
   }
   if (b.name !== undefined) patch.name = strField(b, 'name');
@@ -598,7 +596,6 @@ function enqueueTrackedCa(input: {
   note: string;
   entryUsd?: number;
 }): EnqueueOutcome {
-  if (config.showFomo && input.chain === 'sol') return { kind: 'chain-disabled' };
   if (isPassTier(input.address, input.chain)) {
     return { kind: 'skipped' };
   }
@@ -696,7 +693,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     if (resource === 'alerts') {
-      res.json(exportAlerts(afterId, limit));
+      const origin = req.query.origin === 'fomo' ? 'fomo' : 'main';
+      res.json(exportAlerts(afterId, limit, origin));
       return;
     }
     if (resource === 'token') {
@@ -886,7 +884,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.json({
       observations,
       nextId: observations[observations.length - 1]?.id ?? afterId,
-      telegramAlertRules: config.showFomo ? getFomoTelegramAlertRules() : getTelegramAlertRules(),
+      telegramAlertRules: getTelegramAlertRules(),
+      fomoTelegramAlertRules: getFomoTelegramAlertRules(),
     });
 
   });
@@ -970,18 +969,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   });
   
   app.get('/api/telegram-alert-rules', (_req, res) => {
-    if (config.showFomo) {
-      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
-      return;
-    }
     res.json(getTelegramAlertRules());
   });
 
   app.put('/api/telegram-alert-rules', (req, res) => {
-    if (config.showFomo) {
-      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
-      return;
-    }
     const body: unknown = req.body;
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
       res.status(400).json({ error: 'body must be a JSON object' });
@@ -1077,10 +1068,6 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   app.patch('/api/wallets/:id', (req, res) => {
     const cur = getWallet(req.params.id);
     if (!cur) {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
-    if (config.showFomo && cur.chain === 'sol') {
       res.status(404).json({ error: 'not found' });
       return;
     }
@@ -1314,10 +1301,6 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    if (config.showFomo && parsed.chain === 'sol') {
-      res.json({ inserted: 0, skipped: 'chain-disabled' });
-      return;
-    }
     if (isPassTier(parsed.ca, parsed.chain)) {
       res.json({ inserted: 0, skipped: 'pass-tier' });
       return;
@@ -1378,10 +1361,6 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     const parsed = parseFomoWatchTradeBody(req.body);
     if (isParseError(parsed)) {
       res.status(400).json({ error: parsed.error });
-      return;
-    }
-    if (config.showFomo && parsed.chain === 'sol') {
-      res.json({ inserted: 0, skipped: 'chain-disabled' });
       return;
     }
     // A FOMO user is NOT a wallet — resolve through the fomo_users accessors

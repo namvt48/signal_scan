@@ -2,7 +2,6 @@ import { CHAINS } from '../shared/chain.js';
 import type { AlertMetricObservation, AlertMetricSnapshot, AlertTrackedMetadata } from '../alert-feed.js';
 import { validatedIconUrl } from '../providers/dexscreener.js';
 import { DEFAULT_TELEGRAM_ALERT_RULES, type TelegramAlertRules } from '../telegram-alert-settings.js';
-import { isSuppressedTelegramAlert } from './alert-policy.js';
 import type { MonitorConfig } from './config.js';
 import { MonitorStore } from './store.js';
 import { TelegramBot, TelegramSendError } from './telegram.js';
@@ -94,6 +93,12 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
       !nullableNumber(t100Multiple) || !nullableNumber(lf) || !nullableNumber(trackedHoldingPct) ||
       (holders !== undefined && !nullableNumber(holders)) ||
       (t100First !== undefined && !nullableNumber(t100First))) return null;
+  const rawOrigin = field(raw, 'origin');
+  const origin = rawOrigin === 'market' || rawOrigin === 'wallet' || rawOrigin === 'fomo'
+    ? rawOrigin
+    : metric === 'trackerBuy'
+      ? trackerBuyer?.address ? 'wallet' : 'fomo'
+      : 'market';
   return {
     id: id as number,
     ca,
@@ -117,6 +122,7 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
       ...(xHandle ? { xHandle } : {}),
       ...(tracked ? { tracked } : {}),
     } satisfies AlertMetricSnapshot,
+    origin,
   };
 }
 
@@ -152,6 +158,10 @@ export class MonitorAlerts {
     A: { ...DEFAULT_TELEGRAM_ALERT_RULES },
     B: { ...DEFAULT_TELEGRAM_ALERT_RULES },
   };
+  private readonly fomoRules: Record<Source, TelegramAlertRules> = {
+    A: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+    B: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+  };
   constructor(
     private readonly store: MonitorStore,
     private readonly config: MonitorConfig,
@@ -162,7 +172,9 @@ export class MonitorAlerts {
 
   async tick(): Promise<void> {
     await this.consumeSource('A', this.config.apiAUrl);
-    await this.consumeSource('B', this.config.apiBUrl);
+    if (this.config.apiBUrl && this.config.apiBUrl !== this.config.apiAUrl) {
+      await this.consumeSource('B', this.config.apiBUrl);
+    }
     await this.sendPending();
   }
 
@@ -188,7 +200,8 @@ export class MonitorAlerts {
         previousId = observation.id;
       }
       this.rules[source] = parseRules(field(body, 'telegramAlertRules')) ?? this.rules[source];
-      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules[source]);
+      this.fomoRules[source] = parseRules(field(body, 'fomoTelegramAlertRules')) ?? this.rules[source];
+      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules[source], this.fomoRules[source]);
       await this.acknowledgeSource(baseUrl, committedCursor);
     } catch (error) {
       console.error(`[monitor] alert feed ${source} failed: ${responseKind(error)}`);
@@ -211,10 +224,6 @@ export class MonitorAlerts {
   private async sendPending(): Promise<void> {
     if (!this.bot.configured) return;
     for (const pending of this.store.pendingTelegramAlerts(this.now(), OUTBOX_BATCH_SIZE)) {
-      if (isSuppressedTelegramAlert(pending.payload, pending.alertId)) {
-        this.store.markTelegramAlertSuppressed(pending.alertId);
-        continue;
-      }
       if (!this.store.markTelegramAlertSending(pending.alertId)) continue;
       try {
         await this.bot.send(pending.payload, {
