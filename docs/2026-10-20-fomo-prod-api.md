@@ -77,7 +77,8 @@ Chú thích trạng thái:
 - `threshold` lọc theo position size; chưa rõ có bỏ giao dịch nhỏ hay không.
 - `limit` nhận tới 100 (live 2026-10-22: `limit=100` trả 100 item). Response
   không có cursor dùng được cho trang kế; watcher giữ cursor cục bộ theo
-  `createdAt` + `id` và poll lại trang đầu mỗi 60s.
+  `createdAt` + `id` and polled the first page every 60s (historical observation
+  from 2026-10-22; this interval is configured separately per deployment).
 
 ### 3.3 Token / holders
 
@@ -287,7 +288,7 @@ body = r.json()["responseObject"]
 |---|---|---|
 | Bal / holdings | `/v2/users/{id}/balances` | `balances[]` lồng `balance`, `userToken`, `valuation`; amount token là nguồn, USD tính theo giá hiện tại |
 | Position active/closed | `/v2/users/{id}/balances` + `/trades?userId={id}&orderBy=closedAt` + `/trades/{tradeId}` | `/trades` **requires `x-supported-chains`**; without it prod-api returns only Solana `activeTrades` (measured: 20 vs 33 active rows for one user). `/balances` is still authoritative for transfer-in positions, which `/trades` omits; union both sources. Pair vắng mặt trong response đầy đủ **không đủ** để đóng: FOMO có thể bỏ sót position cross-chain còn mở (FLOAT, 2026-10-22). Chỉ đóng sau khi trade detail xác nhận `closedAt`/amount 0; partial SELL còn mở thì cập nhật amount còn lại, không zero. Chỉ đọc trade detail khi có sell sau buy gần nhất (hoặc alert BUY thiếu balance) để hạn chế request |
-| Từng fill | `/v2/users/{id}/swaps` | Map → `FomoSwap`; watcher poll 60s và POST alert; xử lý `inNetworkId`/`outNetworkId` |
+| Từng fill | `/v2/users/{id}/swaps` | Map → `FomoSwap`; instance A's `fomo-watch.service` poll mỗi 300s từ 2026-10-29; POST alert; xử lý `inNetworkId`/`outNetworkId` |
 | Equity/PnL history | `/v2/userTokens/aggregatedSnapshot` | `snapshotId`, `pnl`, `equity` |
 | Alert candidate | `/feed/token` | `swap_buy`/`swap_sell`, `usdAmount`, `tradeId`, `userId`; nhưng token-centric + threshold |
 | User directory | `/v2/leaderboard*` | Có `userId` ổn định, wallets, PnL/volume/holdings |

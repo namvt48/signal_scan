@@ -114,6 +114,7 @@ function DashboardShell() {
   // Token detail page DISABLED — state kept out so no detail query can be triggered.
   // const [selectedToken, setSelectedToken] = useState<{ chain: string; ca: string } | null>(null);
   const [tab, setTab] = useState<Tab>('dashboard');
+  const [managementView, setManagementView] = useState<'sol' | 'evm' | 'fomo'>('sol');
   // Keep visited tables mounted to preserve sort/filter state. SignalTable
   // pauses inactive polling and reuses fresh rows when a tab is reactivated.
   const [visited, setVisited] = useState<Set<Tab>>(() => new Set<Tab>(['dashboard']));
@@ -127,7 +128,7 @@ function DashboardShell() {
   return (
     <div className="min-h-[100dvh] bg-canvas text-ink">
       <header className="sticky top-0 z-40 border-b border-line bg-canvas/90 backdrop-blur">
-        <div className="flex h-14 w-full items-center justify-between gap-4 px-4 sm:px-6">
+        <div className="flex h-14 w-full items-center justify-between gap-0 px-1 sm:gap-4 sm:px-6">
           <BrandMark />
           <nav aria-label="Main" className="flex items-center self-stretch">
             {TABS.map((t) => (
@@ -139,7 +140,7 @@ function DashboardShell() {
                   setVisited((prev) => (prev.has(t.id) ? prev : new Set(prev).add(t.id)));
                 }}
                 aria-current={tab === t.id ? 'page' : undefined}
-                className={`h-full border-b-2 px-3 text-[13px] font-semibold transition-colors ${
+                className={`h-full border-b-2 px-1 text-[11px] font-semibold transition-colors sm:px-3 sm:text-[13px] ${
                   tab === t.id ? 'border-accent font-bold text-ink' : 'border-transparent text-ink2 hover:text-ink'
                 }`}
               >
@@ -200,13 +201,29 @@ function DashboardShell() {
           )}
           {tab === 'wallets' && (
             <>
-              <WalletsPage />
-              {/* FOMO watch list is instance-b only: a sibling surface in the same tab,
-                  behind SHOW_FOMO. Flag off → nothing renders (no tab, no heading, no button). */}
               {SHOW_FOMO && (
-                <div className="mt-10">
-                  <FomoUsersPage />
-                </div>
+                <nav aria-label="Management views" className="mb-5 flex flex-wrap gap-1 border-b border-line">
+                  {([
+                    ['sol', 'Solana wallet'],
+                    ['evm', 'EVM wallet'],
+                    ['fomo', 'FOMO users'],
+                  ] as const).map(([view, label]) => (
+                    <button
+                      key={view}
+                      type="button"
+                      onClick={() => setManagementView(view)}
+                      aria-current={managementView === view ? 'page' : undefined}
+                      className={`border-b-2 px-3 py-2 text-[13px] font-semibold transition-colors ${
+                        managementView === view ? 'border-accent text-ink' : 'border-transparent text-ink2 hover:text-ink'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </nav>
+              )}
+              {SHOW_FOMO && managementView === 'fomo' ? <FomoUsersPage /> : (
+                <WalletsPage key={managementView} scope={SHOW_FOMO && managementView !== 'fomo' ? managementView : undefined} />
               )}
             </>
           )}

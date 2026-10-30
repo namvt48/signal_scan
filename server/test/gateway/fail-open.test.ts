@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { metricSweep } from '../../src/poller.js';
-import { open } from '../../src/db.js';
+import { insertTrackedCa, open } from '../../src/db.js';
 import { log } from '../../src/log.js';
 import { GatewayClient, GatewayTransportError } from '../../src/gateway-client.js';
 import { GmgnMarketProvider } from '../../src/providers/gmgn.js';
@@ -55,6 +55,7 @@ test('todo15: a fetch rejection is typed GatewayTransportError (the fail-open in
 
 test('todo15: gateway UNREACHABLE → the sweep completes without throwing and warns', async () => {
   open(':memory:');
+  insertTrackedCa({ address: CA, chain: 'sol', note: 'test' });
   const provider = gmgnVia((async () => {
     throw new TypeError('fetch failed');
   }) as unknown as typeof fetch);
@@ -82,6 +83,7 @@ test('todo15: gateway UNREACHABLE → the sweep completes without throwing and w
 
 test('bug3: an upstream non-2xx (envelope.status 400) is logged per-CA and does NOT abort the pass', async () => {
   open(':memory:');
+  insertTrackedCa({ address: CA, chain: 'sol', note: 'test' });
   const provider = gmgnVia((async () =>
     jsonResponse(200, { status: 400, body: null, headers: {} })) as unknown as typeof fetch);
 
@@ -106,6 +108,7 @@ test('bug3: an upstream non-2xx (envelope.status 400) is logged per-CA and does 
 
 test('bug3: a gateway 429 budget denial is logged, NEVER retried, and does NOT abort the pass', async () => {
   open(':memory:');
+  insertTrackedCa({ address: CA, chain: 'sol', note: 'test' });
   let calls = 0;
   const provider = gmgnVia((async () => {
     calls += 1;
@@ -145,6 +148,7 @@ test('bug3: one failing CA does not stop the pass — the next CA is still swept
     { address: 'CA-BAD-111111111111111111111111111111111', chain: 'sol' as const },
     { address: 'CA-GOOD-22222222222222222222222222222222', chain: 'sol' as const },
   ];
+  for (const target of two) insertTrackedCa({ ...target, note: 'test' });
   const warns: unknown[][] = [];
   const origError = log.error;
   const origWarn = log.warn;

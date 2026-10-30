@@ -172,10 +172,9 @@ def get_price_usd(ca: str, chain: str = "sol") -> float | None:
 def _warm_prices(tx) -> None:
     """Warm `_info` cho mọi mint trong tx TRƯỚC detect_swaps.
 
-    `_swap_event` cố ý KHÔNG network — chỉ đọc cache `_info`; mint chưa warm ⇒
-    px=0 ⇒ quote_usd=0 ⇒ usd_pending ⇒ `track_post_body` trả None ⇒ CA của token
-    ví thật sự mua KHÔNG BAO GIỜ được post. Việc warm này trước 2026-09-16 do
-    một tiện ích giá cũ đảm nhiệm; bản detector rewrite per-step làm mất call site.
+    `_swap_event` không chạm mạng, chỉ đọc cache `_info`. Warm giá trước detect
+    để trade có valuation khi nguồn giá sẵn sàng; nếu chưa có giá, emitter bỏ
+    amountUsd/price thay vì tạo BUY giá 0. BUY thật vẫn được gửi tới API.
     WSOL/stablecoin nằm trong `quotes_map` nên vòng lặp dưới BỎ QUA ⇒ riêng giá
     SOL phải warm đường `_sol_px` (nhánh quote WSOL đọc biến này, không đọc
     `_info`). Fail-soft: mint không lấy được giá không được chặn tx."""

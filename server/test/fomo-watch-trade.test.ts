@@ -8,8 +8,10 @@ import {
   deleteTrackedCa,
   findTrackedCa,
   insertFomoUser,
+  insertTrackedCa,
   listTrackedCas,
   open,
+  setSetting,
 } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { fomoHoldingsIdle } from '../src/poller.js';
@@ -23,9 +25,10 @@ const JSON_HEADERS = { 'content-type': 'application/json', authorization: `Beare
 const HANDLE = 'fomo-trader-1';
 const USER_ID = 'fomo-uid-1';
 const CA = 'FomoCaSource001';
+const REPLAY_CA = 'FomoReplayCa001';
 const BUY_CA = 'FomoBuyNewCa001';
 const SELL_CA = 'FomoSellNewCa001';
-const REPLAY_CA = 'FomoReplayCa001';
+const RECENT_TRADE_TS = Date.now();
 
 let auth: TestAuth;
 let server: Server;
@@ -53,10 +56,11 @@ function trade(overrides: Record<string, unknown> = {}): Record<string, unknown>
     type: 'buy',
     tokenAddress: CA,
     chain: 'sol',
-    ts: 1_758_000_000_000,
+    ts: RECENT_TRADE_TS,
+    provenance: 'live',
+    token: 'STOCKER',
     usdValue: 2985,
     price: 0.002,
-    token: 'STOCKER',
     ...overrides,
   };
 }
@@ -73,6 +77,7 @@ function rowOf(eventId: string): Record<string, unknown> | undefined {
 
 before(async () => {
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   fomoUserId = insertFomoUser({ handle: HANDLE, user_id: USER_ID, name: 'Fomo One' }).id;
   handleOnlyId = insertFomoUser({ handle: 'handle-only', name: 'Handle Only' }).id;
   uidFirstId = insertFomoUser({ handle: 'uid-first', user_id: 'fomo-uid-2', name: 'UID First' }).id;
@@ -97,7 +102,7 @@ test('POST /api/fomo-watch/trades: a valid body creates exactly one row with the
   assert.equal(row?.ca, CA);
   assert.equal(row?.chain, 'sol');
   assert.equal(row?.type, 'buy');
-  assert.equal(row?.ts, 1_758_000_000_000);
+  assert.equal(row?.ts, RECENT_TRADE_TS);
   assert.equal(row?.usd_value, 2985);
   assert.equal(row?.price, 0.002);
   assert.equal(row?.token, 'STOCKER');
@@ -281,6 +286,24 @@ test('POST /api/fomo-watch/trades: a BUY enqueues the CA into tracked_cas exactl
   assert.equal(listTrackedCas().filter((r) => r.address === BUY_CA && r.chain === 'sol').length, 1);
 });
 
+test('historical FOMO BUY persists without admission or alert metrics', async () => {
+  const ca = 'FomoHistoricalCa01';
+  const body = trade({
+    eventId: 'evt-fomo-historical',
+    tokenAddress: ca,
+    provenance: 'historical',
+    tradeUsd: 25_000,
+  });
+  const res = await post(body);
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  assert.ok(rowOf('evt-fomo-historical'), 'the historical trade remains in FOMO history');
+  assert.equal(findTrackedCa(ca, 'sol'), undefined);
+  assert.equal(getAlertMetricObservations(0, 1000).some(
+    (row) => row.ca === ca && row.metric === 'trackerBuy',
+  ), false);
+});
+
 test('POST /api/fomo-watch/trades: a repeat BUY (same eventId) adds no second tracked_cas row', async () => {
   const res = await post(trade({ eventId: 'evt-fomo-buy-new', tokenAddress: BUY_CA }));
   assert.equal(res.status, 200);
@@ -446,4 +469,49 @@ test('POST /api/fomo-watch/trades: a legacy fomo-feed event id is stored as fomo
   const again = await post({ ...body, eventId: canonical });
   assert.equal(again.status, 200);
   assert.equal(again.json.inserted, 0);
+});
+test('FOMO watch skips pre-deployment events before trade, CA, or holding work', async () => {
+  const cutoff = Date.now() - 1_000;
+  setSetting('systemDeployAt', String(cutoff));
+  const res = await post(trade({ eventId: 'evt-fomo-predeploy', tokenAddress: 'FomoPredeployCa001', ts: cutoff - 1, txHash: '0xpredeploy' }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.json, { inserted: 0, skipped: 'pre-deploy' });
+  assert.equal(rowOf('evt-fomo-predeploy'), undefined);
+  assert.equal(findTrackedCa('FomoPredeployCa001', 'sol', true), undefined);
+  setSetting('systemDeployAt', '1700000000000');
+});
+test('FOMO stores stale BUY history without reactivating an inactive CA', async () => {
+  const staleCa = 'FomoStaleBuyCA001';
+  const tracked = insertTrackedCa({ address: staleCa, chain: 'sol', note: 'fomo' });
+  getDb().prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?").run(tracked.id);
+  const ts = Date.now() - 48 * 60 * 60 * 1000 - 1;
+  const res = await post(trade({ eventId: 'evt-fomo-stale-buy', tokenAddress: staleCa, ts }));
+
+  assert.equal(res.status, 200);
+  assert.equal(res.json.inserted, 1);
+  assert.equal(rowOf('evt-fomo-stale-buy')?.ts, ts);
+  assert.equal(findTrackedCa(staleCa, 'sol', true)?.status, 'inactive');
+  assert.equal(findTrackedCa(staleCa, 'sol'), undefined);
+});
+
+test('FOMO ingest rejects missing provenance and future events without storing them', async () => {
+  const missing = trade({ eventId: 'fomo-no-provenance' });
+  delete missing.provenance;
+  assert.equal((await post(missing)).status, 400);
+  assert.equal((await post(trade({ eventId: 'fomo-future', ts: Date.now() + 60_000 }))).status, 400);
+  assert.equal(rowOf('fomo-no-provenance'), undefined);
+  assert.equal(rowOf('fomo-future'), undefined);
+});
+
+test('historical FOMO BUY cannot reactivate an inactive CA even within 48h', async () => {
+  const ca = 'FomoHistoricalInactive';
+  const row = insertTrackedCa({ address: ca, chain: 'sol', note: 'manual' });
+  getDb().prepare("UPDATE tracked_cas SET status='inactive' WHERE id=?").run(row.id);
+  const response = await post(trade({
+    eventId: 'fomo-historical-inactive', tokenAddress: ca, provenance: 'historical', ts: Date.now() - 1_000,
+  }));
+  assert.equal(response.json.inserted, 1);
+  assert.equal(findTrackedCa(ca, 'sol', true)?.status, 'inactive');
+  assert.ok(rowOf('fomo-historical-inactive'));
+  assert.equal(getAlertMetricObservations(0, 1000).some((item) => item.ca === ca), false);
 });

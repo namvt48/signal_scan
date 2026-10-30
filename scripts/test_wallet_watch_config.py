@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Config-from-API của wallet_watch: load_config_from_api + track_post_body usd.
+"""Config-from-API của wallet_watch và single trade ingest.
 
 Chạy: python3 scripts/test_wallet_watch_config.py   (offline — http_json bị stub,
 không gọi mạng). Cover:
@@ -9,10 +9,8 @@ không gọi mạng). Cover:
   (c) API wallets trả list → address từng item thành wallet list (override file).
   (d) API wallets trả list (kể cả []) → tab Wallet là NGUỒN DUY NHẤT, [] xoá hết ví;
       lỗi mạng/sai shape → giữ list seed từ file/CLI.
-  (e) track_post_body: có giá ⇒ "usd" đúng bằng quote_usd; THIẾU giá ⇒ body KHÔNG
-      có key "usd" nhưng VẪN post (server lưu entry_usd NULL rồi tự gate $50 —
-      fail-open, Q1 2026-09-21). _swap_event KHÔNG còn drop theo min_usd (§9.2:
-      ngưỡng detect = 0 hằng số) — min_usd chỉ còn để log.
+  (e) Trade có giá giữ valuation; BUY chưa có giá bỏ amountUsd/price để không
+      bị hiểu thành BUY 0 USD. _swap_event không drop theo min_usd; API giữ gate.
 
 Monkeypatch qua setattr(...) — pyright cấm gán attribute lạ trên ModuleType
 nhưng cho phép đọc; pattern tương đương _seed(ww) của test_wallet_watch.
@@ -92,7 +90,7 @@ print("OK (b): API settings chết → giữ cli/default, load không raise")
 
 # ---------- (c) wallets API list → override file ----------
 
-api_w = [{"address": "ApiWalletAAA", "name": "ct01"}, {"address": "ApiWalletBBB"}]
+api_w = [{"address": "ApiWalletAAA", "name": "ct01", "chain": "sol"}, {"address": "ApiWalletBBB", "chain": "sol"}]
 ws, _ = _load(_stub({"values": {"minUsd": 1}}, api_w), FILE_SEED, 0.5)
 assert ws == ["ApiWalletAAA", "ApiWalletBBB"], f"phải dùng address từ API, got {ws}"
 print("OK (c): API wallets non-empty override file/CLI")
@@ -164,10 +162,7 @@ ev, _, bm, qm = ww._swap_event(*args)
 assert ev is not None, "qusd=50 > min_usd=10 ⇒ event phải được emit"
 assert bm == TOK and qm == ww.WSOL, "base/quote sai ⇒ fixture test hỏng"
 assert ev["quote_usd"] == 50.0, "fixture: quote_usd phải đúng 50.0"
-body = ww.track_post_body(ev)
-assert body is not None and body["usd"] == 50.0 == ev["quote_usd"], body
-assert isinstance(body["usd"], float)
-assert body["address"] == TOK and body["chain"] == "sol", "field cũ không được đổi"
+ev["provenance"] = "live"
 
 # §9.2: ngưỡng DETECT = 0 hằng số. min_usd=60 chỉ là con số server dùng ở bước
 # add-CA ⇒ detector KHÔNG được drop theo nó (đo thật: buys $4.88–49.19 bị mất —
@@ -182,19 +177,8 @@ setattr(ww, "min_usd", 0.0)
 ww._sol_px["v"] = 0.0  # thiếu price ⇒ quote_usd None (không bịa 0) ⇒ usd_pending
 ev3, _, _, _ = ww._swap_event(*args)
 assert ev3 is not None and ev3["usd_pending"] and ev3["quote_usd"] is None, ev3
-body3 = ww.track_post_body(ev3)
-assert body3 is not None and "usd" not in body3, (
-    f"thiếu giá vẫn phải post (fail-open server) nhưng KHÔNG bịa usd: {body3}"
-)
-print(
-    "OK (e): quote_usd=50 → body.usd=50; min_usd KHÔNG gate emit; thiếu giá ⇒ None + no usd"
-)
+ev3["provenance"] = "live"
 
-# ---------- event shape cũ (thiếu type) → None, không post mù ----------
-
-legacy = {"side": "BUY", "mint": "M1", "wallet": W, "sig": SIG}
-assert ww.track_post_body(legacy) is None, "type != SWAP ⇒ không vào queue CA"
-print("OK: event không phải SWAP → None (chỉ SWAP mới vào queue CA)")
 
 # ---------- (f) watch_trade_body: trade cho cột `Tracked by` ----------
 
@@ -218,18 +202,10 @@ assert ww.watch_trade_body({**ev, "sig": None}) is None, "thiếu sig ⇒ None"
 assert ww.watch_trade_body({**ev, "wallet": ""}) is None, "thiếu wallet ⇒ None"
 assert ww.watch_trade_body({**ev, "mint": ""}) is None, "thiếu mint ⇒ None"
 
-# CẢ 2 đường đều post buy thiếu giá (fail-open, Q1 2026-09-21): CA path bỏ hẳn key
-# "usd" (server lưu entry_usd NULL rồi tự gate $50), Tracked by path ghi 0.
+# Unknown price is omitted so the API does not mistake it for a priced zero-dollar BUY.
 b3 = ww.watch_trade_body(ev3, 1_758_000_000)
-assert b3 is not None and b3["amountUsd"] == 0.0 and b3["price"] == 0.0, b3
-ca_body3 = ww.track_post_body(ev3)
-assert ca_body3 is not None and ca_body3["address"] == TOK and "usd" not in ca_body3, (
-    f"CA path fail-open khi thiếu giá, KHÔNG bịa usd: {ca_body3}"
-)
-assert (
-    ww.watch_trade_body({**ev, "quote_usd": "rác", "qty": float("inf")})["amountUsd"]
-    == 0.0
-)
+assert b3 is not None and "amountUsd" not in b3 and "price" not in b3, b3
+assert "amountUsd" not in ww.watch_trade_body({**ev, "quote_usd": "rác", "qty": float("inf")})
 print("OK (f): watch_trade_body — buy có/không giá, sell có side, thiếu khoá → None")
 
 # ---------- (g) Bearer CHỈ gắn cho API của mình (server bật auth 2026-09-28) ----------
@@ -256,11 +232,9 @@ assert ww._auth_headers("http://127.0.0.1:8125/api/wallets") == {
 }, "phải khớp _api_url HIỆN HÀNH, không phải giá trị lúc import"
 print("OK (g): Bearer chỉ gắn cho _api_url; Solana RPC không dính token")
 
-# ---------- (h) 2 đường POST tự dựng Request trong emit.py phải kèm Bearer ----------
+# ---------- (h) Direct trade POST must carry API authentication ----------
 
-# http_json KHÔNG phải đường duy nhất chạm API: emit.track_event / emit.post_trade
-# tự gọi urllib.request.urlopen. Thiếu token ở đây ⇒ sau khi bật auth daemon vẫn
-# GET được (tưởng khoẻ) mà ÂM THẦM ngừng ghi CA + trade — đúng loại lỗi im lặng.
+# Direct trade delivery must carry API authentication.
 
 _seen_headers: list[dict[str, str]] = []
 
@@ -284,17 +258,15 @@ try:
     setattr(ww, "_service_token", "svc-tok")
     setattr(ww, "_api_url", "http://127.0.0.1:8124")
     setattr(ww, "_track", True)
-    setattr(ww, "_posted_mints", set())
-    ww.track_event(ev)  # POST /api/tracked-cas
     ww.post_trade(ww.watch_trade_body(ev))  # POST /api/wallet-watch/trades
 finally:
     urllib.request.urlopen = _real_urlopen
 
-assert len(_seen_headers) == 2, f"phải bắt được 2 POST, got {len(_seen_headers)}"
+assert len(_seen_headers) == 1, f"expected one authenticated trade POST, got {len(_seen_headers)}"
 for h in _seen_headers:
     assert h.get("Authorization") == "Bearer svc-tok", f"POST thiếu Bearer: {h}"
     assert h.get("Content-type") == "application/json", h
-print("OK (h): cả 2 đường POST của emit.py đều kèm Bearer")
+print("OK (h): single trade POST carries Bearer authentication")
 
 # ---------- (i) duyệt TỪNG TX: cùng mint POST 2 lần, KHÔNG bị cache nuốt ----------
 
@@ -306,8 +278,8 @@ _seen_headers.clear()
 urllib.request.urlopen = _capture
 try:
     setattr(ww, "_track", True)
-    ww.track_event(ev)
-    ww.track_event(ev)  # cùng mint, TX khác ⇒ vẫn phải POST
+    ww.watch_trade_event(ev)
+    ww.watch_trade_event({**ev, "sig": SIG + "-second"})
 finally:
     urllib.request.urlopen = _real_urlopen
 assert len(_seen_headers) == 2, (

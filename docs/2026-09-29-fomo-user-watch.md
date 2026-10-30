@@ -42,6 +42,11 @@ the column tooltip:
 
 > do not compute market share, trade counts, or volume from it
 
+The configured `FOMO_POLL_INTERVAL_S` is the target cycle start-to-start interval
+(production: 300 seconds). User swaps are fetched sequentially in worker threads,
+so the asyncio heartbeat continues during network I/O. Sweeps never overlap; if one
+takes longer than the target interval, the next begins immediately after it finishes.
+
 Do not read the `FOMO by` counts as platform-wide activity, and do not sum them into a
 market share or a volume figure. The column answers one narrow question: "did a trader
 on our watch list take a large position in this coin recently, and how big was it".
@@ -390,16 +395,20 @@ Raw alert sample: `.omo/evidence/fomo-user-watch/task-0-alert-sample.jsonl`.
 Two changes were added after the original build (todos 12 and 13 in the plan); the
 runbook above already reflects them.
 
-**A watched trader's BUY now enqueues its CA for tracking.** In
-`POST /api/fomo-watch/trades`, when the alert is a `type='buy'`, is not Solana, and
-`findTrackedCa(ca, chain)` is falsy, the route calls
-`insertTrackedCa({ address, chain, note:'fomo', entryUsd })` then `kickCAs([...])`, so
-the normal poller starts tracking the token like any other tracked CA. It fires only
-for a genuinely new trade row and only when the CA is not already tracked, so a
-replayed alert is a strict no-op (no re-enqueue, no re-kick).
-This is **tracked-CA state, not wallet state**: `wallet_trades`, `insertTrades` and
-`kickWalletRow` remain untouched by the FOMO path. Only `buy` enqueues - a `sell` of an
-untracked CA adds nothing. There is no entry-size gate (per the user's request).
+**A newly inserted live/cursor BUY can enqueue or reactivate its CA.** The
+`POST /api/fomo-watch/trades` body requires `provenance` (`live`, `cursor`, or
+`historical`). The shared admission gate applies to all supported chains and
+rejects future/pre-deployment events, BUYs outside the 48-hour activity window,
+Pass-blocked CAs, and known entry sizes below the configured minimum. Unknown
+entry size remains eligible.
+
+Expanded historical trade-detail fills and bootstrap token-feed items carry
+`historical`: they can persist in `fomo_trades`, but cannot add/reactivate a CA,
+emit tracker-buy observations, or trigger holdings/position/market refreshes.
+Per-user crawl windows and existing feed cursors carry `cursor`, preserving
+legitimate catch-up after an outage. Duplicate event IDs remain no-ops.
+This is tracked-CA state, not native wallet state: the FOMO route never writes
+`wallet_trades` or invokes `kickWalletRow`. SELLs never admit CAs.
 
 **`Sell PnL` - a separate realised-PnL figure.** Each FOMO user row now reports
 `sellPnlUsd` (SUM of SELL `usd_value`, may be negative) in addition to `buyUsd`; the
@@ -510,6 +519,32 @@ The Discover UI also requested `/v2/leaderboard`, `/watchlist`, `/v2/clans/leade
 - No code, API provider, websocket, or deployment was changed as part of this investigation.
 
 ---
+
+## 16. Alita following synchronization
+
+The API bridge now exposes Alita's read-only following pages and profile. When
+enabled on instance B, the API poller checks them every 15 minutes and adds newly
+followed users to `fomo_users` with the stable FOMO `userId` and the `Alita follow`
+tag. Existing rows are matched case-insensitively by handle and tagged without
+overwriting their manual metadata.
+
+Removal is deliberately conservative:
+
+- A snapshot is complete only when the owner profile ID is correct, the following
+  count is unchanged before/after pagination, and the unique paginated IDs exactly
+  match that count.
+- An incomplete or failed poll may add/tag returned users, but never removes or
+  untags anyone; it also resets pending absence confirmation.
+- Removal requires the same user to be absent from two complete snapshots at least
+  one polling interval apart. Rows created by the sync are deleted on confirmation
+  (existing trade/position foreign keys cascade); manual/CSV rows are kept and only
+  lose the sync tag.
+
+`GET /api/fomo/follow-sync` reports the last sync state; `POST` triggers an
+admin-only run. The Makefile enables this by default for instance B and keeps it
+off for A; pass `FOMO_ALITA_SYNC=off` to disable B. Compose's raw default is off.
+Do not infer an unfollow from profile privacy or a short page; the count check is
+the deletion gate.
 
 ## Source index
 

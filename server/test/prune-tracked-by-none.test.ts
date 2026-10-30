@@ -64,14 +64,14 @@ test('pruneTrackedByNone: drops a CA no wallet is Tracked by', () => {
 
   const dropped = pruneTrackedByNone(WINDOW).map((r) => r.address).sort();
 
-  assert.deepEqual(dropped, [FOMO_SELL, FOMO_SELL_STALE, FOMO_STALE, HELD_OLD, NO_TRADE].sort());
+  assert.deepEqual(dropped, [FOMO_SELL, FOMO_SELL_STALE, FOMO_STALE, NO_TRADE].sort());
   assert.notEqual(findTrackedCa(FOMO_BUY, 'sol'), undefined, 'a fomo-watched buy inside the window must survive the tracked-by-none prune');
   assert.equal(findTrackedCa(FOMO_SELL, 'sol'), undefined, 'a sell-only fomo CA reads `none` on the FOMO dash, so it must be pruned');
   assert.notEqual(findTrackedCa(TIERED, 'sol'), undefined, 'a tier-rated CA must survive the tracked-by-none prune');
   assert.notEqual(getTokenState(TIERED, 'sol'), undefined, 'and keep its market data');
   assert.notEqual(getTokenState(HELD_OLD, 'sol'), undefined, 'a deactivated CA preserves its token_state');
   assert.notEqual(getTokenState(IN_WINDOW, 'sol'), undefined, 'a kept CA keeps its token_state');
-  assert.equal(findTrackedCa(HELD_OLD, 'sol'), undefined, 'deactivated CA is removed from tracking');
+  assert.notEqual(findTrackedCa(HELD_OLD, 'sol'), undefined, 'a positive snapshot keeps its holder CA tracked without a recent buy');
 });
 
 test('pruneUntrackedCas: a FOMO BUY inside the window keeps the CA, a lone SELL does not', () => {

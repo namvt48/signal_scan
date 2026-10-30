@@ -23,10 +23,16 @@ import {
   GMGN_TOKEN_INFO_ENDPOINT,
   GMGN_TOKEN_INFO_PATH,
   GMGN_TOKEN_INFO_WEIGHT,
+  GMGN_WALLET_ACTIVITY_ENDPOINT,
+  GMGN_WALLET_ACTIVITY_PATH,
+  GMGN_WALLET_ACTIVITY_URL,
+  GMGN_WALLET_ACTIVITY_WEIGHT,
   GmgnTokenInfoSingleFlight,
+  gmgnErrorHint,
   gmgnTokenInfoUpstream,
   handleGmgnTokenInfo,
   parseGmgnTokenInfo,
+  parseGmgnWalletActivity,
 } from '../../src/gateway/gmgn.js';
 import {
   GATED_HEADER,
@@ -96,15 +102,24 @@ interface PostResult {
   headers: Headers;
 }
 
-async function post(base: string, body: unknown, token?: string): Promise<PostResult> {
+async function post(
+  base: string,
+  body: unknown,
+  token?: string,
+  path = GMGN_TOKEN_INFO_PATH,
+): Promise<PostResult> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (token !== undefined) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`${base}${GMGN_TOKEN_INFO_PATH}`, {
+  const res = await fetch(`${base}${path}`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
   });
   return { status: res.status, json: await res.json(), headers: res.headers };
+}
+
+function postActivity(base: string, body: unknown, token?: string): Promise<PostResult> {
+  return post(base, body, token, GMGN_WALLET_ACTIVITY_PATH);
 }
 class SignallingSingleFlight extends GmgnTokenInfoSingleFlight {
   private invocations = 0;
@@ -476,4 +491,109 @@ test('a GMGN 429 gates shared egress before the next key can call upstream', asy
       assert.equal(calls, 1, 'the second key must not send a request during the shared ban');
     },
   );
+});
+test('wallet activity validates EVM wallets/chains, limit and opaque cursor', () => {
+  const wallet = `0x${'a'.repeat(40)}`;
+  for (const chain of ['base', 'bsc', 'eth', 'robinhood'] as const) {
+    assert.deepEqual(parseGmgnWalletActivity({ wallet, chain }), {
+      ok: true,
+      value: { wallet, chain, limit: 20 },
+    });
+  }
+  assert.equal(parseGmgnWalletActivity({ wallet, chain: 'sol' }).ok, false);
+  assert.equal(parseGmgnWalletActivity({ wallet: 'not-an-address', chain: 'base' }).ok, false);
+  assert.equal(parseGmgnWalletActivity({ wallet, chain: 'base', limit: 0 }).ok, false);
+  assert.equal(parseGmgnWalletActivity({ wallet, chain: 'base', limit: 101 }).ok, false);
+  assert.equal(parseGmgnWalletActivity({ wallet, chain: 'base', cursor: 4 }).ok, false);
+  assert.equal(parseGmgnWalletActivity({ wallet, chain: 'base', cursor: 'x'.repeat(2049) }).ok, false);
+});
+
+test('GMGN activity error hints keep upstream messages private', () => {
+  assert.equal(gmgnErrorHint('{"message":"invalid API key"}'), 'auth_rejected');
+  assert.equal(gmgnErrorHint('{"message":"invalid chain"}'), 'chain_rejected');
+  assert.equal(gmgnErrorHint('{"message":"invalid query parameter"}'), 'request_parameter_rejected');
+  assert.equal(gmgnErrorHint('{"message":"invalid wallet address"}'), 'wallet_invalid');
+  assert.equal(gmgnErrorHint('{"message":"wallet not found"}'), 'wallet_unknown');
+  assert.equal(gmgnErrorHint('{"message":"wallet is required"}'), 'wallet_missing');
+  assert.equal(gmgnErrorHint('{"message":"secret value"}'), 'unclassified');
+  assert.equal(gmgnErrorHint('not-json'), 'unclassified');
+});
+
+test('wallet activity route is authenticated, forwards cursor and uses both weighted GMGN limiters', async () => {
+  const requests: GatewayRequest[] = [];
+  const upstream: UpstreamFetch = async (request) => {
+    requests.push(request);
+    return okUpstream('{"code":0,"data":{"activities":[],"next":""}}');
+  };
+  const keyLimiter = recordingLimiter();
+  const egressLimiter = recordingLimiter();
+  const wallet = `0x${'a'.repeat(40)}`;
+
+  await withServer(
+    { gmgnUpstream: upstream, runLimiter: keyLimiter.run, runEgressLimiter: egressLimiter.run },
+    async (base) => {
+      const unauthorized = await postActivity(base, { wallet, chain: 'base' });
+      assert.equal(unauthorized.status, 401);
+      const invalid = await postActivity(base, { wallet, chain: 'sol' }, TOKENS.watcher);
+      assert.equal(invalid.status, 400);
+
+      const response = await postActivity(
+        base,
+        { wallet, chain: 'robinhood', limit: 20, cursor: 'opaque-next', priority: 2 },
+        TOKENS.watcher,
+      );
+      assert.equal(response.status, 200);
+      assert.equal((response.json as GatewayEnvelope).status, 200);
+      assert.deepEqual(requests, [{
+        provider: 'gmgn',
+        endpoint: GMGN_WALLET_ACTIVITY_ENDPOINT,
+        params: { chain: 'robinhood', wallet_address: wallet, limit: 20, cursor: 'opaque-next' },
+        priority: 2,
+      }]);
+      assert.equal(keyLimiter.calls[0]?.api, 'gmgn');
+      assert.equal(keyLimiter.calls[0]?.opts.weight, GMGN_WALLET_ACTIVITY_WEIGHT);
+      assert.equal(keyLimiter.calls[0]?.opts.priority, 2);
+      assert.equal(keyLimiter.calls[0]?.opts.path, GMGN_WALLET_ACTIVITY_ENDPOINT);
+      assert.equal(keyLimiter.calls[0]?.opts.caller, 'watcher');
+      assert.equal(egressLimiter.calls[0]?.api, 'gmgn-egress');
+      assert.equal(egressLimiter.calls[0]?.opts.weight, GMGN_WALLET_ACTIVITY_WEIGHT);
+      assert.equal(keyLimiter.calls.length, 1, 'unauthorized/invalid calls never enter the limiter');
+      assert.equal(egressLimiter.calls.length, 1);
+    },
+  );
+});
+
+test('wallet activity upstream signs fresh requests and preserves pagination parameters', async () => {
+  const urls: string[] = [];
+  const apiKeys: string[] = [];
+  const wallet = `0x${'b'.repeat(40)}`;
+  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    urls.push(String(input));
+    const headers = init?.headers as Record<string, string> | undefined;
+    apiKeys.push(headers?.['X-APIKEY'] ?? '');
+    return new Response('{"code":0,"data":{"activities":[],"next":"next-2"}}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof fetch;
+  const upstream = gmgnTokenInfoUpstream({ fetchImpl: fakeFetch, apiKey: 'gmgn-key' });
+  const request: GatewayRequest = {
+    provider: 'gmgn',
+    endpoint: GMGN_WALLET_ACTIVITY_ENDPOINT,
+    params: { chain: 'base', wallet_address: wallet, limit: 20, cursor: 'next-1' },
+  };
+
+  await upstream(request, 'watcher');
+  await upstream(request, 'watcher');
+
+  const first = new URL(urls[0]!);
+  const second = new URL(urls[1]!);
+  assert.equal(first.origin + first.pathname, GMGN_WALLET_ACTIVITY_URL);
+  assert.equal(first.searchParams.get('chain'), 'base');
+  assert.equal(first.searchParams.get('wallet_address'), wallet);
+  assert.equal(first.searchParams.get('limit'), '20');
+  assert.equal(first.searchParams.get('cursor'), 'next-1');
+  assert.ok(Number(first.searchParams.get('timestamp')) > 0);
+  assert.notEqual(first.searchParams.get('client_id'), second.searchParams.get('client_id'));
+  assert.deepEqual(apiKeys, ['gmgn-key', 'gmgn-key']);
 });

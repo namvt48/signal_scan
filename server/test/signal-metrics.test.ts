@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { freshDisplayValue, holderCountClass, percentageInRange, sumKnownPercentages, sumKnownUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../../src/lib/signalMetrics.js';
+import { freshDisplayValue, holderCountClass, netInflowUsd, percentageInRange, sumKnownPercentages, sumKnownUsd, totalBalanceUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../../src/lib/signalMetrics.js';
 import { sortTrackedWalletsByBalance } from '../../src/lib/walletSort.js';
 import type { TrackedWalletStat } from '../../src/types.js';
 
@@ -58,6 +58,40 @@ test('Buy totals are unknown if any member amount is unresolved', () => {
   assert.equal(sumKnownUsd([null]), null);
   assert.equal(sumKnownUsd([60, null]), null);
   assert.equal(sumKnownUsd([Number.NaN]), null);
+});
+
+test('Total balance sums all native and FOMO balances, including members beyond the preview', () => {
+  const wallets = Array.from({ length: 6 }, (_, i) => ({ balUsd: i + 1 }));
+  const users = [{ balUsd: 10.25 }, { balUsd: 0 }];
+  assert.equal(totalBalanceUsd(wallets, users), 31.25);
+  assert.equal(totalBalanceUsd(wallets, []), 21);
+  assert.equal(totalBalanceUsd([], users), 10.25);
+  assert.equal(totalBalanceUsd([], []), 0);
+  assert.equal(totalBalanceUsd([{ balUsd: 0 }], [{ balUsd: 0 }]), 0);
+});
+
+test('Total balance never presents incomplete or invalid member balances as a complete sum', () => {
+  assert.equal(totalBalanceUsd([{}], []), undefined);
+  assert.equal(totalBalanceUsd([{ balUsd: 100 }], [{}]), undefined);
+  assert.equal(totalBalanceUsd([{}, { balUsd: 100 }], []), undefined);
+  assert.equal(totalBalanceUsd([], [{ balUsd: Number.NaN }]), undefined);
+  assert.equal(totalBalanceUsd([{ balUsd: Infinity }], []), undefined);
+  assert.equal(totalBalanceUsd([{ balUsd: Number.MAX_VALUE }, { balUsd: Number.MAX_VALUE }], []), undefined);
+});
+
+test('FOMO inflow subtracts sell proceeds, preserving signed flows and measured zero', () => {
+  assert.equal(netInflowUsd(400, 250), 150);
+  assert.equal(netInflowUsd(500, 900), -400);
+  assert.equal(netInflowUsd(0, 90), -90);
+  assert.equal(netInflowUsd(0, 0), 0);
+});
+
+test('FOMO inflow stays unknown when either flow total is incomplete or non-finite', () => {
+  assert.equal(netInflowUsd(null, 250), null);
+  assert.equal(netInflowUsd(400, null), null);
+  assert.equal(netInflowUsd(null, null), null);
+  assert.equal(netInflowUsd(Number.NaN, 0), null);
+  assert.equal(netInflowUsd(400, Number.POSITIVE_INFINITY), null);
 });
 
 test('buy volume uses raw strictly-greater thresholds and rainbow takes priority over yellow', () => {

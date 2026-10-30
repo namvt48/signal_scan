@@ -57,14 +57,20 @@ services:
       FOMO_PRIVY_ORIGIN: https://fomo.family
       FOMO_PRIVY_APP_ID: ${FOMO_PRIVY_APP_ID:-}
       FOMO_IMPERSONATE: ${FOMO_IMPERSONATE:-chrome}
-      FOMO_REQUEST_DELAY_MS: ${FOMO_REQUEST_DELAY_MS:-62}
-      FOMO_CONCURRENCY: ${FOMO_CONCURRENCY:-4}
+      FOMO_GUARD_STATE_FILE: /state/request-guard.json
+      FOMO_REQUEST_DELAY_MS: ${FOMO_REQUEST_DELAY_MS:-1000}
+      FOMO_CONCURRENCY: ${FOMO_CONCURRENCY:-1}
       FOMO_TIMEOUT_SECONDS: ${FOMO_TIMEOUT_SECONDS:-30}
       PORT: "8080"
+    env_file:
+      - path: ./${DATA_DIR:-data}/fomo-prod-runtime.env
+        required: false
     volumes:
       # access_token + refresh_token, mode 0600, never committed. The bridge
       # rewrites both atomically when Privy rotates the session.
       - ./${DATA_DIR:-data}/fomo-prod-credentials:/credentials
+      # Persist the account-wide FOMO guard across container restarts.
+      - ./${DATA_DIR:-data}/fomo-prod-guard:/state
     ports:
       # Host watcher only; API uses the compose DNS name on the internal net.
       - "127.0.0.1:${FOMO_BRIDGE_PORT:-8131}:8080"
@@ -88,6 +94,10 @@ services:
       CRAWL_WS_ENDPOINT: ws://signal-scan-chrome-${INSTANCE:-a}:3000
       NANSEN_CRAWL: "on"
       FOMO_PROD_URL: ${FOMO_PROD_URL:-http://fomo-prod:8080}
+      FOMO_ALITA_SYNC: ${FOMO_ALITA_SYNC:-off}
+      FOMO_ALITA_USER_ID: ${FOMO_ALITA_USER_ID:-2c43be94-b528-5fe2-9dc3-27837e009cc8}
+      FOMO_ALITA_POLL_MS: ${FOMO_ALITA_POLL_MS:-900000}
+      FOMO_ALITA_TAG: "${FOMO_ALITA_TAG:-Alita follow}"
       # Setup queue is serviced independently; TTL/retry clocks gate requests per CA.
       POLL_SETUP_SWEEP_MS: "300000"
     volumes:

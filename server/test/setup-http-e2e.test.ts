@@ -22,9 +22,6 @@ process.env.NANSEN_CRAWL = 'on';
 process.env.NEW_CA_PRIORITY_MS = '1000';
 process.env.DB_PATH = dbFile;
 process.env.SETUP_CACHE_FILE = join(dir, 'nansen-cache.json');
-// AUTH CONTRACT v1: POST /api/tracked-cas accepts the service role — the same
-// token the wallet_watch daemon sends. Env BEFORE the src imports (config snapshot).
-process.env.SERVICE_TOKEN = 'e2e-service-token';
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,6 +38,9 @@ const { DoorPool, setPoolForTest } = await import('../src/crawl.js');
 const { setPollerDeps, earlySetupIdle } = await import('../src/poller.js');
 const { createApp } = await import('../src/api.js');
 const { NANSEN_HOURLY_STATS_URL } = await import('../src/providers/nansen.js');
+// The auth testkit must load after the startup environment above.
+const { createTestAuth } = await import('./auth-testkit.js');
+let adminAuthorization = '';
 
 const CHAIN: Chain = 'sol';
 const CA1 = 'CA-HTTP-1';
@@ -175,7 +175,7 @@ let base = '';
 async function postTrackedCa(body: unknown): Promise<{ status: number; json: TrackedCaJson }> {
   const res = await fetch(`${base}/api/tracked-cas`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.SERVICE_TOKEN}` },
+    headers: { 'content-type': 'application/json', authorization: adminAuthorization },
     body: JSON.stringify(body),
   });
   return { status: res.status, json: (await res.json()) as TrackedCaJson };
@@ -188,7 +188,9 @@ before(async () => {
   await installFakeDoor();
   const flows = installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]]), flowRows([[2, 120], [1, 130]]));
   setPollerDeps(fakeProvider(), null, flows); // startPoller's wiring, minus the sweeps
-  server = createApp('test').listen(0);
+  const auth = await createTestAuth();
+  adminAuthorization = await auth.bearer(auth.adminEmail);
+  server = createApp('test', auth.deps).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });

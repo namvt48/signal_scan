@@ -1,0 +1,29 @@
+{
+  "result": "PASS",
+  "wallet_files": 365,
+  "summary_rows": 365,
+  "sql_distinct_counts_match": true,
+  "all_wallet_ca_pairs_match_snapshot": true,
+  "duplicate_ca_rows": 0,
+  "zip_crc": "PASS",
+  "buy_rows_in_snapshot": 3809,
+  "window_duration_hours": 48.0,
+  "zip_sha256": "d9e17d7335084f4412bec14ef643989b04e26046f178664d3de9b742e7f7dde9",
+  "summary_sha256": "bf6418d00582cb5f5a64140bd5570b7246bbcbd527b9a28b21e3b7978994cf7e",
+  "metadata": {
+    "window_start_vietnam": "2026-10-27T19:35:29.155000+07:00",
+    "window_end_vietnam": "2026-10-29T19:35:29.155000+07:00",
+    "window_start_ms_inclusive": 1793104529155,
+    "window_end_ms_exclusive": 1793277329155,
+    "source": "Production instance A wallet_trades joined to current tracked Solana wallets; BUY only, trade timestamp",
+    "filters": "No Nansen setup, tier, balance, tracked_cas status, dashboard visibility, or min-USD filter",
+    "ca_definition": "Distinct CA purchased by this wallet in the window; not necessarily a token first discovered globally in this window",
+    "wallet_count": 365,
+    "wallets_with_buys": 184,
+    "buy_rows": 3809,
+    "wallet_ca_pairs": 1509,
+    "unique_cas": 839,
+    "orphan_buy_rows": 0,
+    "scope_limit": "Recorded BUYs in DB, not an independent on-chain completeness audit. FOMO users are not included."
+  }
+}

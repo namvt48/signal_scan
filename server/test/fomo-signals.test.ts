@@ -743,3 +743,38 @@ test('FOMO Bal is chain-scoped and preserves unknown versus measured zero', () =
   assert.equal(zeroRows[0]?.balUsd, 0, 'zero is exact even when token price is unavailable');
   assert.deepEqual(fomoUserStatsByCa(NOW).get(`robinhood:${zeroCa}`), zeroRows);
 });
+test('verifying one unchanged position does not refresh a sibling CA amount or its stale price', () => {
+  const user = insertFomoUser({ handle: '@pair-scoped-verification' });
+  const caA = 'fomo-pair-verified-a';
+  const caB = 'fomo-pair-verified-b';
+  for (const ca of [caA, caB]) {
+    insertTrackedCa({ address: ca, chain: 'base', note: '', entryUsd: 60 });
+    upsertTokenInfo(token(ca, 'base'));
+  }
+  const oldAt = NOW - 2 * DAY;
+  const position = (ca: string, amount: number, price: number) => ({
+    fomo_user_id: user.id,
+    ca,
+    chain: 'base' as const,
+    trade_id: null,
+    status: 'open',
+    amount,
+    cost_basis_usd: 10,
+    avg_entry_price: 1,
+    price_usd: price,
+    realized_pnl_usd: 0,
+    unrealized_pnl_usd: 0,
+    fetched_at: oldAt,
+  });
+  syncFomoPositionsSnapshot(user.id, [position(caA, 100, 0.5), position(caB, 200, 1)], oldAt);
+  syncFomoPositionsSnapshot(user.id, [position(caA, 100, 0.5)], NOW);
+
+  const verified = fomoUserStats(caA, 'base', NOW);
+  const staleSibling = fomoUserStats(caB, 'base', NOW);
+  assert.equal(verified[0]?.holdingAmount, 100);
+  assert.equal(verified[0]?.balUsd, 0.1, 'an unchanged amount is reverified, but its old position price is not');
+  assert.equal(staleSibling[0]?.holdingAmount, undefined, 'the user-wide position snapshot cannot freshen an omitted CA');
+  assert.equal(staleSibling[0]?.balUsd, undefined);
+  assert.deepEqual(fomoUserStatsByCa(NOW).get(`base:${caA}`), verified);
+  assert.deepEqual(fomoUserStatsByCa(NOW).get(`base:${caB}`), staleSibling);
+});

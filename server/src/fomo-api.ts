@@ -19,6 +19,7 @@ export type FomoApiOutcome =
   | 'no_data'
   | 'incomplete'
   | 'invalid_payload'
+  | 'guard_blocked'
   | 'http_error'
   | 'rate_limited'
   | 'timeout'
@@ -263,7 +264,6 @@ const timestampMs = (value: unknown): number | null => {
   return null;
 };
 
-const ATTEMPTS = 3;
 const TIMEOUT_MS = 20_000;
 const STATUS_TIMEOUT_MS = 3_000;
 const STATUS_CACHE_MS = 15_000;
@@ -337,6 +337,7 @@ function bucketFor(endpoint: FomoApiEndpoint, atMs: number): TelemetryBucket {
 }
 
 const FAILURE_OUTCOMES: Partial<Record<FomoApiOutcome, true>> = {
+  guard_blocked: true,
   invalid_payload: true,
   http_error: true,
   rate_limited: true,
@@ -492,12 +493,10 @@ async function requestFomoEndpoint(endpoint: FomoApiEndpoint, identity: string):
     retryAfterMs: null,
   };
   if (config.fomoProdUrl === '') return empty;
+  const upstream = await fomoUpstreamHealth();
+  if (upstream.apiStatus === 'down') return { ...empty, outcome: 'upstream_down' };
 
-  const health = await fomoUpstreamHealth();
-  if (health.apiStatus === 'down' || health.liveDataStatus === 'down') {
-    return { ...empty, outcome: 'upstream_down' };
-  }
-  const maxAttempts = health.apiStatus === 'operational' && health.liveDataStatus === 'operational' ? ATTEMPTS : 1;
+  const maxAttempts = 1;
   const url = new URL(`${config.fomoProdUrl}/v2/users/${encodeURIComponent(identity)}/${endpoint}`);
   if (endpoint === 'swaps') url.searchParams.set('limit', '100');
   let attempts = 0;
@@ -527,14 +526,14 @@ async function requestFomoEndpoint(endpoint: FomoApiEndpoint, identity: string):
       const retryAfter = (status === 429 || status === 503)
         ? retryAfterMs(response.headers.get('retry-after'), Date.now())
         : null;
+      const guard = response.headers.get('x-fomo-guard');
+      if (guard !== null || (status === 403 && response.headers.get('x-fomo-retry-handled') === '1')) {
+        return { ...empty, outcome: 'guard_blocked', status, attempts, attemptFailures, retryAfterMs: retryAfter };
+      }
       if (status === 429) {
         return { ...empty, outcome: 'rate_limited', status, attempts, attemptFailures, retryAfterMs: retryAfter };
       }
-      if (status !== 503 || retryAfter !== null || attempt === maxAttempts) {
-        return { ...empty, outcome: 'http_error', status, attempts, attemptFailures, retryAfterMs: retryAfter };
-      }
-      await delay(500 * 2 ** attempt);
-      continue;
+      return { ...empty, outcome: 'http_error', status, attempts, attemptFailures, retryAfterMs: retryAfter };
     }
 
     let body: unknown;
@@ -650,4 +649,103 @@ export async function fetchFomoBalances(identity: string): Promise<FomoApiResult
   // full page as possibly truncated so sync never closes a tracked position
   // that simply fell off the end.
   return finishFomoResult('balances', request, 'success', positions, body.balances.length < 100);
+}
+
+export interface FomoFollowingUser {
+  id: string;
+  handle: string;
+  displayName: string;
+  private: boolean | null;
+}
+
+export interface FomoFollowingResult {
+  ok: boolean;
+  users: FomoFollowingUser[];
+  status: number | null;
+  error: string | null;
+}
+
+export interface FomoProfileResult {
+  ok: boolean;
+  /** null when the profile is absent or its identity/payload cannot be trusted. */
+  profile: { id: string; handle: string | null; private: boolean | null; following: number | null } | null;
+  status: number | null;
+  error: string | null;
+}
+
+const FOLLOW_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+
+async function bridgeFetch(url: URL): Promise<Response | null> {
+  try {
+    return await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchFomoFollowingPage(userId: string, lastId?: string): Promise<FomoFollowingResult> {
+  if (config.fomoProdUrl === '' || !FOLLOW_ID_RE.test(userId) || (lastId !== undefined && !FOLLOW_ID_RE.test(lastId))) {
+    return { ok: false, users: [], status: null, error: 'invalid_identity' };
+  }
+  const url = new URL(`${config.fomoProdUrl}/v2/users/${encodeURIComponent(userId)}/followingPaginate`);
+  if (lastId) url.searchParams.set('lastId', lastId);
+  const response = await bridgeFetch(url);
+  if (response === null) return { ok: false, users: [], status: null, error: 'network_error' };
+  if (!response.ok) return { ok: false, users: [], status: response.status, error: 'http_error' };
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, users: [], status: response.status, error: 'invalid_payload' };
+  }
+  const envelope = unwrapEnvelope(body);
+  const rawUsers = envelope?.users;
+  if (!Array.isArray(rawUsers)) return { ok: false, users: [], status: response.status, error: 'invalid_payload' };
+  const users: FomoFollowingUser[] = [];
+  for (const raw of rawUsers) {
+    if (!isRecord(raw)) return { ok: false, users: [], status: response.status, error: 'invalid_payload' };
+    const id = strOrNull(raw.id);
+    const handle = strOrNull(raw.userHandle);
+    if (id === null || handle === null) return { ok: false, users: [], status: response.status, error: 'invalid_payload' };
+    users.push({
+      id,
+      handle,
+      displayName: strOrNull(raw.displayName) ?? handle,
+      private: typeof raw.private === 'boolean' ? raw.private : null,
+    });
+  }
+  return { ok: true, users, status: response.status, error: null };
+}
+
+export async function fetchFomoUserProfile(userId: string): Promise<FomoProfileResult> {
+  if (config.fomoProdUrl === '' || !FOLLOW_ID_RE.test(userId)) {
+    return { ok: false, profile: null, status: null, error: 'invalid_identity' };
+  }
+  const url = new URL(`${config.fomoProdUrl}/v2/users/${encodeURIComponent(userId)}`);
+  const response = await bridgeFetch(url);
+  if (response === null) return { ok: false, profile: null, status: null, error: 'network_error' };
+  if (response.status === 404) return { ok: false, profile: null, status: 404, error: 'not_found' };
+  if (!response.ok) return { ok: false, profile: null, status: response.status, error: 'http_error' };
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { ok: false, profile: null, status: response.status, error: 'invalid_payload' };
+  }
+  const profile = unwrapEnvelope(body);
+  const id = profile === null ? null : strOrNull(profile.id);
+  if (profile === null || id === null) return { ok: false, profile: null, status: response.status, error: 'invalid_payload' };
+  return {
+    ok: true,
+    profile: {
+      id,
+      handle: strOrNull(profile.userHandle),
+      private: typeof profile.private === 'boolean' ? profile.private : null,
+      following: typeof profile.following === 'number' && Number.isSafeInteger(profile.following) && profile.following >= 0
+        ? profile.following
+        : null,
+    },
+    status: response.status,
+    error: null,
+  };
 }

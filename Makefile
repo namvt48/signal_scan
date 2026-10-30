@@ -20,6 +20,7 @@
 #   make wallet-watch-deploy # deploy/restart Solana wallet watcher only
 #   make fomo-watch-deploy  # deploy/restart only the FOMO swaps poller
 #   make fomo-prod-deploy   # build/restart only the FOMO prod bridge
+#   make ca-lifecycle-deploy # deploy CA admission/retention + affected wallet watchers only
 #   make logs / api-log / status / test / firewall
 #
 # Ghi chú:
@@ -50,18 +51,34 @@ POLL_SETUP_MS ?= 10800000
 
 # Instance selector: `make deploy INSTANCE=b` = second parallel deployment with its
 # own dir/port/DB. Default `a` = primary deployment.
-INSTANCE  ?= a
-REMOTE_DIR ?= /root/signal_scan
-PORT      ?= 8124
-DATA_DIR  ?= data
-PROJECT   ?= signal_scan
+INSTANCE ?= a
+ifeq ($(INSTANCE),b)
+REMOTE_DIR ?= /root/signal_scan_b
+PORT ?= 8125
+DATA_DIR ?= data-b
+PROJECT ?= signal_scan_b
 SHOW_CLAN ?= on
-TITLE     ?= signal_scan
+TITLE ?= fomo
 SHOW_FOMO ?= on
-BIND      ?= 127.0.0.1
-DOMAIN    ?= signal-scan.duckdns.org
+BIND ?= 0.0.0.0
+DOMAIN ?=
+FOMO_ALITA_SYNC ?= on
+else
+REMOTE_DIR ?= /root/signal_scan
+PORT ?= 8124
+DATA_DIR ?= data
+PROJECT ?= signal_scan
+SHOW_CLAN ?= on
+TITLE ?= signal_scan
+SHOW_FOMO ?= on
+BIND ?= 127.0.0.1
+DOMAIN ?= signal-scan.duckdns.org
+FOMO_ALITA_SYNC ?= off
+endif
 FOMO_BRIDGE_PORT ?= 8131
-
+FOMO_ALITA_USER_ID ?= 2c43be94-b528-5fe2-9dc3-27837e009cc8
+FOMO_ALITA_POLL_MS ?= 900000
+FOMO_ALITA_TAG ?= Alita\ follow
 # URL mà `make test` dùng để kiểm tra TỪ MÁY LOCAL.
 ifeq ($(DOMAIN),)
 BASE ?= http://$(SERVER):$(PORT)
@@ -71,7 +88,8 @@ endif
 LEGACY_CONTAINER := signal_scan
 
 # Passed to every docker compose call so the two instances stay isolated.
-COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS) POLL_SETUP_MS=$(POLL_SETUP_MS) FOMO_BRIDGE_PORT=$(FOMO_BRIDGE_PORT)
+FOMO_RUNTIME_OVERRIDES = $(foreach name,FOMO_UPSTREAM_ENABLED FOMO_REQUEST_QUOTA_MODE FOMO_MAX_REQUESTS_PER_MINUTE FOMO_MAX_REQUESTS_PER_HOUR FOMO_MAX_REQUESTS_PER_DAY,$(if $($(name)),$(name)=$($(name))))
+COMPOSE_ENV := PORT=$(PORT) BIND=$(BIND) DATA_DIR=$(DATA_DIR) COMPOSE_PROJECT_NAME=$(PROJECT) INSTANCE=$(INSTANCE) SHOW_CLAN=$(SHOW_CLAN) TITLE=$(TITLE) SHOW_FOMO=$(SHOW_FOMO) POLL_FLOWS_MS=$(POLL_FLOWS_MS) POLL_SETUP_MS=$(POLL_SETUP_MS) FOMO_BRIDGE_PORT=$(FOMO_BRIDGE_PORT) FOMO_ALITA_SYNC=$(FOMO_ALITA_SYNC) FOMO_ALITA_USER_ID=$(FOMO_ALITA_USER_ID) FOMO_ALITA_POLL_MS=$(FOMO_ALITA_POLL_MS) FOMO_ALITA_TAG=$(FOMO_ALITA_TAG) $(FOMO_RUNTIME_OVERRIDES)
 
 # Port cần mở ở ufw: instance a đi qua Caddy (80/443), instance b qua $(PORT).
 FIREWALL_PORTS := $(if $(DOMAIN),80 443,$(PORT))
@@ -82,12 +100,14 @@ SCP       := scp -o BatchMode=yes -o ConnectTimeout=10
 RSYNC_SSH := ssh -o BatchMode=yes -o ConnectTimeout=10
 
 FOMO_RELEASE_FILES := \
+	docker-compose.yml \
 	server/src/alert-feed.ts \
 	server/src/api.ts \
 	server/src/auth.ts \
 	server/src/config.ts \
 	server/src/db.ts \
 	server/src/fomo-api.ts \
+	server/src/fomo-follow-sync.ts \
 	server/src/poller.ts \
 	server/src/public-api-contract.ts \
 	server/src/public-export.ts \
@@ -97,7 +117,6 @@ FOMO_RELEASE_FILES := \
 	server/src/shared/chain-slugs.ts \
 	server/src/providers/evm.ts \
 	server/src/telegram-alert-settings.ts \
-	server/src/monitor/alert-policy.ts \
 	server/src/monitor/alerts.ts \
 	server/src/monitor/collector.ts \
 	server/src/monitor/store.ts \
@@ -105,36 +124,68 @@ FOMO_RELEASE_FILES := \
 	server/src/monitor/types.ts \
 	server/public/monitor.html
 
+CA_LIFECYCLE_RELEASE_FILES := \
+	server/src/api.ts \
+	server/src/auth.ts \
+	server/src/config.ts \
+	server/src/db.ts \
+	server/src/poller.ts \
+	server/src/settings.ts \
+	server/src/signals.ts \
+	server/src/fomo-balance-discovery.ts \
+	server/src/fomo-api.ts \
+	server/src/fomo-follow-sync.ts \
+	server/src/public-export-route.ts \
+	server/src/signal-page.ts \
+	server/src/sol-wallet-holdings.ts \
+	server/src/sol-wallet-refresh.ts \
+	server/src/sol-wallet-sync.ts \
+	server/src/wallet-discovery-state.ts \
+	server/src/wallet-holdings-discovery.ts
+
 # Keep Telegram presentation deploy isolated from alert-state and API changes.
-.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-chain-sync gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy frontend-deploy
+.PHONY: deploy up down restart logs api-log status test firewall ssh-rm gmgn-keygen gmgn-env gmgn-status gateway-up gateway-deploy gateway-chain-sync gateway-down gateway-log monitor-deploy monitor-restart monitor-alerts-deploy monitor-telegram-format-deploy monitor-periodic-report-deploy routing-smoke fomo-prod-deploy fomo-watch-deploy fomo-evm-watch-deploy fomo-rpc-apply fomo-api-deploy fomo-release-deploy watchers-up fresh-retry-deploy market-data-reconcile cohort-labels-api-up nansen-egress-deploy frontend-deploy gmgn-wallet-activity-deploy
 .PHONY: wallet-watch-deploy
+.PHONY: ca-lifecycle-deploy ca-lifecycle-watchers-deploy
+.PHONY: wallet-watch-rpc-deploy
 
 # Standalone partner API lifecycle on the selected production host.
 PUBLIC_API_PROJECT := signal_scan_public_api
 PUBLIC_API_COMPOSE = docker compose -p $(PUBLIC_API_PROJECT) -f docker-compose.public-api.yml
-.PHONY: public-api-deploy public-api-build public-api-up public-api-down public-api-logs public-api-status docs-deploy
+.PHONY: public-api-deploy public-api-bluegreen-deploy public-api-build public-api-up public-api-down public-api-logs public-api-status docs-deploy
+.PHONY: public-api-runtime-deploy
+PUBLIC_API_FOMO_DATA_DIR ?= $(REMOTE_DIR)/$(DATA_DIR)
+
+public-api-bluegreen-deploy:
+	@test "$(INSTANCE)" = a || { echo 'public-api-bluegreen-deploy is restricted to INSTANCE=a'; exit 1; }
+	rsync -azcR -e "$(RSYNC_SSH)" docker-compose.public-api.yml server/Dockerfile.public-api server/package.json server/package-lock.json server/src/api.ts server/src/crawl.ts server/src/db.ts server/src/http-lifecycle.ts server/src/public-api.ts server/src/public-api-contract.ts server/src/public-export-route.ts server/src/public-export-server.ts server/src/public-export-snapshot.ts server/src/public-export-snapshot-worker.ts server/src/public-export.ts deploy/bluegreen/public-api.sh $(HOST):$(REMOTE_DIR)/
+	$(SSH) "cd $(REMOTE_DIR) && PUBLIC_API_A_DATA_DIR='$(REMOTE_DIR)/$(DATA_DIR)' PUBLIC_API_FOMO_DATA_DIR='$(PUBLIC_API_FOMO_DATA_DIR)' bash deploy/bluegreen/public-api.sh"
+
+public-api-runtime-deploy: public-api-bluegreen-deploy
 
 public-api-build:
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) build public-api"
+	@test "$(INSTANCE)" = a || { echo 'public-api-build is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'cd $(REMOTE_DIR) && active=$$(cat deploy/bluegreen/public-api-active 2>/dev/null || printf blue); case "$$active" in blue) service=public-api; main=public-api-export-main; fomo=public-api-export-fomo;; green) service=public-api-green; main=public-api-export-main-green; fomo=public-api-export-fomo-green;; *) echo "invalid active slot: $$active" >&2; exit 1;; esac; INSTANCE=a PUBLIC_API_A_DATA_DIR="$(REMOTE_DIR)/$(DATA_DIR)" PUBLIC_API_FOMO_DATA_DIR="$(PUBLIC_API_FOMO_DATA_DIR)" $(PUBLIC_API_COMPOSE) build "$$service" "$$main" "$$fomo"'
 
 public-api-up:
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) up -d public-api"
+	@test "$(INSTANCE)" = a || { echo 'public-api-up is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'cd $(REMOTE_DIR) && active=$$(cat deploy/bluegreen/public-api-active 2>/dev/null || printf blue); case "$$active" in blue) service=public-api; main=public-api-export-main; fomo=public-api-export-fomo;; green) service=public-api-green; main=public-api-export-main-green; fomo=public-api-export-fomo-green;; *) echo "invalid active slot: $$active" >&2; exit 1;; esac; INSTANCE=a PUBLIC_API_A_DATA_DIR="$(REMOTE_DIR)/$(DATA_DIR)" PUBLIC_API_FOMO_DATA_DIR="$(PUBLIC_API_FOMO_DATA_DIR)" $(PUBLIC_API_COMPOSE) up -d "$$service" "$$main" "$$fomo"'
 
 public-api-down:
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) stop public-api"
+	@test "$(INSTANCE)" = a || { echo 'public-api-down is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'cd $(REMOTE_DIR) && active=$$(cat deploy/bluegreen/public-api-active 2>/dev/null || printf blue); case "$$active" in blue) service=public-api; main=public-api-export-main; fomo=public-api-export-fomo;; green) service=public-api-green; main=public-api-export-main-green; fomo=public-api-export-fomo-green;; *) echo "invalid active slot: $$active" >&2; exit 1;; esac; INSTANCE=a PUBLIC_API_A_DATA_DIR="$(REMOTE_DIR)/$(DATA_DIR)" PUBLIC_API_FOMO_DATA_DIR="$(PUBLIC_API_FOMO_DATA_DIR)" $(PUBLIC_API_COMPOSE) stop "$$service" "$$main" "$$fomo"'
 
 public-api-logs:
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) logs -f public-api"
+	@test "$(INSTANCE)" = a || { echo 'public-api-logs is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'cd $(REMOTE_DIR) && active=$$(cat deploy/bluegreen/public-api-active 2>/dev/null || printf blue); case "$$active" in blue) service=public-api; main=public-api-export-main; fomo=public-api-export-fomo;; green) service=public-api-green; main=public-api-export-main-green; fomo=public-api-export-fomo-green;; *) echo "invalid active slot: $$active" >&2; exit 1;; esac; INSTANCE=a PUBLIC_API_A_DATA_DIR="$(REMOTE_DIR)/$(DATA_DIR)" PUBLIC_API_FOMO_DATA_DIR="$(PUBLIC_API_FOMO_DATA_DIR)" $(PUBLIC_API_COMPOSE) logs -f "$$service" "$$main" "$$fomo"'
 
 public-api-status:
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=$(INSTANCE) $(PUBLIC_API_COMPOSE) ps public-api"
+	@test "$(INSTANCE)" = a || { echo 'public-api-status is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'cd $(REMOTE_DIR) && active=$$(cat deploy/bluegreen/public-api-active 2>/dev/null || printf blue); case "$$active" in blue) service=public-api; main=public-api-export-main; fomo=public-api-export-fomo;; green) service=public-api-green; main=public-api-export-main-green; fomo=public-api-export-fomo-green;; *) echo "invalid active slot: $$active" >&2; exit 1;; esac; INSTANCE=a PUBLIC_API_A_DATA_DIR="$(REMOTE_DIR)/$(DATA_DIR)" PUBLIC_API_FOMO_DATA_DIR="$(PUBLIC_API_FOMO_DATA_DIR)" $(PUBLIC_API_COMPOSE) ps "$$service" "$$main" "$$fomo"'
 
 public-api-deploy:
 	@test "$(INSTANCE)" = a || { echo 'public-api-deploy currently publishes through instance A only'; exit 1; }
-	@$(MAKE) deploy INSTANCE=a
-	$(SSH) "set -eu; cd $(REMOTE_DIR); test -s server/.env; test -s server/public-api.env; docker network inspect signal-scan-gateway >/dev/null"
-	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env config --quiet && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env build api web && $(COMPOSE_ENV) docker compose --env-file .env --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api web; else $(COMPOSE_ENV) docker compose config --quiet && $(COMPOSE_ENV) docker compose build api web && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api web; fi"
-	$(SSH) "cd $(REMOTE_DIR) && INSTANCE=a $(PUBLIC_API_COMPOSE) config --quiet && INSTANCE=a $(PUBLIC_API_COMPOSE) build public-api && INSTANCE=a $(PUBLIC_API_COMPOSE) up -d public-api"
+	@$(MAKE) public-api-bluegreen-deploy INSTANCE=a
 
 # Publish the static developer docs (public/) through instance A's web container.
 # Rebuilds/recreates `web` only: the API and public-api containers are untouched.
@@ -159,7 +210,7 @@ routing-smoke:
 deploy:
 	$(SSH) "mkdir -p $(REMOTE_DIR)"
 	$(SCP) -r $(FILES) $(HOST):$(REMOTE_DIR)/
-	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude public-api.env --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src public $(HOST):$(REMOTE_DIR)/
+	rsync -azc --delete --exclude node_modules --exclude dist --exclude .env --exclude public-api.env --exclude '/server/data*' --exclude '/data*' --exclude '/keys' -e "$(RSYNC_SSH)" server src public $(HOST):$(REMOTE_DIR)/
 	$(SSH) "cd $(REMOTE_DIR) && $(COMPOSE_ENV) docker compose build && echo '== deploy OK — instance=$(INSTANCE) port=$(PORT) dir=$(REMOTE_DIR)'"
 
 # Deploy only the Fresh retry gate fix to instance A; never sync/rebuild web or B.
@@ -178,6 +229,27 @@ fomo-api-deploy:
 	sleep 3
 	$(SSH) "curl -fsS http://127.0.0.1:$(PORT)/api/health >/dev/null && echo 'instance $(INSTANCE) API health OK'"
 
+# Ship only CA lifecycle/admission and wallet-discovery server sources; no web,
+# gateway, B instance, or unrelated rsync --delete scope.
+ca-lifecycle-deploy:
+	@test "$(INSTANCE)" = a || { echo 'ca-lifecycle-deploy is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'set -eu; cd $(REMOTE_DIR); stamp=$$(date -u +%Y%m%dT%H%M%SZ); backup=deploy-backups/ca-lifecycle-$$stamp; install -d -m 0700 "$$backup"; for f in $(CA_LIFECYCLE_RELEASE_FILES); do if [ -f "$$f" ]; then install -d -m 0700 "$$backup/$${f%/*}"; cp -p "$$f" "$$backup/$$f"; fi; done; printf "source backup: %s/%s\\n" "$(REMOTE_DIR)" "$$backup"'
+	rsync -azcR -e "$(RSYNC_SSH)" $(CA_LIFECYCLE_RELEASE_FILES) $(HOST):$(REMOTE_DIR)/
+	$(SSH) 'set -eu; cd $(REMOTE_DIR); if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env config --quiet; $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build api; $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate api; else $(COMPOSE_ENV) docker compose config --quiet; $(COMPOSE_ENV) docker compose build api; $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate api; fi; for attempt in $$(seq 1 30); do curl -fsS http://127.0.0.1:8124/api/health >/dev/null 2>&1 && break; if [ "$$attempt" -eq 30 ]; then echo "API health check failed"; exit 1; fi; sleep 1; done; for svc in api web; do cid=$$($(COMPOSE_ENV) docker compose ps -q "$$svc"); envs=$$(docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" "$$cid"); if printf "%s\\n" "$$envs" | grep -Eq "^(AUTH_DISABLED|VITE_AUTH_DISABLED)="; then echo "auth bypass flag present in $$svc container"; exit 1; fi; done; echo "instance A API healthy; auth bypass flags absent"'
+	@$(MAKE) ca-lifecycle-watchers-deploy INSTANCE=a
+	@$(MAKE) fomo-watch-deploy INSTANCE=a
+
+# Restart only the SOL and EVM wallet watchers whose BUY payloads carry the
+# tracking timestamp; leave the separate FOMO swaps watcher untouched.
+ca-lifecycle-watchers-deploy:
+	@test "$(INSTANCE)" = a || { echo 'ca-lifecycle-watchers-deploy is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'set -eu; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; systemctl is-active --quiet wallet-watch.service; systemctl is-active --quiet fomo-evm-wallet-watch.service; stamp=$$(date -u +%Y%m%dT%H%M%SZ); backup=/opt/wallet-watch/deploy-backups/ca-lifecycle-$$stamp; install -d -m 0700 "$$backup/wallet/watchers/common" "$$backup/wallet/watchers/sol" "$$backup/evm/watchers/common" "$$backup/evm/watchers/evm"; for f in watchers/common/config.py watchers/common/emit.py; do cp -p "/opt/wallet-watch/$$f" "$$backup/wallet/$$f"; cp -p "/opt/fomo-wallet-watch/$$f" "$$backup/evm/$$f"; done; for f in watchers/sol/feed.py watchers/sol/recovery.py; do cp -p "/opt/wallet-watch/$$f" "$$backup/wallet/$$f"; done; for f in feed.py classify.py delivery.py journal.py; do cp -p "/opt/fomo-wallet-watch/watchers/evm/$$f" "$$backup/evm/watchers/evm/$$f"; done; printf "watcher backup: %s\\n" "$$backup"'
+	$(SCP) watchers/common/config.py watchers/common/emit.py $(HOST):/opt/wallet-watch/watchers/common/
+	$(SCP) watchers/sol/feed.py watchers/sol/recovery.py $(HOST):/opt/wallet-watch/watchers/sol/
+	$(SCP) watchers/common/config.py watchers/common/emit.py $(HOST):/opt/fomo-wallet-watch/watchers/common/
+	$(SCP) watchers/evm/feed.py watchers/evm/classify.py watchers/evm/delivery.py watchers/evm/journal.py $(HOST):/opt/fomo-wallet-watch/watchers/evm/
+	$(SSH) 'set -eu; /opt/wallet-watch/venv/bin/python -m py_compile /opt/wallet-watch/watchers/common/config.py /opt/wallet-watch/watchers/common/emit.py /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/recovery.py; /opt/wallet-watch/venv/bin/python -m py_compile /opt/fomo-wallet-watch/watchers/common/config.py /opt/fomo-wallet-watch/watchers/common/emit.py /opt/fomo-wallet-watch/watchers/evm/feed.py /opt/fomo-wallet-watch/watchers/evm/classify.py /opt/fomo-wallet-watch/watchers/evm/delivery.py /opt/fomo-wallet-watch/watchers/evm/journal.py; systemctl restart wallet-watch.service fomo-evm-wallet-watch.service; systemctl is-active --quiet wallet-watch.service; systemctl is-active --quiet fomo-evm-wallet-watch.service; systemctl show wallet-watch.service fomo-evm-wallet-watch.service -p ActiveState -p MainPID'
+
 # Apply the monitor's B/Solana suppression before restarting either API.
 fomo-release-deploy:
 	@$(MAKE) monitor-alerts-deploy
@@ -185,9 +257,15 @@ fomo-release-deploy:
 
 
 wallet-watch-deploy:
-	$(SSH) 'set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/wallet-watch/watchers/sol/feed.py; test -f /opt/wallet-watch/watchers/sol/classify.py; systemctl is-active --quiet wallet-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; stamp=$$(date +%Y%m%d%H%M%S); cp -p /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/feed.py.pre-inflow-$$stamp; cp -p /opt/wallet-watch/watchers/sol/classify.py /opt/wallet-watch/watchers/sol/classify.py.pre-inflow-$$stamp; printf "watcher backups: feed.py.pre-inflow-%s classify.py.pre-inflow-%s\\n" "$$stamp" "$$stamp"'
-	$(SCP) watchers/sol/feed.py watchers/sol/classify.py $(HOST):/opt/wallet-watch/watchers/sol/
-	$(SSH) "set -eu; /opt/wallet-watch/venv/bin/python -m py_compile /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/classify.py; systemctl restart wallet-watch.service; systemctl is-active --quiet wallet-watch.service; systemctl show wallet-watch.service -p ActiveState -p MainPID"
+	$(SSH) 'set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/wallet-watch/watchers/sol/feed.py; test -f /opt/wallet-watch/watchers/sol/classify.py; test -f /opt/wallet-watch/watchers/common/emit.py; systemctl is-active --quiet wallet-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; stamp=$$(date +%Y%m%d%H%M%S); for rel in watchers/sol/feed.py watchers/sol/classify.py watchers/sol/recovery.py watchers/common/emit.py; do src=/opt/wallet-watch/$$rel; if [ -f "$$src" ]; then cp -p "$$src" "$$src.pre-recovery-$$stamp"; fi; done; printf "watcher backups: *pre-recovery-%s\\n" "$$stamp"'
+	$(SCP) watchers/sol/feed.py watchers/sol/classify.py watchers/sol/recovery.py $(HOST):/opt/wallet-watch/watchers/sol/
+	$(SCP) watchers/common/emit.py $(HOST):/opt/wallet-watch/watchers/common/
+	$(SSH) "set -eu; /opt/wallet-watch/venv/bin/python -m py_compile /opt/wallet-watch/watchers/sol/feed.py /opt/wallet-watch/watchers/sol/recovery.py /opt/wallet-watch/watchers/sol/classify.py /opt/wallet-watch/watchers/common/emit.py; systemctl restart wallet-watch.service; systemctl is-active --quiet wallet-watch.service; systemctl show wallet-watch.service -p ActiveState -p MainPID"
+
+wallet-watch-rpc-deploy:
+	$(SSH) 'set -eu; systemctl is-active --quiet wallet-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -o root -g root -m 0755 /opt/wallet-watch/deploy'
+	$(SCP) deploy/set_wallet_watch_rpc_env.py deploy/apply_wallet_watch_rpc_env.sh $(HOST):/opt/wallet-watch/deploy/
+	$(SSH) 'bash /opt/wallet-watch/deploy/apply_wallet_watch_rpc_env.sh'
 
 fomo-evm-watch-deploy:
 	$(SSH) "set -eu; test -x /opt/wallet-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -m 0750 /opt/fomo-wallet-watch/watchers/common /opt/fomo-wallet-watch/watchers/evm /opt/fomo-wallet-watch/data /root/signal-scan-monitor/heartbeats"
@@ -201,13 +279,14 @@ fomo-evm-watch-deploy:
 # $(DATA_DIR)/fomo-prod-credentials and are never copied by a Makefile.
 fomo-prod-deploy:
 	rsync -azcR --exclude '__pycache__' -e "$(RSYNC_SSH)" server/fomo-prod $(HOST):$(REMOTE_DIR)/
-	$(SSH) "set -eu; cd $(REMOTE_DIR); install -d -m 0700 $(DATA_DIR)/fomo-prod-credentials; if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build fomo-prod && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate fomo-prod; else $(COMPOSE_ENV) docker compose build fomo-prod && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate fomo-prod; fi"
-	$(SSH) "curl -sS --max-time 10 http://127.0.0.1:$(FOMO_BRIDGE_PORT)/health"
+	rsync -azc -e "$(RSYNC_SSH)" docker-compose.yml $(HOST):$(REMOTE_DIR)/docker-compose.yml
+	$(SSH) "set -eu; cd $(REMOTE_DIR); install -d -m 0700 $(DATA_DIR)/fomo-prod-credentials $(DATA_DIR)/fomo-prod-guard; if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env build fomo-prod && $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --no-deps --force-recreate fomo-prod; else $(COMPOSE_ENV) docker compose build fomo-prod && $(COMPOSE_ENV) docker compose up -d --no-deps --force-recreate fomo-prod; fi"
 
 fomo-watch-deploy:
-	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs"
+	$(SSH) "set -eu; test -x /opt/fomo-watch/venv/bin/python; test -f /opt/fomo-watch/fomo.env; test -f /etc/systemd/system/fomo-watch.service; curl -fsS http://127.0.0.1:8124/api/health >/dev/null; install -d -o root -g root -m 0700 /opt/fomo-watch/logs; install -d -o root -g root -m 0755 /etc/systemd/system/fomo-watch.service.d"
 	$(SCP) watchers/fomo/feed.py watchers/fomo/main.py $(HOST):/opt/fomo-watch/watchers/fomo/
-	$(SSH) "set -eu; /opt/fomo-watch/venv/bin/python -m py_compile /opt/fomo-watch/watchers/fomo/feed.py /opt/fomo-watch/watchers/fomo/main.py; systemctl restart fomo-watch.service; systemctl is-active --quiet fomo-watch.service; systemctl --no-pager --full status fomo-watch.service"
+	$(SCP) deploy/fomo-watch-polling.conf $(HOST):/etc/systemd/system/fomo-watch.service.d/30-poll-interval.conf
+	$(SSH) "set -eu; /opt/fomo-watch/venv/bin/python -m py_compile /opt/fomo-watch/watchers/fomo/feed.py /opt/fomo-watch/watchers/fomo/main.py; systemctl daemon-reload; systemctl enable fomo-watch.service; systemctl restart fomo-watch.service; systemctl is-active --quiet fomo-watch.service; systemctl --no-pager --full status fomo-watch.service"
 
 fomo-rpc-apply:
 	$(SSH) "cd $(REMOTE_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then $(COMPOSE_ENV) docker compose --env-file /root/signal-scan-monitor/monitor.env up -d --force-recreate api; else $(COMPOSE_ENV) docker compose up -d --force-recreate api; fi"
@@ -256,6 +335,19 @@ gateway-deploy:
 	$(SSH) "docker network create signal-scan-gateway || true"
 	$(SSH) "docker volume create signal-scan-market-data >/dev/null"
 	$(SSH) "cd $(GATEWAY_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d gateway; else docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d gateway; fi"
+
+.PHONY: nansen-efficiency-gateway-deploy
+# Ship paid-request accounting without the broad gateway-deploy source deletion.
+nansen-efficiency-gateway-deploy:
+	@test "$(INSTANCE)" = a || { echo 'nansen-efficiency-gateway-deploy is restricted to INSTANCE=a'; exit 1; }
+	$(SSH) 'set -eu; cd $(GATEWAY_DIR); stamp=$$(date -u +%Y%m%dT%H%M%SZ); backup=deploy-backups/nansen-efficiency-gateway-$$stamp; install -d -m 0700 "$$backup/server/src/gateway"; for f in app.ts credit.ts nansen.ts; do cp -p "server/src/gateway/$$f" "$$backup/server/src/gateway/$$f"; done; docker image tag signal_scan-gateway "signal_scan-gateway:rollback-$$stamp"; printf "gateway backup: %s/%s\\n" "$(GATEWAY_DIR)" "$$backup"'
+	rsync -azcR -e "$(RSYNC_SSH)" server/src/gateway/app.ts server/src/gateway/credit.ts server/src/gateway/nansen.ts $(HOST):$(GATEWAY_DIR)/
+	$(SSH) "set -eu; cd $(GATEWAY_DIR); if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d --no-deps --force-recreate gateway; else docker compose -f docker-compose.gateway.yml config --quiet && docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d --no-deps --force-recreate gateway; fi"
+
+# Deploy only the GMGN wallet-activity gateway change; no API/web source is synced.
+gmgn-wallet-activity-deploy:
+	rsync -azcR -e "$(RSYNC_SSH)" server/src/gateway/gmgn.ts server/src/gateway/app.ts $(HOST):$(GATEWAY_DIR)/
+	$(SSH) "cd $(GATEWAY_DIR) && if [ -f /root/signal-scan-monitor/monitor.env ]; then docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml config --quiet && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml build gateway && docker compose --env-file /root/signal-scan-monitor/monitor.env -f docker-compose.gateway.yml up -d --no-deps --force-recreate gateway; else docker compose -f docker-compose.gateway.yml config --quiet && docker compose -f docker-compose.gateway.yml build gateway && docker compose -f docker-compose.gateway.yml up -d --no-deps --force-recreate gateway; fi"
 
 # Deploy Fresh Wallet's direct Browserless door on VPS 250; keep the proxy file and all other Nansen routes unchanged.
 nansen-egress-deploy:

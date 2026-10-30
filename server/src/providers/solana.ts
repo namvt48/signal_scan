@@ -101,6 +101,11 @@ export function parseTokenAccounts(json: unknown): Map<string, number> {
   const out = new Map<string, number>();
   let parsed = 0;
   for (const acct of (result as { value: unknown[] }).value) {
+    const accountData = (acct as { account?: { data?: unknown } })?.account?.data;
+    if (Array.isArray(accountData)) {
+      throw new SafeRpcError('solana rpc: getTokenAccountsByOwner returned no parsed token info for raw token account data');
+    }
+
     const info = (acct as { account?: { data?: { parsed?: { info?: { mint?: unknown; tokenAmount?: { uiAmountString?: unknown; amount?: unknown; decimals?: unknown } } } } } })
       ?.account?.data?.parsed?.info;
     const mint = info?.mint;
@@ -118,12 +123,10 @@ export function parseTokenAccounts(json: unknown): Map<string, number> {
     if (!Number.isFinite(amount) || amount <= 0) continue;
     out.set(mint, (out.get(mint) ?? 0) + amount);
   }
-  // A NON-EMPTY account list where not ONE entry yielded a parsed mint means the
-  // node did not apply the jsonParsed parser (it falls back to raw base64 `data`
-  // for accounts its parser cannot handle). Returning an empty map here would make
-  // the caller DELETE this wallet's holdings and silently collapse Tracked by /
-  // Holding %, so treat it as a failure and let the caller try the next endpoint.
-  // An EMPTY `value` array is the legitimate "holds none of these" case — no throw.
+  // Any raw/base64 account row fails in the loop above, including mixed responses:
+  // treating a partially parsed list as complete could erase a wallet's holdings.
+  // A non-empty list with no parsed mint also fails; an empty value array is the
+  // legitimate "holds none of these" case.
   if (parsed === 0 && (result as { value: unknown[] }).value.length > 0) {
     throw new SafeRpcError('solana rpc: getTokenAccountsByOwner returned accounts with no parsed token info');
   }

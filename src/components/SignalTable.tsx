@@ -1,20 +1,21 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { MagnifyingGlass, XLogo } from '@phosphor-icons/react';
-import { dataStore } from '../services/dataStore';
+import { dataStore, type SignalPageStats } from '../services/dataStore';
 import { useAllFactors } from '../services/debugFlags';
 import { CHAIN_LINKS } from '../chain';
 import { SHOW_CLAN, SHOW_FOMO } from '../config';
-import { RATED_TIERS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
+import { RATED_TIERS, CHAINS, type Chain, type FomoUserStat, type NansenThresholds, type Tier, type TokenSignal, type TrackedWalletStat } from '../types';
+import { normalizeClan } from '../lib/clan';
 import { ago, compact, formatTimestamp, pct, shortAddr, tokenAmount, usd } from '../lib/format';
 import { sortTrackedWalletsByBalance, type WalletBalanceSort } from '../lib/walletSort';
-import { freshDisplayValue, freshPercentageInRange, holderCountClass, percentageInRange, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
+import { freshDisplayValue, freshPercentageInRange, holderCountClass, netInflowUsd, percentageInRange, totalBalanceUsd, trackedHoldingClass, trackedUsdClass, volume24hClass, volumeClass } from '../lib/signalMetrics';
 import { compareTrackedActivity } from '../lib/activitySort';
 import { TokenNote } from './TokenNote';
 import { FreshWalletChart } from './FreshWalletChart';
 import { T100Chart } from './T100Chart';
 import { HolderCountChart } from './HolderCountChart';
 import { MarketCapChart } from './MarketCapChart';
-import { Chip, EmptyState, ErrorState, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
+import { Chip, EmptyState, ErrorState, Modal, Pill, SkeletonRows, TableShell, Td, Th, TierBadge, TierSelect, TokenAvatar, walletNameClass } from './ui';
 import { ChainBadge } from './ChainBadge';
 import { useAuth } from '../auth/use-auth';
 
@@ -37,30 +38,24 @@ function SetupValue({ value, pass }: { value: string; pass: boolean }) {
   );
 }
 
-/*
- * Inline/full wallet table, six fixed columns so every row lines up — and the inline
- * table lines up with the modal table. Numerics right-aligned mono; long names truncate.
- */
-/** Column share of the wallet table — declared on <col> so widths survive with no header row. */
-const WALLET_COLS: readonly string[] = SHOW_CLAN
-  ? ['19%', '10%', '8%', '14%', '18%', '11%', '12%', '8%']
-  : ['21%', '8%', '16%', '19%', '11%', '14%', '11%'];
+/** Shared column shares keep the tracked header, native rows, and FOMO rows aligned. */
+const TRACKED_COLS: readonly string[] = SHOW_CLAN
+  ? ['19%', '10%', '8%', '14%', '17%', '12%', '12%', '8%']
+  : ['21%', '10%', '14%', '17%', '12%', '15%', '11%'];
 
-/*
- * FOMO column shares, parallel to WALLET_COLS: User / Clan? / Bal / Trades / Buy $ / Sell $ / Age.
- * Same SHOW_CLAN rule so the inline table, the header sub-line, and the modal table
- * line up row for row. Shares track each column's widest content (user 2026-10-01):
- * the old split starved the right pair (Sell $ ↔ Age ~16px) and left Clan/Trades
- * with >100px of dead space, so the horizontal rhythm read ragged.
- */
-const FOMO_COLS: readonly string[] = SHOW_CLAN
-  ? ['21%', '10%', '14%', '12%', '15%', '15%', '13%']
-  : ['26%', '16%', '14%', '16%', '16%', '12%'];
+const CHAIN_LABELS: Record<Chain, string> = {
+  sol: 'Solana',
+  base: 'Base',
+  bsc: 'BSC',
+  robinhood: 'Robinhood',
+  eth: 'Ethereum',
+};
 
 /** FOMO lives inside the "Tracked by" column as a second stacked list, so the column count is unchanged. */
 const FOMO_EXTRA = 0;
+const PREVIEW_LIMIT = 5;
 /** Keep ticker text readable beside its note button in both deployment variants. */
-const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2324px]' : 'min-w-[2036px]';
+const TABLE_MIN_W = SHOW_FOMO ? 'min-w-[2436px]' : 'min-w-[2148px]';
 
 /**
  * FOMO rows retain FOMO-user inflow/holding semantics. FOMO holding is the sum
@@ -88,10 +83,12 @@ function tokenBalanceTooltip(amount?: number): string | undefined {
   return formatted === undefined ? undefined : `Current token balance: ${formatted}`;
 }
 
+/** Rows per page request: the first paint shows this many, the rest stream on scroll. */
+const PAGE_SIZE = 60;
+
 /**
- * Wallet breakdown rows (Wallet / Clan / Bal / TXs / Inflow / Age). `head` adds the
- * column labels — the inline cell relies on the "Tracked by" Th sub-line above,
- * so only the popup (a standalone table) renders them.
+ * Native-wallet breakdown rows. `head` supports a standalone table; the inline
+ * table shares its labels with the Tracked by header above.
  */
 interface WalletTableProps {
   wallets: TrackedWalletStat[];
@@ -107,7 +104,7 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
   return (
     <table className="w-full table-fixed border-collapse">
       <colgroup>
-        {WALLET_COLS.map((w, i) => (
+        {TRACKED_COLS.map((w, i) => (
           <col key={i} style={{ width: w }} />
         ))}
       </colgroup>
@@ -119,11 +116,11 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
             <th className="pb-1 pr-1 text-center">Rank</th>
             <th className="pb-1 pr-1 text-left">Group</th>
             <th className="whitespace-nowrap pb-1 pr-1 text-right">
-              <button type="button" onClick={onBalanceSort} title="Sort tracked wallets by balance within this CA" className="group cursor-pointer select-none">
+              <button type="button" onClick={onBalanceSort} title="Sort native wallet balances within this CA" className="group cursor-pointer select-none">
                 Bal <SortIcon dir={balanceSort} />
               </button>
             </th>
-            <th className="pb-1 pr-2 text-right">TXs</th>
+            <th className="pb-1 pr-2 text-right">Trades</th>
             <th className="pb-1 pr-2 text-right">Inflow</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
@@ -139,12 +136,12 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
             </td>
             {SHOW_CLAN && (
               <td className="py-1 pr-3 text-[10.5px]">
-                {w.clan ? (
-                  <span className="block truncate font-mono text-ink2" title={w.clan}>
-                    {w.clan}
+                {normalizeClan(w.clan) ? (
+                  <span className="block truncate font-mono text-ink2" title={normalizeClan(w.clan)}>
+                    {normalizeClan(w.clan)}
                   </span>
                 ) : (
-                  <span className="text-muted">—</span>
+                  <span className="text-muted">-</span>
                 )}
               </td>
             )}
@@ -152,7 +149,7 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
               {w.rank ? (
                 <span className="cohort-rank" data-rank={w.rank}>{w.rank}</span>
               ) : (
-                <span className="text-muted">—</span>
+                <span className="text-muted">-</span>
               )}
             </td>
             <td className="py-1 pr-1 font-mono text-[9px]">
@@ -165,7 +162,7 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
                   ))}
                 </span>
               ) : (
-                <span className="text-muted">—</span>
+                <span className="text-muted">-</span>
               )}
             </td>
             <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2">
@@ -188,76 +185,99 @@ function WalletTable({ wallets, head = false, balanceSort, onBalanceSort, limit 
 }
 
 /*
- * FOMO breakdown rows (User / Clan? / Bal / Trades / Buy $ / Sell $ / Age), sibling of WalletTable.
- * `buyUsd` is Σ BUY spend and `sellUsd` is Σ SELL proceeds — reported separately,
- * never a net figure. Bal is position value; its parenthesized percentage is
- * that value divided by the CA market cap. Newest trade first; long handles
- * truncate; numerics right-aligned mono like the wallet rows.
+ * FOMO breakdown rows reuse the native-wallet column order and widths.
+ * Inflow is the 24h buy spend minus 24h sell proceeds; incomplete totals stay unknown.
  */
-function FomoTable({ users, head = false, limit }: { users: FomoUserStat[]; head?: boolean; limit?: number }) {
+interface FomoTableProps {
+  users: FomoUserStat[];
+  head?: boolean;
+  limit?: number;
+}
+
+function FomoTable({ users, head = false, limit }: FomoTableProps) {
   const sortedRows = [...users].sort((a, b) => b.lastTs - a.lastTs);
   const rows = limit === undefined ? sortedRows : sortedRows.slice(0, limit);
   return (
     <table className="w-full table-fixed border-collapse">
       <colgroup>
-        {FOMO_COLS.map((w, i) => (
+        {TRACKED_COLS.map((w, i) => (
           <col key={i} style={{ width: w }} />
         ))}
       </colgroup>
       {head && (
         <thead>
           <tr className="font-mono text-[9px] font-bold uppercase tracking-[0.03em] text-[#9AA79C]">
-            <th className="pb-1 pr-3 text-left">User</th>
-            {SHOW_CLAN && <th className="pb-1 pr-3 text-left">Clan</th>}
+            <th className="pb-1 pr-2 text-left">User</th>
+            {SHOW_CLAN && <th className="pb-1 pr-2 text-left">Clan</th>}
+            <th className="pb-1 pr-1 text-center">Rank</th>
+            <th className="pb-1 pr-1 text-left">Group</th>
             <th className="whitespace-nowrap pb-1 pr-1 text-right">Bal</th>
-            <th className="pb-1 pr-3 text-right">Trades</th>
-            <th className="pb-1 pr-3 text-right">Buy $</th>
-            <th className="pb-1 pr-3 text-right">Sell $</th>
+            <th className="pb-1 pr-2 text-right">Trades</th>
+            <th className="pb-1 pr-2 text-right">Inflow</th>
             <th className="pb-1 pl-1 text-left">Age</th>
           </tr>
         </thead>
       )}
       <tbody>
-        {rows.map((u) => (
-          <tr key={u.handle}>
-            <td className="py-1 pr-3 text-[11px]">
-              <span className={`block truncate font-medium text-ink ${walletNameClass(u.tags)}`} title={u.name || u.handle}>
-                {u.handle}
-              </span>
-            </td>
-            {SHOW_CLAN && (
-              <td className="py-1 pr-3 text-[10.5px]">
-                {u.clan ? (
-                  <span className="block truncate font-mono text-ink2" title={u.clan}>
-                    {u.clan}
-                  </span>
-                ) : (
-                  <span className="text-muted">—</span>
-                )}
+        {rows.map((u) => {
+          const inflow = netInflowUsd(u.buyUsd, u.sellUsd);
+          return (
+            <tr key={u.handle}>
+              <td className="py-1 pr-3 text-[11px]">
+                <span className={`block truncate font-medium text-ink ${walletNameClass(u.tags)}`} title={u.name || u.handle}>
+                  {u.handle}
+                </span>
               </td>
-            )}
-            <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current position value; parenthesized percentage is position value ÷ CA market cap">
-              <span className={trackedUsdClass(u.balUsd)} title={tokenBalanceTooltip(u.holdingAmount)}>{walletBalanceLabel(u)}</span>
-            </td>
-            <td className="py-1 pr-3 text-right font-mono text-[11px] tabular-nums">
-              <span className="font-semibold text-pos">{u.buys}</span>
-              <span className="text-muted">/</span>
-              <span className="font-semibold text-neg">{u.sells}</span>
-            </td>
-            <td className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-pos" title="24h BUY spend; — when any in-window amount is unavailable">
-              <span className={volumeClass(u.buyUsd ?? undefined, 'buy')}>{u.buyUsd === null ? '—' : usd(u.buyUsd)}</span>
-            </td>
-            <td
-              className="py-1 pr-3 text-right font-mono text-[11px] font-medium tabular-nums text-neg"
-              title="Σ sell proceeds (USD actually received) in the last 24h; - when any sell amount is unavailable"
-            >
-              {u.sellUsd != null && Number.isFinite(u.sellUsd) ? usd(u.sellUsd) : '-'}
-            </td>
-            <td className="whitespace-nowrap py-1 pl-3 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
-          </tr>
-        ))}
+              {SHOW_CLAN && (
+                <td className="py-1 pr-3 text-[10.5px]">
+                  {normalizeClan(u.clan) ? (
+                    <span className="block truncate font-mono text-ink2" title={normalizeClan(u.clan)}>
+                      {normalizeClan(u.clan)}
+                    </span>
+                  ) : (
+                    <span className="text-muted">-</span>
+                  )}
+                </td>
+              )}
+              <td className="py-1 pr-1 text-center font-mono text-[10px]">
+                <span className="text-muted">-</span>
+              </td>
+              <td className="py-1 pr-1 font-mono text-[9px]">
+                <span className="text-muted">-</span>
+              </td>
+              <td className="whitespace-nowrap py-1 pr-1 text-right font-mono text-[11px] tabular-nums text-ink2" title="Current position value; parenthesized percentage is position value ÷ CA market cap">
+                <span className={trackedUsdClass(u.balUsd)} title={tokenBalanceTooltip(u.holdingAmount)}>{walletBalanceLabel(u)}</span>
+              </td>
+              <td className="py-1 pr-2 text-right font-mono text-[11px] tabular-nums">
+                <span className="font-semibold text-pos">{u.buys}</span>
+                <span className="text-muted">/</span>
+                <span className="font-semibold text-neg">{u.sells}</span>
+              </td>
+              <td
+                className={`py-1 pr-2 text-right font-mono text-[11px] font-medium tabular-nums ${
+                  inflow === null ? 'text-muted' : inflow >= 0 ? 'text-pos' : 'text-neg'
+                }`}
+                title="24h buy spend minus sell proceeds; — when either total is incomplete"
+              >
+                <span className={volumeClass(inflow ?? undefined, 'inflow')}>
+                  {inflow === null ? '—' : usd(inflow)}
+                </span>
+              </td>
+              <td className="whitespace-nowrap py-1 pl-1 text-[10.5px] text-muted">{ago(u.lastTs)}</td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
+  );
+}
+
+function BreakdownButton({ label, count, onClick }: { label: string; count: number; onClick: () => void }) {
+  if (count <= PREVIEW_LIMIT) return null;
+  return (
+    <button type="button" onClick={onClick} aria-haspopup="dialog" className="mt-0.5 font-mono text-[10px] font-semibold text-pos hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-active">
+      View all {count} {label}
+    </button>
   );
 }
 
@@ -427,7 +447,7 @@ const HL_HEAD = 'text-center!';
  */
 const C_HEAD = `${HL_HEAD} px-3! whitespace-normal!`;
 
-type SortKey = 'holders' | 'trackedIn' | 'trackedInflow' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
+type SortKey = 'holders' | 'trackedIn' | 'trackedInflow' | 'totalBalance' | 'trackedHolding' | 'volume1h' | 'volume24h' | 't100' | 'lf' | 'fresh' | 'mc';
 /** null = default newest activity on A / newest social or native trade on B — no column armed. */
 type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null;
 
@@ -438,6 +458,7 @@ const SORT_LABEL: Record<SortKey, string> = {
   holders: 'holder count',
   trackedIn: 'Tracked in',
   trackedInflow: 'tracked inflow',
+  totalBalance: 'total balance',
   trackedHolding: 'tracked holding',
   volume1h: '1H volume',
   volume24h: '24H volume',
@@ -533,51 +554,31 @@ function SignalHead({
       <Th className="signal-ca-col w-40 text-center!">CA</Th>
       <Th
         className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'} text-center!`}
-        title={
-          SHOW_FOMO
-            ? 'FOMO watch-list activity. Buy $ is Σ BUY spend, Sell $ is Σ SELL proceeds — neither is net inflow or PnL.'
-            : undefined
-        }
+        title={SHOW_FOMO
+          ? 'Native wallet and FOMO user activity. FOMO inflow is 24h buy spend minus 24h sell proceeds.'
+          : undefined}
       >
-        {SHOW_FOMO ? (
-          <>
-            <span className="block font-mono text-[10px] font-bold tracking-[0.03em] text-muted uppercase">FOMO by</span>
-            <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: FOMO_COLS.join(' ') }}>
-              <span className="text-left">User</span>
-              {SHOW_CLAN && <span className="text-left">Clan</span>}
-              <span className="whitespace-nowrap pr-1 text-right" title="Current position value; percentage = value ÷ market cap">Bal</span>
-              <span className="pr-3 text-right">Trades</span>
-              <span className="pr-3 text-right" title="Σ BUY spend — not net inflow/PnL">
-                Buy $
-              </span>
-              <span className="pr-3 text-right" title="Σ SELL proceeds — not realised PnL">
-                Sell $
-              </span>
-              <span className="pl-3 text-left">Age</span>
-            </span>
-          </>
-        ) : (
-          <>
-            Tracked by
-            <span className="mt-1 grid font-mono text-[10px] font-medium text-muted" style={{ gridTemplateColumns: WALLET_COLS.join(' ') }}>
-              <span className="text-left">Wallet</span>
-              {SHOW_CLAN && <span className="text-left">Clan</span>}
-              <span className="pr-1 text-center">Rank</span>
-              <span className="pr-1 text-left">Group</span>
-              <button
-                type="button"
-                onClick={onWalletBalanceSort}
-                title="Sort tracked wallet balances within each CA; CA order stays unchanged"
-                className="group cursor-pointer select-none whitespace-nowrap pr-1 text-right"
-              >
-                Bal <SortIcon dir={walletBalanceSort} />
-              </button>
-              <span className="pr-2 text-right">TXs</span>
-              <span className="pr-2 text-right">Inflow</span>
-              <span className="pl-1 text-left">Age</span>
-            </span>
-          </>
-        )}
+        <span className="block font-mono text-[10px] font-bold tracking-[0.03em] text-muted uppercase">Tracked by</span>
+        <span
+          className="mt-1 grid font-mono text-[10px] font-medium text-muted"
+          style={{ gridTemplateColumns: TRACKED_COLS.join(' ') }}
+        >
+          <span className="text-left">{SHOW_FOMO ? 'Wallet / User' : 'Wallet'}</span>
+          {SHOW_CLAN && <span className="text-left">Clan</span>}
+          <span className="pr-1 text-center">Rank</span>
+          <span className="pr-1 text-left">Group</span>
+          <button
+            type="button"
+            onClick={onWalletBalanceSort}
+            title="Sort native wallet balances within each CA; FOMO users remain newest-trade first"
+            className="group cursor-pointer select-none whitespace-nowrap pr-1 text-right"
+          >
+            Bal <SortIcon dir={walletBalanceSort} />
+          </button>
+          <span className="pr-2 text-right">Trades</span>
+          <span className="pr-2 text-right">Inflow</span>
+          <span className="pl-1 text-left">Age</span>
+        </span>
       </Th>
       <SortTh label="Tracked in" col="trackedIn" sort={sort} onSort={onSort} className="w-16 text-center!" />
       <SortTh
@@ -612,6 +613,7 @@ function SignalHead({
       />
       <SortTh label="Holder" col="holders" sort={sort} onSort={onSort} className={`w-20 ${C_HEAD}`} />
       <SortTh label="Tracked Inflow" col="trackedInflow" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
+      <SortTh label="Total balance" col="totalBalance" sort={sort} onSort={onSort} className={`w-28 ${C_HEAD}`} />
       <SortTh label="Tracked Holding" col="trackedHolding" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
       <SortTh label="1H Volume" col="volume1h" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
       <SortTh label="24H Volume" col="volume24h" sort={sort} onSort={onSort} className={`w-24 ${C_HEAD}`} />
@@ -633,6 +635,13 @@ export default function SignalTable({
 }) {
   const [signals, setSignals] = useState<TokenSignal[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pageStats, setPageStats] = useState<SignalPageStats | null>(null);
+  const [pageTotal, setPageTotal] = useState<number | null>(null);
+  /** Visible row cap: grows as the sentinel enters view, resets with filters/sort. */
+  const [rowLimit, setRowLimit] = useState(PAGE_SIZE);
+  const loadingMoreRef = useRef(false);
+  const rowLimitRef = useRef(PAGE_SIZE);
+  const sentinelRef = useRef<HTMLTableRowElement | null>(null);
   const lastSignalsAt = useRef(0);
   const queryKeyRef = useRef<string | null>(null);
   const refreshKeyRef = useRef<number | undefined>(undefined);
@@ -645,6 +654,7 @@ export default function SignalTable({
   const [sort, setSort] = useState<SortState>(null);
   const [tierError, setTierError] = useState<string | null>(null);
   const [nansenFilter, setNansenFilter] = useState<Set<NansenFactor>>(new Set());
+  const [chainFilter, setChainFilter] = useState<Chain | ''>('');
   const [holdingOnly, setHoldingOnly] = useState(false);
   const [mcMin, setMcMin] = useState('');
   const [mcMax, setMcMax] = useState('');
@@ -653,25 +663,34 @@ export default function SignalTable({
   const [holdingMin, setHoldingMin] = useState('');
   const [holdingMax, setHoldingMax] = useState('');
   const [rankFilter, setRankFilter] = useState<Set<Tier>>(new Set(RATED_TIERS));
-
+  const [breakdown, setBreakdown] = useState<{ kind: 'wallets' | 'fomo'; signal: TokenSignal } | null>(null);
   const toggleWalletBalanceSort = () => setWalletBalanceSort((current) => current === 'desc' ? 'asc' : 'desc');
+  
   useEffect(() => {
     if (!active) return;
     let alive = true;
     let loading = false;
     let settingsLoaded = false;
     let controller: AbortController | null = null;
+    // Paged first load: the server returns the newest PAGE_SIZE rows plus the
+    // stats tiles' full-view numbers, so the table paints while the rest streams.
     const load = (first: boolean) => {
       if (document.visibilityState !== 'visible' || loading) return;
       loading = true;
       controller = new AbortController();
       dataStore
-        .listSignals(mode === 'rated' ? true : allFactors, controller.signal)
-        .then((rows) => {
-          if (alive) {
-            setSignals(rows);
-            lastSignalsAt.current = Date.now();
+        .listSignalsPage(mode, allFactors, 0, PAGE_SIZE, controller.signal)
+        .then((page) => {
+          if (!alive) return;
+          // Never yank the viewport: a poll refreshes tiles always, but only
+          // replaces rows while the user is still on the first page. Once
+          // scrolled (or in full-list mode) the accumulated list wins.
+          if (rowLimitRef.current === PAGE_SIZE) {
+            setSignals(page.rows);
           }
+          setPageStats(page.stats);
+          setPageTotal(page.total);
+          lastSignalsAt.current = Date.now();
         })
         .catch((e: unknown) => {
           if (alive && first && !(e instanceof DOMException && e.name === 'AbortError')) {
@@ -694,9 +713,15 @@ export default function SignalTable({
       }
     };
     const queryKey = `${mode}:${mode === 'rated' || allFactors ? '1' : '0'}`;
-    const forceRefresh = queryKeyRef.current !== queryKey || refreshKeyRef.current !== refreshKey;
+    const queryChanged = queryKeyRef.current !== queryKey;
+    const forceRefresh = queryChanged || refreshKeyRef.current !== refreshKey;
     queryKeyRef.current = queryKey;
     refreshKeyRef.current = refreshKey;
+    // A different view starts at the first page again.
+    if (queryChanged) {
+      rowLimitRef.current = PAGE_SIZE;
+      setRowLimit(PAGE_SIZE);
+    }
     if (forceRefresh || !signals || Date.now() - lastSignalsAt.current >= 30_000) load(true);
     const id = setInterval(() => load(false), 30_000);
     const onVisibilityChange = () => {
@@ -710,6 +735,94 @@ export default function SignalTable({
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [active, refreshKey, allFactors, mode]);
+
+  useEffect(() => {
+    rowLimitRef.current = rowLimit;
+  }, [rowLimit]);
+
+  // Infinite scroll: the sentinel row requests the next page (which the server
+  // serves from its cached, globally ordered snapshot) and appends the rows.
+  useEffect(() => {
+    if (!signals) return;
+    const sentinel = sentinelRef.current;
+    if (sentinel === null) return;
+    const loadMore = () => {
+      if (loadingMoreRef.current || rowLimit >= (pageTotal ?? 0)) return;
+      loadingMoreRef.current = true;
+      dataStore
+        .listSignalsPage(mode, allFactors, rowLimit, PAGE_SIZE)
+        .then((page) => {
+          // The snapshot can shift between page requests (a new signal lands at
+          // the top); offsets then overlap. Drop already-shown rows so React
+          // keys stay unique, while the offset still advances positionally.
+          setSignals((cur) => {
+            const seen = new Set((cur ?? []).map((row) => row.id));
+            return (cur ?? []).concat(page.rows.filter((row) => !seen.has(row.id)));
+          });
+          setPageTotal(page.total);
+          setPageStats(page.stats);
+          setRowLimit((limit) => limit + page.rows.length);
+        })
+        .catch(() => {
+          /* transient failure: the sentinel stays visible and retries on scroll */
+        })
+        .finally(() => {
+          loadingMoreRef.current = false;
+        });
+    };
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) if (entry.isIntersecting) loadMore();
+    }, { rootMargin: '600px 0px' });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [signals, rowLimit, pageTotal, mode, allFactors]);
+
+  // A column sort or an active filter needs the FULL list to order correctly:
+  // fall back to the plain endpoint (SWR-cached server-side) and show everything.
+  useEffect(() => {
+    const filterActive = chainFilter !== '' || holdingOnly || [mcMin, mcMax, freshMin, freshMax, holdingMin, holdingMax].some((v) => v.trim() !== '') || nansenFilter.size > 0 || (mode === 'rated' && rankFilter.size < RATED_TIERS.length);
+    if (sort === null && !filterActive) {
+      // Clearing the last filter: the list is a full snapshot, so re-arm
+      // pagination from a known offset instead of slicing it arbitrarily.
+      if (rowLimitRef.current !== Number.MAX_SAFE_INTEGER) return;
+      rowLimitRef.current = PAGE_SIZE;
+      setRowLimit(PAGE_SIZE);
+      let alive = true;
+      dataStore
+        .listSignalsPage(mode, allFactors, 0, PAGE_SIZE)
+        .then((page) => {
+          if (!alive) return;
+          setSignals(page.rows);
+          setPageTotal(page.total);
+          setPageStats(page.stats);
+        })
+        .catch(() => {
+          /* keep the full list; the effects retry on the next change */
+        });
+      return () => {
+        alive = false;
+      };
+    }
+    let alive = true;
+    const controller = new AbortController();
+    dataStore
+      .listSignals(mode === 'rated' ? true : allFactors, controller.signal)
+      .then((rows) => {
+        if (alive) {
+          setSignals(rows);
+          setPageTotal(rows.length);
+          rowLimitRef.current = Number.MAX_SAFE_INTEGER;
+          setRowLimit(Number.MAX_SAFE_INTEGER);
+        }
+      })
+      .catch(() => {
+        /* keep the paged rows; retry on the next poll */
+      });
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, [sort, chainFilter, holdingOnly, mcMin, mcMax, freshMin, freshMax, holdingMin, holdingMax, nansenFilter, rankFilter, mode, allFactors]);
 
   if (error) return <ErrorState message={error} onRetry={() => window.location.reload()} />;
 
@@ -735,7 +848,7 @@ export default function SignalTable({
             <thead>
               <SignalHead allFactors={allFactors} walletBalanceSort={walletBalanceSort} />
             </thead>
-            <SkeletonRows rows={8} cols={(allFactors ? 16 : 15) + FOMO_EXTRA} />
+            <SkeletonRows rows={8} cols={(allFactors ? 17 : 16) + FOMO_EXTRA} />
           </table>
         </TableShell>
       </div>
@@ -764,8 +877,9 @@ export default function SignalTable({
     if (max !== null && Number.isFinite(max) && s.marketCap > max) return false;
     return true;
   };
-  const extraActive = holdingOnly || [mcMin, mcMax, freshMin, freshMax, holdingMin, holdingMax].some((v) => v.trim() !== '');
-  const filtered = base.filter((s) => nansenPass(s) && holdingPass(s) && mcPass(s)
+  const chainPass = (s: TokenSignal) => chainFilter === '' || s.chain === chainFilter;
+  const extraActive = chainFilter !== '' || holdingOnly || [mcMin, mcMax, freshMin, freshMax, holdingMin, holdingMax].some((v) => v.trim() !== '');
+  const filtered = base.filter((s) => chainPass(s) && nansenPass(s) && holdingPass(s) && mcPass(s)
     && freshPercentageInRange(s.nansen, freshMin, freshMax)
     && percentageInRange(rowHolding(s), holdingMin, holdingMax));
 
@@ -816,7 +930,9 @@ export default function SignalTable({
   const sortVal = (s: TokenSignal, key: SortKey): number | null | undefined =>
     key === 'holders'
       ? s.holders
-      : key === 'trackedInflow'
+      : key === 'totalBalance'
+        ? totalBalanceUsd(s.trackedWallets, SHOW_FOMO ? s.fomoUsers : undefined)
+        : key === 'trackedInflow'
         ? rowInflow(s)
         : key === 'trackedHolding'
           ? rowHolding(s)
@@ -851,6 +967,11 @@ export default function SignalTable({
     return sort.dir === 'asc' ? av - bv : bv - av;
   });
   const visible: TokenSignal[] = mode === 'rated' ? ratedVisible : sorted;
+  // Row cap for infinite scroll: visible grows only while the paged data is
+  // the source (sort/filter mode forces the full list and disables the cap).
+  const pagedSource = pageStats !== null && rowLimit !== Number.MAX_SAFE_INTEGER;
+  const cappedVisible = pagedSource ? visible.slice(0, rowLimit) : visible;
+  const hasMore = pagedSource && pageTotal !== null && cappedVisible.length < pageTotal;
   /* Cap one symbol's contribution: a 95-char Zalgo ticker (2026-10-21) inflated the column to
      1204px and left a blank gap before Tier. Real tickers up to 16 chars still size the column. */
   const tickerWidth = visible.reduce(
@@ -893,35 +1014,37 @@ export default function SignalTable({
       });
   };
 
-  const summaryCells: StatCell[] =
-    mode === 'rated'
-      ? [
-          { label: 'Tiered so far', value: String(ratedAll.length) },
-          { label: 'S-tier (S+/S)', value: String(tieredCount(ratedAll, 's')), numStyle: { color: '#6B7A1B' } },
-          { label: 'A-tier (A+/A)', value: String(tieredCount(ratedAll, 'a')), numStyle: { color: 'var(--c-pos)' } },
-          { label: 'B-tier (B+/B)', value: String(tieredCount(ratedAll, 'b')), numStyle: { color: 'var(--c-muted)' } },
-        ]
-      : [
-          { label: 'Tokens tracked', value: String(signals.length) },
-          { label: 'Active signal', value: String(passing.length), variant: 'hi' },
-          { label: 'Watch signal', value: String(signals.length - passing.length), variant: 'watch' },
-          { label: '24H volume, combined', value: usd(totalVolume) },
-        ];
+  // Tiles reflect the FULL view (server-computed), not the streamed slice, so
+  // the numbers are correct before every page has arrived.
+  const ratedTotal = pageStats ? pageStats.tiers.s + pageStats.tiers.a + pageStats.tiers.b : ratedAll.length;
+  const summaryCells: StatCell[] = mode === 'rated'
+    ? [
+        { label: 'Tiered so far', value: String(ratedTotal) },
+        { label: 'S-tier (S+/S)', value: String(pageStats ? pageStats.tiers.s : tieredCount(ratedAll, 's')), numStyle: { color: '#6B7A1B' } },
+        { label: 'A-tier (A+/A)', value: String(pageStats ? pageStats.tiers.a : tieredCount(ratedAll, 'a')), numStyle: { color: 'var(--c-pos)' } },
+        { label: 'B-tier (B+/B)', value: String(pageStats ? pageStats.tiers.b : tieredCount(ratedAll, 'b')), numStyle: { color: 'var(--c-muted)' } },
+      ]
+    : [
+        { label: 'Tokens tracked', value: pageStats ? String(pageStats.tracked) : String(signals.length) },
+        { label: 'Active signal', value: pageStats ? String(pageStats.active) : String(passing.length), variant: 'hi' },
+        { label: 'Watch signal', value: pageStats ? String(pageStats.watch) : String(signals.length - passing.length), variant: 'watch' },
+        { label: '24H volume, combined', value: pageStats ? usd(pageStats.volume24h) : usd(totalVolume) },
+      ];
 
   const ratedEmpty = mode === 'rated' && visible.length === 0;
-  const colCount = (allFactors ? 16 : 15) + FOMO_EXTRA;
+  const colCount = (allFactors ? 17 : 16) + FOMO_EXTRA;
 
   return (
     <div className="w-full">
-      {mode === 'rated' ? <RatedHero /> : <Hero count={visible.length} />}
+      {mode === 'rated' ? <RatedHero /> : <Hero count={pageStats ? pageStats.tracked : visible.length} />}
       <StatRow cells={summaryCells} />
       <div className="section-head">
         <h2>{mode === 'rated' ? 'Rated watchlist' : 'Token watchlist'}</h2>
         <span className="meta">
           {mode === 'rated'
             ? rankFilter.size < RATED_TIERS.length
-              ? `Showing ${visible.length}/${ratedAll.length} rated tokens (filtered by rank)`
-              : `${ratedAll.length}/${signals.length} tokens tiered`
+              ? `Showing ${visible.length}/${ratedTotal} rated tokens (filtered by rank)`
+              : `${ratedTotal}/${pageStats ? pageStats.tracked : signals.length} tokens tiered`
             : sort
               ? `sorted by ${SORT_LABEL[sort.key]}, ${sort.dir === 'asc' ? 'ascending' : 'descending'}`
               : SHOW_FOMO ? 'sorted by latest FOMO-user trade (24h)' : 'sorted by tracked activity'}
@@ -967,6 +1090,31 @@ export default function SignalTable({
             <Chip variant="nansen" on={holdingOnly} onClick={() => setHoldingOnly((v) => !v)}>
               Still holding
             </Chip>
+            <span className="filter-label" style={{ marginLeft: 8, textTransform: 'none' }}>Chain</span>
+            <div role="group" aria-label="Filter by chain" className="chain-filter-group">
+              <button
+                type="button"
+                aria-pressed={chainFilter === ''}
+                className={`filter-chip nansen-chip chain-filter-chip ${chainFilter === '' ? 'on' : ''}`}
+                onClick={() => setChainFilter('')}
+              >
+                All chains
+              </button>
+              {CHAINS.map((chain) => (
+                <button
+                  key={chain}
+                  type="button"
+                  aria-pressed={chainFilter === chain}
+                  className={`filter-chip nansen-chip chain-filter-chip ${chainFilter === chain ? 'on' : ''}`}
+                  onClick={() => setChainFilter(chain)}
+                >
+                  <span aria-hidden="true" className="inline-flex shrink-0">
+                    <ChainBadge chain={chain} size="sm" />
+                  </span>
+                  {CHAIN_LABELS[chain]}
+                </button>
+              ))}
+            </div>
             <span className="filter-label" style={{ marginLeft: 8, textTransform: 'none' }}>
               Market Cap (K$)
             </span>
@@ -999,7 +1147,7 @@ export default function SignalTable({
             <input type="number" min="0" max="100" step="any" inputMode="decimal" className="mc-filter-input" placeholder="Max" aria-label="Maximum tracked holding percentage" value={holdingMax} onChange={(e) => setHoldingMax(e.target.value)} />
             {extraActive && (
               <button type="button" className="text-[12px] font-semibold text-pos hover:underline" onClick={() => {
-                setHoldingOnly(false); setMcMin(''); setMcMax(''); setFreshMin(''); setFreshMax(''); setHoldingMin(''); setHoldingMax('');
+                setChainFilter(''); setHoldingOnly(false); setMcMin(''); setMcMax(''); setFreshMin(''); setFreshMax(''); setHoldingMin(''); setHoldingMax('');
               }}>Reset filters</button>
             )}
             {extraActive && (
@@ -1030,15 +1178,17 @@ export default function SignalTable({
                 />
               </thead>
               <tbody className="[&>tr:last-child>td]:border-b-0">
-                {visible.length === 0 ? (
+                {cappedVisible.length === 0 ? (
                   <tr>
                     <td colSpan={colCount} className="px-6 py-10 text-center text-[13px] font-semibold text-muted">
                       No tokens match the selected filters.
                     </td>
                   </tr>
                 ) : (
-                  visible.map((s, i) => {
+                  <>
+                  {cappedVisible.map((s, i) => {
                     const inflow = rowInflow(s);
+                    const totalBalance = totalBalanceUsd(s.trackedWallets, SHOW_FOMO ? s.fomoUsers : undefined);
                     const holding = rowHolding(s);
                     const holdingPartial = rowHoldingPartial(s);
                     const trackedWalletCount = s.trackedWallets.length;
@@ -1058,7 +1208,7 @@ export default function SignalTable({
                         )}
                         <Td className="w-20 px-2.5! text-center!">
                           <div className="relative inline-block">
-                            <TokenAvatar iconUrl={s.iconUrl} symbol={s.symbol} ca={s.ca} />
+                            <TokenAvatar iconUrl={s.iconUrl} symbol={s.symbol} ca={s.ca} avatarVersion={s.dataUpdatedAt?.icon} />
                             {SHOW_FOMO && (
                               <span className="absolute -bottom-1 -right-1">
                                 <ChainBadge chain={s.chain} />
@@ -1100,16 +1250,22 @@ export default function SignalTable({
                         <Td className={`signal-tracked-col ${SHOW_FOMO ? 'w-[768px]' : 'w-[480px]'}`}>
                           {SHOW_FOMO ? (
                             <div className="min-w-0 space-y-1.5">
-                              {fomoUserCount > 0 && (
+                              {trackedWalletCount > 0 && (
                                 <section>
-                                  <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">FOMO users</div>
-                                  <FomoTable users={s.fomoUsers} />
+                                  <div className="mb-0.5 border-b border-line/70 pb-0.5 font-mono text-[9px] font-extrabold uppercase tracking-wide text-ink2">
+                                    Native wallets
+                                  </div>
+                                  <WalletTable wallets={s.trackedWallets} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} limit={PREVIEW_LIMIT} />
+                                  <BreakdownButton label="native wallets" count={trackedWalletCount} onClick={() => setBreakdown({ kind: 'wallets', signal: s })} />
                                 </section>
                               )}
-                              {trackedWalletCount > 0 && (
-                                <section className={fomoUserCount > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
-                                  <div className="mb-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide text-muted">Native wallets</div>
-                                  <WalletTable wallets={s.trackedWallets} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} />
+                              {fomoUserCount > 0 && (
+                                <section className={trackedWalletCount > 0 ? 'border-t border-line/60 pt-1.5' : ''}>
+                                  <div className="mb-0.5 border-b border-line/70 pb-0.5 font-mono text-[9px] font-extrabold uppercase tracking-wide text-ink2">
+                                    FOMO users
+                                  </div>
+                                  <FomoTable users={s.fomoUsers} limit={PREVIEW_LIMIT} />
+                                  <BreakdownButton label="FOMO users" count={fomoUserCount} onClick={() => setBreakdown({ kind: 'fomo', signal: s })} />
                                 </section>
                               )}
                               {fomoUserCount === 0 && trackedWalletCount === 0 && <Pill active={false}>none</Pill>}
@@ -1156,6 +1312,11 @@ export default function SignalTable({
                         <Td className="w-24">
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={inflow === null ? 'One or more in-window FOMO BUY amounts are unavailable' : undefined}><span className={volumeClass(inflow ?? undefined, 'inflow')}>{inflow === null ? '—' : usd(inflow)}</span></div>
                         </Td>
+                        <Td className="w-28">
+                          <div className="text-center font-mono text-[13px] tabular-nums text-ink2">
+                            <span className={trackedUsdClass(totalBalance)}>{totalBalance !== undefined ? usd(totalBalance) : '—'}</span>
+                          </div>
+                        </Td>
                         <Td className="w-24">
                           <div className="text-center font-mono text-[13px] tabular-nums text-ink2" title={holdingPartial ? 'Σ FOMO position value ÷ CA market cap; unknown users are omitted' : undefined}>
                             <span className={trackedHoldingClass(holding)}>{holding !== undefined ? `${holdingPartial ? '≈' : ''}${pct(holding)}` : '—'}</span>
@@ -1179,12 +1340,35 @@ export default function SignalTable({
                         </Td>
                       </tr>
                     );
-                  })
+                  })}
+                  {hasMore && (
+                    <tr ref={sentinelRef}>
+                      <td colSpan={colCount} className="px-6 py-6 text-center font-mono text-[11px] font-semibold text-muted">
+                        Scroll for more — {cappedVisible.length}/{pageTotal ?? 0} loaded
+                      </td>
+                    </tr>
+                  )}
+                  </>
                 )}
               </tbody>
             </table>
           </div>
         </div>
+      )}
+      {breakdown && (
+        <Modal
+          title={`${breakdown.kind === 'wallets' ? 'Native wallets' : 'FOMO users'} — ${breakdown.signal.symbol ? `$${breakdown.signal.symbol.toUpperCase()}` : breakdown.signal.ca}`}
+          onClose={() => setBreakdown(null)}
+          wide
+        >
+          <div className="max-h-[70dvh] overflow-auto">
+            {breakdown.kind === 'wallets' ? (
+              <WalletTable wallets={breakdown.signal.trackedWallets} balanceSort={walletBalanceSort} onBalanceSort={toggleWalletBalanceSort} head />
+            ) : (
+              <FomoTable users={breakdown.signal.fomoUsers} head />
+            )}
+          </div>
+        </Modal>
       )}
       <ScanFooter />
     </div>

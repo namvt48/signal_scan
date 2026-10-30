@@ -1,22 +1,145 @@
+x-public-api-common: &public-api-common
+  build:
+    context: ./server
+    dockerfile: Dockerfile.public-api
+  env_file:
+    - path: server/public-api.env
+      required: false
+  environment:
+    PUBLIC_API_RUN: "1"
+    PUBLIC_API_PORT: "3010"
+    RELEASE_ID: ${RELEASE_ID:-unknown}
+  restart: unless-stopped
+  stop_grace_period: 15s
+
+x-public-export-common: &public-export-common
+  build:
+    context: ./server
+    dockerfile: Dockerfile.public-api
+  command: ["node", "dist/public-export-server.js"]
+  env_file:
+    - path: server/public-api.env
+      required: false
+  environment:
+    PUBLIC_EXPORT_RUN: "1"
+    PORT: "3001"
+    MARKET_DB_PATH: /market-data/market.db
+    SHOW_FOMO: "on"
+  expose:
+    - "3001"
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/healthz').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))"]
+    interval: 5s
+    timeout: 2s
+    retries: 12
+    start_period: 5s
+  restart: unless-stopped
+  stop_grace_period: 15s
+
+x-blue-api-env: &blue-api-env
+  PUBLIC_API_INTERNAL_URL: http://public-api-export-main:3001
+  PUBLIC_API_FOMO_INTERNAL_URL: http://public-api-export-fomo:3001
+
+x-green-api-env: &green-api-env
+  PUBLIC_API_INTERNAL_URL: http://public-api-export-main-green:3001
+  PUBLIC_API_FOMO_INTERNAL_URL: http://public-api-export-fomo-green:3001
+
 services:
   public-api:
-    build:
-      context: ./server
-      dockerfile: Dockerfile.public-api
-    env_file:
-      - path: server/public-api.env
-        required: false
+    <<: *public-api-common
     environment:
+      <<: *blue-api-env
       PUBLIC_API_RUN: "1"
       PUBLIC_API_PORT: "3010"
-      PUBLIC_API_INTERNAL_URL: "http://signal-scan-api-${INSTANCE:-a}:3001"
+      RELEASE_ID: ${RELEASE_ID:-unknown}
     ports:
       - "${PUBLIC_API_BIND:-127.0.0.1}:${PUBLIC_API_HOST_PORT:-3010}:3010"
+    depends_on:
+      public-api-export-main:
+        condition: service_healthy
+      public-api-export-fomo:
+        condition: service_healthy
     networks:
-      signal-scan-gateway:
-        aliases:
-          - signal-scan-public-api
-    restart: unless-stopped
+      signal-scan-gateway: {}
+
+  public-api-green:
+    <<: *public-api-common
+    environment:
+      <<: *green-api-env
+      PUBLIC_API_RUN: "1"
+      PUBLIC_API_PORT: "3010"
+      RELEASE_ID: ${RELEASE_ID:-unknown}
+    ports:
+      - "127.0.0.1:3011:3010"
+    depends_on:
+      public-api-export-main-green:
+        condition: service_healthy
+      public-api-export-fomo-green:
+        condition: service_healthy
+    networks:
+      signal-scan-gateway: {}
+
+  public-api-export-main:
+    <<: *public-export-common
+    environment:
+      PUBLIC_EXPORT_RUN: "1"
+      PORT: "3001"
+      DB_PATH: /data/signal_scan.db
+      MARKET_DB_PATH: /market-data/market.db
+      SHOW_FOMO: "on"
+    volumes:
+      - ${PUBLIC_API_A_DATA_DIR:-./data}:/data:ro
+      - signal-scan-market-data:/market-data:ro
+    networks:
+      signal-scan-gateway: {}
+
+  public-api-export-fomo:
+    <<: *public-export-common
+    environment:
+      PUBLIC_EXPORT_RUN: "1"
+      PORT: "3001"
+      DB_PATH: /data/signal_scan.db
+      MARKET_DB_PATH: /market-data/market.db
+      SHOW_FOMO: "on"
+    volumes:
+      - ${PUBLIC_API_FOMO_DATA_DIR:-${PUBLIC_API_A_DATA_DIR:-./data}}:/data:ro
+      - signal-scan-market-data:/market-data:ro
+    networks:
+      signal-scan-gateway: {}
+
+  public-api-export-main-green:
+    <<: *public-export-common
+    environment:
+      PUBLIC_EXPORT_RUN: "1"
+      PORT: "3001"
+      DB_PATH: /data/signal_scan.db
+      MARKET_DB_PATH: /market-data/market.db
+      SHOW_FOMO: "on"
+    volumes:
+      - ${PUBLIC_API_A_DATA_DIR:-./data}:/data:ro
+      - signal-scan-market-data:/market-data:ro
+    networks:
+      signal-scan-gateway: {}
+
+  public-api-export-fomo-green:
+    <<: *public-export-common
+    environment:
+      PUBLIC_EXPORT_RUN: "1"
+      PORT: "3001"
+      DB_PATH: /data/signal_scan.db
+      MARKET_DB_PATH: /market-data/market.db
+      SHOW_FOMO: "on"
+    volumes:
+      - ${PUBLIC_API_FOMO_DATA_DIR:-${PUBLIC_API_A_DATA_DIR:-./data}}:/data:ro
+      - signal-scan-market-data:/market-data:ro
+    networks:
+      signal-scan-gateway: {}
+
 networks:
   signal-scan-gateway:
     external: true
+
+volumes:
+  signal-scan-market-data:
+    external: true
+    name: signal-scan-market-data

@@ -128,13 +128,14 @@ test('kickWallet: writes the credit-free RPC holdings', async () => {
   };
   setPollerDeps(provider, {} as never);
 
-  const kickWalletId = insertWallet({ address: 'wallet-addr-2', name: 'CT02', tags: [], chain: 'sol', source: 'test' }).id;
+  const kickWalletAddress = 'kick-addr-1';
+  const kickWalletId = insertWallet({ address: kickWalletAddress, name: 'CT02', tags: [], chain: 'sol', source: 'test' }).id;
   const row = () =>
     getDb()
       .prepare('SELECT token_amount FROM wallet_token_state WHERE wallet_id = ? AND ca = ?')
       .get(kickWalletId, 'CA2') as { token_amount: number } | undefined;
 
-  kickWallet(provider, kickWalletId, 'kick-addr-1', 'sol', ['CA2']);
+  kickWallet(provider, kickWalletId, kickWalletAddress, 'sol', ['CA2']);
   for (let i = 0; i < 100 && !row(); i++) await new Promise((r) => setTimeout(r, 5));
   assert.equal(row()?.token_amount, 456, 'kickWallet: activity 403 gated the holdings write');
 });
@@ -228,6 +229,8 @@ test('metricSweep: a stuck Gini CA times out without blocking the next CA or per
     { address: 'CA-GINI-1', chain: 'sol' as const },
     { address: 'CA-GINI-2', chain: 'sol' as const },
   ];
+  insertTrackedCa({ address: 'CA-GINI-1', chain: 'sol', note: 'test' });
+  insertTrackedCa({ address: 'CA-GINI-2', chain: 'sol', note: 'test' });
   updateTokenMetrics('CA-GINI-1', 'sol', { nansenFreshPct: 11 });
   let sweep: Promise<void> | undefined;
   try {

@@ -3,14 +3,13 @@
 // stale entries. If this file fails, someone added a route without making an
 // explicit gating decision — list it in ROUTE_POLICY with its roles. Also pins
 // GET /api/health as explicitly public (monitors depend on it), and pins the
-// FOMO gate matrix (task 2 of .omo/plans/fomo-user-watch.md). All six FOMO
-// routes are now registered (tasks 5+6), so PENDING_ROUTES is empty and the
-// stale-entry check runs at full strength.
+// GET and POST /api/fomo/follow-sync controls are now registered; PENDING_ROUTES is empty,
+// so the stale-entry check runs at full strength.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { insertFomoUser, open } from '../src/db.js';
+import { insertFomoUser, open, setSetting } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { resolveRouteAccess, ROUTE_POLICY } from '../src/auth.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
@@ -94,8 +93,8 @@ test('only health and CA avatar delivery are public', () => {
 
 // --- FOMO gate matrix (task 2) ------------------------------------------------
 // Auth runs in the middleware, BEFORE route resolution, so 401 (anonymous) and
-// 403 (wrong role) are exact and route-independent TODAY. All six routes are
-// registered (tasks 5+6), so gate-PASS outcomes are asserted as real 2xx.
+// 403 (wrong role) are exact and route-independent TODAY. Route-pass outcomes
+// are exercised below against the real app and handler responses.
 
 let auth: TestAuth;
 let server: Server;
@@ -103,6 +102,7 @@ let base = '';
 
 before(async () => {
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   auth = await createTestAuth();
   server = createApp('test', auth.deps).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
@@ -131,7 +131,7 @@ async function req(method: string, path: string, opts: { token?: string; body?: 
   return { status: res.status, json: text === '' ? null : (JSON.parse(text) as unknown) };
 }
 
-/** Concrete request targets for the six gated routes (`:id` filled). */
+/** Concrete request targets for gated FOMO routes (`:id` filled). */
 const FOMO_ROUTES: ReadonlyArray<readonly [method: string, path: string]> = [
   ['GET', '/api/fomo-users'],
   ['POST', '/api/fomo-users'],
@@ -139,14 +139,18 @@ const FOMO_ROUTES: ReadonlyArray<readonly [method: string, path: string]> = [
   ['DELETE', '/api/fomo-users/some-id'],
   ['POST', '/api/fomo-users/import'],
   ['POST', '/api/fomo-watch/trades'],
+  ['GET', '/api/fomo/follow-sync'],
+  ['POST', '/api/fomo/follow-sync'],
 ];
 
-/** The four ADMIN_ONLY fomo-users writes the viewer/service roles must never reach. */
-const FOMO_ADMIN_WRITES: ReadonlyArray<readonly [method: string, path: string]> = [
+/** Admin-only FOMO mutations and sync controls. */
+const FOMO_ADMIN_CONTROLS: ReadonlyArray<readonly [method: string, path: string]> = [
   ['POST', '/api/fomo-users'],
   ['PATCH', '/api/fomo-users/some-id'],
   ['DELETE', '/api/fomo-users/some-id'],
   ['POST', '/api/fomo-users/import'],
+  ['GET', '/api/fomo/follow-sync'],
+  ['POST', '/api/fomo/follow-sync'],
 ];
 
 /** A body shaped for the task-6 parser contract (captured FOMO schema). */
@@ -157,19 +161,22 @@ const FOMO_TRADE_BODY = {
   tokenAddress: 'authCa-fomo-001',
   chain: 'sol',
   ts: 1_758_000_000_000,
+  provenance: 'live',
   usdValue: 3000,
 };
 
-test('resolveRouteAccess pins all six fomo gates to their exact roles', () => {
+test('resolveRouteAccess pins FOMO gates to their exact roles', () => {
   assert.deepEqual(resolveRouteAccess('GET', '/api/fomo-users'), ['admin', 'viewer', 'service']);
   assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-users'), ['admin']);
   assert.deepEqual(resolveRouteAccess('PATCH', '/api/fomo-users/some-id'), ['admin']);
   assert.deepEqual(resolveRouteAccess('DELETE', '/api/fomo-users/some-id'), ['admin']);
   assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-users/import'), ['admin']);
   assert.deepEqual(resolveRouteAccess('POST', '/api/fomo-watch/trades'), ['admin', 'service']);
+  assert.deepEqual(resolveRouteAccess('GET', '/api/fomo/follow-sync'), ['admin']);
+  assert.deepEqual(resolveRouteAccess('POST', '/api/fomo/follow-sync'), ['admin']);
 });
 
-test('anonymous request: 401 on all six fomo routes', async () => {
+test('anonymous request: 401 on all gated FOMO routes', async () => {
   for (const [method, path] of FOMO_ROUTES) {
     const body = method === 'GET' || method === 'DELETE' ? undefined : {};
     const res = await req(method, path, { body });
@@ -178,18 +185,20 @@ test('anonymous request: 401 on all six fomo routes', async () => {
   }
 });
 
-test('viewer token: 403 on the admin-only fomo writes', async () => {
+test('viewer token: 403 on admin-only FOMO controls', async () => {
   const viewer = await auth.signToken(auth.viewerEmail);
-  for (const [method, path] of FOMO_ADMIN_WRITES) {
-    const res = await req(method, path, { token: viewer, body: {} });
+  for (const [method, path] of FOMO_ADMIN_CONTROLS) {
+    const body = method === 'GET' ? undefined : {};
+    const res = await req(method, path, { token: viewer, body });
     assert.equal(res.status, 403, `viewer ${method} ${path} must be 403`);
     assert.deepEqual(res.json, { error: 'forbidden' });
   }
 });
 
-test('service token: 403 on the admin-only fomo writes (least privilege)', async () => {
-  for (const [method, path] of FOMO_ADMIN_WRITES) {
-    const res = await req(method, path, { token: TEST_SERVICE_TOKEN, body: {} });
+test('service token: 403 on admin-only FOMO controls (least privilege)', async () => {
+  for (const [method, path] of FOMO_ADMIN_CONTROLS) {
+    const body = method === 'GET' ? undefined : {};
+    const res = await req(method, path, { token: TEST_SERVICE_TOKEN, body });
     assert.equal(res.status, 403, `service ${method} ${path} must be 403`);
     assert.deepEqual(res.json, { error: 'forbidden' });
   }
@@ -210,4 +219,14 @@ test('service token passes the POST /api/fomo-watch/trades gate (valid body)', a
   const res = await req('POST', '/api/fomo-watch/trades', { token: TEST_SERVICE_TOKEN, body: FOMO_TRADE_BODY });
   assert.equal(res.status, 200);
   assert.deepEqual(res.json, { inserted: 1 });
+});
+
+test('admin can read Alita sync state and trigger a disabled sync safely', async () => {
+  const admin = await auth.signToken(auth.adminEmail);
+  const status = await req('GET', '/api/fomo/follow-sync', { token: admin });
+  assert.equal(status.status, 200);
+  assert.equal(status.json, null);
+  const run = await req('POST', '/api/fomo/follow-sync', { token: admin, body: {} });
+  assert.equal(run.status, 200);
+  assert.equal((run.json as { skipped: boolean }).skipped, true);
 });

@@ -5,7 +5,23 @@
 // effect on the next /api/signals without a restart.
 
 import { FRESH_MIN_PCT, LF_MAX, LF_MIN, MAX_MC, MIN_MC, MIN_USD, T100_MIN_MULTIPLE } from './config.js';
-import { getSetting, setSetting } from './db.js';
+import { getSetting, listTrackedCasSinceSystemDeploy, setSetting, type TrackedCaRow } from './db.js';
+
+export const SYSTEM_DEPLOY_AT_KEY = 'systemDeployAt';
+
+/** Read the durable deployment boundary; invalid/missing persistence fails closed. */
+export function getTrackingSinceMs(): number {
+  const value = Number(getSetting(SYSTEM_DEPLOY_AT_KEY));
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${SYSTEM_DEPLOY_AT_KEY} must be a positive safe integer epoch-ms value`);
+  }
+  return value;
+}
+
+/** Tracked CAs admitted since the persisted system deployment boundary. */
+export function listTrackedCasSinceDeploy(includeInactive = false): TrackedCaRow[] {
+  return listTrackedCasSinceSystemDeploy(includeInactive);
+}
 
 /** Score gates: fresh % min, t100 genesis→trough multiple min, LF absolute band [lfMin, lfMax] — plus the minUsd entry-size gate and the [minMc, maxMc] market-cap band. */
 export interface NansenThresholds {
@@ -124,9 +140,10 @@ export interface SettingsResponse {
   values: NansenThresholds;
   defaults: NansenThresholds;
   debug: { allFactors: boolean };
+  trackingSinceMs: number;
 }
 
 /** Build the /api/settings response from a values set (defaults + current debug flag). */
 export function settingsResponse(values: NansenThresholds): SettingsResponse {
-  return { values, defaults: thresholdDefaults(), debug: { allFactors: getDebugAllFactors() } };
+  return { values, defaults: thresholdDefaults(), debug: { allFactors: getDebugAllFactors() }, trackingSinceMs: getTrackingSinceMs() };
 }

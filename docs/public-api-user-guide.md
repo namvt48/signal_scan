@@ -404,7 +404,13 @@ ws.addEventListener('message', (event) => {
 });
 ```
 
-The WebSocket stream does not replay events missed while disconnected. Deduplicate by `data.id` in the consumer.
+With `?after_id=<last-cursor>`, the WebSocket replays durable inflows after the cursor. Persist `cursor` messages as the cursor advances over filtered rows. Delivery is at-least-once; deduplicate by `data.id`.
+
+### Replay cursors and readiness
+
+For durable reconnect, connect to either WebSocket path with `?after_id=<last-cursor>`. Without the parameter the connection remains live-only. Persist `cursor` message `afterId` values as well as inflow IDs; filtered rows still advance the durable consumer position. Delivery is at-least-once, so deduplicate inflows by `data.id`. A `cursor_gap` or `invalid_cursor` message means the cursor cannot be replayed (retention gap or future ID); the server closes with `1008` and supplies the oldest retained ID when available. `1012` means the service is draining for replacement; reconnect with the last persisted cursor.
+
+`GET https://signal-scan.duckdns.org/readyz` is the deployment readiness probe. It returns `200` with `{ "status": "ready", "release": "<RELEASE_ID>" }` only when token configuration is present and authenticated real exports from both main and FOMO backends succeed. It is bounded, omits backend details, and does not consume public rate-limit quota. `/api/v1/status` remains a shallow process-only check.
 
 ### Recover missed events after reconnect
 
@@ -658,9 +664,13 @@ Same parameters and pagination as wallet trades: `from`/`to` default to the last
 - `after_id` is used for alerts, wallet trades, FOMO alerts, and FOMO trades and must be a non-negative integer.
 - Activity and trade time ranges use epoch milliseconds and the half-open interval `[from, to)`, with a maximum span of 31 days.
 - The HTTP quota is shared by all callers: 120 requests per minute per process. A `429` response includes `Retry-After` in seconds.
-- At most 16 HTTP requests are processed concurrently; excess requests may receive `503`.
+- At most 24 HTTP requests are processed concurrently; excess requests receive `503` with `Retry-After: 1`.
 - The WebSocket limit is 64 concurrent connections per process and is independent of the HTTP quota.
 - Quotas and caches are process-local; production runs one public API replica to keep behavior consistent.
+- Token lists and lookups share a snapshot refreshed in a read-only worker every 15 seconds. `generatedAt` records capture time. Failed refreshes retain a snapshot only while it is less than 60 seconds old; beyond that, token requests fail unavailable. Offset pages are not pinned across refreshes; deduplicate by token ID during long scans.
+- Successful token/detail responses cache for 5 seconds; wallet/user lists, balance charts and per-token FOMO statistics for 15 seconds; activity/trades/positions for 1 second; REST alerts for 500 ms. Errors are not cached. Snapshot responses never remain cached beyond the snapshot's age bound.
+- Omitted activity/trade time bounds use a last-24-hour range anchored to a one-second boundary. Explicit time bounds keep millisecond precision.
+- Keep full scans non-overlapping and use ID cursors for incremental trades/alerts; retry transient failures with backoff and jitter.
 
 ## Errors and recovery
 

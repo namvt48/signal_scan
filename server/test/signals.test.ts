@@ -291,6 +291,46 @@ test('trackedWallets: an UNPRICED holding emits no balUsd (FE "—"), never a fa
   assert.ok(w);
   assert.ok(!('balUsd' in w), 'unpriced balUsd must be absent (FE renders —), never 0');
 });
+
+test('confirmed native zero balances are distinct from unmeasured and unpriced balances', () => {
+  const ca = 'caConfirmedZero-balance-026';
+  const measured = insertWallet({ address: 'wallet-confirmed-zero', name: 'Measured zero', tags: [], chain: 'sol', source: 'test' });
+  const unknown = insertWallet({ address: 'wallet-unmeasured-zero', name: 'Never measured', tags: [], chain: 'sol', source: 'test' });
+  insertTrackedCa({ address: ca, chain: 'sol', note: '' });
+  for (const wallet of [measured, unknown]) {
+    insertTrades(wallet.id, [activity(`zero-buy-${wallet.id}`, 'buy', 10, NOW - 100, ca)], 'watch');
+  }
+  replaceWalletBalances(measured.id, 'sol', [{ ca, amount: 0 }]);
+  getDb().prepare("UPDATE zero_holdings SET zero_at = ? WHERE member_type = 'wallet' AND member_id = ? AND ca = ? AND chain = 'sol'")
+    .run(NOW - 1000, measured.id, ca);
+  // A zero measurement on another chain cannot fill this Solana balance.
+  getDb().prepare("INSERT INTO zero_holdings (member_type, member_id, ca, chain, zero_at) VALUES ('wallet', ?, ?, 'base', ?)")
+    .run(unknown.id, ca, NOW - 1000);
+  const trades = getDb().prepare('SELECT * FROM wallet_trades WHERE ca = ? ORDER BY id').all(ca);
+  const readers = [
+    () => trackedWalletStats(ca, 'sol', NOW),
+    () => assembleSignals(NOW, true).find((signal) => signal.ca === ca && signal.chain === 'sol')!.trackedWallets,
+  ];
+  for (const read of readers) {
+    const rows = read();
+    const zero = rows.find((wallet) => wallet.name === measured.name)!;
+    assert.equal(zero.balUsd, 0);
+    assert.equal(zero.holdingAmount, 0);
+    assert.equal(zero.inflow, 10);
+    assert.equal(zero.buys, 1);
+    assert.equal(zero.sells, 0);
+    assert.equal(zero.lastTs, NOW - 100);
+    assert.equal(rows.find((wallet) => wallet.name === unknown.name)?.balUsd, undefined);
+    assert.equal(rows.find((wallet) => wallet.name === unknown.name)?.holdingAmount, undefined);
+  }
+  replaceWalletBalances(measured.id, 'sol', [{ ca, amount: 25 }]);
+  for (const read of readers) {
+    const positive = read().find((wallet) => wallet.name === measured.name)!;
+    assert.equal(positive.holdingAmount, 25);
+    assert.equal(positive.balUsd, undefined, 'positive balance without a quote stays unknown in USD');
+  }
+  assert.deepEqual(getDb().prepare('SELECT * FROM wallet_trades WHERE ca = ? ORDER BY id').all(ca), trades);
+});
 test('trackedWallets omit holding percentage when supply is zero or unavailable', () => {
   const ca = 'caZeroSupply-balance-025';
   const walletId = insertWallet({ address: 'wallet-addr-zero-supply', name: 'CTZS', tags: [], chain: 'sol', source: 'test' }).id;
@@ -379,27 +419,26 @@ test('trackedWallets: an 8d-old watch buy lists its wallet with zero 24h stats (
   assert.equal(ct01.balUsd, 1);
 });
 
-test('sumHoldingAmount: counts a CA’s holders, never an unlinked wallet’s leftover rows', () => {
+test('sumHoldingAmount includes positive no-trade snapshots and remains chain scoped', () => {
   const CA_H = 'caH-unlinked-holder-020';
   insertTrackedCa({ address: CA_H, chain: 'sol', note: '' });
   const wUn = insertWallet({ address: 'wallet-addr-unlinked-h', name: 'CTUH', tags: [], chain: 'sol', source: 'test' }).id;
   replaceWalletBalances(wUn, 'sol', [{ ca: CA_H, amount: 7_000_000 }]);
-  assert.equal(sumHoldingAmount(CA_H, 'sol'), 0, 'an unlinked wallet holding must not be summed');
+  assert.equal(sumHoldingAmount(CA_H, 'sol'), 7_000_000, 'a positive no-trade snapshot is a current holder');
   insertTrades(wUn, [activity('txh1', 'buy', 100, NOW - DAY, CA_H)], 'watch');
-  assert.equal(sumHoldingAmount(CA_H, 'sol'), 7_000_000, 'a linked holder must be summed');
+  assert.equal(sumHoldingAmount(CA_H, 'sol'), 7_000_000, 'trade provenance does not double-count the same holder');
 });
 
-test('trackedWallets: a wallet holding a CA with NO token_state is NOT returned (holding no longer lights it up)', () => {
+test('trackedWallets: a positive wallet snapshot is visible without token metadata or trades', () => {
   const CA_P = 'caP-noprice-014';
   const w3Id = insertWallet({ address: 'wallet-addr-3', name: 'CT03', tags: [], chain: 'sol', source: 'test' }).id;
   insertTrackedCa({ address: CA_P, chain: 'sol', note: '', entryUsd: 60 });
-  // CT03 HOLDS 2e6 tokens but has NO watch buy -> not in `Tracked by`. Holding
-  // still feeds trackedHolding below (sumHoldingAmount is untouched).
   replaceWalletBalances(w3Id, 'sol', [{ ca: CA_P, amount: 2e6 }]);
   const sig = assembleSignals(NOW).find((s) => s.ca === CA_P);
   assert.ok(sig);
-  assert.deepEqual(sig.trackedWallets.map((w) => w.name), []);
-  assert.equal(sig.trackedHolding, 0); // supply unknown -> guarded to 0, never NaN
+  assert.deepEqual(sig.trackedWallets.map((w) => w.name), ['CT03']);
+  assert.equal(sig.trackedWallets[0]?.holdingAmount, 2e6);
+  assert.equal(sig.trackedHolding, 0); // unknown supply still guards the aggregate to 0
   assert.ok(Number.isFinite(sig.trackedHolding));
 });
 
@@ -453,6 +492,49 @@ test('assembleSignals: a member SELL lifts its CA above a CA whose buy is older'
     sigs.findIndex((s) => s.ca === CA_SELL) < sigs.findIndex((s) => s.ca === CA_BUY),
     'a member sell must lift CA_SELL above CA_BUY',
   );
+});
+
+test('tracked activity matches visible wallet rows and stays scoped to chain', () => {
+  const CA_VISIBLE = 'caOrder-visible-members-025';
+  const CA_SHARED = 'caOrder-cross-chain-026';
+  insertTrackedCa({ address: CA_VISIBLE, chain: 'sol', note: '' });
+  insertTrackedCa({ address: CA_SHARED, chain: 'base', note: '' });
+  insertTrackedCa({ address: CA_SHARED, chain: 'bsc', note: '' });
+
+  const hidden = insertWallet({ address: 'wallet-hidden-order', name: 'Hidden', tags: [], chain: 'sol', source: 'watch' });
+  const visible = insertWallet({ address: 'wallet-visible-order', name: 'Visible', tags: [], chain: 'sol', source: 'watch' });
+  insertTrades(hidden.id, [activity('tx-hidden-new', 'buy', 16, NOW - 1_000, CA_VISIBLE)], 'watch');
+  insertTrades(visible.id, [
+    activity('tx-visible-old', 'buy', 10, NOW - 2 * DAY, CA_VISIBLE),
+    activity('tx-visible-sell', 'sell', 3, NOW - 3_600_000, CA_VISIBLE),
+  ], 'watch');
+  getDb()
+    .prepare("INSERT INTO zero_holdings (member_type, member_id, ca, chain, zero_at) VALUES ('wallet', ?, ?, 'sol', ?)")
+    .run(hidden.id, CA_VISIBLE, NOW - DAY - 1);
+
+  for (const [chain, ts] of [['base', NOW - 2_000], ['bsc', NOW - 3_000]] as const) {
+    const wallet = insertWallet({ address: 'wallet-shared-chain', name: chain, tags: [], chain, source: 'watch' });
+    insertTrades(wallet.id, [{
+      tx: `tx-${chain}-new`,
+      ts,
+      side: 'buy',
+      ca: CA_SHARED,
+      chain,
+      amountUsd: 2,
+      price: 1,
+    }], 'watch');
+  }
+
+  const signals = assembleSignals(NOW, true);
+  const visibleSignal = signals.find((signal) => signal.ca === CA_VISIBLE && signal.chain === 'sol');
+  assert.ok(visibleSignal);
+  assert.deepEqual(visibleSignal.trackedWallets.map((wallet) => wallet.name), ['Visible']);
+  assert.equal(visibleSignal.trackedWallets[0]?.buys, 0);
+  assert.equal(visibleSignal.trackedWallets[0]?.sells, 1);
+  assert.equal(visibleSignal.trackedActivityAt, NOW - 3_600_000);
+
+  assert.equal(signals.find((signal) => signal.ca === CA_SHARED && signal.chain === 'base')?.trackedActivityAt, NOW - 2_000);
+  assert.equal(signals.find((signal) => signal.ca === CA_SHARED && signal.chain === 'bsc')?.trackedActivityAt, NOW - 3_000);
 });
 
 test('computeT100Pct pairs newest snapshot with newest one older than the window', () => {

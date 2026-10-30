@@ -55,6 +55,83 @@ export interface GmgnTokenInfoParams {
 }
 
 export type GmgnTokenInfoParse = { ok: true; value: GmgnTokenInfoParams } | { ok: false };
+/** GMGN wallet activity is a history query, charged at weight 3. */
+export const GMGN_WALLET_ACTIVITY_PATH = '/v1/gmgn/wallet-activity';
+export const GMGN_WALLET_ACTIVITY_URL = 'https://openapi.gmgn.ai/v1/user/wallet_activity';
+export const GMGN_WALLET_ACTIVITY_ENDPOINT = '/v1/user/wallet_activity';
+export const GMGN_WALLET_ACTIVITY_WEIGHT = 3;
+
+export interface GmgnWalletActivityParams {
+  wallet: string;
+  chain: Chain;
+  limit: number;
+  cursor?: string;
+  priority?: Priority;
+}
+
+export type GmgnWalletActivityParse =
+  | { ok: true; value: GmgnWalletActivityParams }
+  | { ok: false };
+
+const EVM_ADDRESS = /^0x[a-fA-F0-9]{40}$/;
+const EVM_CHAINS: Partial<Record<Chain, true>> = { base: true, bsc: true, eth: true, robinhood: true };
+const MAX_CURSOR_LENGTH = 2048;
+
+export function parseGmgnWalletActivity(raw: unknown): GmgnWalletActivityParse {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false };
+  const o = raw as Record<string, unknown>;
+  if (typeof o.wallet !== 'string' || !EVM_ADDRESS.test(o.wallet)) return { ok: false };
+  if (!isChain(o.chain) || EVM_CHAINS[o.chain] !== true) return { ok: false };
+  if (o.limit !== undefined && (!Number.isInteger(o.limit) || (o.limit as number) < 1 || (o.limit as number) > 100)) return { ok: false };
+  if (o.cursor !== undefined && (typeof o.cursor !== 'string' || o.cursor.length > MAX_CURSOR_LENGTH)) return { ok: false };
+  if (o.priority !== undefined && o.priority !== 0 && o.priority !== 1 && o.priority !== 2) return { ok: false };
+  return {
+    ok: true,
+    value: {
+      wallet: o.wallet,
+      chain: o.chain,
+      limit: (o.limit as number | undefined) ?? 20,
+      ...(o.cursor !== undefined ? { cursor: o.cursor as string } : {}),
+      ...(o.priority !== undefined ? { priority: o.priority as Priority } : {}),
+    },
+  };
+}
+
+function toWalletActivityRequest(p: GmgnWalletActivityParams): GatewayRequest {
+  return {
+    provider: 'gmgn',
+    endpoint: GMGN_WALLET_ACTIVITY_ENDPOINT,
+    params: {
+      chain: chainSlugs(p.chain).gmgn,
+      wallet_address: p.wallet,
+      limit: p.limit,
+      ...(p.cursor !== undefined ? { cursor: p.cursor } : {}),
+    },
+    priority: p.priority,
+  };
+}
+
+export async function handleGmgnWalletActivity(
+  rawBody: unknown,
+  caller: Caller,
+  deps: GmgnTokenInfoDeps,
+): Promise<DispatchResult> {
+  const parsed = parseGmgnWalletActivity(rawBody);
+  if (!parsed.ok) return denial(400, 'bad_request');
+  const runOpts: RunOpts = { weight: GMGN_WALLET_ACTIVITY_WEIGHT, priority: parsed.value.priority };
+  const req = toWalletActivityRequest(parsed.value);
+  const pick = deps.pool?.pick();
+  if (deps.pool && !pick) return denial(503, 'gated', { [GATED_HEADER]: new Date(deps.pool.nextAvailableAt()).toISOString() });
+  if (pick) req.provider = pick.limiterKey;
+  const runKeyLimiter: LimiterRun = deps.runLimiter ?? ((api, opts, job) => limiters.run(api, opts, job));
+  const runEgressLimiter: LimiterRun = deps.runEgressLimiter ??
+    ((api, opts, job) => limiters.run(api, opts, job));
+  const runLimiter: LimiterRun = (api, opts, job) =>
+    runKeyLimiter(api, opts, () => runEgressLimiter('gmgn-egress', opts, job));
+  const fetchUpstream = pick ? trackPoolUpstream(deps.pool!, pick) : deps.fetchUpstream;
+  return proxyRequest(req, caller, { fetchUpstream, runLimiter, runOpts });
+}
+
 
 function isChain(value: unknown): value is Chain {
   return typeof value === 'string' && value in CHAIN_SLUGS;
@@ -200,6 +277,36 @@ export interface GmgnUpstreamOpts {
   /** API key override (tests); defaults to the gateway's own env. */
   apiKey?: string;
 }
+/** Reduce untrusted upstream errors to a safe category; never log the raw body. */
+export function gmgnErrorHint(body: string): string {
+  let message = '';
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const value = parsed as Record<string, unknown>;
+      message = [value.error, value.message, value.code]
+        .filter((field): field is string => typeof field === 'string')
+        .join(' ')
+        .toLowerCase();
+    }
+  } catch {
+    return 'unclassified';
+  }
+  if (/api.?key|credential|unauthoriz|auth/.test(message)) return 'auth_rejected';
+  if (/timestamp|client.?id|signature/.test(message)) return 'request_auth_rejected';
+  if (/chain/.test(message)) return 'chain_rejected';
+  if (/wallet|address/.test(message)) {
+    if (/missing|required|empty/.test(message)) return 'wallet_missing';
+    if (/not found|unknown|does not exist/.test(message)) return 'wallet_unknown';
+    if (/invalid|format|checksum/.test(message)) return 'wallet_invalid';
+    if (/unsupported|not supported/.test(message)) return 'wallet_unsupported';
+    return 'wallet_rejected';
+  }
+  if (/limit|cursor|type|parameter|query/.test(message)) return 'request_parameter_rejected';
+  if (/plan|upgrade|weight/.test(message)) return 'plan_restricted';
+  return 'unclassified';
+}
+
 
 /**
  * The REAL upstream fetcher: builds the GET URL with a FRESH `client_id` +
@@ -211,16 +318,31 @@ export function gmgnTokenInfoUpstream(opts: GmgnUpstreamOpts = {}): UpstreamFetc
   const doFetch = opts.fetchImpl ?? fetch;
   const apiKey = opts.apiKey ?? config.gmgnApiKey;
   return async (req) => {
+    const url = req.endpoint === GMGN_TOKEN_INFO_ENDPOINT ? GMGN_TOKEN_INFO_URL
+      : req.endpoint === GMGN_WALLET_ACTIVITY_ENDPOINT ? GMGN_WALLET_ACTIVITY_URL
+      : undefined;
+    if (url === undefined) throw new Error('unsupported GMGN endpoint');
     const qs = new URLSearchParams({
       chain: String(req.params?.chain ?? ''),
-      address: String(req.params?.address ?? ''),
+      ...(req.endpoint === GMGN_TOKEN_INFO_ENDPOINT
+        ? { address: String(req.params?.address ?? '') }
+        : {
+          wallet_address: String(req.params?.wallet_address ?? ''),
+          limit: String(req.params?.limit ?? 20),
+          ...(req.params?.cursor !== undefined ? { cursor: String(req.params.cursor) } : {}),
+        }),
       timestamp: String(Math.floor(Date.now() / 1000)),
       client_id: randomUUID(),
     });
-    const res = await doFetch(`${GMGN_TOKEN_INFO_URL}?${qs.toString()}`, {
+    const res = await doFetch(`${url}?${qs.toString()}`, {
       headers: { 'X-APIKEY': apiKey },
     });
-    return { status: res.status, body: await res.text(), headers: res.headers };
+    const body = await res.text();
+    if (req.endpoint === GMGN_WALLET_ACTIVITY_ENDPOINT && res.status === 400) {
+      const reason = gmgnErrorHint(body);
+      log.warn(`GMGN wallet activity upstream rejected: ${reason}`, { status: res.status });
+    }
+    return { status: res.status, body, headers: res.headers };
   };
 }
 

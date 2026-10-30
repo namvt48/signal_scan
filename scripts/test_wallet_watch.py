@@ -41,6 +41,8 @@ spec = importlib.util.spec_from_file_location(
 assert spec and spec.loader
 ww = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ww)
+# Detector fixtures predate the current deployment; this harness admits their timestamps explicitly.
+ww._tracking_since_ms = 1
 
 
 def _seed(ww):
@@ -141,55 +143,6 @@ print(
     f"OK: {len(EXPECTED)}/{len(EXPECTED)} nhãn per-step khớp ground-truth (gross leg)"
 )
 
-# ---------- track_post_body (--track POST body, pure/không mạng) ----------
-
-TR_W = "AcKpsk3AKJR8YiTrHr2XCFZ2WV8gcM3zjgcr4P1MjHD1"
-TR_SIG = "387w9fh8EF"
-
-
-def _ev(side, mint, quote_usd: float | None = 123.45, type_: str = "SWAP"):
-    ev = {"side": side, "mint": mint, "wallet": TR_W, "sig": TR_SIG, "type": type_}
-    if quote_usd is not None:
-        ev["quote_usd"] = quote_usd
-    return ev
-
-
-assert ww.track_post_body(_ev("BUY", "MintBuy111")) == {
-    "address": "MintBuy111",
-    "chain": "sol",
-    "note": f"auto:BUY by {TR_W} {TR_SIG}",
-    "usd": 123.45,
-}
-assert (
-    ww.track_post_body(_ev("SELL", "MintSell22")) is None
-)  # sell chỉ log, không vào CA tracking
-for side in ("SELL", "TRANSFER_IN", "TRANSFER_OUT", "NEUTRAL"):
-    assert ww.track_post_body(_ev(side, "MintBuy111")) is None, side
-assert ww.track_post_body(_ev("BUY", "")) is None
-assert ww.track_post_body(_ev("SELL", "")) is None
-# type=RECEIVE (airdrop/claim/_recv_event) KHÔNG bao giờ vào queue CA
-assert ww.track_post_body(_ev("BUY", "MintRecv333", type_="RECEIVE")) is None
-print(
-    "OK: track_post_body CHỈ SWAP+BUY → body; SELL/TRANSFER/RECEIVE/empty-mint → None"
-)
-
-# Thiếu giá ⇒ VẪN post nhưng KHÔNG có key 'usd': server lưu entry_usd NULL rồi tự
-# gate $50 của nó (fail-open — Q1 2026-09-21). Detector không được tự bỏ trade thật
-# (§9.2 ngưỡng detect = 0 hằng số; đo $4.88–49.19 buys từng bị gate bỏ: 2BqRLrAGxh).
-unp = ww.track_post_body(_ev("BUY", "MintBuy111", quote_usd=None))
-assert unp == {
-    "address": "MintBuy111",
-    "chain": "sol",
-    "note": f"auto:BUY by {TR_W} {TR_SIG}",
-}, unp
-assert (
-    ww.track_post_body(_ev("BUY", "MintBuy111", quote_usd=0)) == unp
-)  # 0 = chưa biết giá
-priced = ww.track_post_body(_ev("BUY", "MintBuy111", quote_usd=42.0))
-assert priced is not None and priced["usd"] == 42.0, priced
-print(
-    "OK: track_post_body thiếu giá → body KHÔNG có 'usd' (fail-open); priced → usd đúng"
-)
 
 # ---------- quote USDC: quote_usd > 0 không cần network (px=1.0 hardcode) ----------
 
@@ -351,13 +304,13 @@ EC2 = "EC2f5DnHzuNRit1ExqghSifDbp1wgrzktsRRZCtU92MJ"
 tx_dep = json.load(open(os.path.join(HERE, "fixtures", "regress", "3jjAdrCK.json")))
 keys_dep = {a["pubkey"] for a in tx_dep["transaction"]["message"]["accountKeys"]}
 assert EC2 not in keys_dep, "fixture 3jjAdrCK: EC2 phải VẮNG accountKeys (tiền đề test)"
-_ow, _ot = ww._warm_prices, ww.track_event
+_ow, _ot = ww._warm_prices, ww.watch_trade_event
 setattr(ww, "_warm_prices", lambda tx: None)
-setattr(ww, "track_event", lambda ev: None)
+setattr(ww, "watch_trade_event", lambda ev, bt=None: True)
 st = {"wallets": {}}
 ww._handle_tx(tx_dep, "SIGdep", [EC2], st)
 setattr(ww, "_warm_prices", _ow)
-setattr(ww, "track_event", _ot)
+setattr(ww, "watch_trade_event", _ot)
 assert st["wallets"].get(EC2, {}).get("head") == "SIGdep", (
     f"(a) discovery: ví có ATA trong balances bị skip ⇒ st={st}"
 )
@@ -371,7 +324,7 @@ tr = ww._target_event(txr, GPMZ, [])
 assert tr and tr["mint"] == MARINE and tr["amount_basis"] == "net_delta", tr
 assert tr["type"] == "RECEIVE" and tr["side"] == "RECEIVE", tr
 assert tr["usd_pending"] and tr["quote_usd"] is None, tr
-assert ww.track_post_body(tr) is None, "type=RECEIVE KHÔNG vào queue CA"
+assert ww.watch_trade_body(tr) is None, "receive-only event must not become a trade"
 print("OK (d): ví chỉ NHẬN token mà không ký ⇒ event RECEIVE (log-only)")
 
 # ---------- §5.1/§5.4/§5.5 + §4.1 (2026-09-21): qty_net / per-hop CA tracking / phantom ----------
@@ -437,22 +390,19 @@ print(
     f"OK (ii): {mint_seen} mint qty_net == net ví; OK (iii): FLCW fee 3% → qty_net/qty=0.97"
 )
 
-# (iv) _handle_tx keeps every hop in track/log, aggregates wallet-trade USD by
-#      (CA, side) before the DB's unique (wallet, ca, tx, side) key.
-_posts: list[dict] = []
+# (iv) Keep every raw hop in logs; send one aggregated trade per (CA, side)
+#      through the API's unique (wallet, ca, tx, side) key.
 _wrote: list[dict] = []
 _trade_posts: list[tuple[dict, float | None]] = []
 _tgt: list[int] = []
-_o_warm, _o_track, _o_watch, _o_jl, _o_tgt, _o_det = (
+_o_warm, _o_watch, _o_jl, _o_tgt, _o_det = (
     ww._warm_prices,
-    ww.track_event,
     ww.watch_trade_event,
     ww.jl_write,
     ww._target_event,
     ww.detect_swaps,
 )
 setattr(ww, "_warm_prices", lambda tx: None)
-setattr(ww, "track_event", _posts.append)
 setattr(ww, "watch_trade_event", lambda ev, bt=None: _trade_posts.append((ev, bt)))
 setattr(ww, "jl_write", _wrote.append)
 setattr(ww, "_target_event", lambda *a, **k: (_tgt.append(1), None)[1])
@@ -489,20 +439,18 @@ try:
         and ((e["side"] == "BUY" and (e.get("qty_net") or 0) > 0) or e["side"] == "SELL")
     }
     assert len(_trade_posts) == len(real_groups), (_trade_posts, real_groups)
-    assert len(_posts) == n_hop, f"post phải ĐỦ {n_hop} hop, got {len(_posts)}"
     assert all("ts_epoch_ms" in e and e["ts_epoch_ms"] > 0 for e in _wrote), _wrote
     assert all(
         e["ts_epoch_ms"] == int((tx_m.get("blockTime") or 0) * 1000) for e in _wrote
     ), "ts_epoch_ms phải từ blockTime"
-    _posts.clear()
     _trade_posts.clear()
     ww._handle_tx(tx_m, "SIGmulti", [w_m], st_m)  # cùng sig ⇒ dedupe
-    assert not _posts and not _trade_posts, f"dedupe hỏng: {_posts} {_trade_posts}"
+    assert not _trade_posts, f"dedupe hỏng: {_trade_posts}"
 
     # §4.1 phantom CHƯA fix (xem (i)): hiện row phantom vẫn được post như mọi row khác.
 
-    # Multiple hops for one CA stay individually logged/tracked but collapse
-    # to one sum-valued wallet-trade row under the server's unique transaction key.
+    # Multiple hops for one CA remain individually logged but produce one
+    # sum-valued trade under the server's unique transaction key.
     _base = {
         "ts": "09-21 10:00:00",
         "slot": 1,
@@ -612,14 +560,9 @@ try:
         "detect_swaps",
         lambda tx, wallet, trace=None, with_transfers=False: list(stub),
     )
-    _posts.clear(), _wrote.clear()
+    _wrote.clear()
     _trade_posts.clear()
     ww._handle_tx(tx_m, "SIGstub", [w_m], st_m)
-    assert [(p["mint"], p["side"]) for p in _posts] == [
-        ("Mint1", "BUY"), ("Mint2", "BUY"), ("Mint2", "BUY"),
-        ("Mint2", "BUY"), ("Mint3", "BUY"), ("Mint5", "BUY"),
-        ("Mint5", "SELL"),
-    ], _posts
     grouped = {(e["mint"], e["side"]): e for e, _ in _trade_posts}
     assert set(grouped) == {
         ("Mint1", "BUY"), ("Mint2", "BUY"), ("Mint3", "BUY"),
@@ -724,7 +667,6 @@ try:
     # Route endpoint can exist only as the quote side of the final SELL.
     route_only = route[:3]
     setattr(ww, "detect_events", lambda tx, wallet: list(route_only))
-    _posts.clear()
     _trade_posts.clear()
     ww._handle_tx(tx_m, "SIGroute-only", [w_m], st_m)
     quote_only_buys = [
@@ -733,16 +675,14 @@ try:
     assert len(quote_only_buys) == 1, quote_only_buys
     assert abs(quote_only_buys[0]["quote_usd"] - 2686.5) < 1e-8, quote_only_buys[0]
     assert quote_only_buys[0]["qty"] == 17492650.024268, quote_only_buys[0]
-    assert any(e["mint"] == "MintFinal" and e["side"] == "BUY" for e in _posts), _posts
 finally:
     setattr(ww, "_warm_prices", _o_warm)
-    setattr(ww, "track_event", _o_track)
     setattr(ww, "watch_trade_event", _o_watch)
     setattr(ww, "jl_write", _o_jl)
     setattr(ww, "_target_event", _o_tgt)
     setattr(ww, "detect_swaps", _o_det)
 print(
-    "OK (iv): per-hop CA/log + per-(CA,side) wallet-trade aggregation + dedupe + fallback"
+    "OK (iv): per-hop log + per-(CA,side) single-ingest aggregation + dedupe + fallback"
 )
 # (v) §7.3 rotate + gzip theo NGÀY UTC: file live `events.jsonl` GIỮ NGUYÊN TÊN
 #     (ruleA_real_regress.py đọc thẳng path đó) — bản cũ chỉ được nén sang

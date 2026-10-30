@@ -10,7 +10,6 @@ import {
   getMetricPollCache,
   isPassTier,
   latestSnapshot,
-  latestWatchTradeTsByCa,
   listMetricPollCache,
   listTiers,
   listTrackedCas,
@@ -67,9 +66,9 @@ export interface TrackedWalletStat {
   buys: number;
   /** watch SELL count inside the window. */
   sells: number;
-  /** Current token balance USD for this (wallet, CA) — absent when never measured (NULL). */
+  /** Current token balance USD; 0 when zero_holding confirms empty; absent when unmeasured or a positive holding lacks price. */
   balUsd?: number;
-  /** Current balance in token units from wallet_token_state; absent when not measured. */
+  /** Current token balance in units; 0 when zero_holding confirms empty; absent when unmeasured. */
   holdingAmount?: number;
   /** Current token balance as a share of total supply; absent when balance/supply is unknown. */
   holdingPct?: number;
@@ -144,8 +143,8 @@ export interface TokenSignal {
   /** Net USD tracked wallets put in over the last 24h (buys − sells); may be negative. */
   trackedInflow: number;
   /**
-   * Newest source='watch' trade ts (epoch ms — buy OR sell) from a member wallet inside the
-   * inflow window; 0 = no tracked activity yet. Orders the table (newest activity first).
+   * Newest source='watch' buy OR sell by a displayed native member, in the 24h
+   * activity window; chain-scoped, with 0 when no displayed trade exists.
    */
   trackedActivityAt: number;
   /** Latest captured FOMO buy/sell or native watch trade for this (chain, CA), across all history. */
@@ -206,15 +205,9 @@ function supplyShare(holdingAmount: number | null, supply: number | null): numbe
  * name-list + gross-buy-sum pair (contract change 2026-09-24: the FE
  * renders per-wallet rows, and inflow goes NET = buys − sells).
  *
- * MEMBERSHIP provenance unchanged (user 2026-09-22, verbatim: "giờ chỉ có một nguồn là
- * detect buy bằng wallet watch thì mới thêm wallet và CA đó vào, từ đó bắt đầu
- * tính inflow, không backfill lại lịch sử"): a wallet is listed ONLY on a
- * source='watch' BUY — now EVER-BOUGHT (permanent, no time window; the old 7d
- * TRACKED_BY_WINDOW_MS bound dropped an early buyer from the CA's `Tracked by`).
- * The wallet_watch Solana-RPC
- * detector is the sole writer that lights it up, a merely-HOLDING wallet does
- * not qualify, and source='nansen'/retired-sweep rows never count (NO BACKFILL).
- * A sell-only wallet is absent and its sells uncounted.
+ * MEMBERSHIP comes from an ever-observed watch BUY, a SOL holding snapshot, or
+ * a positive measured wallet balance. Discovery can list existing holders with
+ * zero buys, sells, and trades; it does not backfill or fabricate trade history.
  *
  * The stats (inflow/buys/sells/lastTs) cover the 24h inflow window — NARROWER
  * than membership, so a member whose newest buy is older appears with zero
@@ -242,25 +235,31 @@ export function trackedWalletStats(ca: string, chain: string, now: number): Trac
               SUM(CASE WHEN t.side = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.side = 'sell' THEN 1 ELSE 0 END) AS sells,
               COALESCE(MAX(t.ts), 0) AS lastTs,
-              MAX(s.balance_usd) AS balUsd,
-              MAX(s.token_amount) AS holdingAmount,
+              COALESCE(MAX(s.balance_usd), MAX(CASE WHEN zh.zero_at IS NOT NULL THEN 0 END)) AS balUsd,
+              COALESCE(MAX(s.token_amount), MAX(CASE WHEN zh.zero_at IS NOT NULL THEN 0 END)) AS holdingAmount,
               MAX(state.supply) AS supply
          FROM wallets w
          LEFT JOIN wallet_trades t
            ON t.wallet_id = w.id AND t.ca = @ca AND t.chain = @chain AND t.source = 'watch' AND t.ts >= @statSince
          LEFT JOIN wallet_token_state s ON s.wallet_id = w.id AND s.ca = @ca AND s.chain = @chain
+         LEFT JOIN zero_holdings zh
+           ON zh.member_type = 'wallet' AND zh.member_id = w.id AND zh.ca = @ca AND zh.chain = @chain
          LEFT JOIN token_state state ON state.ca = @ca AND state.chain = @chain
-         WHERE EXISTS (SELECT 1 FROM wallet_trades b
-                        WHERE b.wallet_id = w.id AND b.ca = @ca AND b.chain = @chain
-                          AND b.side = 'buy' AND b.source = 'watch'
-                          AND NOT EXISTS (
-                            SELECT 1 FROM zero_holdings zh
-                             WHERE zh.member_type = 'wallet'
-                               AND zh.member_id = b.wallet_id
-                               AND zh.ca = b.ca
-                               AND zh.chain = b.chain
-                               AND zh.zero_at <= @statSince
-                          ))
+         WHERE (
+           EXISTS (SELECT 1 FROM wallet_trades b
+                    WHERE b.wallet_id = w.id AND b.ca = @ca AND b.chain = @chain
+                      AND b.side = 'buy' AND b.source = 'watch'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM zero_holdings zh
+                         WHERE zh.member_type = 'wallet' AND zh.member_id = b.wallet_id
+                           AND zh.ca = b.ca AND zh.chain = b.chain AND zh.zero_at <= @statSince
+                      ))
+           OR (@chain = 'sol' AND EXISTS (
+             SELECT 1 FROM sol_wallet_holding_membership h
+              WHERE h.wallet_id = w.id AND h.ca = @ca AND h.chain = 'sol'
+           ))
+           OR s.token_amount > 0
+         )
          GROUP BY w.id
          ORDER BY lastTs DESC, w.name`,
     )
@@ -305,12 +304,17 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
           WHERE b.side = 'buy' AND b.source = 'watch'
             AND NOT EXISTS (
               SELECT 1 FROM zero_holdings zh
-               WHERE zh.member_type = 'wallet'
-                 AND zh.member_id = b.wallet_id
-                 AND zh.ca = b.ca
-                 AND zh.chain = b.chain
-                 AND zh.zero_at <= @statSince
-            ))
+               WHERE zh.member_type = 'wallet' AND zh.member_id = b.wallet_id
+                 AND zh.ca = b.ca AND zh.chain = b.chain AND zh.zero_at <= @statSince
+            )
+         UNION
+         SELECT h.chain, h.ca, h.wallet_id FROM sol_wallet_holding_membership h
+          JOIN wallets hw ON hw.id = h.wallet_id AND hw.chain = 'sol'
+         UNION
+         SELECT s.chain, s.ca, s.wallet_id FROM wallet_token_state s
+          JOIN wallets hw ON hw.id = s.wallet_id AND hw.chain = s.chain
+         WHERE s.token_amount > 0
+       )
        SELECT m.chain AS chain,
               m.ca AS ca,
               w.address AS address,
@@ -321,14 +325,16 @@ export function trackedWalletStatsByCa(now: number): Map<string, TrackedWalletSt
               SUM(CASE WHEN t.side = 'buy' THEN 1 ELSE 0 END) AS buys,
               SUM(CASE WHEN t.side = 'sell' THEN 1 ELSE 0 END) AS sells,
               COALESCE(MAX(t.ts), 0) AS lastTs,
-              MAX(s.balance_usd) AS balUsd,
-              MAX(s.token_amount) AS holdingAmount,
+              COALESCE(MAX(s.balance_usd), MAX(CASE WHEN zh.zero_at IS NOT NULL THEN 0 END)) AS balUsd,
+              COALESCE(MAX(s.token_amount), MAX(CASE WHEN zh.zero_at IS NOT NULL THEN 0 END)) AS holdingAmount,
               MAX(state.supply) AS supply
          FROM members m
          JOIN wallets w ON w.id = m.wallet_id
          LEFT JOIN wallet_trades t
            ON t.wallet_id = m.wallet_id AND t.ca = m.ca AND t.chain = m.chain AND t.source = 'watch' AND t.ts >= @statSince
          LEFT JOIN wallet_token_state s ON s.wallet_id = m.wallet_id AND s.ca = m.ca AND s.chain = m.chain
+         LEFT JOIN zero_holdings zh
+           ON zh.member_type = 'wallet' AND zh.member_id = m.wallet_id AND zh.ca = m.ca AND zh.chain = m.chain
          LEFT JOIN token_state state ON state.ca = m.ca AND state.chain = m.chain
         GROUP BY m.chain, m.ca, m.wallet_id
         ORDER BY m.chain, m.ca, lastTs DESC, w.name`,
@@ -470,8 +476,8 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
               COUNT(t.id) AS trades,
               COALESCE(MAX(t.ts), 0) AS lastTs,
               CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                         AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                   WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
+                         AND (p.amount IS NULL OR p.verified_at IS NULL OR p.verified_at < @apiSince OR a.captured_at >= p.verified_at) THEN a.amount
+                   WHEN p.amount IS NOT NULL AND p.verified_at >= @apiSince THEN p.amount
                    WHEN h.measured_at >= @apiSince THEN h.amount END AS holdingAmount,
               MAX(CASE WHEN p.fetched_at >= @apiSince THEN p.price_usd END) AS positionPrice,
               MAX(state.price) AS tokenPrice,
@@ -490,7 +496,7 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
          LEFT JOIN (
            SELECT p.fomo_user_id, p.ca, p.chain, p.trade_id, p.status, p.amount, p.cost_basis_usd,
                   p.avg_entry_price, p.price_usd, p.realized_pnl_usd, p.unrealized_pnl_usd,
-                  COALESCE(ps.checked_at, p.fetched_at) AS fetched_at
+                  p.fetched_at, COALESCE(p.verified_at, p.fetched_at) AS verified_at
              FROM fomo_positions p
              LEFT JOIN fomo_position_snapshots ps ON ps.fomo_user_id = p.fomo_user_id
          ) p
@@ -517,6 +523,11 @@ export function fomoUserStats(ca: string, chain: string, now: number): FomoUserS
                                AND zh.chain = bp.chain
                                AND zh.zero_at <= @statSince
                           )))
+            OR EXISTS (SELECT 1 FROM fomo_api_holdings ah
+                         JOIN fomo_api_balance_snapshots aps
+                           ON aps.fomo_user_id = ah.fomo_user_id AND aps.captured_at = ah.captured_at
+                        WHERE ah.fomo_user_id = u.id AND ah.ca = @ca AND ah.chain = @chain
+                          AND ah.amount > 0 AND ah.captured_at >= @apiSince AND aps.available != 0)
         GROUP BY u.id
         ORDER BY lastTs DESC, u.handle`,
     )
@@ -581,7 +592,13 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
                  AND zh.ca = p.ca
                  AND zh.chain = p.chain
                  AND zh.zero_at <= @statSince
-            ))
+            )
+          UNION
+         SELECT DISTINCT a.chain, a.ca, a.fomo_user_id
+           FROM fomo_api_holdings a
+           JOIN fomo_api_balance_snapshots s
+             ON s.fomo_user_id = a.fomo_user_id AND s.captured_at = a.captured_at
+          WHERE a.amount > 0 AND a.captured_at >= @apiSince AND s.available != 0)
        SELECT m.chain AS chain,
               m.ca AS ca,
               u.handle AS handle,
@@ -595,8 +612,8 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
               COUNT(t.id) AS trades,
               COALESCE(MAX(t.ts), 0) AS lastTs,
               CASE WHEN a.fomo_user_id IS NOT NULL AND a.captured_at >= @apiSince AND s.captured_at = a.captured_at AND s.available != 0
-                         AND (p.amount IS NULL OR p.fetched_at IS NULL OR p.fetched_at < @apiSince OR a.captured_at >= p.fetched_at) THEN a.amount
-                   WHEN p.amount IS NOT NULL AND p.fetched_at >= @apiSince THEN p.amount
+                         AND (p.amount IS NULL OR p.verified_at IS NULL OR p.verified_at < @apiSince OR a.captured_at >= p.verified_at) THEN a.amount
+                   WHEN p.amount IS NOT NULL AND p.verified_at >= @apiSince THEN p.amount
                    WHEN h.measured_at >= @apiSince THEN h.amount END AS holdingAmount,
               MAX(CASE WHEN p.fetched_at >= @apiSince THEN p.price_usd END) AS positionPrice,
               MAX(state.price) AS tokenPrice,
@@ -612,7 +629,7 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
          LEFT JOIN (
            SELECT p.fomo_user_id, p.ca, p.chain, p.trade_id, p.status, p.amount, p.cost_basis_usd,
                   p.avg_entry_price, p.price_usd, p.realized_pnl_usd, p.unrealized_pnl_usd,
-                  COALESCE(ps.checked_at, p.fetched_at) AS fetched_at
+                  p.fetched_at, COALESCE(p.verified_at, p.fetched_at) AS verified_at
              FROM fomo_positions p
              LEFT JOIN fomo_position_snapshots ps ON ps.fomo_user_id = p.fomo_user_id
          ) p
@@ -653,21 +670,24 @@ export function fomoUserStatsByCa(now: number): Map<string, FomoUserStat[]> {
 }
 
 /**
- * Σ current token amount (token units) for one CA, over the wallets that CA is
- * `Tracked by` only — same source='watch' BUY provenance as the trackedWalletStats
- * membership, so Tracked holding can never count a wallet the rows above do not
- * list (user 2026-09-23). The sweep no longer refreshes unlinked wallets, so their
- * leftover rows must not be summed. Scoped to one (chain, ca) identity
- * (user 2026-09-28) so the same address on another chain cannot inflate it.
+ * `Tracked by` only — watch BUY history, SOL snapshot membership, or a positive
+ * measured balance. Unlinked stale zero/negative rows are not summed. Scoped to
+ * one (chain, ca) identity so the same address on another chain cannot inflate it.
  */
 export function sumHoldingAmount(ca: string, chain: string): number {
   const row = getDb()
     .prepare(
       `SELECT COALESCE(SUM(s.token_amount), 0) AS total FROM wallet_token_state s
         WHERE s.ca = ? AND s.chain = ?
-          AND EXISTS (SELECT 1 FROM wallet_trades t
-                       WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
-                         AND t.side = 'buy' AND t.source = 'watch')`,
+          AND (EXISTS (SELECT 1 FROM wallet_trades t
+                        WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
+                          AND t.side = 'buy' AND t.source = 'watch')
+               OR (s.chain = 'sol' AND EXISTS (
+                 SELECT 1 FROM sol_wallet_holding_membership h
+                  WHERE h.wallet_id = s.wallet_id AND h.ca = s.ca AND h.chain = 'sol'
+               ))
+               OR s.token_amount > 0)
+      `,
     )
     .get(ca, chain) as { total: number };
   return row.total;
@@ -676,10 +696,9 @@ export function sumHoldingAmount(ca: string, chain: string): number {
 /**
  * Batched sumHoldingAmount for the /api/signals pass (N+1 fix): ONE GROUP BY
  * over wallet_token_state keyed `${chain}:${ca}` (same equality as the per-CA
- * `WHERE s.ca = ? AND s.chain = ?`). Filters are verbatim the per-CA ones — only
- * wallets with ANY source='watch' BUY (NO time bound) are summed. A CA with no
- * qualifying rows is ABSENT — callers read `map.get(`${chain}:${ca}`) ?? 0`,
- * matching the per-CA COALESCE(SUM, 0).
+ * `WHERE s.ca = ? AND s.chain = ?`). Membership follows the same rule as the
+ * per-CA query. A CA with no qualifying rows is ABSENT — callers read
+ * `map.get(`${chain}:${ca}`) ?? 0`, matching the per-CA COALESCE(SUM, 0).
  */
 export function sumHoldingAmountByCa(): Map<string, number> {
   const rows = getDb()
@@ -688,6 +707,11 @@ export function sumHoldingAmountByCa(): Map<string, number> {
         WHERE EXISTS (SELECT 1 FROM wallet_trades t
                        WHERE t.wallet_id = s.wallet_id AND t.ca = s.ca AND t.chain = s.chain
                          AND t.side = 'buy' AND t.source = 'watch')
+           OR (s.chain = 'sol' AND EXISTS (
+             SELECT 1 FROM sol_wallet_holding_membership h
+              WHERE h.wallet_id = s.wallet_id AND h.ca = s.ca AND h.chain = 'sol'
+           ))
+           OR s.token_amount > 0
         GROUP BY s.chain, s.ca`,
     )
     .all() as { chain: string; ca: string; total: number }[];
@@ -892,7 +916,6 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
   // next /api/signals without a restart.
   const th = getThresholds();
   const out: TokenSignal[] = [];
-  const lastActivityAt = latestWatchTradeTsByCa(now - 86_400_000);
   // User-set tiers (token_tiers) keyed `${chain}:${ca}` — one read for the whole pass.
   const tierByCa = new Map(listTiers().map((t) => [`${t.chain}:${t.ca}`, t.tier] as const));
   // Batched reads keep database round trips independent of CA count.
@@ -979,6 +1002,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
     // One query feeds both the FE rows and the token total — Σ rows by contract,
     // so the token figure can never drift from what the rows add up to.
     const trackedWallets = walletStatsByCa.get(`${c.chain}:${c.address}`) ?? [];
+    const trackedActivityAt = trackedWallets.reduce((latest, wallet) => Math.max(latest, wallet.lastTs), 0);
     const trackedInflow = trackedWallets.reduce((sum, w) => sum + w.inflow, 0);
     // The FOMO watch list rides along but never feeds trackedInflow/ordering —
     // separate list, separate stats, no leakage into the wallet score path.
@@ -1017,7 +1041,7 @@ export function assembleSignals(now: number = Date.now(), allFactors = getDebugA
       ...(st?.market_cap != null ? { marketCap: st.market_cap } : {}),
       ...(st?.market_cap_history_json ? { marketCapHistory: downsampleHistory(JSON.parse(st.market_cap_history_json) as { t: number; value: number }[], LIST_HISTORY_POINTS) } : {}),
       trackedInflow,
-      trackedActivityAt: lastActivityAt.get(c.address) ?? 0,
+      trackedActivityAt,
       fomoActivityAt: fomoActivityAt.get(`${c.chain}:${c.address}`) ?? 0,
       trackedHolding,
       volume24h: st?.volume24h ?? 0,

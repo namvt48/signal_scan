@@ -5,11 +5,13 @@ Chạy: python3 scripts/test_fomo_watch.py
 Không gọi mạng/API thật: fetch swaps và POST ingest đều được stub.
 """
 
+import asyncio
 import json
 import os
 import re
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,6 +20,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from watchers.fomo import feed  # noqa: E402
+_request_bytes_with_retry = feed._request_bytes_with_retry
 
 feed.save_state = lambda st: None
 
@@ -226,6 +229,38 @@ st = {"deployed_at": t0, "crawl_at": {"fomo-user-1": t0 + 6_000}, "first_seen_at
 emitted = poll_at(t0 + 7_000, st, [swap(id="cut", createdAt=t0 + 6_500)], truncated=True)
 check(emitted == 0 and posted == [] and st["crawl_at"]["fomo-user-1"] == t0 + 6_000,
       "truncation: window and dedupe state are preserved")
+
+# A guard-blocked poll is one failed fetch, not an empty page: preserve the
+# account cursor and last-good timestamp until a later scheduled cycle.
+feed._seen = set()
+st = {"deployed_at": t0, "crawl_at": {"fomo-user-1": t0 + 6_000}, "first_seen_at": {},
+      "last_ts": t0 + 5_000, "emitted": 2}
+guard_fetches = []
+feed._fetch_swaps = lambda identity, cycle_id, **kwargs: (guard_fetches.append(1) or None)
+with patch.object(feed.time, "time", return_value=(t0 + 7_000) / 1000):
+    emitted = feed._poll_user(user, st, "cycle-guard-blocked")
+check(emitted == 0 and len(guard_fetches) == 1, "guard denial: one fetch and no immediate retry")
+check(st["crawl_at"]["fomo-user-1"] == t0 + 6_000 and st["last_ts"] == t0 + 5_000,
+      "guard denial: cursor and last-good timestamp stay unchanged")
+
+feed._request_bytes_with_retry = _request_bytes_with_retry
+for guard_status in (403, 429):
+    attempted = []
+    error = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+        "http://bridge.invalid/swaps", guard_status, "guard denied",
+        {"X-Fomo-Guard": "suspended", "X-Fomo-Retry-Handled": "1"}, None,
+    )
+
+    def raise_guard_error(*args, **kwargs):
+        attempted.append(1)
+        raise error
+
+    with patch.object(feed.urllib.request, "urlopen", side_effect=raise_guard_error):
+        try:
+            feed._request_bytes_with_retry(feed.urllib.request.Request("http://bridge.invalid/swaps"))
+        except __import__("urllib.error", fromlist=["HTTPError"]).HTTPError:
+            pass
+    check(len(attempted) == 1, f"bridge {guard_status}: no consumer retry")
 
 # Two fills in the same millisecond both emit; the next window skips the boundary.
 feed._seen = set()
@@ -439,6 +474,8 @@ feed._fetch_trade_swaps = lambda trade_id, cycle_id: [
 emitted, size, ok = feed._poll_evm_ca({"chain": "robinhood", "address": evm_ca}, {"fomo-user-1"}, st, "evm-trade")
 check(ok and emitted == 2 and len(posted) == 2, "evm trade: feed fill expands to both directions")
 check([b["eventId"] for b in posted] == ["fomo-swap:evm-current", "fomo-swap:evm-history"], "evm trade: swap ids use the canonical id")
+check(posted[0]["provenance"] == "cursor" and posted[1]["provenance"] == "historical",
+      "evm trade: current fill may discover CAs, expanded history may not")
 check(posted[1]["type"] == "buy" and posted[1]["tradeUsd"] == 4208.17, "evm trade: historical buy carries trade USD")
 check(posted[1]["usdValue"] == 4208.17, "evm trade: historical buy carries entry size")
 check(posted[0]["type"] == "sell" and posted[0]["tradeUsd"] == 2738.59, "evm trade: sell uses proceeds")
@@ -569,6 +606,77 @@ emitted, size, ok = feed._poll_evm_ca(
 )
 check(ok and emitted == 1, "cutover: a new fill still ingests")
 check(posted[-1]["eventId"] == "fomo-swap:new-fill", "cutover: new fill uses the canonical id")
+
+def assert_poll_keeps_heartbeat_alive():
+    beat_times = []
+    original_sleep = asyncio.sleep
+
+    def blocking_user_poll(*_args):
+        time.sleep(0.08)
+        return 0
+
+    async def quick_sleep(_delay):
+        await original_sleep(0.005)
+
+    async def run():
+        heartbeat = asyncio.create_task(feed._beat_loop())
+        try:
+            await feed._poll_loop({"crawl_at": {}, "first_seen_at": {}}, once=True)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+
+    with patch.object(feed, "_wl", {"users": [user], "next": 0, "skipped": 0}), \
+         patch.object(feed, "refresh_watch_list"), \
+         patch.object(feed, "_poll_user", side_effect=blocking_user_poll), \
+         patch.object(feed, "_beat", side_effect=lambda: beat_times.append(time.monotonic())), \
+         patch.object(feed, "_diagnostic"), \
+         patch.object(feed, "FOMO_EVM_FEED", False), \
+         patch.object(feed.asyncio, "sleep", quick_sleep):
+        asyncio.run(run())
+    check(len(beat_times) >= 3, "poll sweep: heartbeat continues while sync user poll is blocked")
+
+def assert_poll_interval_counts_from_cycle_start():
+    delays = []
+    interval = 0.25
+
+    class StopAfterScheduledSleep(Exception):
+        pass
+
+    def blocking_user_poll(*_args):
+        time.sleep(0.08)
+        return 0
+
+    async def capture_sleep(delay):
+        delays.append(delay)
+        raise StopAfterScheduledSleep
+
+    async def run():
+        try:
+            await feed._poll_loop({"crawl_at": {}, "first_seen_at": {}}, once=False)
+        except StopAfterScheduledSleep:
+            pass
+
+    with patch.object(feed, "_wl", {"users": [user], "next": 0, "skipped": 0}), \
+         patch.object(feed, "refresh_watch_list"), \
+         patch.object(feed, "_poll_user", side_effect=blocking_user_poll), \
+         patch.object(feed, "_beat"), \
+         patch.object(feed, "_diagnostic"), \
+         patch.object(feed, "FOMO_EVM_FEED", False), \
+         patch.object(feed, "FOMO_POLL_INTERVAL_S", interval), \
+         patch.object(feed.asyncio, "sleep", capture_sleep):
+        asyncio.run(run())
+    check(len(delays) == 1 and 0 <= delays[0] < 0.20,
+          "poll cadence: sleep is reduced by sweep duration")
+
+
+assert_poll_interval_counts_from_cycle_start()
+
+
+assert_poll_keeps_heartbeat_alive()
 
 tmp.cleanup()
 print(f"\n{total - fail}/{total} checks passed")

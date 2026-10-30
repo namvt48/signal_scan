@@ -119,6 +119,7 @@ export interface PolicyEntry {
 export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'GET', path: '/api/health', access: 'public' }, // monitors — ALWAYS public
   { method: 'GET', path: '/api/me', access: ALL_ROLES },
+  { method: 'GET', path: '/api/signals/page', access: ALL_ROLES },
   { method: 'GET', path: '/api/signals', access: ALL_ROLES },
   { method: 'GET', path: '/api/token-avatar/:chain/:ca', access: 'public' },
   { method: 'GET', path: '/api/settings', access: ALL_ROLES }, // the daemon reads it
@@ -136,7 +137,7 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'DELETE', path: '/api/wallets/:id', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/wallets/import', access: ADMIN_ONLY },
   { method: 'GET', path: '/api/tracked-cas', access: ALL_ROLES },
-  { method: 'POST', path: '/api/tracked-cas', access: ADMIN_SERVICE }, // wallet_watch daemon
+  { method: 'POST', path: '/api/tracked-cas', access: ADMIN_ONLY },
   { method: 'DELETE', path: '/api/tracked-cas/:id', access: ADMIN_ONLY },
   { method: 'PUT', path: '/api/tokens/:chain/:ca/note', access: ADMIN_ONLY },
   { method: 'PUT', path: '/api/tier', access: ADMIN_ONLY },
@@ -150,6 +151,8 @@ export const ROUTE_POLICY: readonly PolicyEntry[] = [
   { method: 'PATCH', path: '/api/fomo-users/:id', access: ADMIN_ONLY },
   { method: 'DELETE', path: '/api/fomo-users/:id', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/fomo-users/import', access: ADMIN_ONLY },
+  { method: 'GET', path: '/api/fomo/follow-sync', access: ADMIN_ONLY },
+  { method: 'POST', path: '/api/fomo/follow-sync', access: ADMIN_ONLY },
   { method: 'POST', path: '/api/fomo-watch/trades', access: ADMIN_SERVICE }, // fomo_watch daemon
 ];
 

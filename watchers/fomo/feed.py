@@ -381,6 +381,25 @@ def _new_cycle_id() -> str:
     return f"{time.time_ns()}-{next(_DIAGNOSTIC_SEQUENCE)}"
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            from datetime import datetime, timezone
+
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
 def _request_bytes_with_retry(
     req: urllib.request.Request,
     on_attempt: Any = None,
@@ -388,7 +407,10 @@ def _request_bytes_with_retry(
     timeout: float = _INGEST_TIMEOUT_S,
 ) -> bytes:
     """Read a complete response inside each bounded HTTP/transport attempt."""
-    for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
+    # Bridge GET retries belong to the bridge, not this consumer. Keep the
+    # existing bounded retries only for local idempotent ingest POSTs.
+    max_attempts = _HTTP_MAX_ATTEMPTS if req.get_method() == "POST" else 1
+    for attempt in range(1, max_attempts + 1):
         started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -410,14 +432,12 @@ def _request_bytes_with_retry(
                     status_code=ex.code,
                     duration_ms=round((time.monotonic() - started) * 1000, 3),
                 )
-            if ex.code not in _RETRYABLE_HTTP or attempt == _HTTP_MAX_ATTEMPTS:
+            if ex.code not in _RETRYABLE_HTTP or attempt == max_attempts:
                 raise
             delay = min(0.5 * (2 ** (attempt - 1)), 2.0)
-            try:
-                retry_after = float(ex.headers.get("Retry-After", ""))
-                delay = min(max(delay, retry_after), 2.0)
-            except (TypeError, ValueError):
-                pass
+            retry_after = _retry_after_seconds(ex.headers.get("Retry-After"))
+            if retry_after is not None:
+                delay = max(delay, retry_after)
         except (
             urllib.error.URLError,
             TimeoutError,
@@ -430,7 +450,7 @@ def _request_bytes_with_retry(
                     error_type=type(ex).__name__,
                     duration_ms=round((time.monotonic() - started) * 1000, 3),
                 )
-            if attempt == _HTTP_MAX_ATTEMPTS:
+            if attempt == max_attempts:
                 raise
             delay = min(0.5 * (2 ** (attempt - 1)), 2.0)
         time.sleep(delay)
@@ -785,6 +805,7 @@ def _trade_swap_body(
         return None, reason
     if body["chain"] != chain or not _same_token(body["tokenAddress"], ca, chain):
         return None, "other_token"
+    body["provenance"] = "historical"
     body["eventId"] = f"fomo-swap:{swap_id}"
     if body["type"] == "buy" and "tradeUsd" in body:
         body["usdValue"] = body["tradeUsd"]
@@ -885,6 +906,7 @@ def _poll_evm_ca(
     key = f"{chain}:{ca}"
     cursors = st.setdefault("evm_cursors", {})
     cursor = _num(cursors.get(key))
+    bootstrapping = cursor is None
     if cursor is None:
         # Bootstrap skips old history, but keeps a short grace window anchored
         # to NOW: when a watched buy pulls a new CA into tracking, its recent
@@ -918,6 +940,7 @@ def _poll_evm_ca(
                 feed_id=item.get("id"),
             )
             continue
+        body["provenance"] = "historical" if bootstrapping else "cursor"
         # The token feed is not user-scoped: keep only watched traders.
         if body.get("userId") not in watched:
             cursor = float(at)
@@ -954,6 +977,9 @@ def _poll_evm_ca(
                     # it is not, keep the feed-mapped body as a fallback.
                     if body["eventId"] not in derived_ids:
                         derived.append(body)
+                    for candidate in derived:
+                        if candidate["eventId"] == body["eventId"]:
+                            candidate["provenance"] = "historical" if bootstrapping else "cursor"
                     bodies = derived
 
         failed = False
@@ -1273,6 +1299,7 @@ def _poll_user(user: dict[str, str], st: dict[str, Any], cycle_id: str) -> int:
                 swap_id=swap.get("id"),
             )
             continue
+        body["provenance"] = "cursor"
         event_id = body["eventId"]
         if event_id in _seen:
             continue
@@ -1322,9 +1349,11 @@ async def _beat_loop() -> None:
 
 async def _poll_loop(st: dict[str, Any], once: bool) -> None:
     first = True
+    loop = asyncio.get_running_loop()
     while True:
+        cycle_started_at = loop.time()
         try:
-            refresh_watch_list(st, force=first)
+            await asyncio.to_thread(refresh_watch_list, st, force=first)
             users = list(_wl["users"])
             cycle_id = _new_cycle_id()
             _diagnostic(
@@ -1335,7 +1364,7 @@ async def _poll_loop(st: dict[str, Any], once: bool) -> None:
             )
             for user in users:
                 try:
-                    _poll_user(user, st, cycle_id)
+                    await asyncio.to_thread(_poll_user, user, st, cycle_id)
                 except Exception as ex:
                     print(
                         f"  ! fomo poll {user['identity'][:8]}…: {type(ex).__name__}",
@@ -1348,8 +1377,8 @@ async def _poll_loop(st: dict[str, Any], once: bool) -> None:
                         error_type=type(ex).__name__,
                     )
             if FOMO_EVM_FEED:
-                refresh_evm_cas(force=first)
-                _poll_evm_feed(st, cycle_id)
+                await asyncio.to_thread(refresh_evm_cas, force=first)
+                await asyncio.to_thread(_poll_evm_feed, st, cycle_id)
             _beat()
             _diagnostic(
                 "poll_cycle_finished",
@@ -1361,7 +1390,8 @@ async def _poll_loop(st: dict[str, Any], once: bool) -> None:
         first = False
         if once:
             return
-        await asyncio.sleep(FOMO_POLL_INTERVAL_S)
+        delay = max(0.0, FOMO_POLL_INTERVAL_S - (loop.time() - cycle_started_at))
+        await asyncio.sleep(delay)
 
 
 def run_feed(once: bool = False) -> None:

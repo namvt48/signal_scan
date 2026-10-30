@@ -5,7 +5,10 @@ import {
   findTrackedCa,
   getDb,
   getTokenState,
+  insertFomoUser,
+  insertFomoTrade,
   insertTrackedCa,
+  insertWallet,
   listTrackedCas,
   open,
   pruneUntrackedCas,
@@ -18,6 +21,7 @@ import { insertTrades, replaceWalletBalances, upsertTokenInfo } from '../src/ing
 import { assembleSignals, fomoUserStats, trackedWalletStats } from '../src/signals.js';
 import { insertWallet, insertFomoUser, insertFomoTrade } from '../src/db.js';
 import { setPollerDeps, walletSweep } from '../src/poller.js';
+import { configureWalletDiscovery, enqueueAllWalletDiscoveries, pendingWalletDiscoveryPairs, walletDiscoveryIdle } from '../src/wallet-holdings-discovery.js';
 import type { MarketDataProvider } from '../src/providers/provider.js';
 
 describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership', () => {
@@ -66,27 +70,27 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
     const prunedAddrs = pruned.map((r) => r.address);
 
     assert.ok(prunedAddrs.includes(CA), 'CA older than 48h must be in pruned list');
-    assert.ok(!prunedAddrs.includes(TIERED_CA), 'Tiered CA must never be pruned');
+    assert.ok(prunedAddrs.includes(TIERED_CA), 'user tier does not extend BUY activity');
 
-    // VERIFY: Data is NOT deleted!
     assert.notEqual(getTokenState(CA, 'sol'), undefined, 'token_state data MUST NOT be wiped on 48h deactivation');
 
-    // VERIFY: Status is inactive and excluded from listTrackedCas() and assembleSignals()
     const activeCas = listTrackedCas().map((c) => c.address);
     assert.ok(!activeCas.includes(CA), 'Inactive CA must be excluded from active tracking');
-    assert.ok(activeCas.includes(TIERED_CA), 'Tiered CA must remain active');
+    assert.ok(!activeCas.includes(TIERED_CA), 'Inactive tiered CA must be excluded from active tracking');
 
     const signals = assembleSignals(Date.now(), false);
     const signalCas = signals.map((s) => s.ca);
     assert.ok(!signalCas.includes(CA), 'Inactive CA must be removed from dashboard interface');
-    assert.ok(signalCas.includes(TIERED_CA), 'Tiered CA must be present on dashboard interface');
+    assert.ok(!signalCas.includes(TIERED_CA), 'Inactive tiered CA must be removed from dashboard interface');
 
-    // VERIFY: Reactivation on new BUY
     const existing = findTrackedCa(CA, 'sol', true);
     assert.equal(existing?.status, 'inactive');
 
-    // Simulate new BUY inflow: re-adding/enqueueing reactivates it
+    const wallet = insertWallet({ address: 'lifecycle-wallet', name: 'lifecycle', tags: [], chain: 'sol', source: 'watch' });
     const readded = insertTrackedCa({ address: CA, chain: 'sol', note: 'new-inflow-buy' });
+    insertTrades(wallet.id, [
+      { tx: 'reactivation-buy', ts: Date.now(), side: 'buy', ca: CA, chain: 'sol', amountUsd: 5, price: 1 },
+    ], 'watch');
     assert.equal(readded.status, 'queued');
 
     const activeCasAfter = listTrackedCas().map((c) => c.address);
@@ -94,6 +98,7 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
 
     const signalsAfter = assembleSignals(Date.now(), false);
     assert.ok(signalsAfter.map((s) => s.ca).includes(CA), 'Reactivated CA must reappear on dashboard interface');
+
   });
 
   it('Instance A Tracked by: wallet stays in Tracked by for 24h after holding hits 0%, removed after 24h', () => {
@@ -224,11 +229,12 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
     const CA_ACTIVE = 'sol-sweep-active-4444444444444444444444';
 
     // Setup mock provider
+    const polledCas: string[] = [];
     const provider: MarketDataProvider = {
       name: 'nansen',
       tokenInfo: async () => { throw new Error('unused'); },
       metric: async () => ({}),
-      walletTokenHoldings: async () => [],
+      walletTokenHoldings: async (_wallet, _chain, cas = []) => { polledCas.push(...cas); return []; },
     };
     setPollerDeps(provider, {} as never);
 
@@ -258,6 +264,10 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
     // Configure CA_48H: added 50 hours ago (> 48h) with no buy in window
     const fiftyHoursAgo = new Date(Date.now() - 50 * 3600 * 1000).toISOString();
     getDb().prepare('UPDATE tracked_cas SET added_at = ? WHERE address = ?').run(fiftyHoursAgo, CA_48H);
+    const oldWallet = insertWallet({ address: 'w-expired', chain: 'sol', name: 'WExpired', tags: [], source: 'watch' });
+    insertTrades(oldWallet.id, [
+      { tx: 'tx-old', ts: Date.now() - 50 * 3600 * 1000, side: 'buy', ca: CA_48H, chain: 'sol', amountUsd: 1000, price: 1 },
+    ], 'watch');
 
     // Configure CA_SCORE_0: complete 0/3 score (nansen_fresh_pct=0, t100_multiple=0, genesis_bal=999999)
     getDb().prepare(`
@@ -274,8 +284,20 @@ describe('CA Lifecycle (48h soft-deactivation) and 24h zero-holding membership',
     insertTrades(w.id, [{ tx: 'tx-act', ts: Date.now() - 3600 * 1000, side: 'buy', ca: CA_ACTIVE, chain: 'sol', amountUsd: 1000, price: 1 }], 'watch');
     replaceWalletBalances(w.id, 'sol', [{ ca: CA_ACTIVE, amount: 500 }]);
 
-    // Run walletSweep (which executes pruneUntrackedCas, zeroScoreGate, pruneTrackedByNone)
+    // This CA lifecycle check starts after the new full-holder discovery queue has completed.
+    configureWalletDiscovery(provider, {
+      sleep: async () => {},
+      solRpc: { getTokenAccountsByOwner: async () => new Map() },
+    });
+    enqueueAllWalletDiscoveries();
+    await walletDiscoveryIdle();
+    assert.deepEqual([...pendingWalletDiscoveryPairs()], [], 'the full discovery must finish before stale CA pruning');
+
+
+
+    // Run walletSweep (which executes pruneUntrackedCas, zeroScoreGate, pruneTrackedByNone).
     await walletSweep(provider as never);
+    assert.equal(polledCas.includes(CA_48H), false, 'expired CA must be deactivated before wallet polling');
 
     // VERIFY:
     // CA_48H: soft deactivated, token_state preserved!

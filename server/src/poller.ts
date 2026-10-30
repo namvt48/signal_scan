@@ -3,12 +3,17 @@
 // up against the rate limiter. ONE shared provider instance — constructing a
 // provider per sweep would double the leaky buckets.
 
+import { configureFomoDiscovery, enqueueAllFomoDiscoveries, fomoDiscoverySweep, isFomoDiscoveryPending } from './fomo-balance-discovery.js';
+import { configureWalletDiscovery, enqueueWalletDiscoveriesForCas, pendingWalletDiscoveryPairs, walletDiscoverySweep, serializeWalletHoldings, startWalletDiscovery } from './wallet-holdings-discovery.js';
+import { pruneDiscoveryTargets } from './wallet-discovery-state.js';
+import { runAlitaFollowSync } from './fomo-follow-sync.js';
 import { CA_INFLOW_WINDOW_MS, SNAPSHOT_RETENTION_MS, TRACKED_BY_WINDOW_MS, config } from './config.js';
 import { canonicalCa, type Chain } from './shared/chain.js';
 import {
   deleteSnapshotsBefore,
   deactivateTrackedCasByIds,
   findTrackedCa,
+  getWallet,
   getSetting,
   setSetting,
   getTokenState,
@@ -30,14 +35,15 @@ import {
   saveFomoApiRequestState,
   getFomoTradeEnrichmentTarget,
   getFomoPositionSnapshot,
+  listFomoBalanceRefillUsers,
   listFomoPositionTargets,
   listTrackedCas,
   pruneTrackedByNone,
   pruneUntrackedCas,
   trackedByPairs,
-  updateFomoTradeUsd,
   syncFomoPositionsSnapshot,
-  upsertFomoPosition,
+  syncFomoApiBalancesSnapshot,
+  updateFomoTradeUsd,
   upsertNansenSeries,
   watchedCasForWallet,
   type CaScoreGateRow,
@@ -291,6 +297,12 @@ function cacheSharedMarketResponse(
   }
 }
 
+function marketWorkAllowed(ca: string, chain: Chain, dataset: string): boolean {
+  if (findTrackedCa(ca, chain)) return true;
+  log.info('[collector] market_skipped', { ca, chain, dataset, reason: 'inactive_or_untracked' });
+  return false;
+}
+
 async function cachedMetric(
   provider: MarketDataProvider,
   ca: string,
@@ -298,6 +310,7 @@ async function cachedMetric(
   kind: MetricKind,
   requestedIntervalMs: number,
 ): Promise<CachedMetricResult> {
+  if (!marketWorkAllowed(ca, chain, kind)) return { patch: null, fetched: false, responseAt: null };
   const intervalMs = metricInterval(kind, requestedIntervalMs);
   const shared = sharedMarketMetric(kind);
   const key = `${chain}:${ca}:${shared ? GMGN_MARKET_CACHE_KIND : kind}`;
@@ -742,6 +755,7 @@ async function exchangeLf(ca: string, chain: Chain, deployedAt?: number | null, 
     const requestFrom = anchorFrom - bucketMs;
     // Padding must not change the selected wire granularity near day seven.
     const to = Math.min(requestFrom + (lfRule === 'bucket-day-v2' ? 999 * dayMs : 7 * dayMs), now);
+    if (signal?.aborted || !marketWorkAllowed(ca, chain, 'lf')) return undefined;
     const rows = await client.tokenFlows({
       chain,
       token_address: ca,
@@ -1023,6 +1037,7 @@ async function seriesAtRung(ca: string, chain: Chain, signal?: AbortSignal): Pro
     // ONE attempt at a given request start. The deploy clamp (`t >= from`) is applied
     // AFTER the response, so the request itself may start EARLIER than the deploy.
     const attempt = async (reqFrom: number): Promise<SeriesAttempt> => {
+      if (signal?.aborted || !marketWorkAllowed(ca, chain, 'series')) return { why: 'inactive_or_aborted' };
       const rows = await client.tokenFlows({
         chain,
         token_address: ca,
@@ -1051,7 +1066,7 @@ async function seriesAtRung(ca: string, chain: Chain, signal?: AbortSignal): Pro
     // unavailable anyway (exchangeLf needs the genesis) and the wider window would
     // return nothing but the pre-genesis back-fill, which isBackFill refuses — a call
     // that can never buy anything, once per kick.
-    if (!('rows' in got) && deployedAt && wideFrom < from) {
+    if (!('rows' in got) && deployedAt && wideFrom < from && !signal?.aborted && findTrackedCa(ca, chain)) {
       log.info('[poller] series short, retry as 30d daily', ca.slice(0, 8));
       got = await attempt(wideFrom);
     }
@@ -1120,6 +1135,7 @@ export function refreshSeries(ca: string, chain: Chain): Promise<void> {
   const urgent = st?.t100_multiple == null || st?.genesis_bal == null ||
     isNewCa(tracked?.added_at, Date.now() - config.newCaPriorityMs);
   return enqueueSetup(ca, chain, urgent ? 0 : 1, async (signal) => {
+    if (!marketWorkAllowed(ca, chain, 'setup')) return;
     const now = Date.now();
     const cached = getSetupCacheEntry(ca, chain);
     if (cached && isSeriesFresh(cached, now)) applySetupCacheEntry(cached);
@@ -1175,7 +1191,7 @@ async function applySeriesPass(
     responseAt: seriesResponseAt ?? null, points: fetched?.points.length ?? 0,
     runMs: Date.now() - seriesStartedAt,
   });
-  if (signal.aborted) return undefined;
+  if (signal.aborted || !marketWorkAllowed(ca, chain, 'series')) return undefined;
   const series = fetched?.points;
   if (fetchSeries && seriesProviderAvailable) {
     if (series && series.length > 0) clearSetupRetry(ca, chain, 'series');
@@ -1228,7 +1244,7 @@ async function applySeriesPass(
     ca, chain, providerAvailable: lfProviderAvailable, previousRule: prev?.lf_rule ?? null,
   });
   const lf = fetchLf && lfProviderAvailable ? await exchangeLf(ca, chain, st.deployed_at, signal) : undefined;
-  if (signal.aborted) return undefined;
+  if (signal.aborted || !marketWorkAllowed(ca, chain, 'lf')) return undefined;
   if (fetchLf) log.info('[collector] lf_finish', {
     ca, chain, outcome: !lfProviderAvailable ? 'provider_unavailable' : lf ? 'fetched' : 'no_data',
     points: lf?.points.length ?? 0, runMs: Date.now() - lfStartedAt,
@@ -1300,43 +1316,48 @@ export function zeroScoreGate(): void {
   }
 }
 
+function pendingDiscoveryPairs(): Set<string> {
+  const pending = pendingWalletDiscoveryPairs();
+  if (isFomoDiscoveryPending()) {
+    for (const ca of listTrackedCas(true)) pending.add(`${ca.chain}:${ca.address}`);
+  }
+  return pending;
+}
 /**
- * Holdings half of the wallet sweep — credit-free on sol, ONE getTokenAccountsByOwner
- * per (CA, wallet) pair, so it keeps the faster cadence. Its own try/catch: a dead
- * trades door can never gate this (that inerting bug is what this split exists to
- * prevent). The pair set is exactly the `Tracked by` link — the source='watch' BUY
- * that feeds trackedByNames/inflow/holding (user 2026-09-23), so no wallet without a
- * CA link and no mint outside that pair is ever queried. Pairs whose CA is inside
- * NEW_CA_PRIORITY_MS go first (user 2026-09-24), same jump-the-queue rule as the
- * metric/setup sweeps.
+ * Deactivate expired CAs before forming the native-wallet poll set. Discovery
+ * targets are pruned in the same sweep so inactive CAs cannot be polled again.
  */
 export async function walletSweep(provider: MarketDataProvider): Promise<void> {
+  const dropped = pruneUntrackedCas(CA_INFLOW_WINDOW_MS, Date.now());
+  for (const r of dropped) {
+    log.warn(`[poller] prune untracked CA ${r.address} ${r.chain} (added ${r.added_at}) ${r.note}`);
+  }
+  pruneDiscoveryTargets();
+
   const tracked = listTrackedCas();
   const pairs = newCaPairsFirst(tracked, trackedByPairs(tracked.map((c) => c.address)));
   await pacedFor(pairs, config.pollWalletsMs, async (p) => {
     try {
-      const balances = await provider.walletTokenHoldings(p.wallet.address, p.wallet.chain, [p.ca]);
-      replaceWalletBalances(p.wallet.id, p.wallet.chain, balances);
+      await serializeWalletHoldings(p.wallet.id, async (lease) => {
+        const balances = await provider.walletTokenHoldings(p.wallet.address, p.wallet.chain, [p.ca]);
+        if (!lease.isCurrent()) return;
+        const current = getWallet(p.wallet.id);
+        if (current?.address === p.wallet.address && current.chain === p.wallet.chain) {
+          replaceWalletBalances(p.wallet.id, p.wallet.chain, balances);
+        }
+      });
     } catch (e) {
       log.error('[poller] walletSweep holdings', p.wallet.name, e);
     }
   });
-  // Runs AFTER the holdings above: the prune's "no wallet holds it" test reads
-  // exactly what this pass just wrote.
-  const dropped = pruneUntrackedCas(CA_INFLOW_WINDOW_MS);
-  for (const r of dropped) {
-    log.warn(`[poller] prune untracked CA ${r.address} ${r.chain} (added ${r.added_at}) ${r.note}`);
-  }
-  // The market-cap band is a DISPLAY filter only (user 2026-09-24): a CA below the
-  // floor stays TRACKED so it can surface the moment its cap crosses it. Deleting it
-  // here (the old pruneOutOfBandCas) guaranteed churn — add → learn mc → delete → re-add.
-  zeroScoreGate();
   // FOMO social positions and holdings refresh only from incoming alert events.
   // Native wallet holdings above retain their normal polling cadence.
-  // No wallet `Tracked by` -> the row renders "tracked by none"; drop it (user 2026-09-25).
-  // Mock skipped: seed CAs are demo rows with no watch trades.
+  const pending = pendingDiscoveryPairs();
+  zeroScoreGate();
+  // No wallet `Tracked by` -> the row renders `tracked by none`; keep the separate
+  // grace-window policy independent from BUY-age deactivation above.
   if (config.mode !== 'mock') {
-    for (const r of pruneTrackedByNone(TRACKED_BY_WINDOW_MS)) {
+    for (const r of pruneTrackedByNone(TRACKED_BY_WINDOW_MS, 10 * 60_000, pending)) {
       log.warn(`[poller] prune tracked-by-none CA ${r.address} ${r.chain} (added ${r.added_at}) ${r.note}`);
     }
   }
@@ -1604,6 +1625,15 @@ async function withFomoPositionSlot(run: () => Promise<void>): Promise<void> {
     else activeFomoPositionBatches--;
   }
 }
+async function serializeFomoDiscovery(userId: string, run: () => Promise<void>): Promise<void> {
+  const previous = fomoPositionUserDrains.get(userId) ?? Promise.resolve();
+  let settled!: Promise<void>;
+  settled = previous.then(() => withFomoPositionSlot(run)).finally(() => {
+    if (fomoPositionUserDrains.get(userId) === settled) fomoPositionUserDrains.delete(userId);
+  });
+  fomoPositionUserDrains.set(userId, settled);
+  await settled;
+}
 
 /** Resolve + measure ONE alert's wallet fire-and-forget — never blocks the API
  *  response, never rejects (trackFomoWalletFromTx swallows every failure). */
@@ -1631,6 +1661,72 @@ export async function fomoPositionCooldownRefreshIdle(): Promise<void> {
     if (pending.length === 0 && fomoPositionCooldownRefreshes.size === 0 && fomoPositionUserDrains.size === 0) return;
   }
 }
+
+const FOMO_BALANCE_REFILL_BATCH_SIZE = 4;
+const FOMO_BALANCE_REFILL_INTERVAL_MS = 15_000;
+let fomoBalanceRefillRunning = false;
+let fomoBalanceRefillTimer: NodeJS.Timeout | null = null;
+
+/** Refresh stale FOMO holdings only; this path never fetches swaps or trade details. */
+export async function fomoBalanceRefillSweep(): Promise<void> {
+  if (fomoBalanceRefillRunning || config.fomoProdUrl === '') return;
+  fomoBalanceRefillRunning = true;
+  try {
+    const users = listFomoBalanceRefillUsers(Date.now(), FOMO_BALANCE_REFILL_BATCH_SIZE);
+    await Promise.all(users.map(async (user) => {
+      const previous = fomoPositionUserDrains.get(user.id) ?? Promise.resolve();
+      let settled!: Promise<void>;
+      const drain = previous.then(() => withFomoPositionSlot(async () => {
+        const fetchedAt = Date.now();
+        const result = await fetchFomoBalances(user.user_id ?? user.handle);
+        saveFomoApiOutcome(user.id, 'balances', result.outcome, result.retryAfterMs, Date.now());
+        if (result.outcome !== 'success' || result.value === null) return;
+
+        const positionRows: FomoPositionInput[] = result.value.map((position) => ({
+          fomo_user_id: user.id,
+          ca: position.ca,
+          chain: position.chain,
+          trade_id: position.tradeId,
+          status: position.status,
+          amount: position.amount,
+          cost_basis_usd: position.costBasisUsd,
+          avg_entry_price: position.avgEntryPrice,
+          price_usd: position.priceUsd,
+          realized_pnl_usd: position.realizedPnlUsd,
+          unrealized_pnl_usd: position.unrealizedPnlUsd,
+          fetched_at: fetchedAt,
+        }));
+        syncFomoApiBalancesSnapshot(user.id, positionRows, fetchedAt, result.complete);
+      }));
+      settled = drain.catch((error: unknown) => log.error('[poller] fomo balance refill', error))
+        .finally(() => {
+          if (fomoPositionUserDrains.get(user.id) === settled) fomoPositionUserDrains.delete(user.id);
+        });
+      fomoPositionUserDrains.set(user.id, settled);
+      await settled;
+    }));
+  } finally {
+    fomoBalanceRefillRunning = false;
+  }
+}
+
+function scheduleFomoBalanceRefill(delayMs = FOMO_BALANCE_REFILL_INTERVAL_MS): void {
+  if (fomoBalanceRefillTimer !== null || config.fomoProdUrl === '') return;
+  fomoBalanceRefillTimer = setTimeout(() => {
+    fomoBalanceRefillTimer = null;
+    void fomoBalanceRefillSweep()
+      .catch((error: unknown) => log.error('[poller] fomo balance refill sweep', error))
+      .finally(() => scheduleFomoBalanceRefill());
+  }, delayMs);
+  fomoBalanceRefillTimer.unref();
+}
+
+function startFomoBalanceRefill(): void {
+  if (fomoBalanceRefillTimer === null && config.fomoProdUrl !== '') {
+    scheduleFomoBalanceRefill(0);
+  }
+}
+
 
 
 /** Refresh ONE trader's positions from an alert; never called by a periodic sweep. */
@@ -1827,7 +1923,7 @@ async function refreshFomoPositionAlertBatch(
       detail.chain !== buy.chain ||
       canonicalCa(detail.ca, detail.chain) !== canonicalCa(buy.ca, buy.chain)
     ) continue;
-    upsertFomoPosition({
+    const recovered: FomoPositionInput = {
       fomo_user_id: fomoUserId,
       ca: buy.ca,
       chain: buy.chain,
@@ -1841,7 +1937,8 @@ async function refreshFomoPositionAlertBatch(
       realized_pnl_usd: detail.realizedPnlUsd,
       unrealized_pnl_usd: null,
       fetched_at: Date.now(),
-    });
+    };
+    syncFomoPositionsSnapshot(fomoUserId, [recovered], recovered.fetched_at);
     clearFomoPositionPrice(fomoUserId, buy.ca, buy.chain);
   }
 }
@@ -1890,17 +1987,25 @@ export function kickFomoPositions(
 }
 
 
-/** Add hook shares the periodic cache gates; wallet links still get their scoped refresh. */
-export function kickCAs(cas: readonly { address: string; chain: Chain }[]): void {
-  if (!pollerDeps) return;
-  if (pollerScope !== 'wallets') {
-    for (const c of cas) {
-      void kickToken(pollerDeps.provider, c.address, c.chain).then(() => {
-        kickSetupEarly([c]);
-      });
-    }
+/** Kick market/setup work and durable holder scans for newly tracked CAs. */
+export function kickCAs(cas: readonly { address: string; chain: Chain }[], refreshExisting = false): void {
+  const scanWallets = pollerScope !== 'market';
+  if (scanWallets) {
+    enqueueWalletDiscoveriesForCas(cas, refreshExisting);
+    enqueueAllFomoDiscoveries();
+    void fomoDiscoverySweep();
   }
-  if (pollerScope !== 'market') kickWalletHoldingsFor(cas);
+  if (!pollerDeps) return;
+  if (pollerScope === 'wallets') {
+    void walletDiscoverySweep();
+    return;
+  }
+  const kicks = cas.map((ca) => kickToken(pollerDeps!.provider, ca.address, ca.chain).then(() => {
+    kickSetupEarly([ca]);
+  }));
+  void Promise.all(kicks).then(() => {
+    if (scanWallets) void walletDiscoverySweep();
+  });
 }
 
 // Newly-added tokens enter the same queue as chart and background refreshes.
@@ -1984,6 +2089,7 @@ function metricIntervalFor(kind: MetricKind): number {
 }
 
 async function bootstrapTokenInfo(provider: MarketDataProvider, address: string, chain: Chain): Promise<void> {
+  if (!marketWorkAllowed(address, chain, 'bootstrap')) return;
   const key = `${chain}:${address}`;
   const active = tokenInfoBootstraps.get(key);
   if (active) return active;
@@ -2147,6 +2253,7 @@ function rehydrateCachedToken(ca: string, chain: Chain): void {
 /** Cold CA add queries once; re-adds restore cached state and fetch only datasets due. */
 export function kickToken(provider: MarketDataProvider, address: string, chain: Chain): Promise<void> {
   return (async () => {
+    if (!marketWorkAllowed(address, chain, 'token')) return;
     try {
       if (!METRIC_KINDS.some((kind) => getMetricPollCache(address, chain, kind))) {
         await bootstrapTokenInfo(provider, address, chain);
@@ -2187,15 +2294,16 @@ export function kickWallet(
   cas: readonly string[],
 ): void {
   if (cas.length === 0) return;
-  void (async () => {
-    try {
-      const balances = await provider.walletTokenHoldings(address, chain, cas);
-      replaceWalletBalances(walletId, chain, balances);
-      log.info(`[poller] kickWallet ${address.slice(0, 8)}: ${balances.length} position(s) / ${cas.length} pair(s)`);
-    } catch (e) {
-      log.error('[poller] kickWallet holdings', address, e);
-    }
-  })();
+  void serializeWalletHoldings(walletId, async (lease) => {
+    const balances = await provider.walletTokenHoldings(address, chain, cas);
+    if (!lease.isCurrent()) return;
+    const current = getWallet(walletId);
+    if (!current || current.address !== address || current.chain !== chain) return;
+    replaceWalletBalances(walletId, chain, balances);
+    log.info(`[poller] kickWallet ${address.slice(0, 8)}: ${balances.length} position(s) / ${cas.length} pair(s)`);
+  }).catch((error) => {
+    log.error('[poller] kickWallet holdings', address, error);
+  });
 }
 
 /**
@@ -2220,6 +2328,10 @@ export function startPoller(
 ): void {
   pollerScope = scope;
   setPollerDeps(provider, nansenApi, tokenFlows);
+  configureWalletDiscovery(provider);
+  if (scope !== 'market') startWalletDiscovery();
+  configureFomoDiscovery({ runSerialized: serializeFomoDiscovery });
+  startFomoBalanceRefill();
   const tasks: PollTask[] = [];
   if (scope !== 'wallets') {
     tasks.push(
@@ -2245,7 +2357,13 @@ export function startPoller(
     }
   }
   if (scope !== 'market') {
-    tasks.push({ name: 'walletSweep', intervalMs: config.pollWalletsMs, fn: () => walletSweep(provider) });
+    tasks.push(
+      ...(config.fomoProdUrl !== '' ? [{ name: 'fomoHoldingsDiscovery', intervalMs: FOMO_BALANCE_REFILL_INTERVAL_MS, fn: () => fomoDiscoverySweep() }] : []),
+      { name: 'walletSweep', intervalMs: config.pollWalletsMs, fn: () => walletSweep(provider) },
+    );
+  }
+  if (scope !== 'wallets' && config.showFomo && config.fomoAlitaSync) {
+    tasks.push({ name: 'alitaFollowSync', intervalMs: config.fomoAlitaPollMs, fn: async () => { await runAlitaFollowSync(); } });
   }
   if (scope !== 'wallets' && config.crawlEnabled) {
     // F1=(b) (plan setup-fill-on-add T5): the marks count from the SYSTEM deploy

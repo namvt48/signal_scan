@@ -6,7 +6,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { getDb, insertFomoTrade, insertFomoUser, open } from '../src/db.js';
+import { getDb, getFomoApiRequestState, insertFomoTrade, insertFomoUser, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { createTestAuth, type TestAuth } from './auth-testkit.js';
 
@@ -73,6 +73,7 @@ test('POST /api/fomo-users: creates and returns the camelCase DTO row', async ()
   for (const key of ['user_id', 'wallet_solana', 'wallet_evm', 'created_at']) {
     assert.ok(!(key in res.json), `snake_case key ${key} must not leak`);
   }
+  assert.equal(getFomoApiRequestState(res.json.id, 'balances')?.last_outcome, 'discovery_queued');
 });
 
 test('POST /api/fomo-users: a handle-only body uses the handle as its name (user 2026-10-01)', async () => {
@@ -167,6 +168,20 @@ test('POST /api/fomo-users/import: tags enrich an existing handle and never blan
   assert.deepEqual(rawRow('@imp-tags')?.tags, '["Unicon"]');
   await req('POST', '/api/fomo-users/import', { body: { rows: [{ handle: '@imp-tags', name: 'T2' }] } });
   assert.deepEqual(rawRow('@imp-tags')?.tags, '["Unicon"]', 'a tags-less re-import kept the stored tags');
+});
+test('FOMO import requeues an existing user whose stable API identity changes', async () => {
+  const created = await req('POST', '/api/fomo-users', { body: { handle: '@identity-change' } });
+  const id = created.json.id as string;
+  getDb().prepare(`UPDATE fomo_api_request_state SET last_outcome='success', next_eligible_at=0
+    WHERE fomo_user_id=? AND endpoint='balances'`).run(id);
+
+  const imported = await req('POST', '/api/fomo-users/import', {
+    body: { rows: [{ handle: '@identity-change', userId: 'new-stable-id' }] },
+  });
+
+  assert.equal(imported.status, 200);
+  assert.equal(rawRow('@identity-change')?.user_id, 'new-stable-id');
+  assert.equal(getFomoApiRequestState(id, 'balances')?.last_outcome, 'discovery_queued');
 });
 
 test('DELETE /api/fomo-users/:id: 204, GET omits it, FK cascade cleans fomo_trades', async () => {

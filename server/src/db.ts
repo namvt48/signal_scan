@@ -255,6 +255,13 @@ CREATE TABLE IF NOT EXISTS wallet_token_state (
   PRIMARY KEY (wallet_id, ca, chain),
   FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS sol_wallet_holding_membership (
+  wallet_id TEXT NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+  ca TEXT NOT NULL,
+  chain TEXT NOT NULL CHECK(chain = 'sol'),
+  PRIMARY KEY (wallet_id, ca, chain)
+);
+CREATE INDEX IF NOT EXISTS idx_sol_wallet_holding_membership_ca ON sol_wallet_holding_membership(chain, ca);
 CREATE TABLE IF NOT EXISTS wallet_trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   wallet_id TEXT,
@@ -332,6 +339,7 @@ CREATE TABLE IF NOT EXISTS fomo_follow_sync (
   last_error TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   last_count INTEGER,
+  last_complete INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS fomo_follow_missing (
@@ -440,6 +448,7 @@ CREATE TABLE IF NOT EXISTS fomo_positions (
   realized_pnl_usd REAL,
   unrealized_pnl_usd REAL,
   fetched_at INTEGER NOT NULL,
+  verified_at INTEGER,
   PRIMARY KEY (fomo_user_id, ca, chain)
 );
 CREATE INDEX IF NOT EXISTS idx_fomo_positions_ca_chain ON fomo_positions(ca, chain);
@@ -478,6 +487,8 @@ export function open(path: string, sharedMarketPath = ''): void {
   // (delete wallet -> trades/balances cleaned) depend on this.
   instance.pragma('foreign_keys = ON');
   instance.exec(SCHEMA);
+  const followSyncCols = (instance.pragma('table_info(fomo_follow_sync)') as { name: string }[]).map((c) => c.name);
+  if (!followSyncCols.includes('last_complete')) instance.exec('ALTER TABLE fomo_follow_sync ADD COLUMN last_complete INTEGER NOT NULL DEFAULT 0');
   const metricPollCols = (instance.pragma('table_info(metric_poll_cache)') as { name: string }[]).map((c) => c.name);
   if (!metricPollCols.includes('retry_class')) instance.exec('ALTER TABLE metric_poll_cache ADD COLUMN retry_class TEXT');
   instance.exec(`
@@ -611,6 +622,11 @@ export function open(path: string, sharedMarketPath = ''): void {
   if (!cols.includes('icon_url')) instance.exec('ALTER TABLE token_state ADD COLUMN icon_url TEXT');
   // x_handle is the token's bare X handle (GMGN token/info) — TEXT affinity.
   if (!cols.includes('x_handle')) instance.exec('ALTER TABLE token_state ADD COLUMN x_handle TEXT');
+  const positionCols = (instance.pragma('table_info(fomo_positions)') as { name: string }[]).map((c) => c.name);
+  if (!positionCols.includes('verified_at')) {
+    instance.exec('ALTER TABLE fomo_positions ADD COLUMN verified_at INTEGER');
+    instance.exec('UPDATE fomo_positions SET verified_at = fetched_at WHERE verified_at IS NULL');
+  }
   // Auto-migrate any tier 'P' into blocked_cas (idempotent)
   instance.exec(`
     INSERT OR IGNORE INTO blocked_cas (address, chain, reason, blocked_at)
@@ -681,13 +697,15 @@ export function open(path: string, sharedMarketPath = ''): void {
   if (!fomoUserCols.includes('tags')) {
     instance.exec("ALTER TABLE fomo_users ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
   }
-  // wallets.clan — display-only label rendered beside the wallet name (user
-  // 2026-09-24: "clan chỉ là một cái tên bên cạnh name của wallet"). NOT a
-  // filter/route key: nothing queries it. Existing wallets default to 'a'.
+  // wallets.clan — display-only label. One-time data migration clears synthetic
+  // 'a' defaults from older releases while preserving actual clan labels.
   const walletCols = (instance.pragma('table_info(wallets)') as { name: string }[]).map((c) => c.name);
   if (!walletCols.includes('clan')) {
-    instance.exec('ALTER TABLE wallets ADD COLUMN clan TEXT');
-    instance.exec("UPDATE wallets SET clan = 'a' WHERE clan IS NULL");
+    instance.exec("ALTER TABLE wallets ADD COLUMN clan TEXT NOT NULL DEFAULT ''");
+  }
+  if ((instance.pragma('user_version', { simple: true }) as number) < 1) {
+    instance.exec("UPDATE wallets SET clan = '' WHERE lower(trim(clan)) = 'a'");
+    instance.pragma('user_version = 1');
   }
   // T3 (evm-base-bsc): chain-aware wallet keys — SQLite can't drop UNIQUE/PK via
   // ALTER, so rebuild the 3 tables (copy with chain='sol') in ONE transaction
@@ -801,10 +819,35 @@ export function open(path: string, sharedMarketPath = ''): void {
     `);
   }
 }
+/**
+ * Open an existing database for export-only processes.
+ *
+ * Unlike open(), this never creates directories, applies schema changes,
+ * backfills rows, or starts migrations. Keep the mount read-only as a second
+ * line of defense; query_only also covers attached databases.
+ */
+export function openReadOnly(path: string, sharedMarketPath = ''): void {
+  if (path === ':memory:') throw new Error('read-only database requires an existing file');
+  sharedMarketAttached = sharedMarketPath !== '';
+  instance = new Database(path, { readonly: true, fileMustExist: true });
+  instance.pragma('busy_timeout = 5000');
+  instance.pragma('foreign_keys = ON');
+  if (sharedMarketPath !== '') {
+    instance.prepare('ATTACH DATABASE ? AS market_data').run(sharedMarketPath);
+    instance.exec(`
+      CREATE TEMP VIEW token_state AS SELECT * FROM market_data.token_state;
+      CREATE TEMP VIEW metric_poll_cache AS SELECT * FROM market_data.metric_poll_cache;
+      CREATE TEMP VIEW holder_snapshots AS SELECT * FROM market_data.holder_snapshots;
+      CREATE TEMP VIEW nansen_series AS SELECT * FROM market_data.nansen_series;
+    `);
+  }
+  instance.pragma('query_only = ON');
+}
+
 function backfillFomoEvmWalletGroups(db: Database.Database): void {
   const rows = db
     .prepare(`SELECT * FROM wallets WHERE chain IN (${EVM_CHAINS.map(() => '?').join(',')})
-      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 ELSE 2 END`)
+      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 WHEN 'robinhood' THEN 2 ELSE 3 END`)
     .all(...EVM_CHAINS) as WalletRow[];
   const groups = new Map<string, WalletRow[]>();
   for (const row of rows) {
@@ -851,61 +894,53 @@ export function listWallets(): WalletRow[] {
 }
 
 /**
- * The (CA, wallet) pairs a CA set is `Tracked by` — a source='watch' BUY row, the
- * sole writer (signals.trackedByNames). This PAIR is the unit a holdings query
- * spends (user 2026-09-23: "query cặp CA-wallet chứ không query linh tinh"): the
- * caller asks the RPC for exactly that mint at that wallet, never the wallet's
- * whole token-account list.
+ * The (CA, wallet) pairs a CA set is `Tracked by`: watch BUY history, a SOL
+ * membership snapshot, or a positive measured wallet balance. Discovery can
+ * surface a legacy holder without inventing trade history. This PAIR is the unit
+ * a holdings query spends (user 2026-09-23: "query cặp CA-wallet chứ không query
+ * linh tinh"): pair refreshes ask for exactly that mint, never the whole portfolio.
  */
 export function trackedByPairs(cas: readonly string[]): { ca: string; wallet: WalletRow }[] {
   if (cas.length === 0) return [];
   const ph = cas.map(() => '?').join(',');
   const rows = getDb()
     .prepare(
-      `SELECT DISTINCT t.ca AS ca, w.* FROM wallet_trades t
-         JOIN wallets w ON w.id = t.wallet_id
-        WHERE t.ca IN (${ph}) AND t.side = 'buy' AND t.source = 'watch'
-        ORDER BY w.name, t.ca`,
+      `SELECT DISTINCT q.ca AS ca, w.* FROM (
+         SELECT t.ca, t.chain, t.wallet_id FROM wallet_trades t
+          WHERE t.ca IN (${ph}) AND t.side = 'buy' AND t.source = 'watch'
+         UNION
+         SELECT h.ca, h.chain, h.wallet_id FROM sol_wallet_holding_membership h
+          WHERE h.ca IN (${ph})
+         UNION
+         SELECT s.ca, s.chain, s.wallet_id FROM wallet_token_state s
+          WHERE s.ca IN (${ph}) AND s.token_amount > 0
+       ) q JOIN wallets w ON w.id = q.wallet_id AND w.chain = q.chain
+        ORDER BY w.name, q.ca`,
     )
-    .all(...cas) as ({ ca: string } & WalletRow)[];
+    .all(...cas, ...cas, ...cas) as ({ ca: string } & WalletRow)[];
   return rows.map(({ ca, ...wallet }) => ({ ca, wallet }));
 }
 
-/** The CAs to re-query for one wallet now: every still-tracked CA it has traded (BUY or
- *  SELL) — a sell-only wallet still refreshes its holding; it just is not a member
- *  (`Tracked by` stays BUY-only, see trackedByPairs). */
+/** CAs that still need a balance read for one wallet, including positive snapshots. */
 export function watchedCasForWallet(walletId: string): string[] {
   const rows = getDb()
     .prepare(
-      `SELECT DISTINCT t.ca AS ca FROM wallet_trades t
+      `SELECT DISTINCT t.ca FROM wallet_trades t
+        JOIN tracked_cas c ON c.address = t.ca AND c.chain = t.chain
         WHERE t.wallet_id = ? AND t.source = 'watch'
-          AND t.ca IN (SELECT address FROM tracked_cas)`,
+       UNION
+       SELECT h.ca FROM sol_wallet_holding_membership h
+        JOIN tracked_cas c ON c.address = h.ca AND c.chain = h.chain
+        WHERE h.wallet_id = ? AND h.chain = 'sol'
+       UNION
+       SELECT s.ca FROM wallet_token_state s
+        JOIN tracked_cas c ON c.address = s.ca AND c.chain = s.chain
+        WHERE s.wallet_id = ? AND s.token_amount > 0`,
     )
-    .all(walletId) as { ca: string }[];
+    .all(walletId, walletId, walletId) as { ca: string }[];
   return rows.map((r) => r.ca);
 }
 
-/**
- * MAX(ts) of each CA's source='watch' trades — buy OR sell — inside the window,
- * restricted to MEMBER (wallet, CA) pairs (a wallet with ANY source='watch' buy —
- * membership is ever-bought, no time window, the trackedWalletStats rule). This is
- * the recency key that orders the dashboard: a member's SELL bumps its CA exactly
- * like a buy (user 2026-09-24). Activity from a non-member wallet is ignored, so a
- * CA with no tracked wallet of its own keeps the 0 sentinel and sinks.
- */
-export function latestWatchTradeTsByCa(sinceTs: number): Map<string, number> {
-  const rows = getDb()
-    .prepare(
-      `SELECT t.ca AS ca, MAX(t.ts) AS ts FROM wallet_trades t
-        WHERE t.source = 'watch' AND t.ts >= @sinceTs
-          AND EXISTS (SELECT 1 FROM wallet_trades b
-                       WHERE b.wallet_id = t.wallet_id AND b.ca = t.ca
-                         AND b.side = 'buy' AND b.source = 'watch')
-        GROUP BY t.ca`,
-    )
-    .all({ sinceTs }) as { ca: string; ts: number }[];
-  return new Map(rows.map((r) => [r.ca, r.ts]));
-}
 
 export function getWallet(id: string): WalletRow | undefined {
   return getDb().prepare('SELECT * FROM wallets WHERE id = ?').get(id) as WalletRow | undefined;
@@ -936,14 +971,17 @@ export function updateWallet(id: string, next: WalletInput): WalletRow | undefin
 }
 
 export function deleteWallet(id: string): void {
-  // FK ON DELETE CASCADE cleans wallet_token_state + wallet_trades.
-  getDb().prepare('DELETE FROM wallets WHERE id = ?').run(id);
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare('DELETE FROM wallets WHERE id = ?').run(id);
+    db.prepare("DELETE FROM zero_holdings WHERE member_type = 'wallet' AND member_id = ?").run(id);
+  })();
 }
 
 export function findEvmWalletGroup(address: string): WalletRow[] {
   return getDb()
     .prepare(`SELECT * FROM wallets WHERE lower(address) = ? AND chain IN (${EVM_CHAINS.map(() => '?').join(',')})
-      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 ELSE 2 END`)
+      ORDER BY CASE chain WHEN 'base' THEN 0 WHEN 'bsc' THEN 1 WHEN 'robinhood' THEN 2 ELSE 3 END`)
     .all(address.trim().toLowerCase(), ...EVM_CHAINS) as WalletRow[];
 }
 
@@ -1110,6 +1148,17 @@ export function listTrackedCas(includeInactive = false): TrackedCaRow[] {
   return getDb().prepare("SELECT * FROM tracked_cas WHERE status != 'inactive' ORDER BY added_at DESC").all() as TrackedCaRow[];
 }
 
+/** Only dashboard CAs admitted on or after the persisted deployment boundary. */
+export function listTrackedCasSinceSystemDeploy(includeInactive = false): TrackedCaRow[] {
+  const cutoffMs = Number(getSetting('systemDeployAt'));
+  if (!Number.isSafeInteger(cutoffMs) || cutoffMs <= 0) {
+    throw new Error('systemDeployAt must be a positive safe integer epoch-ms value');
+  }
+  const cutoff = new Date(cutoffMs).toISOString();
+  const status = includeInactive ? '' : " AND status != 'inactive'";
+  return getDb().prepare(`SELECT * FROM tracked_cas WHERE added_at >= ?${status} ORDER BY added_at DESC`).all(cutoff) as TrackedCaRow[];
+}
+
 /** A poll target — the (address, chain) pair the sweeps actually need. */
 export interface CaTarget {
   address: string;
@@ -1163,13 +1212,13 @@ function reconcileMarketTrackedCas(now: number): CaTarget[] {
   const insert = db.prepare(
     `INSERT INTO tracked_cas (id, address, chain, note, added_at, status)
      VALUES (?, ?, ?, 'shared-market', ?, 'queued')
-     ON CONFLICT(address, chain) DO UPDATE SET status = 'queued'`,
+     ON CONFLICT(address, chain) DO NOTHING`,
   );
   for (const target of desired) {
     const key = `${target.chain}:${target.address}`;
     if (!currentKeys.has(key)) {
-      insert.run(randomUUID(), target.address, target.chain, new Date(now).toISOString());
-      added.push(target);
+      const result = insert.run(randomUUID(), target.address, target.chain, new Date(now).toISOString());
+      if (result.changes > 0) added.push(target);
     }
   }
   const remove = db.prepare("DELETE FROM tracked_cas WHERE address = ? AND chain = ? AND note = 'shared-market'");
@@ -1329,11 +1378,9 @@ export function deleteTrackedCa(id: string): void {
 }
 
 /**
- * "This tracked CA carries no user tier" — the guard EVERY auto-delete path must
- * carry. A CA the user rated is one they want kept, so the 48h inflow prune, the
- * tracked-by-none prune and the zero-score gate must all spare it (user 2026-09-28).
- * Defined once so the three paths cannot drift apart. Reads tracked_cas via the
- * alias `t`, which every candidate query below uses.
+ * "This tracked CA carries no user tier" — the guard shared by tracked-by-none
+ * prune paths. The 48h BUY expiry is separate: a non-P tier never extends CA
+ * activity, while the Pass tombstone remains permanently blocked.
  */
 const NOT_TIERED = `NOT EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier != 'P')`;
 /**
@@ -1373,6 +1420,11 @@ function sweepOrphanedCaData(): void {
        SELECT 1 FROM tracked_cas t
         WHERE t.address = wallet_token_state.ca AND t.chain = wallet_token_state.chain)`,
   ).run();
+  db.prepare(
+    `DELETE FROM sol_wallet_holding_membership WHERE NOT EXISTS (
+       SELECT 1 FROM tracked_cas t
+        WHERE t.address = sol_wallet_holding_membership.ca AND t.chain = sol_wallet_holding_membership.chain)`,
+  ).run();
   // token_tiers is deliberately NOT swept here: the address→tier map is permanent
   // ("nhớ lưu lại cái map address với tier lại, mỗi khi add mới CA thì check cái này").
   // A CA pruned and later re-added must come back with its tier intact, so a tier row
@@ -1381,65 +1433,52 @@ function sweepOrphanedCaData(): void {
 }
 
 /**
- * Drop every tracked CA no tracked wallet interacts with: no wallet the CA is
- * `Tracked by` HOLDS it (wallet_token_state joined to a source='watch' BUY — the
- * holdings of an unlinked wallet are stale by construction, user 2026-09-23) AND
- * none BOUGHT it inside `windowMs`. The window runs
- * from the LAST inflow; a CA nothing ever bought falls back to `added_at`, so a
- * hand-added CA gets the full window before it can die (user 2026-09-20).
- * A wallet that bought and sold within seconds (GERI: a 26s flip) leaves
- * `trackedWallets` empty forever, so the row only clogs the table and the FE with no signal.
- *
- * "Xoá hoàn toàn" (user 2026-09-20): the drop also sweeps the CA's own market
- * data via sweepOrphanedCaData(). Wallet history (wallet_trades) is deliberately kept.
- *
- * Returns the dropped rows so the caller can log them — the DELETE is not undoable.
- * A CA with a stored user tier is never a candidate. Every clause is scoped to the
- * row's own (chain, ca) (user 2026-09-28): tracked_cas is UNIQUE(address, chain), so
- * a position or a buy on base must never keep bsc:0x… alive.
- * A FOMO user's BUY inside `windowMs` also keeps the CA (user 2026-10-01): the FOMO
- * dash carries no wallet watch data, so the wallet clauses alone would drain it.
- * A lone SELL does NOT (same date, second call): the dash lists members off BUY rows
- * only, so a sell-only CA shows `none` and is noise.
+ * Soft-deactivate tracked CAs with no BUY in `windowMs`: latest wallet/FOMO BUY
+ * wins, and `added_at` is the grace-period anchor only when no BUY exists.
+ * Balances, tiers, SELLs, and pending discovery do not extend activity. Expiry
+ * preserves CA history. Pass/blocked cleanup remains the separate hard-delete rule.
  */
 export function pruneUntrackedCas(windowMs: number, now: number = Date.now()): TrackedCaRow[] {
   const db = getDb();
   const since = now - windowMs;
   const cutoff = new Date(since).toISOString();
 
-  // Rule 1: Pass tier / blocked_cas (hard delete and data wipe)
-  const passDoomed = db
-    .prepare(
-      `SELECT t.* FROM tracked_cas t
-        WHERE EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier = 'P')
-           OR EXISTS (SELECT 1 FROM blocked_cas b WHERE b.address = t.address AND b.chain = t.chain)`,
-    )
-    .all() as TrackedCaRow[];
+  return db.transaction(() => {
+    const passDoomed = db
+      .prepare(
+        `SELECT t.* FROM tracked_cas t
+          WHERE EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier = 'P')
+             OR EXISTS (SELECT 1 FROM blocked_cas b WHERE b.address = t.address AND b.chain = t.chain)`,
+      )
+      .all() as TrackedCaRow[];
 
-  // Rule 2: Older than 48h and no new buy inflow in the last 48h (soft deactivate, NEVER wiped!)
-  const inactiveDoomed = db
-    .prepare(
-      `SELECT t.* FROM tracked_cas t
-        WHERE t.added_at <= ?
-          AND t.status != 'inactive'
-          AND ${NOT_TIERED}
-          AND NOT EXISTS (SELECT 1 FROM wallet_trades w
-                           WHERE w.ca = t.address AND w.chain = t.chain AND w.side = 'buy' AND w.ts >= ?)
-          AND NOT ${FOMO_ACTIVE}`,
-    )
-    .all(cutoff, since, since) as TrackedCaRow[];
+    const inactiveDoomed = db
+      .prepare(
+        `WITH buys AS (
+           SELECT chain, ca, ts FROM wallet_trades WHERE side = 'buy'
+           UNION ALL
+           SELECT chain, ca, ts FROM fomo_trades WHERE type = 'buy'
+         ), latest_buy AS (
+           SELECT chain, ca, MAX(ts) AS ts FROM buys GROUP BY chain, ca
+         )
+         SELECT t.* FROM tracked_cas t
+         LEFT JOIN latest_buy b ON b.chain = t.chain AND b.ca = t.address
+         WHERE t.status != 'inactive'
+           AND NOT EXISTS (SELECT 1 FROM token_tiers tt WHERE tt.ca = t.address AND tt.chain = t.chain AND tt.tier = 'P')
+           AND NOT EXISTS (SELECT 1 FROM blocked_cas b WHERE b.address = t.address AND b.chain = t.chain)
+           AND ((b.ts IS NOT NULL AND b.ts <= ?) OR (b.ts IS NULL AND t.added_at <= ?))`,
+      )
+      .all(since, cutoff) as TrackedCaRow[];
 
-  db.transaction(() => {
-    // Pass tier: hard delete and sweep
     const del = db.prepare('DELETE FROM tracked_cas WHERE id = ?');
-    for (const r of passDoomed) del.run(r.id);
+    for (const row of passDoomed) del.run(row.id);
     if (passDoomed.length > 0) sweepOrphanedCaData();
 
-    // 48h no inflow: soft deactivate ONLY. Keep all data intact!
-    const deact = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?");
-    for (const r of inactiveDoomed) deact.run(r.id);
+    const deactivate = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE address = ? AND chain = ?");
+    for (const row of inactiveDoomed) deactivate.run(row.address, row.chain);
+
+    return [...passDoomed, ...inactiveDoomed];
   })();
-  return [...passDoomed, ...inactiveDoomed];
 }
 
 /**
@@ -1456,7 +1495,7 @@ export function pruneUntrackedCas(windowMs: number, now: number = Date.now()): T
  * a lone SELL leaves the dash's FOMO column reading `none` (membership is buy-based), so
  * a sell must NOT spare the CA — 29 such sell-only rows were pruning as noise (2026-10-01).
  */
-export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): TrackedCaRow[] {
+export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000, protectedPairs: ReadonlySet<string> = new Set()): TrackedCaRow[] {
   const db = getDb();
   const since = Date.now() - withinMs;
   const cutoff = new Date(Date.now() - graceMs).toISOString();
@@ -1478,10 +1517,20 @@ export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): Tra
           AND t.status != 'inactive'
           AND ${NOT_TIERED}
           AND NOT EXISTS (SELECT 1 FROM wallet_trades b
-                           WHERE b.ca = t.address AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= ?)
+                           WHERE b.ca = t.address AND b.chain = t.chain AND b.side = 'buy' AND b.source = 'watch' AND b.ts >= ?)
+          AND NOT EXISTS (SELECT 1 FROM wallet_token_state hs
+                           WHERE hs.ca = t.address AND hs.chain = t.chain AND hs.token_amount > 0)
+          AND NOT EXISTS (SELECT 1 FROM sol_wallet_holding_membership h
+                           WHERE h.ca = t.address AND h.chain = t.chain)
+          AND NOT EXISTS (SELECT 1 FROM fomo_positions fp
+                           WHERE fp.ca = t.address AND fp.chain = t.chain AND (fp.amount > 0 OR fp.cost_basis_usd > 0))
+          AND NOT EXISTS (SELECT 1 FROM fomo_api_holdings fa
+                           JOIN fomo_api_balance_snapshots fs ON fs.fomo_user_id = fa.fomo_user_id AND fs.captured_at = fa.captured_at
+                           WHERE fa.ca = t.address AND fa.chain = t.chain AND fa.amount > 0 AND fs.available != 0)
           AND NOT ${FOMO_ACTIVE}`,
     )
     .all(cutoff, since, since) as TrackedCaRow[];
+  const safeInactiveDoomed = inactiveDoomed.filter((row) => !protectedPairs.has(`${row.chain}:${row.address}`));
 
   db.transaction(() => {
     // Pass tier: hard delete and sweep
@@ -1491,10 +1540,10 @@ export function pruneTrackedByNone(withinMs: number, graceMs = 10 * 60_000): Tra
 
     // Untracked: soft deactivate ONLY. Keep all data intact!
     const deact = db.prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?");
-    for (const r of inactiveDoomed) deact.run(r.id);
+    for (const r of safeInactiveDoomed) deact.run(r.id);
   })();
 
-  return [...passDoomed, ...inactiveDoomed];
+  return [...passDoomed, ...safeInactiveDoomed];
 }
 
 /** One tracked CA joined with the token_state columns the zero-score gate judges on. */
@@ -1532,10 +1581,12 @@ export function listCaScoreGateCandidates(): CaScoreGateRow[] {
          FROM tracked_cas t
          LEFT JOIN token_state s ON s.ca = t.address AND s.chain = t.chain
         WHERE NOT EXISTS (SELECT 1 FROM wallet_token_state wts
-                           WHERE wts.ca = t.address AND wts.chain = t.chain AND wts.token_amount > 0
-                             AND EXISTS (SELECT 1 FROM wallet_trades wt
-                                          WHERE wt.wallet_id = wts.wallet_id AND wt.ca = wts.ca AND wt.chain = wts.chain
-                                            AND wt.side = 'buy' AND wt.source = 'watch'))
+                           WHERE wts.ca = t.address AND wts.chain = t.chain AND wts.token_amount > 0)
+          AND NOT EXISTS (SELECT 1 FROM fomo_positions fp
+                           WHERE fp.ca = t.address AND fp.chain = t.chain AND (fp.amount > 0 OR fp.cost_basis_usd > 0))
+          AND NOT EXISTS (SELECT 1 FROM fomo_api_holdings fa
+                           JOIN fomo_api_balance_snapshots fs ON fs.fomo_user_id = fa.fomo_user_id AND fs.captured_at = fa.captured_at
+                           WHERE fa.ca = t.address AND fa.chain = t.chain AND fa.amount > 0 AND fs.available != 0)
           AND t.status != 'inactive'
           AND ${NOT_TIERED}`,
     )
@@ -1643,9 +1694,6 @@ export function setTier(ca: string, chain: Chain, tier: Tier): void {
          ON CONFLICT(address, chain) DO NOTHING`,
       ).run(canon, chain, Date.now());
       deleteTrackedCaByAddress(canon, chain);
-    } else {
-      // Ensure CA is active when tiered
-      db.prepare("UPDATE tracked_cas SET status = 'queued' WHERE address = ? AND chain = ? AND status = 'inactive'").run(canon, chain);
     }
   })();
 }
@@ -2228,6 +2276,7 @@ export interface FomoFollowSyncRow {
   last_error: string | null;
   consecutive_failures: number;
   last_count: number | null;
+  last_complete: number;
   updated_at: number;
 }
 
@@ -2386,7 +2435,7 @@ export function recordFomoFollowSyncAttempt(ownerUserId: string, ownerHandle: st
     .run(ownerUserId, ownerHandle, at, at);
 }
 
-export function recordFomoFollowSyncSuccess(ownerUserId: string, at: number, count: number): void {
+export function recordFomoFollowSyncSuccess(ownerUserId: string, at: number, count: number, complete: boolean): void {
   getDb()
     .prepare(
       `UPDATE fomo_follow_sync
@@ -2394,10 +2443,11 @@ export function recordFomoFollowSyncSuccess(ownerUserId: string, at: number, cou
               last_error = NULL,
               consecutive_failures = 0,
               last_count = ?,
+              last_complete = ?,
               updated_at = ?
         WHERE owner_user_id = ?`,
     )
-    .run(at, count, at, ownerUserId);
+    .run(at, count, complete ? 1 : 0, at, ownerUserId);
 }
 
 export function recordFomoFollowSyncFailure(ownerUserId: string, at: number, error: string): void {
@@ -2426,6 +2476,9 @@ export function markFomoFollowMissing(ownerUserId: string, targetUserId: string,
        VALUES (?, ?, ?)`,
     )
     .run(ownerUserId, targetUserId, at);
+}
+export function clearFomoFollowMissingForOwner(ownerUserId: string): void {
+  getDb().prepare('DELETE FROM fomo_follow_missing WHERE owner_user_id = ?').run(ownerUserId);
 }
 
 export function clearFomoFollowMissing(ownerUserId: string, targetUserId: string): void {
@@ -2778,7 +2831,15 @@ export function upsertFomoPosition(input: FomoPositionInput): void {
        price_usd = COALESCE(excluded.price_usd, fomo_positions.price_usd),
        realized_pnl_usd = COALESCE(excluded.realized_pnl_usd, fomo_positions.realized_pnl_usd),
        unrealized_pnl_usd = COALESCE(excluded.unrealized_pnl_usd, fomo_positions.unrealized_pnl_usd),
-       fetched_at = excluded.fetched_at
+       fetched_at = CASE WHEN COALESCE(excluded.trade_id, fomo_positions.trade_id) IS NOT fomo_positions.trade_id
+                           OR COALESCE(excluded.status, fomo_positions.status) IS NOT fomo_positions.status
+                           OR COALESCE(excluded.amount, fomo_positions.amount) IS NOT fomo_positions.amount
+                           OR COALESCE(excluded.cost_basis_usd, fomo_positions.cost_basis_usd) IS NOT fomo_positions.cost_basis_usd
+                           OR COALESCE(excluded.avg_entry_price, fomo_positions.avg_entry_price) IS NOT fomo_positions.avg_entry_price
+                           OR COALESCE(excluded.price_usd, fomo_positions.price_usd) IS NOT fomo_positions.price_usd
+                           OR COALESCE(excluded.realized_pnl_usd, fomo_positions.realized_pnl_usd) IS NOT fomo_positions.realized_pnl_usd
+                           OR COALESCE(excluded.unrealized_pnl_usd, fomo_positions.unrealized_pnl_usd) IS NOT fomo_positions.unrealized_pnl_usd
+                         THEN excluded.fetched_at ELSE fomo_positions.fetched_at END
      WHERE COALESCE(excluded.trade_id, fomo_positions.trade_id) IS NOT fomo_positions.trade_id
         OR COALESCE(excluded.status, fomo_positions.status) IS NOT fomo_positions.status
         OR COALESCE(excluded.amount, fomo_positions.amount) IS NOT fomo_positions.amount
@@ -2811,6 +2872,49 @@ export function upsertFomoPosition(input: FomoPositionInput): void {
 export interface FomoPositionTarget {
   ca: string;
   chain: Chain;
+}
+
+/** Users whose dashboard membership has a missing or stale position measurement. */
+export function listFomoBalanceRefillUsers(now: number, limit = 4): FomoUserRow[] {
+  const boundedLimit = Math.max(0, Math.min(100, Math.floor(limit)));
+  const db = getDb();
+  return db.transaction(() => {
+    const rows = db.prepare(`
+      SELECT DISTINCT u.*
+        FROM fomo_users u
+        JOIN (
+          SELECT fomo_user_id, ca, chain FROM fomo_trades WHERE type = 'buy'
+          UNION
+          SELECT fomo_user_id, ca, chain FROM fomo_positions WHERE cost_basis_usd > 0 OR amount > 0
+        ) m ON m.fomo_user_id = u.id
+        JOIN tracked_cas tc ON tc.address = m.ca AND tc.chain = m.chain AND tc.status != 'inactive'
+        LEFT JOIN fomo_positions p ON p.fomo_user_id = u.id AND p.ca = m.ca AND p.chain = m.chain
+        LEFT JOIN fomo_api_holdings a ON a.fomo_user_id = u.id AND a.ca = m.ca AND a.chain = m.chain
+        LEFT JOIN fomo_api_balance_snapshots s ON s.fomo_user_id = u.id
+        LEFT JOIN fomo_api_request_state r ON r.fomo_user_id = u.id AND r.endpoint = 'balances'
+       WHERE NOT EXISTS (SELECT 1 FROM zero_holdings z WHERE z.member_type = 'fomo'
+              AND z.member_id = u.id AND z.ca = m.ca AND z.chain = m.chain AND z.zero_at <= ?)
+         AND (p.amount IS NULL OR COALESCE(p.verified_at, p.fetched_at) <= ?)
+         AND (a.captured_at IS NULL OR s.captured_at IS NULL OR s.captured_at < a.captured_at
+              OR s.available = 0 OR a.captured_at <= ?)
+         AND (r.last_outcome IS NULL OR r.last_outcome NOT IN ('success', 'refill_queued') OR COALESCE(r.last_attempt_at, 0) <= ?)
+         AND COALESCE(r.next_eligible_at, 0) <= ?
+       ORDER BY COALESCE(r.last_attempt_at, 0), u.id
+       LIMIT ?
+    `).all(now - 86_400_000, now - 3_600_000, now - 3_600_000,
+      now - 3_600_000, now, boundedLimit) as FomoUserRow[];
+    const update = db.prepare(`
+      INSERT INTO fomo_api_request_state
+        (fomo_user_id, endpoint, last_attempt_at, next_eligible_at, consecutive_failures, last_outcome)
+      VALUES (?, 'balances', ?, ?, 0, 'refill_queued')
+      ON CONFLICT(fomo_user_id, endpoint) DO UPDATE SET
+        last_attempt_at = excluded.last_attempt_at,
+        next_eligible_at = excluded.next_eligible_at,
+        last_outcome = excluded.last_outcome
+    `);
+    for (const user of rows) update.run(user.id, now, now + 3_600_000);
+    return rows;
+  })();
 }
 
 /** CAs the dashboard currently lists for one user, before the active-CAs filter. */
@@ -2871,7 +2975,7 @@ export function syncFomoPositionsSnapshot(
 ): void {
   const db = getDb();
   const run = db.transaction(() => {
-    const dashboardCas = new Set(listTrackedCas().map((ca) => `${ca.chain}:${ca.address}`));
+    const dashboardCas = new Set(listTrackedCasSinceSystemDeploy().map((ca) => `${ca.chain}:${ca.address}`));
     const incoming = new Map<string, FomoPositionInput>();
     for (const position of positions) {
       const ca = canonicalCa(position.ca, position.chain);
@@ -2880,10 +2984,45 @@ export function syncFomoPositionsSnapshot(
     }
     for (const position of incoming.values()) {
       upsertFomoPosition(position);
+      db.prepare('UPDATE fomo_positions SET verified_at = ? WHERE fomo_user_id = ? AND ca = ? AND chain = ?')
+        .run(checkedAt, fomoUserId, position.ca, position.chain);
     }
     upsertFomoPositionSnapshot({ fomo_user_id: fomoUserId, checked_at: checkedAt });
   });
   run();
+}
+
+/** Atomically persist a successful balance response and its per-pair measurements. */
+export function syncFomoApiBalancesSnapshot(
+  fomoUserId: string,
+  positions: readonly FomoPositionInput[],
+  checkedAt: number,
+  complete: boolean,
+): void {
+  const db = getDb();
+  db.transaction(() => {
+    const tracked = new Set(listTrackedCasSinceSystemDeploy().map((row) => `${row.chain}:${row.address}`));
+    const upsert = db.prepare(`
+      INSERT INTO fomo_api_holdings (fomo_user_id, ca, chain, amount, pct, captured_at)
+      VALUES (?, ?, ?, ?, NULL, ?)
+      ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+        amount = excluded.amount, pct = excluded.pct, captured_at = excluded.captured_at
+    `);
+    for (const position of positions) {
+      if (position.amount === null) continue;
+      const ca = canonicalCa(position.ca, position.chain);
+      if (!tracked.has(`${position.chain}:${ca}`)) continue;
+      upsert.run(fomoUserId, ca, position.chain, position.amount, checkedAt);
+    }
+    upsertFomoApiBalanceSnapshot({
+      fomo_user_id: fomoUserId,
+      checked_at: checkedAt,
+      captured_at: checkedAt,
+      complete: complete ? 1 : 0,
+      truncated: complete ? 0 : 1,
+      available: 1,
+    });
+  })();
 }
 
 export interface FomoPositionSnapshot {
@@ -2919,6 +3058,56 @@ export function getFomoApiBalanceSnapshot(fomoUserId: string): FomoApiBalanceSna
       'SELECT fomo_user_id, checked_at, captured_at, complete, truncated, available FROM fomo_api_balance_snapshots WHERE fomo_user_id = ?',
     )
     .get(fomoUserId) as FomoApiBalanceSnapshot | undefined;
+}
+
+export interface FomoApiHoldingInput {
+  fomo_user_id: string;
+  ca: string;
+  chain: Chain;
+  amount: number;
+  pct: number | null;
+  captured_at: number;
+}
+
+export function upsertFomoApiHolding(input: FomoApiHoldingInput): void {
+  getDb().prepare(`
+    INSERT INTO fomo_api_holdings (fomo_user_id, ca, chain, amount, pct, captured_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fomo_user_id, ca, chain) DO UPDATE SET
+      amount = excluded.amount, pct = excluded.pct, captured_at = excluded.captured_at
+  `).run(input.fomo_user_id, canonicalCa(input.ca, input.chain), input.chain,
+    input.amount, input.pct, input.captured_at);
+  if (input.amount > 0) clearZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain);
+  else recordZeroHolding('fomo', input.fomo_user_id, input.ca, input.chain, input.captured_at);
+}
+
+export function upsertFomoApiBalanceSnapshot(input: FomoApiBalanceSnapshot): void {
+  getDb().prepare(`
+    INSERT INTO fomo_api_balance_snapshots
+      (fomo_user_id, checked_at, captured_at, complete, truncated, available)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fomo_user_id) DO UPDATE SET
+      checked_at = excluded.checked_at, captured_at = excluded.captured_at,
+      complete = excluded.complete, truncated = excluded.truncated, available = excluded.available
+  `).run(input.fomo_user_id, input.checked_at, input.captured_at, input.complete, input.truncated, input.available);
+}
+
+export function syncFomoApiBalanceSnapshot(
+  fomoUserId: string,
+  holdings: readonly Omit<FomoApiHoldingInput, 'fomo_user_id' | 'captured_at'>[],
+  snapshot: Omit<FomoApiBalanceSnapshot, 'fomo_user_id'>,
+): void {
+  const db = getDb();
+  db.transaction(() => {
+    for (const holding of holdings) {
+      upsertFomoApiHolding({
+        ...holding,
+        fomo_user_id: fomoUserId,
+        captured_at: snapshot.checked_at,
+      });
+    }
+    upsertFomoApiBalanceSnapshot({ ...snapshot, fomo_user_id: fomoUserId });
+  })();
 }
 
 /** Stored position row for the public FOMO export (raw API values, no 24h gate). */

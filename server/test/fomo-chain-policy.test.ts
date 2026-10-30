@@ -78,15 +78,15 @@ test('merged instance startup retains both Solana and EVM tracking and wallets',
 });
 
 test('merged API accepts Solana and EVM buys, wallet events and direct enqueue', async () => {
-  const evmBuy = await request('/api/fomo-watch/trades', { eventId: 'enabled-base-buy', trader: 'chain-policy-user', type: 'buy', tokenAddress: EVM_CA, chain: 'base', ts: Date.now(), usdValue: 100, tradeUsd: 100 });
+  const evmBuy = await request('/api/fomo-watch/trades', { eventId: 'enabled-base-buy', trader: 'chain-policy-user', type: 'buy', tokenAddress: EVM_CA, chain: 'base', ts: Date.now(), provenance: 'live', usdValue: 100, tradeUsd: 100 });
   assert.equal(evmBuy.status, 200);
   assert.deepEqual(evmBuy.body, { inserted: 1 });
 
-  const enqueue = await request('/api/tracked-cas', { address: '22222222222222222222222222222222222222222222', chain: 'sol', note: 'manual', entryUsd: 150 });
+  const enqueue = await request('/api/tracked-cas', { address: '22222222222222222222222222222222222222222222', chain: 'sol', note: 'manual', entryUsd: 150 }, adminToken);
   assert.equal(enqueue.status, 201);
   assert.equal(enqueue.body.chain, 'sol');
 
-  const walletEvent = await request('/api/wallet-watch/trades', { wallet: SOL_WALLET, tx: 'sol-trade-tx', ca: SOL_CA, chain: 'sol', side: 'buy', ts: Date.now(), amountUsd: 100 });
+  const walletEvent = await request('/api/wallet-watch/trades', { wallet: SOL_WALLET, tx: 'sol-trade-tx', ca: SOL_CA, chain: 'sol', side: 'buy', ts: Date.now(), amountUsd: 100, provenance: 'live' });
   assert.equal(walletEvent.status, 200);
   assert.deepEqual(walletEvent.body, { inserted: 1 });
 

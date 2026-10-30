@@ -64,12 +64,12 @@ const tableSql = (table: string): string =>
 const count = (table: string): number =>
   (getDb().prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
 
-function makeLegacyDb(path: string): void {
+function makeLegacyDb(path: string, clan = 'a'): void {
   const legacy = new Database(path);
   legacy.exec(OLD_DDL);
   legacy
     .prepare('INSERT INTO wallets (id, address, name, tags, chain, source, clan) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run('w1', 'addr-1', 'OLD-WALLET', '["sniper"]', 'sol', 'manual', 'a');
+    .run('w1', 'addr-1', 'OLD-WALLET', '["sniper"]', 'sol', 'manual', clan);
   legacy
     .prepare('INSERT INTO wallet_token_state (wallet_id, ca, balance_usd, token_amount) VALUES (?, ?, ?, ?)')
     .run('w1', 'ca-1', 12.5, 100);
@@ -79,7 +79,7 @@ function makeLegacyDb(path: string): void {
   legacy.close();
 }
 
-test('migration: old prod-shape DB keeps every row, backfilled chain=sol', () => {
+test('migration: old prod-shape DB keeps all rows and removes the synthetic clan', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wchain-mig-'));
   try {
     const path = join(dir, 'legacy.db');
@@ -87,7 +87,7 @@ test('migration: old prod-shape DB keeps every row, backfilled chain=sol', () =>
 
     open(path);
 
-    // Rows preserved, chain backfilled.
+    // Rows preserved, chain backfilled, synthetic clan removed.
     assert.equal(count('wallets'), 1);
     assert.equal(count('wallet_token_state'), 1);
     assert.equal(count('wallet_trades'), 1);
@@ -96,7 +96,7 @@ test('migration: old prod-shape DB keeps every row, backfilled chain=sol', () =>
     assert.equal(w.name, 'OLD-WALLET');
     assert.equal(w.tags, '["sniper"]');
     assert.equal(w.chain, 'sol');
-    assert.equal(w.clan, 'a');
+    assert.equal(w.clan, '');
     const s = getDb().prepare('SELECT * FROM wallet_token_state').get() as Record<string, unknown>;
     assert.deepEqual(
       { wallet_id: s.wallet_id, ca: s.ca, balance_usd: s.balance_usd, token_amount: s.token_amount, chain: s.chain },
@@ -162,6 +162,37 @@ test('migration: old prod-shape DB keeps every row, backfilled chain=sol', () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+test('migration leaves non-synthetic clan labels untouched', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wchain-clan-mig-'));
+  try {
+    const path = join(dir, 'legacy.db');
+    makeLegacyDb(path, 'b');
+
+    open(path);
+
+    const wallet = getDb().prepare('SELECT clan FROM wallets WHERE id = ?').get('w1') as { clan: string };
+    assert.equal(wallet.clan, 'b');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('synthetic clan cleanup runs only once', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wchain-clan-once-'));
+  try {
+    const path = join(dir, 'legacy.db');
+    makeLegacyDb(path);
+    open(path);
+
+    getDb().prepare('UPDATE wallets SET clan = ? WHERE id = ?').run('a', 'w1');
+    open(path);
+
+    const wallet = getDb().prepare('SELECT clan FROM wallets WHERE id = ?').get('w1') as { clan: string };
+    assert.equal(wallet.clan, 'a');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 test('fresh DB: open() on an empty path creates the chain-aware shape directly', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wchain-fresh-'));

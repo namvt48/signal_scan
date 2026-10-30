@@ -21,7 +21,7 @@ import type { TgmFlowsRequest, TgmFlowsRow, TokenFlowsClient } from '../src/prov
 import type { MarketDataProvider } from '../src/providers/provider.js';
 import type { Chain } from '../src/shared/chain.js';
 
-const { open, getTokenState } = await import('../src/db.js');
+const { open, getTokenState, insertTrackedCa } = await import('../src/db.js');
 const { updateTokenMetrics } = await import('../src/ingest.js');
 const { loadSetupCache } = await import('../src/setup-cache.js');
 const { refreshSeries, setPollerDeps } = await import('../src/poller.js');
@@ -67,6 +67,7 @@ function countingFlows(pick: (req: TgmFlowsRequest, from: number, to: number) =>
 async function runRefresh(deployedAt: number, client: TokenFlowsClient): Promise<void> {
   open(':memory:');
   loadSetupCache(join(mkdtempSync(join(tmpdir(), 't100-window-')), 'nansen-cache.json'));
+  insertTrackedCa({ address: CA, chain: CHAIN, note: 'test' });
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
   setPollerDeps(stubProvider, null, client);
   await refreshSeries(CA, CHAIN);

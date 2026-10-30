@@ -7,14 +7,15 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
-import { findEvmWalletGroup, getDb, insertWallet, open } from '../src/db.js';
+import { findEvmWalletGroup, getDb, insertFomoUser, insertTrackedCa, insertWallet, open } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { createTestAuth, type TestAuth } from './auth-testkit.js';
+import { initializeDiscoveryState } from '../src/wallet-discovery-state.js';
 
 const ADDRESS_A = `0x${'a'.repeat(40)}`;
 const ADDRESS_B = `0x${'b'.repeat(40)}`;
 const ADDRESS_C = `0x${'c'.repeat(40)}`;
-const EXPECTED_CHAINS = ['base', 'bsc', 'robinhood'];
+const EXPECTED_CHAINS = ['base', 'bsc', 'robinhood', 'eth'];
 
 let auth: TestAuth;
 let server: Server;
@@ -51,7 +52,17 @@ after(() => {
   config.showFomo = false;
 });
 
-test('one EVM add creates all three chain rows and duplicate addresses are case-insensitive', async () => {
+test('one EVM add queues only the new group and refreshes FOMO users', async () => {
+  const ca = `0x${'d'.repeat(40)}`;
+  const solCa = '3aR2xbqmWd8vxkFNraWMCYb6vUEgLvW4bJTo7bjWGdAu';
+  insertTrackedCa({ address: ca, chain: 'base', note: '' });
+  insertTrackedCa({ address: solCa, chain: 'sol', note: '' });
+  const oldSolWallet = insertWallet({ address: '3bzaJd5yZG73EVDz8xosQb7gfZm2LN5auFGh6wnP1n1f', name: 'old-sol', tags: [], chain: 'sol', source: 'manual' });
+  const fomoUser = insertFomoUser({ handle: 'old-fomo', user_id: 'stable-old-fomo' });
+  initializeDiscoveryState();
+  const revision = (getDb().prepare("SELECT value FROM wallet_discovery_meta WHERE key='revision'").get() as {value:number}).value;
+  getDb().prepare('UPDATE wallet_discovery_wallets SET frontier=? WHERE wallet_id=?').run(revision, oldSolWallet.id);
+  const oldSolState = getDb().prepare('SELECT address,chain,epoch,frontier FROM wallet_discovery_wallets WHERE wallet_id=?').get(oldSolWallet.id);
   const created = await req('POST', '/api/wallets', {
     address: ADDRESS_A,
     name: 'CT-EVM-A',
@@ -62,8 +73,16 @@ test('one EVM add creates all three chain rows and duplicate addresses are case-
   assert.equal(created.status, 201);
   assert.equal(created.json.chain, 'base');
   assert.equal(created.json.address, ADDRESS_A);
-  assert.deepEqual(findEvmWalletGroup(ADDRESS_A).map((row) => row.chain), EXPECTED_CHAINS);
-  assert.ok(findEvmWalletGroup(ADDRESS_A).every((row) => row.name === 'CT-EVM-A' && row.tags === '["early"]'));
+  const rows = findEvmWalletGroup(ADDRESS_A);
+  assert.deepEqual(rows.map((row) => row.chain), EXPECTED_CHAINS);
+  assert.ok(rows.every((row) => row.name === 'CT-EVM-A' && row.tags === '["early"]'));
+  const job = getDb().prepare('SELECT address,chain,frontier FROM wallet_discovery_wallets WHERE wallet_id=?').get(rows[0]!.id) as {address:string;chain:string;frontier:number};
+  assert.deepEqual(job, { address: ADDRESS_A, chain: 'base', frontier: 0 });
+  const targets = getDb().prepare('SELECT ca FROM wallet_discovery_targets WHERE chain=?').all('base') as {ca:string}[];
+  assert.deepEqual(targets.map(({ ca: address }) => address), [ca]);
+  assert.deepEqual(getDb().prepare('SELECT address,chain,epoch,frontier FROM wallet_discovery_wallets WHERE wallet_id=?').get(oldSolWallet.id), oldSolState);
+  const fomoState = getDb().prepare("SELECT last_outcome FROM fomo_api_request_state WHERE fomo_user_id=? AND endpoint='balances'").get(fomoUser.id) as {last_outcome:string};
+  assert.equal(fomoState.last_outcome, 'discovery_queued');
 
   const duplicate = await req('POST', '/api/wallets', {
     address: ADDRESS_A.toUpperCase().replace('0X', '0x'),
@@ -71,7 +90,7 @@ test('one EVM add creates all three chain rows and duplicate addresses are case-
     chain: 'evm',
   });
   assert.equal(duplicate.status, 409);
-  assert.equal(findEvmWalletGroup(ADDRESS_A).length, 3);
+  assert.equal(findEvmWalletGroup(ADDRESS_A).length, 4);
 });
 
 test('EVM group edits propagate to all chains and reject an address collision atomically', async () => {
@@ -102,7 +121,10 @@ test('EVM group edits propagate to all chains and reject an address collision at
   assert.equal(updated.status, 200);
   const group = findEvmWalletGroup(ADDRESS_C);
   assert.deepEqual(group.map((row) => row.chain), EXPECTED_CHAINS);
-  assert.ok(group.every((row) => row.name === 'CT-EVM-C' && row.tags === '["changed"]' && row.address === ADDRESS_C));
+  const job = getDb().prepare('SELECT address,chain,frontier FROM wallet_discovery_wallets WHERE wallet_id=?').get(group[0]!.id) as {address:string;chain:string;frontier:number};
+  assert.deepEqual(job, { address: ADDRESS_C, chain: 'base', frontier: 0 });
+  const targets = getDb().prepare('SELECT ca FROM wallet_discovery_targets WHERE chain=?').all('base') as {ca:string}[];
+  assert.deepEqual(targets.map(({ ca: address }) => address), [`0x${'d'.repeat(40)}`]);
 });
 
 test('EVM CSV import is idempotent and delete removes the full group', async () => {

@@ -8,15 +8,21 @@ Tách từ scripts/wallet_watch.py (T7) — dời nguyên văn.
 import json
 import random
 import sys
+import threading
 import time
+import math
 from typing import Any, Iterator
 
 from watchers.common import config
 from watchers.common.config import RPC_DEFAULTS, load_config_from_api
-from watchers.common.emit import fmt, jl_write, track_event, watch_trade_event
+from watchers.common.emit import fmt, jl_write, watch_trade_event
 from watchers.common.price import _warm_prices
 from watchers.common.state import _beat, save_state
 from watchers.sol.classify import TIER_A, TIER_B, _keys, _target_event, detect_events
+from watchers.sol.recovery import initialize_tracking_window, reconcile_cycle
+_PROCESS_LOCK = threading.RLock()
+
+
 
 _MAJOR_MINTS = TIER_A | TIER_B
 
@@ -25,78 +31,78 @@ _MAJOR_MINTS = TIER_A | TIER_B
 _emitted: set[tuple[str, str, str | None, str | None, int | None]] = set()
 
 
-def _handle_tx(tx, sig, wallets, st) -> None:
-    """Emit path DUY NHẤT — chỉ block feed gọi: tx lấy TRỰC TIẾP từ getBlock của
-    slot đang quét (KHÔNG crawl sig lịch sử của ví). Mỗi ví tracked có mặt trong
-    accountKeys → detect_swaps → print + jl_write + track_event, rồi cập nhật
-    head. KHÔNG save_state — caller tự quyết nhịp lưu.
-
-    `_warm_prices` chạy TRƯỚC detect_swaps (giá quote phải có sẵn trong cache);
-    `_target_event` gộp cả tx về ĐÚNG 1 token đích để `track_event` — log/
-    `events.jsonl` vẫn giữ đủ MỌI step để soi route."""
-    if (
-        config._cfg_next and time.time() >= config._cfg_next
-    ):  # ~5 phút/lần, chỉ khi tới hạn
+def _handle_tx(tx, sig, wallets, st, provenance="live") -> bool:
+    """Classify and deliver one transaction; False keeps its source cursor open."""
+    if config._cfg_next and time.time() >= config._cfg_next:
         load_config_from_api(wallets)
-    # FIX discovery: accountKeys (dù đã merge ALT qua _keys) vẫn bỏ sót ví chỉ
-    # xuất hiện qua ATA của nó — 3jjAdrCK: EC2f5Dn nhận 15.000 USDC mà KHÔNG nằm
-    # trong accountKeys ⇒ tx vô hình, không event, không CA. Owner trong
-    # pre/postTokenBalances là nguồn "ví có liên quan" đầy đủ, sẵn có trong
-    # payload (0 RPC thêm).
-    _meta = tx.get("meta") or {}
-    keys = set(_keys(tx["transaction"]["message"], _meta))
-    keys |= {
-        b["owner"]
-        for b in (_meta.get("preTokenBalances") or [])
-        + (_meta.get("postTokenBalances") or [])
-        if b.get("owner")
-    }
-    hits = [w for w in wallets if w in keys]
+    cutoff = config._tracking_since_ms
+    block_time = tx.get("blockTime")
+    if not isinstance(cutoff, int) or isinstance(cutoff, bool) or cutoff <= 0:
+        return False
     if (
-        not hits
-    ):  # tx không dính ví nào ⇒ KHÔNG warm giá (bottleneck cũ: 0.1s/mint × mọi tx)
-        return
+        not isinstance(block_time, (int, float))
+        or isinstance(block_time, bool)
+        or not math.isfinite(block_time)
+        or block_time <= 0
+    ):
+        return False
+    event_ts_ms = int(block_time * 1000)
+    if event_ts_ms < cutoff:
+        return True
+    meta = tx.get("meta") or {}
+    keys = set(_keys(tx["transaction"]["message"], meta))
+    keys |= {
+        balance["owner"]
+        for balance in (meta.get("preTokenBalances") or [])
+        + (meta.get("postTokenBalances") or [])
+        if balance.get("owner")
+    }
+    hits = [wallet for wallet in wallets if wallet in keys]
+    if not hits:
+        return True
     _warm_prices(tx)
-    for w in hits:
-        st["wallets"].setdefault(w, {})["head"] = sig
-        evs = detect_events(tx, w)
-        ms = int((tx.get("blockTime") or time.time()) * 1000)  # §5.4 mốc epoch-ms
+    complete = True
+    for wallet in hits:
+        observation_start = st.get("sol_recovery", {}).get(wallet, {}).get("observation_start_ms")
+        event_provenance = provenance
+        if isinstance(observation_start, int) and event_ts_ms < observation_start:
+            event_provenance = "historical"
+        events = detect_events(tx, wallet)
         fresh = []
-        for ev in evs:
-            ev["ts_epoch_ms"] = ms
-            key = (sig, w, ev.get("mint"), ev.get("side"), ev.get("step"))
-            if key in _emitted:  # §5.5 dedupe tường minh theo hop
-                continue
-            _emitted.add(key)
-            fresh.append(ev)
-            print(fmt(ev), flush=True)
-            jl_write(ev)
-        # Keep every SWAP hop available to the route-cost pass: a later SELL of
-        # an intermediate mint may deliver the CA that the wallet finally holds.
-        route_events = [e for e in fresh if e.get("type") == "SWAP"]
+        for event in events:
+            event["ts_epoch_ms"] = event_ts_ms
+            event["provenance"] = event_provenance
+            key = (sig, wallet, event.get("mint"), event.get("side"), event.get("step"))
+            if key not in _emitted:
+                fresh.append(event)
+        route_events = [event for event in fresh if event.get("type") == "SWAP"]
         hops = [
-            e
-            for e in route_events
-            if (e.get("side") == "SELL")
-            or (e.get("side") == "BUY" and (e.get("qty_net") or 0) > 0)
+            event
+            for event in route_events
+            if event.get("side") == "SELL"
+            or (event.get("side") == "BUY" and (event.get("qty_net") or 0) > 0)
         ]
-        tracked = {
-            (ev.get("wallet"), ev.get("sig"), ev.get("mint"), ev.get("side"))
-            for ev in hops
-        }
-        for ev in hops:
-            track_event(ev)
-        for ev in _aggregate_watch_hops(route_events):
-            key = (ev.get("wallet"), ev.get("sig"), ev.get("mint"), ev.get("side"))
-            if ev.get("side") == "BUY" and key not in tracked:
-                track_event(ev)
-            watch_trade_event(ev, tx.get("blockTime"))
+        delivered = True
+        for event in _aggregate_watch_hops(route_events):
+            if watch_trade_event(event, tx.get("blockTime")) is False:
+                delivered = False
         if fresh and not hops:
-            ev = _target_event(tx, w, evs)
-            if ev is not None:
-                track_event(ev)
-                watch_trade_event(ev, tx.get("blockTime"))
-
+            event = _target_event(tx, wallet, events)
+            if event is not None:
+                event["provenance"] = event_provenance
+                event["ts_epoch_ms"] = event_ts_ms
+                if watch_trade_event(event, tx.get("blockTime")) is False:
+                    delivered = False
+        if not delivered:
+            complete = False
+            continue
+        st["wallets"].setdefault(wallet, {})["head"] = sig
+        for event in fresh:
+            key = (sig, wallet, event.get("mint"), event.get("side"), event.get("step"))
+            _emitted.add(key)
+            print(fmt(event), flush=True)
+            jl_write(event)
+    return complete
 
 def _aggregate_watch_hops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One row per (wallet, tx, CA, side), carrying closed-route buy cost."""
@@ -380,13 +386,24 @@ def run_block_feed(wallets, st, opts) -> None:
             if isinstance(r, dict) and isinstance(r.get("transactions"), list):
                 blk = r
                 kind = "ok"
-            elif isinstance(r, dict):
-                kind = "retry"  # malformed ⇒ thử lại
             else:
-                kind = "skip"  # result null ⇒ slot thật sự bị bỏ
+                kind = "retry"  # null/malformed result is not evidence a slot was skipped
         if isinstance(blk, dict):
+            block_complete = True
             for tx in _block_txs(blk, slot):
-                _handle_tx(tx, tx["transaction"]["signatures"][0], wallets, st)
+                try:
+                    handled = _handle_tx(tx, tx["transaction"]["signatures"][0], wallets, st, "cursor")
+                except Exception as err:
+                    print(f"  ! process slot {slot}: {type(err).__name__}: {str(err)[:80]}", file=sys.stderr)
+                    handled = False
+                if handled is False:
+                    block_complete = False
+                    break
+            if not block_complete:
+                blk = None
+                kind = "retry"
+                print(f"# retry slot {slot}: transaction delivery incomplete", flush=True)
+        if isinstance(blk, dict):
             ps = blk.get("parentSlot")
             if prev_slot is not None and isinstance(ps, int) and ps < prev_slot:
                 print(
@@ -402,28 +419,19 @@ def run_block_feed(wallets, st, opts) -> None:
             if opts["once"]:
                 return
             continue
-        if kind == "skip":  # slot thật sự bị bỏ — bình thường
+        if kind == "skip":  # only explicit ledger-skip RPC errors are safe to advance
             st["block_slot"] = slot
             slot += 1
             attempts = 0
             unused += 1
-        else:  # retry — thử lại đúng slot
+        else:
             attempts += 1
-            if attempts >= _BLOCK_RETRY_MAX:
-                print(
-                    f"# GIVEUP slot {slot} sau {attempts} lần thử — tiến 1 slot",
-                    flush=True,
-                )
-                st["block_slot"] = slot
-                slot += 1
-                attempts = 0
-                unused += 1
-            else:
-                time.sleep(min(_RETRY_CAP_S, _RETRY_BASE_S * 2 ** (attempts - 1)))
-                _beat()
-                continue
-        # --once KHÔNG được quét vô hạn trên chuỗi slot chết; thoát có save_state
-        # để block_slot persist cho resume.
+            if opts["once"] and attempts >= _BLOCK_RETRY_MAX:
+                raise RuntimeError(f"getBlock slot {slot} failed after {attempts} retries; cursor unchanged")
+            delay = min(_RETRY_CAP_S, _RETRY_BASE_S * 2 ** min(attempts - 1, 10))
+            time.sleep(delay)
+            _beat()
+            continue
         if opts["once"] and unused >= _ONCE_MAX_SLOTS:
             save_state(st)
             return
@@ -464,11 +472,10 @@ def _ws_shards(items, n):
     return [items[i::n] for i in range(n)]
 
 
-def process_sig(sig, wallets, st, err=None) -> None:
-    """Fetch 1 tx rồi emit qua _handle_tx (dedupe theo hop nằm TRONG _handle_tx).
-    err!=None = tx fail ⇒ không fetch."""
+def process_sig(sig, wallets, st, err=None, provenance="live") -> bool:
+    """Fetch and deliver one transaction; False leaves the recovery cursor unchanged."""
     if err is not None:
-        return
+        return True
     try:
         tx = config.rpc(
             "getTransaction",
@@ -476,29 +483,48 @@ def process_sig(sig, wallets, st, err=None) -> None:
                 sig,
                 {
                     "encoding": "jsonParsed",
-                    # mainnet có tx version-1; ver=0 ⇒ -32015 "Transaction version
-                    # (1) is not supported" ⇒ MẤT MỌI tx v1 (cùng defect của
-                    # _BLOCK_PARAMS — đo 2026-09-15).
                     "maxSupportedTransactionVersion": 1,
                     "commitment": "confirmed",
                 },
             ],
         )
-    except Exception as e:
-        print(f"  ! {sig[:12]}… getTransaction: {e}", file=sys.stderr)
-        return
+    except Exception as exc:
+        print(f"  ! {sig[:12]}… getTransaction: {exc}", file=sys.stderr)
+        return False
     if not tx:
-        return
-    _handle_tx(tx, sig, wallets, st)
-    save_state(st)
+        return False
+    try:
+        with _PROCESS_LOCK:
+            handled = _handle_tx(tx, sig, list(wallets), st, provenance)
+            if handled is False:
+                return False
+            save_state(st)
+    except Exception as exc:
+        print(f"  ! {sig[:12]}… process: {type(exc).__name__}: {str(exc)[:80]}", file=sys.stderr)
+        return False
+async def _reconcile_loop(wallets, st, interval=30.0):
+    """Run bounded history reconciliation without blocking the websocket loop."""
+    import asyncio
+
+    interval = max(1.0, float(interval))
+    while True:
+        try:
+            cutoff = config._tracking_since_ms
+            if isinstance(cutoff, int) and not isinstance(cutoff, bool) and cutoff > 0:
+                initialize_tracking_window(st, tuple(wallets), cutoff, _PROCESS_LOCK)
+                await asyncio.to_thread(
+                    reconcile_cycle, tuple(wallets), st, process_sig, _PROCESS_LOCK
+                )
+        except Exception as exc:
+            print(
+                f"  ! SOL recovery: {type(exc).__name__}: {str(exc)[:100]}",
+                file=sys.stderr,
+            )
+        await asyncio.sleep(interval)
 
 
 def run_ws_feed(wallets, st) -> None:
-    """Feed chính: ws `logsSubscribe` (1 sub/ví) — node push ngay sig của tx có
-    nhắc ví. Chia ví ra `len(RPCS)` connection, MỖI KEY 1 connection — rớt thì
-    shard đó đổi key kế. FORWARD-ONLY: KHÔNG crawl getSignaturesForAddress (nguồn
-    CA cũ). Ví ký giao dịch của chính nó ⇒ có trong accountKeys ⇒ `mentions` luôn
-    khớp, không miss CA (tx bên thứ 3 chỉ chạm ATA là log-only, không sinh CA)."""
+    """Maintain subscriptions for the latest authoritative SOL wallet list."""
     import asyncio
 
     try:
@@ -506,67 +532,43 @@ def run_ws_feed(wallets, st) -> None:
     except ImportError:
         sys.exit("feed=ws cần:  pip install websockets   (hoặc --feed block)")
 
-    dropped = [w for w in wallets if not _valid_pubkey(w)]
-    if dropped:
-        print(
-            f"# feed=ws bỏ {len(dropped)} ví non-base58 (Helius từ chối cả shard): "
-            + ", ".join(d[:12] for d in dropped),
-            file=sys.stderr,
-            flush=True,
-        )
-        wallets = [w for w in wallets if _valid_pubkey(w)]
+    wallets[:] = [w for w in wallets if _valid_pubkey(w)]
+
+    interval = max(1.0, float(getattr(config, "_SOL_RECONCILE_INTERVAL_S", 30.0)))
 
     async def _beat_loop():
-        while True:  # watchdog coi heartbeat là sống; ví im lặng vẫn phải đập nhịp
+        while True:
             _beat()
             await asyncio.sleep(30)
 
     async def _worker(q):
-        """A: getTransaction (urllib blocking, timeout 20s + retry) chạy trong thread
-        để KHÔNG chặn event loop — loop rảnh mới trả pong kịp (hết 1011 keepalive
-        timeout). Một worker duy nhất giữ `st` đơn luồng nên không cần lock."""
         while True:
             sig, err = await q.get()
             try:
                 await asyncio.to_thread(process_sig, sig, wallets, st, err)
-            except Exception as e:  # process_sig tự bắt rồi; đây chỉ là chốt chặn
-                print(
-                    f"  ! worker process_sig {sig[:12]}…: {type(e).__name__}: {str(e)[:80]}",
-                    file=sys.stderr,
-                )
+            except Exception as e:
+                print(f"  ! worker process_sig {sig[:12]}…: {type(e).__name__}: {str(e)[:80]}", file=sys.stderr)
+            finally:
+                q.task_done()
 
     async def _shard(sid, sliced, eps, nshard, q):
-        k = sid  # shard khởi động ở key riêng ⇒ các connection không trùng key
+        k = sid
         backoff = 1.0
         while True:
             try:
                 async with websockets.connect(
-                    _wss(eps[k % len(eps)]),
-                    open_timeout=10,
-                    ping_interval=20,
-                    ping_timeout=60,  # B: loop có thể vướng thoáng qua, đừng giết socket
-                    max_size=None,
+                    _wss(eps[k % len(eps)]), open_timeout=10,
+                    ping_interval=20, ping_timeout=60, max_size=None,
                 ) as ws:
-                    for i, w in enumerate(
-                        sliced, 1
-                    ):  # public chỉ nhận 1 address/mentions/sub ⇒ 1 sub mỗi ví
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": i,
-                                    "method": "logsSubscribe",
-                                    "params": [{"mentions": [w]}],
-                                }
-                            )
-                        )
-                    print(
-                        f"# feed=ws shard {sid + 1}/{nshard} key#{k % len(eps)}"
-                        f" logsSubscribe {len(sliced)} ví (tổng {len(wallets)})",
-                        flush=True,
-                    )
+                    for i, w in enumerate(sliced, 1):
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0", "id": i, "method": "logsSubscribe",
+                            "params": [{"mentions": [w]}],
+                        }))
+                        await asyncio.sleep(0.05)
+                    print(f"# feed=ws shard {sid + 1}/{nshard} key#{k % len(eps)} logsSubscribe {len(sliced)} ví", flush=True)
                     _beat()
-                    backoff = 1.0  # kết nối + subscribe OK ⇒ reset backoff
+                    backoff = 1.0
                     while True:
                         m = json.loads(await ws.recv())
                         _beat()
@@ -575,39 +577,57 @@ def run_ws_feed(wallets, st) -> None:
                                 raise RuntimeError(m["error"]["message"])
                             continue
                         p = m.get("params") or {}
-                        if "error" in p:  # lỗi trên kênh subscribe ⇒ reconnect
+                        if "error" in p:
                             raise RuntimeError(str(p["error"])[:60])
                         v = p.get("result", {}).get("value", {})
                         if v.get("signature"):
-                            # A: đẩy tx sang worker (to_thread) — KHÔNG chặn recv,
-                            # nên loop vẫn trả keepalive pong (hết 1011 timeout).
                             await q.put((v["signature"], v.get("err")))
+            except asyncio.CancelledError:
+                raise
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
                 k += 1
-                delay = (
-                    backoff + random.random()
-                )  # C: jitter — 6 shard đừng hồi cùng lúc
-                print(
-                    f"  ! ws đứt shard {sid + 1} ({type(e).__name__}: {str(e)[:70]})"
-                    f" -> key kế, reconnect sau {delay:.1f}s",
-                    file=sys.stderr,
-                )
+                delay = backoff + random.random()
+                print(f"  ! ws đứt shard {sid + 1} ({type(e).__name__}: {str(e)[:70]}) -> key kế, reconnect sau {delay:.1f}s", file=sys.stderr)
                 await asyncio.sleep(delay)
                 backoff = min(60.0, backoff * 2)
 
     async def _run():
-        # chỉ shard trên endpoint CHÍNH: default (publicnode/mainnet-beta) không
-        # nhận logsSubscribe ⇒ shard thừa chỉ reconnect-loop (log cũ "ws đứt shard 7").
         eps = [u for u in config.RPCS if u not in RPC_DEFAULTS] or list(config.RPCS)
-        slices = _ws_shards(wallets, len(eps))
-        q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(
-            maxsize=2000
-        )  # A: hàng đợi tx cho worker
-        tasks = [asyncio.create_task(_beat_loop()), asyncio.create_task(_worker(q))]
-        for sid, sliced in enumerate(slices):
-            tasks.append(asyncio.create_task(_shard(sid, sliced, eps, len(slices), q)))
-        await asyncio.gather(*tasks)
+        q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=2000)
+        shards: list[asyncio.Task] = []
+        worker = asyncio.create_task(_worker(q))
+        recovery = asyncio.create_task(_reconcile_loop(wallets, st, interval))
+        beat = asyncio.create_task(_beat_loop())
+        subscribed = None
+        try:
+            while True:
+                if config._cfg_next == 0 or time.time() >= config._cfg_next:
+                    load_config_from_api(wallets)
+                latest = tuple(dict.fromkeys(w for w in wallets if _valid_pubkey(w)))
+                if latest != subscribed:
+                    old = shards
+                    for task in old:
+                        task.cancel()
+                    if old:
+                        await asyncio.gather(*old, return_exceptions=True)
+                    subscribed = latest
+                    slices = _ws_shards(list(latest), len(eps)) if latest else []
+                    shards = [
+                        asyncio.create_task(_shard(sid, part, eps, len(slices), q))
+                        for sid, part in enumerate(slices)
+                    ]
+                await asyncio.sleep(min(30.0, config._CFG_REFRESH_S))
+        finally:
+            for task in shards:
+                task.cancel()
+            worker.cancel()
+            recovery.cancel()
+            beat.cancel()
+            await asyncio.gather(*shards, worker, recovery, beat, return_exceptions=True)
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass

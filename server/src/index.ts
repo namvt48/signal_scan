@@ -15,6 +15,7 @@ import { startPoller } from './poller.js';
 import { cacheKey, loadSetupCache, pruneSetupCache } from './setup-cache.js';
 import { createApp } from './api.js';
 import { cohortLabelIndex } from './cohort-labels.js';
+import { startSolWalletSync } from './sol-wallet-schedule.js';
 
 open(config.dbPath, config.marketDbPath);
 if (config.marketDbPath === '') seedIfEmpty();
@@ -95,6 +96,11 @@ cohortLabelIndex.start(
   (error) => log.warn('[cohort-labels] refresh failed', error),
   (wallets) => log.info(`[cohort-labels] refreshed ${wallets} wallet labels`),
 );
+
+// Reconcile only the primary SOL wallet table; EVM wallet rows remain untouched.
+const stopSolWalletSyncSchedule = startSolWalletSync();
+process.once('SIGTERM', stopSolWalletSyncSchedule);
+process.once('SIGINT', stopSolWalletSyncSchedule);
 
 createApp(provider.name).listen(config.port, () => {
   log.info(

@@ -39,6 +39,25 @@ export interface ParsedFomoImportRow {
   data?: FomoImportRow;
   reason?: string;
 }
+/** Server-side stats for one page of signals (mirrors SignalPageStats in server/src/signal-page.ts). */
+export interface SignalPageStats {
+  tracked: number;
+  active: number;
+  watch: number;
+  volume24h: number;
+  tiers: { s: number; a: number; b: number };
+}
+
+/** One page of the paged signals response; rows continue at the next offset. */
+export interface SignalPage {
+  rows: TokenSignal[];
+  total: number;
+  stats: SignalPageStats;
+}
+
+/** Which table is asking: 'rated' always requests the tiered view server-side. */
+export type SignalView = 'dashboard' | 'rated';
+
 export type WalletWriteInput = Omit<Wallet, 'id' | 'rank' | 'groups' | 'chain'> & { chain: WalletScope };
 export type WalletWritePatch = Partial<WalletWriteInput>;
 
@@ -54,6 +73,7 @@ export interface DataStore {
   updateFomoUser(id: string, patch: Partial<Omit<FomoUser, 'id'>>): Promise<FomoUser>;
   deleteFomoUser(id: string): Promise<void>;
   importFomoUsers(rows: FomoImportRow[]): Promise<ImportResult>;
+  listSignalsPage(view: SignalView, allFactors: boolean, offset: number, limit: number, signal?: AbortSignal): Promise<SignalPage>;
   listSignals(allFactors?: boolean, signal?: AbortSignal): Promise<TokenSignal[]>;
   getSettings(): Promise<Settings>;
   updateSettings(patch: SettingsPatch): Promise<Settings>;
@@ -583,9 +603,28 @@ export const localDataStore: DataStore = {
     return { added: added.length, skipped: [] };
   },
 
-  async listSignals(): Promise<TokenSignal[]> {
+  // Local dev has ~40 seed rows; reuse the same page math as the server so the
+  // UI behaves identically without VITE_API_BASE.
+  async listSignalsPage(view: SignalView, allFactors: boolean, offset: number, limit: number): Promise<SignalPage> {
+    const rows = await this.listSignals(allFactors ? true : false);
+    const passing = rows.filter((s) => s.nansen.score >= 1 || s.tier !== null);
+    const rated = rows.filter((s) => s.tier !== null && s.tier !== 'P');
+    const tiers = {
+      s: rated.filter((s) => s.tier === 'S+' || s.tier === 'S').length,
+      a: rated.filter((s) => s.tier === 'A+' || s.tier === 'A').length,
+      b: rated.filter((s) => s.tier === 'B+' || s.tier === 'B').length,
+    };
+    const viewRows = view === 'rated' ? rated : allFactors ? rows : passing;
+    return {
+      rows: viewRows.slice(offset, offset + limit),
+      total: viewRows.length,
+      stats: { tracked: rows.length, active: passing.length, watch: rows.length - passing.length, volume24h: viewRows.reduce((sum, s) => sum + s.volume24h, 0), tiers },
+    };
+  },
+  async listSignals(allFactors?: boolean): Promise<TokenSignal[]> {
     const tiers = readTiers();
     const notes = readNotes();
+    void allFactors; // seed rows carry no server-side gates; param exists for contract parity
     return SEED_SIGNALS.map((s) => ({ ...s, note: notes[`${s.chain}:${s.ca}`] ?? '', tier: tiers[`${s.chain}:${s.ca}`] ?? s.tier ?? null }));
   },
 

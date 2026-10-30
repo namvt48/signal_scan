@@ -1,7 +1,7 @@
 export const CHAINS = ['sol', 'base', 'bsc', 'robinhood', 'eth'] as const;
 export type Chain = (typeof CHAINS)[number];
-// Wallet-group import networks; `eth` is a supported FOMO chain but is not auto-added to a group.
-export const EVM_CHAINS = ['base', 'bsc', 'robinhood'] as const satisfies readonly Chain[];
+// Wallet-group import networks; adding `evm` expands to every supported EVM chain.
+export const EVM_CHAINS = ['base', 'bsc', 'robinhood', 'eth'] as const satisfies readonly Chain[];
 export type WalletScope = Chain | 'evm';
 
 export const TIERS = ['S+', 'S', 'A+', 'A', 'B+', 'B', 'P'] as const;
@@ -90,9 +90,9 @@ export interface TrackedWalletStat {
   buys: number;
   /** watch SELL count in the window. */
   sells: number;
-  /** Current token balance USD for this (wallet, CA) — ABSENT when never measured. */
+  /** Current token balance USD; 0 when zero_holding confirms empty; absent when unmeasured or a positive holding lacks price. */
   balUsd?: number;
-  /** Current held amount in token units; absent when no wallet balance measurement exists. */
+  /** Current held token units; 0 when zero_holding confirms empty; absent when unmeasured. */
   holdingAmount?: number;
   /** Current token balance as a share of total supply; absent when balance/supply is unknown. */
   holdingPct?: number;
@@ -164,8 +164,9 @@ export interface TokenSignal {
   /** Net USD tracked wallets put in over the last 24h (buys − sells); may be negative. */
   trackedInflow: number;
   /**
-   * Epoch ms of the newest tracked trade — buy OR sell — from a member wallet; 0 = none yet.
-   * Dashboard A uses this as its default sort key (newest activity first); B sorts by FOMO user lastTs.
+   * Epoch ms of the newest buy OR sell from a displayed native wallet in the 24h window;
+   * chain-scoped, with 0 when no displayed member trade exists.
+   * Dashboard A uses this as its default sort key; FOMO-user activity is merged by the UI.
    */
   trackedActivityAt: number;
   /** Latest captured FOMO buy/sell or native watch trade for this (chain, CA), across all history. */

@@ -77,6 +77,7 @@ _service_token = os.environ.get("SIGNAL_SCAN_SERVICE_TOKEN", "").strip()
 _cfg_cli_min_usd: float = (
     min_usd  # giá trị --min-usd: fallback khi API settings chết/lỗi
 )
+_tracking_since_ms: int | None = None  # server-authoritative systemDeployAt
 _cfg_next = 0.0  # time.time() tới hạn refresh config từ API kế tiếp (0 = chưa nạp)
 _CFG_REFRESH_S = 300.0  # ~5 phút: đổi config trên UI có hiệu lực không cần restart
 
@@ -149,11 +150,16 @@ def gateway_json(path, payload, timeout=20):
 
 
 def _api_min_usd():
-    """GET {api}/api/settings → values.minUsd dạng float hữu hạn > 0; None nếu
-    lỗi bất kỳ (mạng/HTTP non-2xx/thiếu key/sai kiểu/không hữu hạn) — caller giữ
-    giá trị CLI/default. Không bao giờ raise."""
+    """Fetch runtime thresholds and the authoritative tracked-CA deployment cutoff."""
+    global _tracking_since_ms
     try:
         data = http_json(f"{_api_url}/api/settings", timeout=5)
+        cutoff = data.get("trackingSinceMs")
+        _tracking_since_ms = (
+            cutoff
+            if isinstance(cutoff, int) and not isinstance(cutoff, bool) and cutoff > 0
+            else None
+        )
         v = (data.get("values") or {}).get("minUsd")
         if (
             isinstance(v, (int, float))
@@ -165,7 +171,6 @@ def _api_min_usd():
     except Exception as ex:  # URLError/HTTPError/AttributeError (response sai shape)…
         print(f"  ! api settings: {type(ex).__name__}: {str(ex)[:60]}", file=sys.stderr)
     return None
-
 
 def _api_wallets(chain="sol"):
     """GET {api}/api/wallets → list địa chỉ `address` (str không rỗng) của từng

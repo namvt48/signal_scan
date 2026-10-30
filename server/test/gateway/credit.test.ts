@@ -22,6 +22,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter, once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { createGatewayApp } from '../../src/gateway/app.js';
 import type { CallerTokens } from '../../src/gateway/auth.js';
@@ -29,6 +30,7 @@ import {
   NANSEN_CREDIT_LIMITER,
   NANSEN_CREDIT_PATH,
   NANSEN_DOOR_PATH,
+  handleNansenCredit,
   type DoorPost,
 } from '../../src/gateway/nansen.js';
 import { DEXSCREENER_PATH } from '../../src/gateway/dexscreener.js';
@@ -310,4 +312,81 @@ test('(g) budget 0 = unlimited: the pre-flight never denies', async () => {
     }
     assert.equal(credits.snapshot().used.a, 5, 'usage is still accounted when uncapped');
   });
+});
+
+test('paid metrics count real dispatches, not cross-caller cache hits', async () => {
+  const credits = new CreditAccountant({ budget: 0 });
+  const upstream: UpstreamFetch = async () => ({
+    status: 200, body: '{"data":[{"balance":42}]}',
+    headers: { 'x-nansen-credits-cost': '7' },
+  });
+  const runLimiter: LimiterRun = (_api, _opts, fn) => fn();
+  await withServer({ credits, nansenCreditUpstream: upstream, runLimiter }, async (base) => {
+    await post(base, NANSEN_CREDIT_PATH, creditBody('PAID-METRIC-CA'), TOKENS.a);
+    await post(base, NANSEN_CREDIT_PATH, creditBody('PAID-METRIC-CA'), TOKENS.b);
+    const response = await fetch(`${base}/metrics`, { headers: { authorization: `Bearer ${TOKENS.a}` } });
+    const metrics = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(metrics.cache.hits, 1);
+    assert.deepEqual(metrics.nansenPaid.total, {
+      attempts: 1, responsesWithData: 1, emptyResponses: 0, invalidResponses: 0,
+      errors: 0, reportedCredits: 7, estimatedCredits: 0,
+    });
+    assert.deepEqual(metrics.nansenPaid.byEndpoint['token-information'], metrics.nansenPaid.total);
+    assert.equal(credits.snapshot().used.a, 7);
+    assert.equal(credits.snapshot().used.b, 0);
+  });
+});
+
+test('paid metrics distinguish empty data, invalid payloads, HTTP and transport errors', async () => {
+  const credits = new CreditAccountant({ budget: 0 });
+  const cases: UpstreamResponse[] = [
+    { status: 200, body: '{"data":[]}', headers: {} },
+    { status: 200, body: 'not-json', headers: { 'x-nansen-credits-cost': ' ' } },
+    { status: 429, body: '{"error":"rate_limited"}', headers: {} },
+    { status: 200, body: '{"success":false,"error":"denied"}', headers: {} },
+  ];
+  const wrapped = credits.wrap(async () => {
+    const response = cases.shift();
+    if (!response) throw new Error('transport failed');
+    return response;
+  });
+  const request = { provider: NANSEN_CREDIT_LIMITER, endpoint: '/api/v1/tgm/flows?secret=hidden', body: {} };
+  for (let index = 0; index < 4; index += 1) await wrapped(request, 'a');
+  await assert.rejects(wrapped(request, 'a'), /transport failed/);
+  const metrics = credits.efficiencySnapshot();
+  assert.deepEqual(metrics.total, {
+    attempts: 5, responsesWithData: 0, emptyResponses: 1, invalidResponses: 1,
+    errors: 3, reportedCredits: 0, estimatedCredits: 3,
+  });
+  assert.deepEqual(Object.keys(metrics.byEndpoint), ['flows']);
+  assert.equal(credits.snapshot().used.a, 3);
+});
+
+test('joined Nansen requests share one paid dispatch across callers', async () => {
+  const credits = new CreditAccountant({ budget: 0 });
+  const cache = new GatewayCache();
+  const gate = new EventEmitter();
+  const started = once(gate, 'started');
+  const upstream = credits.wrap(async () => {
+    gate.emit('started');
+    await once(gate, 'release');
+    return okUpstream('{"data":[{"balance":42}]}');
+  });
+  const body = creditBody('JOINED-PAID-CA');
+  const run = (caller: 'a' | 'b') => handleNansenCredit(body, caller, {
+    fetchUpstream: upstream, runLimiter: (_api, _opts, fn) => fn(),
+  });
+  const first = cache.dispatch(NANSEN_CREDIT_LIMITER, body, 'a', () => run('a'), credits.preflight);
+  await started;
+  const joined = cache.dispatch(NANSEN_CREDIT_LIMITER, body, 'b', () => run('b'), credits.preflight);
+  assert.equal(cache.joinedCount(), 1);
+  gate.emit('release');
+  const results = await Promise.all([first, joined]);
+  assert.equal(results[0].status, 200);
+  assert.deepEqual(results[0], results[1]);
+  assert.equal(credits.efficiencySnapshot().total.attempts, 1);
+  assert.equal(credits.efficiencySnapshot().total.estimatedCredits, 1);
+  assert.equal(credits.snapshot().used.a, 1);
+  assert.equal(credits.snapshot().used.b, 0);
 });

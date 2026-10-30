@@ -1,6 +1,7 @@
 """Durable delivery of EVM wallet trades to the wallet-watch API."""
 
 import email.utils
+import json
 import time
 import urllib.error
 
@@ -9,11 +10,11 @@ from watchers.common import config
 _journal = None
 _MAX_BACKOFF = 3600
 _BASE_BACKOFF = 2
-_TRADE_FIELDS = ("wallet", "ca", "tx", "ts", "side", "chain", "amountUsd", "price")
+_TRADE_FIELDS = ("wallet", "ca", "tx", "ts", "side", "chain", "amountUsd", "price", "provenance")
 
 
 def configure(journal):
-    """Set the durable outbox used by post_trade and the delivery worker."""
+    """Set the durable outbox used by the delivery worker."""
     global _journal
     _journal = journal
 
@@ -26,6 +27,8 @@ def _require_journal():
 
 def post_trade(body):
     """Queue a candidate trade; block metadata stays local to the journal."""
+    if body.get("provenance") not in ("live", "cursor", "historical"):
+        raise ValueError("trade provenance is required")
     journal = _require_journal()
     trade = {key: body[key] for key in _TRADE_FIELDS if key in body}
     journal.enqueue(trade, block=body.get("block", 0), block_hash=body.get("blockHash", ""))

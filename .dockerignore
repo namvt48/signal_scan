@@ -3,4 +3,13 @@ dist
 server/node_modules
 server/dist
 data
+server/data*
+backups
 .git
+.env
+.env.*
+**/.env
+**/.env.*
+**/public-api.env*
+keys
+data-b

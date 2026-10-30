@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import type { AlertMetricObservation } from '../src/alert-feed.js';
 import { config } from '../src/config.js';
 import { createApp } from '../src/api.js';
-import { getDb, insertFomoUser, open } from '../src/db.js';
+import { getDb, insertFomoUser, open, setSetting } from '../src/db.js';
 import { readMonitorConfig } from '../src/monitor/config.js';
 import { MonitorAlerts } from '../src/monitor/alerts.js';
 import { MonitorStore } from '../src/monitor/store.js';
@@ -1045,6 +1045,7 @@ test('FOMO trade API feeds one thresholded Tracker Buying Telegram alert end-to-
   const store = new MonitorStore(':memory:');
   let api: Server | undefined;
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   const user = insertFomoUser({ handle: 'midcurver', user_id: 'integration-user', name: 'Midcurver' });
   const ca = '0x88ad8ddf1e3898412146a534538d418c6f8a9062';
   getDb().prepare('INSERT INTO token_state (ca, chain, symbol, market_cap, supply) VALUES (?, ?, ?, ?, ?)')
@@ -1074,6 +1075,7 @@ test('FOMO trade API feeds one thresholded Tracker Buying Telegram alert end-to-
         tokenAddress: ca,
         chain: 'robinhood',
         ts: 1_791_879_930_000,
+        provenance: 'live',
         tradeUsd: 24_865.82,
         usdValue: 24_875,
       }),

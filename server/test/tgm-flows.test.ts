@@ -25,7 +25,7 @@ import type { TgmFlowsRequest, TgmFlowsRow, TokenFlowsClient } from '../src/prov
 import type { MarketDataProvider } from '../src/providers/provider.js';
 import type { Chain } from '../src/shared/chain.js';
 
-const { open, getTokenState } = await import('../src/db.js');
+const { open, getTokenState, insertTrackedCa } = await import('../src/db.js');
 const { updateTokenMetrics, updateTokenAnalytics } = await import('../src/ingest.js');
 const { loadSetupCache, getSetupCacheEntry } = await import('../src/setup-cache.js');
 const { refreshSeries, setPollerDeps } = await import('../src/poller.js');
@@ -35,6 +35,10 @@ const { GatewayClient } = await import('../src/gateway-client.js');
 const CA = 'CA-TGM-FLOWS';
 const CHAIN: Chain = 'sol';
 const DAY = 86_400_000;
+function openActiveCa(): void {
+  open(':memory:');
+  insertTrackedCa({ address: CA, chain: CHAIN, note: 'test' });
+}
 
 const stubProvider: MarketDataProvider = {
   name: 'stub-tgm-flows',
@@ -78,9 +82,10 @@ function tempCacheFile(): string {
 }
 
 async function runRefreshAtAge(ageDays: number): Promise<void> {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const now = Date.now();
+  insertTrackedCa({ address: CA, chain: CHAIN, note: 'test' });
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt: now - ageDays * DAY });
   setPollerDeps(stubProvider, null, installDenseFlows());
   await refreshSeries(CA, CHAIN);
@@ -117,7 +122,7 @@ test('T100: age 40d → 1 call over the WHOLE life, not a capped first month', a
 });
 
 test('pre-genesis back-fill is clamped out of both T100 and LF', async () => {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
@@ -156,7 +161,7 @@ function installDailyOnlyFlows(dailyRows: readonly TgmFlowsRow[]): TokenFlowsCli
 }
 
 async function runDailyOnly(deployedAt: number, dailyRows: readonly TgmFlowsRow[]): Promise<void> {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
   setPollerDeps(stubProvider, null, installDailyOnlyFlows(dailyRows));
@@ -190,7 +195,7 @@ function installNoHourlyFlows(dailyRows: readonly TgmFlowsRow[], exchangeRows: r
 }
 
 test('an EMPTY hourly window retries as a 30d daily window instead of dropping the pass (CASES, measured)', async () => {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const deployedAt = Date.now() - 2 * DAY;
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
@@ -220,7 +225,7 @@ test('an EMPTY hourly window retries as a 30d daily window instead of dropping t
 });
 
 test('a flat back-fill series (holders 0) is refused: it never becomes the chart (THERANOS, measured)', async () => {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
@@ -242,7 +247,7 @@ test('a flat back-fill series (holders 0) is refused: it never becomes the chart
 });
 
 test('a ONE-bucket widened series still charts, but must NOT flip T100 (keeps previous, so the CA stays incomplete)', async () => {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const deployedAt = Date.now() - 2 * DAY;
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
@@ -329,7 +334,7 @@ test('T100: the factor fires from the wire rows alone (synthetic dip)', async ()
 test('T100: a flat series (≥2 buckets, no drawdown) writes multiple 1 over the previous value', async () => {
   // The inverse of the ONE-bucket case above: two or more REAL buckets that never fell
   // are enough to assert "chua xa", so a previous 1.5 must be replaced by 1.
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
@@ -355,7 +360,7 @@ test('T100: a flat series (≥2 buckets, no drawdown) writes multiple 1 over the
 });
 
 test('keep previous: a flows throw leaves genesis_bal / t100_multiple untouched and stamps no marker', async () => {
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
@@ -417,7 +422,7 @@ test('tokenFlows: ONE gateway request, per_page 1000, no order_by/filters', asyn
 
 test('live chart path: refreshSeries → seriesAtRung fetches through the gateway', async () => {
   const realFetch = globalThis.fetch;
-  open(':memory:');
+  openActiveCa();
   loadSetupCache(tempCacheFile());
   const deployedAt = Date.now() - 3 * DAY;
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });

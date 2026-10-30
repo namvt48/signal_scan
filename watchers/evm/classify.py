@@ -434,20 +434,22 @@ def classify_swaps(chain, wallet, tx):
 
 
 def trade_body(ev, usd, ts_ms):
-    """Body POST /api/wallet-watch/trades (T4: server tra wallet theo
-    (address, chain); side lowercase 'buy'/'sell'). `usd` None = chưa định giá
-    được ⇒ amountUsd 0 (server fail-open, như semantics watch_trade_body Sol)."""
+    """Single trade ingest body; unknown valuation is omitted so admission stays fail-open."""
     qty = ev.get("qty") or 0.0
-    return {
+    body = {
         "wallet": ev["wallet"],
         "chain": ev["chain"],
         "ca": ev["ca"],
         "tx": ev["tx"],
         "ts": int(ts_ms),
-        "amountUsd": float(usd) if usd else 0.0,
-        "price": float(usd) / qty if usd and qty > 0 else 0.0,
         "side": "sell" if ev["side"] == "SELL" else "buy",
+        "provenance": "cursor",
     }
+    if usd is not None and usd > 0:
+        body["amountUsd"] = float(usd)
+        if qty > 0:
+            body["price"] = float(usd) / qty
+    return body
 
 
 def fmt_event(ev) -> str:

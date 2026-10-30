@@ -3,7 +3,7 @@
 // cannot tell them apart.
 
 import type { Chain, FomoUser, PeriodicScanSettings, Settings, SettingsPatch, TelegramAlertRules, Tier, TokenSignal, Wallet } from '../types';
-import type { DataStore, FomoImportRow, ImportResult, ImportRow, WalletWriteInput, WalletWritePatch } from './dataStore';
+import type { DataStore, FomoImportRow, ImportResult, ImportRow, SignalPage, SignalView, WalletWriteInput, WalletWritePatch } from './dataStore';
 import { byHandle, byName } from './sort';
 
 const BASE = `${import.meta.env.VITE_API_BASE}/api`;
@@ -96,10 +96,12 @@ export const restDataStore: DataStore = {
     return request<ImportResult>('/fomo-users/import', json('POST', { rows }));
   },
 
+  async listSignalsPage(view: SignalView, allFactors: boolean, offset: number, limit: number, signal?: AbortSignal): Promise<SignalPage> {
+    return request<SignalPage>(`/signals/page?view=${view}&allFactors=${allFactors ? '1' : '0'}&offset=${offset}&limit=${limit}`, { signal });
+  },
   async listSignals(allFactors?: boolean, signal?: AbortSignal): Promise<TokenSignal[]> {
     return request<TokenSignal[]>(`/signals?allFactors=${allFactors ? '1' : '0'}`, { signal });
   },
-
 
 
   async getSettings(): Promise<Settings> {

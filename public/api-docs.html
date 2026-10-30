@@ -601,10 +601,11 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/wallets?limit=50&amp;offse
             <tr><td>from / to</td><td>last 24 h</td><td>positive span ≤ 31 days</td><td>Token activity, wallet trades, FOMO trades.</td></tr>
           </tbody></table>
           <div class="split">
-            <article class="note-card"><h3>HTTP quota</h3><p>120 requests/minute per process, shared by all callers. At most 16 concurrent requests; excess receives <code>503</code>. Identical in-flight export requests share work and successful exports are cached for 500 ms in a bounded cache.</p></article>
+            <article class="note-card"><h3>HTTP quota and cache</h3><p>120 requests/minute per process, shared by all callers. At most 24 concurrent requests; excess receives <code>503</code> with <code>Retry-After: 1</code>. Identical in-flight requests share work. Successful token/detail responses cache for 5s; wallet/user lists, balance charts and FOMO statistics for 15s; activity/trades/positions for 1s; alerts for 500ms. Cache: up to 512 entries / 32 MiB serialized data. Errors are not cached.</p></article>
             <article class="note-card"><h3>WebSocket capacity</h3><p>64 connections per process, independent of the HTTP quota. The stream is polled once per process and shared across clients.</p></article>
           </div>
           <p class="intro">Quotas and caches are process-local, so the service runs one public replica. Do not assume limits scale with replicas.</p>
+          <p class="intro">Token pages share a snapshot built in a read-only worker every 15 seconds. <code>generatedAt</code> is capture time; snapshots are never served at 60 seconds of age or older. A failed refresh does not erase a still-valid snapshot. Pages are not pinned across refreshes; deduplicate token IDs during long scans. Omitted activity/trade time bounds use one-second boundaries; explicit bounds retain millisecond precision. WebSocket delivery cadence is unchanged.</p>
         </section>
 
         <section class="section" id="errors">
