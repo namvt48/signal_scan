@@ -26,6 +26,7 @@ class Journal:
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA busy_timeout=30000")
             self._schema()
+            self._migrate_trade_provenance()
 
     def _schema(self):
         self._db.executescript("""
@@ -60,6 +61,7 @@ class Journal:
           block INTEGER NOT NULL, block_hash TEXT NOT NULL, transaction_json TEXT,
           trace_wallets TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
           attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
+          reason TEXT NOT NULL DEFAULT '',
           UNIQUE(chain,tx,block_hash));
         """)
         columns = {
@@ -68,9 +70,28 @@ class Journal:
         for name, definition in (
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("next_at", "REAL NOT NULL DEFAULT 0"),
+            ("reason", "TEXT NOT NULL DEFAULT ''"),
         ):
             if name not in columns:
                 self._db.execute(f"ALTER TABLE candidates ADD COLUMN {name} {definition}")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS candidates_due ON candidates(chain,status,next_at,block,id)"
+        )
+
+    def _migrate_trade_provenance(self):
+        """Upgrade previously observed cursor events without resetting delivery state."""
+        with self._transaction() as db:
+            key = "outbox_provenance_cursor_migration"
+            if db.execute("SELECT 1 FROM meta WHERE key=?", (key,)).fetchone():
+                return
+            for row in db.execute("SELECT id, payload FROM outbox WHERE delivered=0").fetchall():
+                payload = json.loads(row["payload"])
+                if not isinstance(payload, dict):
+                    raise ValueError("journal outbox payload is not an object")
+                if "provenance" not in payload:
+                    updated = {**payload, "provenance": "cursor"}
+                    db.execute("UPDATE outbox SET payload=? WHERE id=?", (self._json(updated), row["id"]))
+            db.execute("INSERT INTO meta(key, value) VALUES(?, ?)", (key, "1"))
 
     def close(self):
         with self._lock:
@@ -221,9 +242,9 @@ class Journal:
         current = time.time() if now is None else now
         with self._lock:
             rows = self._db.execute(
-                """SELECT tx,block,block_hash,transaction_json,trace_wallets,attempts
+                """SELECT tx,block,block_hash,transaction_json,trace_wallets,attempts,reason
                    FROM candidates WHERE chain=? AND status='pending' AND next_at<=?
-                   ORDER BY block,id LIMIT ?""",
+                   ORDER BY block DESC,id DESC LIMIT ?""",
                 (chain, current, max(0, limit)),
             ).fetchall()
         return [
@@ -234,26 +255,28 @@ class Journal:
                 "transaction": json.loads(row[3]) if row[3] else None,
                 "trace_wallets": json.loads(row[4]),
                 "attempts": row[5],
+                "reason": row[6],
             }
             for row in rows
         ]
 
     def defer_candidate(
-        self, chain, tx_hash, block, block_hash, next_at, increment_attempts=True
+        self, chain, tx_hash, block, block_hash, next_at, increment_attempts=True, reason=""
     ):
         with self._transaction() as db:
-            if increment_attempts:
-                db.execute(
-                    """UPDATE candidates SET attempts=attempts+1,next_at=?
-                       WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
-                    (float(next_at), chain, tx_hash, self._number(block), block_hash or ""),
-                )
-            else:
-                db.execute(
-                    """UPDATE candidates SET next_at=?
-                       WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
-                    (float(next_at), chain, tx_hash, self._number(block), block_hash or ""),
-                )
+            db.execute(
+                """UPDATE candidates SET attempts=attempts+?,next_at=?,reason=?
+                   WHERE chain=? AND tx=? AND block=? AND block_hash=? AND status='pending'""",
+                (
+                    int(increment_attempts),
+                    float(next_at),
+                    str(reason)[:160],
+                    chain,
+                    tx_hash,
+                    self._number(block),
+                    block_hash or "",
+                ),
+            )
 
     def complete_candidate(self, chain, tx_hash, block, block_hash=""):
         with self._transaction() as db:

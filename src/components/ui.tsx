@@ -390,6 +390,30 @@ export function Td({ className = '', children, title }: { className?: string; ch
   );
 }
 
+const AVATAR_REFRESH_MS = 5 * 60_000;
+const avatarRefreshListeners = new Set<() => void>();
+let avatarRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function useAvatarRefreshBucket(enabled: boolean): number {
+  const [bucket, setBucket] = useState(() => Math.floor(Date.now() / AVATAR_REFRESH_MS));
+  useEffect(() => {
+    if (!enabled) return;
+    const refresh = () => setBucket(Math.floor(Date.now() / AVATAR_REFRESH_MS));
+    avatarRefreshListeners.add(refresh);
+    if (avatarRefreshTimer === null) {
+      avatarRefreshTimer = setInterval(() => avatarRefreshListeners.forEach((listener) => listener()), AVATAR_REFRESH_MS);
+    }
+    return () => {
+      avatarRefreshListeners.delete(refresh);
+      if (avatarRefreshListeners.size === 0 && avatarRefreshTimer !== null) {
+        clearInterval(avatarRefreshTimer);
+        avatarRefreshTimer = null;
+      }
+    };
+  }, [enabled]);
+  return bucket;
+}
+
 /*
  * Token avatar (reference .ava-badge): the icon when the API supplied one, else the
  * symbol's first letter on the dark lime badge. A failing image flips to the badge so
@@ -397,18 +421,26 @@ export function Td({ className = '', children, title }: { className?: string; ch
  * beside it: `fixed` on purpose — the table's `overflow-x-auto` ancestor would clip an
  * absolutely-positioned child (a scroll container clips both axes).
  */
-export function TokenAvatar({ iconUrl, symbol }: { iconUrl?: string; symbol?: string; ca: string }) {
+export function TokenAvatar({ iconUrl, symbol, avatarVersion }: { iconUrl?: string; symbol?: string; ca: string; avatarVersion?: number }) {
   const [failed, setFailed] = useState(false);
   const [zoom, setZoom] = useState<{ x: number; y: number } | null>(null);
+  const refreshBucket = useAvatarRefreshBucket(Boolean(iconUrl));
+  const imageUrl = iconUrl
+    ? `${iconUrl}${iconUrl.includes('?') ? '&' : '?'}v=${avatarVersion ?? 0}&r=${refreshBucket}`
+    : undefined;
+  useEffect(() => {
+    setFailed(false);
+    setZoom(null);
+  }, [imageUrl]);
   const letter = symbol ? symbol.slice(0, 1).toUpperCase() : '';
-  if (iconUrl && !failed) {
+  if (imageUrl && !failed) {
     // ponytail: preview size is fixed; make it a CSS var if it ever needs to be themed.
     const Z = 320;
     const GAP = 12;
     return (
       <>
         <img
-          src={iconUrl}
+          src={imageUrl}
           alt={symbol ? `${symbol} logo` : 'token logo'}
           loading="lazy"
           decoding="async"
@@ -426,7 +458,7 @@ export function TokenAvatar({ iconUrl, symbol }: { iconUrl?: string; symbol?: st
         />
         {zoom && (
           <img
-            src={iconUrl}
+            src={imageUrl}
             alt=""
             aria-hidden="true"
             className="pointer-events-none fixed z-50 -translate-y-1/2 rounded-2xl border border-line object-cover shadow-md"

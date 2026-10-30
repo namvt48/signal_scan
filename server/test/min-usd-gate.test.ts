@@ -2,20 +2,18 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
-import { findTrackedCa, insertTrackedCa, listTrackedCas, open } from '../src/db.js';
+import { findTrackedCa, getDb, insertTrackedCa, insertWallet, listTrackedCas, open, setSetting } from '../src/db.js';
 import { getThresholds, updateThresholds } from '../src/settings.js';
 import { assembleSignals } from '../src/signals.js';
 import { createApp } from '../src/api.js';
+import { createTestAuth } from './auth-testkit.js';
 
 const CA_LOW = 'caUsd-low-001';
 const CA_OK = 'caUsd-ok-002';
 const CA_NULL = 'caUsd-null-003';
 const CA_EDGE = 'caUsd-edge-004';
-// AUTH CONTRACT v1: POST /api/tracked-cas accepts the service role (the daemon's
-// path). Static imports snapshot config before this module body runs, so the
-// token goes in via createApp deps instead of env.
-const SERVICE_TOKEN = 'min-usd-gate-service-token';
-const AUTH_HEADER = { authorization: `Bearer ${SERVICE_TOKEN}` };
+// Manual CA additions use the actual admin auth path; automatic BUYs use trade ingest.
+const AUTH_HEADER: Record<string, string> = {};
 
 function signalCas(): string[] {
   return assembleSignals().map((s) => s.ca);
@@ -26,12 +24,16 @@ let base = '';
 
 before(async () => {
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   // Given: four tracked CAs — below, above, unknown (NULL), and exactly at the default gate.
   insertTrackedCa({ address: CA_LOW, chain: 'sol', note: '', entryUsd: 10 });
   insertTrackedCa({ address: CA_OK, chain: 'sol', note: '', entryUsd: 60 });
   insertTrackedCa({ address: CA_NULL, chain: 'sol', note: '' });
   insertTrackedCa({ address: CA_EDGE, chain: 'sol', note: '', entryUsd: 50 });
-  server = createApp('test', { serviceToken: SERVICE_TOKEN }).listen(0);
+  insertWallet({ address: 'min-usd-wallet', name: 'Gate', tags: [], chain: 'sol', source: 'test' });
+  const auth = await createTestAuth();
+  AUTH_HEADER.authorization = `Bearer ${await auth.signToken(auth.adminEmail)}`;
+  server = createApp('test', auth.deps).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -109,6 +111,15 @@ async function postTrackedCa(body: unknown): Promise<{ status: number; json: any
   return { status: res.status, json: await res.json() };
 }
 
+async function postAutoBuy(ca: string, ts: number, extra: Record<string, unknown> = {}) {
+  const response = await fetch(`${base}/api/wallet-watch/trades`, {
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH_HEADER },
+    body: JSON.stringify({ wallet: 'min-usd-wallet', ca, tx: `${ca}:${ts}`,
+      chain: 'sol', side: 'buy', ts, provenance: 'cursor', ...extra }),
+  });
+  return { status: response.status, json: await response.json() };
+}
+
 function trackedAddresses(): string[] {
   return listTrackedCas().map((r) => r.address);
 }
@@ -136,6 +147,42 @@ test('POST /api/tracked-cas: usd at/above minUsd is queued (201)', async () => {
   assert.ok(cas.includes('caGate-ok-103'), 'usd=60 must be queued');
 });
 
+test('automatic BUY admissions enforce the inclusive deployment boundary', async () => {
+  const cutoff = Date.now() - 1_000;
+  setSetting('systemDeployAt', String(cutoff));
+  try {
+    const inactive = 'caGate-inactive-predeploy-109';
+    insertTrackedCa({ address: inactive, chain: 'sol', note: 'wallet-trade' });
+    getDb().prepare("UPDATE tracked_cas SET status = 'inactive' WHERE address = ? AND chain = 'sol'").run(inactive);
+    const before = await postAutoBuy('caGate-predeploy-106', cutoff - 1);
+    assert.equal(before.status, 200);
+    assert.deepEqual(before.json, { inserted: 0, skipped: 'pre-deploy' });
+    assert.equal(findTrackedCa('caGate-predeploy-106', 'sol', true), undefined);
+    assert.equal((await postAutoBuy(inactive, cutoff - 1)).status, 200);
+    assert.equal(findTrackedCa(inactive, 'sol', true)?.status, 'inactive');
+    const missing = await postAutoBuy('caGate-missing-ts-107', cutoff, { ts: undefined });
+    assert.equal(missing.status, 400);
+    assert.equal(findTrackedCa('caGate-missing-ts-107', 'sol', true), undefined);
+    const boundary = await postAutoBuy('caGate-boundary-108', cutoff);
+    assert.equal(boundary.status, 200);
+    assert.equal(boundary.json.inserted, 1);
+    assert.ok(findTrackedCa('caGate-boundary-108', 'sol'));
+    const settings = await fetch(`${base}/api/settings`, { headers: AUTH_HEADER });
+    assert.equal((await settings.json() as { trackingSinceMs: number }).trackingSinceMs, cutoff);
+  } finally {
+    setSetting('systemDeployAt', '1700000000000');
+  }
+});
+
+test('stale automatic BUY is retained without reactivating an inactive CA', async () => {
+  const ca = 'caGate-stale-buy-110';
+  const tracked = insertTrackedCa({ address: ca, chain: 'sol', note: 'wallet-trade' });
+  getDb().prepare("UPDATE tracked_cas SET status = 'inactive' WHERE id = ?").run(tracked.id);
+  const response = await postAutoBuy(ca, Date.now() - 48 * 60 * 60 * 1000 - 1);
+  assert.equal(response.status, 200);
+  assert.equal(response.json.inserted, 1);
+  assert.equal(findTrackedCa(ca, 'sol', true)?.status, 'inactive');
+});
 test('POST /api/tracked-cas: absent usd fails open (201) — unknown price still queues', async () => {
   // When: the daemon could not price the buy.
   const res = await postTrackedCa({ address: 'caGate-null-104', chain: 'sol', note: '' });

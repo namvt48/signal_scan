@@ -71,7 +71,11 @@ for rid, addr, note, entry in rows:
     ww._warm_prices(tx)
     evs = ww.detect_swaps(tx, wallet)
     tgt = ww._target_event(tx, wallet, evs)
-    body = ww.track_post_body(tgt) if tgt else None
+    trade = ww.watch_trade_body({**tgt, "provenance": "historical"}, tx.get("blockTime")) if tgt else None
+    body = (
+        {"address": trade["ca"], "usd": trade.get("amountUsd"), "note": f"auto:BUY by {wallet} {sig}"}
+        if trade and trade["side"] == "buy" else None
+    )
     todo.append((act, rid, addr, note, sig, wallet, body))
 
 print(f"rows auto={len(rows)} todo={len(todo)}\n")

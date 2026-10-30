@@ -161,6 +161,125 @@ test('serves backend exports that take longer than three seconds', async () => {
     ]);
   }
 });
+test('coalesces concurrent public requests and reuses the short response cache', async () => {
+  let upstreamCalls = 0;
+  const cacheSourceApp = express();
+  cacheSourceApp.get('/api/internal/public-export', (_req, res) => {
+    upstreamCalls++;
+    res.json({ generatedAt: 123, data: [], nextOffset: null });
+  });
+  const cacheSource = cacheSourceApp.listen(0);
+  await new Promise((resolve) => cacheSource.once('listening', resolve));
+  const cacheSourceUrl = `http://127.0.0.1:${(cacheSource.address() as AddressInfo).port}`;
+  const cacheService = createPublicApiApp({ internalUrl: cacheSourceUrl, internalToken: 'internal-secret' }).listen(0);
+  await new Promise((resolve) => cacheService.once('listening', resolve));
+  const cacheServiceUrl = `http://127.0.0.1:${(cacheService.address() as AddressInfo).port}`;
+  const requestUrl = `${cacheServiceUrl}/api/v1/tokens?limit=7&offset=42`;
+  try {
+    const responses = await Promise.all(Array.from({ length: 6 }, () => fetch(requestUrl)));
+    assert.deepEqual(responses.map((response) => response.status), Array(6).fill(200));
+    assert.equal(upstreamCalls, 1, 'identical in-flight requests must share one export fetch');
+    assert.equal((await fetch(requestUrl)).status, 200);
+    assert.equal(upstreamCalls, 1, 'a cache hit must not start another export fetch');
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve) => cacheService.close(() => resolve())),
+      new Promise<void>((resolve) => cacheSource.close(() => resolve())),
+    ]);
+  }
+});
+test('uses bounded freshness by resource and keeps FOMO responses separate', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let mainCalls = 0;
+  let fomoCalls = 0;
+  let failActivity = true;
+  const mainApp = express();
+  mainApp.get('/api/internal/public-export', (req, res) => {
+    if (req.query.resource === 'activity' && failActivity) { res.status(503).end(); return; }
+    mainCalls++;
+    res.json({ source: 'main', calls: mainCalls });
+  });
+  const fomoApp = express();
+  fomoApp.get('/api/internal/public-export', (_req, res) => {
+    fomoCalls++;
+    res.json({ source: 'fomo', calls: fomoCalls });
+  });
+  const mainSource = mainApp.listen(0);
+  const fomoSource = fomoApp.listen(0);
+  await Promise.all([
+    new Promise((resolve) => mainSource.once('listening', resolve)),
+    new Promise((resolve) => fomoSource.once('listening', resolve)),
+  ]);
+  const local = createPublicApiApp({
+    internalUrl: `http://127.0.0.1:${(mainSource.address() as AddressInfo).port}`,
+    fomoInternalUrl: `http://127.0.0.1:${(fomoSource.address() as AddressInfo).port}`,
+    internalToken: 'internal-secret',
+  }).listen(0);
+  await new Promise((resolve) => local.once('listening', resolve));
+  const base = `http://127.0.0.1:${(local.address() as AddressInfo).port}`;
+  try {
+    const tokenPath = '/api/v1/tokens?limit=7&offset=42';
+    const first = await (await fetch(`${base}${tokenPath}`)).json() as { source: string; calls: number };
+    now += 1_000;
+    const cached = await (await fetch(`${base}${tokenPath}`)).json() as { source: string; calls: number };
+    assert.deepEqual(first, { source: 'main', calls: 1 });
+    assert.deepEqual(cached, first, 'token pages remain cached within their five-second freshness window');
+    const fomo = await (await fetch(`${base}/api/v1/fomo/tokens?limit=7&offset=42`)).json() as { source: string; calls: number };
+    assert.deepEqual(fomo, { source: 'fomo', calls: 1 }, 'FOMO uses its own upstream and cache identity');
+    assert.equal(mainCalls, 1);
+    assert.equal(fomoCalls, 1);
+    const activityPath = '/api/v1/tokens/sol/CA/activity?from=1&to=86400001';
+    assert.equal((await fetch(`${base}${activityPath}`)).status, 502);
+    failActivity = false;
+    assert.equal((await fetch(`${base}${activityPath}`)).status, 200, 'failed upstream responses are not cached');
+    now += 1_050;
+    await fetch(`${base}${activityPath}`);
+    assert.equal(mainCalls, 3, 'activity results expire after one second');
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve) => local.close(() => resolve())),
+      new Promise<void>((resolve) => mainSource.close(() => resolve())),
+      new Promise<void>((resolve) => fomoSource.close(() => resolve())),
+    ]);
+  }
+});
+
+test('expires cached token responses at the upstream snapshot age bound', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let unavailable = false;
+  const source = express().get('/api/internal/public-export', (_req, res) => {
+    if (unavailable) { res.status(503).end(); return; }
+    res.setHeader('X-Signal-Scan-Snapshot-At', String(now - 59_000));
+    res.json({ generatedAt: now - 59_000, data: [], nextOffset: null });
+  }).listen(0);
+  await new Promise((resolve) => source.once('listening', resolve));
+  const local = createPublicApiApp({
+    internalUrl: `http://127.0.0.1:${(source.address() as AddressInfo).port}`,
+    internalToken: 'internal-secret',
+  }).listen(0);
+  await new Promise((resolve) => local.once('listening', resolve));
+  const path = `http://127.0.0.1:${(local.address() as AddressInfo).port}/api/v1/tokens`;
+  try {
+    assert.equal((await fetch(path)).status, 200);
+    unavailable = true;
+    now += 1_000;
+    assert.equal((await fetch(path)).status, 502, 'five-second response TTL must not extend the snapshot past 60 seconds');
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve) => local.close(() => resolve())),
+      new Promise<void>((resolve) => source.close(() => resolve())),
+    ]);
+  }
+});
+
+test('keeps an explicit recent from valid when to uses the current time', async (t) => {
+  t.mock.method(Date, 'now', () => 1_790_000_000_500);
+  const response = await get('/api/v1/tokens/sol/CA/activity?from=1790000000400');
+  assert.equal(response.status, 200);
+});
+
 
 test('applies a global quota without requiring a client credential', async () => {
   const local = createPublicApiApp({ internalUrl: sourceUrl, internalToken: 'internal-secret' }).listen(0);

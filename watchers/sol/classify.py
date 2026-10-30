@@ -211,14 +211,9 @@ def _fee_candidate(
 
 
 def _legs_with_roles(tx, wallet, trace=None, rejected=None, anchored=None):
-    """Bước 1+2 + roles Bước 3. Leg = parsed SPL transfer dưới token program,
-    frame_id = instance-path (top_i, height, parent_program, invocation_seq) —
-    KHÔNG phải program-id trần (3BbWVS3K gọi cùng program 3× cho 3 pool ⇒ gộp
-    theo id sẽ merge 3 step thành 1, bug F9). enclosing_program = program gần
-    nhất trên stack ∉ _PLUMBING ∪ token ∪ _AGGREGATORS (reject-by-denylist: DEX
-    lạ tự lọt; fee leg do aggregator CPI ⇒ encl=aggregator ⇒ loại). Role endpoint
-    thuần bằng balance: WALLET > RELAY (vắng hoặc Δ=0) > POOL. Mỗi leg/instruction
-    bị loại ⇒ trace `REJECT <frame> <mint> <reason>`."""
+    """Collect ordinary pool/wallet legs, then admit POOL→POOL settlement only
+    when one unique, different-mint wallet leg in the same CPI frame proves the
+    handoff's direction and common pool owner."""
     meta = tx.get("meta") or {}
     msg = tx["transaction"]["message"]
     keys = _keys(msg, meta)  # giữ ALT merge cho tx v0 thật; fixture: 0 ALT
@@ -271,6 +266,7 @@ def _legs_with_roles(tx, wallet, trace=None, rejected=None, anchored=None):
 
     deny = _PLUMBING | _TOKEN_PROGS | _AGGREGATORS
     legs = []
+    pool_handoffs = []
     for ti, seq, h, ix, stack in _frames(msg, meta):
         parent = stack[-2] if len(stack) >= 2 else (None, None)
         frame = (ti, h, parent[0], parent[1])
@@ -292,8 +288,6 @@ def _legs_with_roles(tx, wallet, trace=None, rejected=None, anchored=None):
             rej(frame, mint, "not_spl")
             continue
         dec = info.get("decimals") or ta.get("decimals") or dbase(mint or "", dec_of)
-        # "swap-anchored": leg ví chạm tới nằm trong frame program ∈ _SWAP_PROGRAMS
-        # (phủ cả leg reject + cả 2 chiều ví; JUP stake ∉ registry ⇒ withdraw không tính)
         if (
             anchored is not None
             and mint
@@ -312,21 +306,33 @@ def _legs_with_roles(tx, wallet, trace=None, rejected=None, anchored=None):
             rej(frame, mint, why)
             continue
         rs, rd = role(src), role(dst)
-        if (rs == "POOL") == (rd == "POOL"):
-            cap_fee(
-                src,
-                dst,
-                mint,
-                raw,
-                dec,
-                frame,
-                seq,
-                "no_pool_endpoint",
-                stack,
-                parent,
-                ix,
+        if rs == rd == "POOL":
+            if encl not in _PUMP_ROUTE:
+                cap_fee(src, dst, mint, raw, dec, frame, seq, "no_pool_endpoint", stack, parent, ix)
+                rej(frame, mint, "no_pool_endpoint")
+                continue
+            if not own.get(src) or own.get(src) == own.get(dst):
+                cap_fee(src, dst, mint, raw, dec, frame, seq, "no_pool_endpoint", stack, parent, ix)
+                rej(frame, mint, "no_pool_endpoint")
+                continue
+            pool_handoffs.append(
+                {
+                    "mint": mint,
+                    "src": src,
+                    "dst": dst,
+                    "raw": raw,
+                    "dec": dec,
+                    "frame": frame,
+                    "encl": encl,
+                    "seq": seq,
+                    "src_owner": own.get(src),
+                    "dst_owner": own.get(dst),
+                }
             )
-            rej(frame, mint, "no_pool_endpoint")  # 0 POOL (junk) hoặc 2 POOL (AMBIG)
+            continue
+        if (rs == "POOL") == (rd == "POOL"):
+            cap_fee(src, dst, mint, raw, dec, frame, seq, "no_pool_endpoint", stack, parent, ix)
+            rej(frame, mint, "no_pool_endpoint")
             continue
         legs.append(
             {
@@ -345,6 +351,46 @@ def _legs_with_roles(tx, wallet, trace=None, rejected=None, anchored=None):
                 "pool": own.get(src if rs == "POOL" else dst),
             }
         )
+    handoff_matches = []
+    for handoff in pool_handoffs:
+        matches = []
+        for leg in legs:
+            if leg["frame"] != handoff["frame"] or leg["mint"] == handoff["mint"]:
+                continue
+            if (
+                leg["rs"] == "POOL"
+                and leg["rd"] == "WALLET"
+                and handoff["dst_owner"]
+                and handoff["dst_owner"] == leg["pool"]
+            ):
+                matches.append((leg, "buy"))
+            elif (
+                leg["rs"] == "WALLET"
+                and leg["rd"] == "POOL"
+                and handoff["src_owner"]
+                and handoff["src_owner"] == leg["pool"]
+            ):
+                matches.append((leg, "sell"))
+        handoff_matches.append((handoff, matches))
+    companion_counts = {}
+    for _, matches in handoff_matches:
+        for leg, _ in matches:
+            companion_counts[id(leg)] = companion_counts.get(id(leg), 0) + 1
+    for handoff, matches in handoff_matches:
+        if len(matches) != 1 or companion_counts.get(id(matches[0][0])) != 1:
+            rej(handoff["frame"], handoff["mint"], "no_pool_endpoint")
+            continue
+        _, side = matches[0]
+        leg = {
+            **handoff,
+            "rs": "POOL",
+            "rd": "WALLET",
+            "wflat": False,
+            "pool": handoff["src_owner"] if side == "buy" else handoff["dst_owner"],
+        }
+        if side == "sell":
+            leg["rs"], leg["rd"] = "WALLET", "POOL"
+        legs.extend((leg,))
     return legs
 
 
@@ -480,7 +526,7 @@ def _swap_event(tx, wallet, sig, ts, sa, sb, pool, rank, net_map=None, tot_map=N
     quote_usd = quote_qty × price cache (WSOL ⇒ _sol_px, USDC/USDT ⇒ 1.0);
     CHƯA BIẾT GIÁ ⇒ None + usd_pending (§5.2: không bịa 0) và KHÔNG drop
     (§5.3/§9.2: ngưỡng detect = 0 hằng số; gate $50 nằm ở server
-    POST /api/tracked-cas — detector không được tự bỏ trade thật).
+    POST /api/wallet-watch/trades — detector không được tự bỏ trade thật).
     Trả (event, base_leg, base_mint, quote_mint)."""
     bm, qm, inferred = _base_quote(sa["mint"], sb["mint"], rank)
     bl, ql = (sa, sb) if sa["mint"] == bm else (sb, sa)
@@ -693,6 +739,10 @@ def detect_swaps(tx, wallet, trace=None, with_transfers=False) -> list[dict[str,
     meta = tx.get("meta") or {}
     if meta.get("err") is not None:
         return []
+    net = _net_owner(tx, wallet)
+    signers = _signer_keys(tx)
+    if wallet not in signers and not any(net.values()):
+        return []
     sig = tx["transaction"]["signatures"][0]
     ts = datetime.fromtimestamp(tx.get("blockTime") or time.time(), ICT).strftime(
         "%m-%d %H:%M:%S"
@@ -738,7 +788,6 @@ def detect_swaps(tx, wallet, trace=None, with_transfers=False) -> list[dict[str,
         bm, _qm, _inf = _base_quote(sa["mint"], sb["mint"], rank)
         bl = sa if sa["mint"] == bm else sb
         gross[bm] = gross.get(bm, 0.0) + bl["raw"] / 10 ** bl["dec"]
-    net = _net_owner(tx, wallet)
     promoted, fee_out = _promote_fee_candidates(rejected, steps, rank)
     net_adj = dict(net)
     for m, extra in fee_out.items():
@@ -750,6 +799,9 @@ def detect_swaps(tx, wallet, trace=None, with_transfers=False) -> list[dict[str,
         ev, bl, bm, qm = _swap_event(
             tx, wallet, sig, ts, sa, sb, pool, rank, net_adj, gross
         )
+        # Ví không ký phải có net delta đúng mint; leg pool chung không chứng minh họ đã mua.
+        if wallet not in signers and not net.get(bm, 0.0):
+            continue
         if trace:
             trace(f"PAIR {frame} {_dsym(bm)}←{_dsym(qm)} by={by}")
         if ev is not None:
@@ -925,9 +977,8 @@ def _fill_event(tx, wallet, dest, buyer, evs):
 def _recv_event(tx, wallet, mint, qty):
     """Ví KHÔNG ký, KHÔNG bán gì mà VẪN nhận memecoin (deposit/airdrop/claim) —
     69LjZU +20.060.836 (4F5JCkWy), airdrop +990 (2oJtynk92s): trước đây các tx
-    này không sinh event nào (ví coi như không liên quan). Quote chưa biết ⇒
-    quote_usd=0 + usd_pending=True ⇒ track_post_body bỏ qua (chỉ log/events.jsonl)
-    — KHÔNG tự đẩy token rác vào queue CA."""
+    này không sinh event nào (ví coi như không liên quan). RECEIVE chỉ log,
+    không gửi trade và không tự add/reactivate CA."""
     return {
         "ts": datetime.fromtimestamp(tx.get("blockTime") or time.time(), ICT).strftime(
             "%m-%d %H:%M:%S"

@@ -39,7 +39,7 @@ export interface PublicToken {
     trackedHolding: number;
     /** Net USD tracked wallets put in over the trailing 24h (buys − sells); may be negative. */
     trackedInflow: number;
-    /** Newest tracked watch trade timestamp (epoch ms); 0 = no tracked activity yet. */
+    /** Latest 24h buy/sell from a displayed native member; chain-scoped, zero when absent. */
     trackedActivityAt: number;
   };
   /** Balance-distribution extremes per lookback window; null when no snapshot data exists. */

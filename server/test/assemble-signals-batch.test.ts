@@ -97,7 +97,7 @@ test('sumHoldingAmountByCa matches sumHoldingAmount for every tracked CA', () =>
   for (const c of listTrackedCas()) {
     assert.equal(all.get(`${c.chain}:${c.address}`) ?? 0, sumHoldingAmount(c.address, c.chain), `holding ${c.chain}:${c.address}`);
   }
-  assert.equal(all.get(`sol:${CA1}`) ?? 0, 1500, 'W1 1000 + W2 500; W3 (no watch buy) excluded');
+  assert.equal(all.get(`sol:${CA1}`) ?? 0, 2499, 'positive no-trade holder W3 is included with W1 and W2');
   assert.equal(all.get(`sol:${CA2}`) ?? 0, 2000, 'watch buy with no time bound still counts the holding');
 });
 
@@ -110,7 +110,7 @@ test('trackedWalletStatsByCa matches trackedWalletStats for every tracked CA', (
 
 test('member with no trade in the 24h window keeps its zero-stat row + balUsd (LEFT JOIN lock)', () => {
   const rows = trackedWalletStatsByCa(NOW).get(`sol:${CA1}`) ?? [];
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   // Active member leads (lastTs DESC), full conditional-spread shape.
   assert.deepStrictEqual(rows[0], {
     name: 'A1',
@@ -135,6 +135,18 @@ test('member with no trade in the 24h window keeps its zero-stat row + balUsd (L
     balUsd: 0.5,
     holdingAmount: 500,
     holdingPct: (500 / 1e9) * 100,
+  });
+  // Positive measured balances surface holders without watch trades.
+  assert.deepStrictEqual(rows[2], {
+    name: 'C3',
+    tags: [],
+    inflow: 0,
+    buys: 0,
+    sells: 0,
+    lastTs: 0,
+    balUsd: 0.999,
+    holdingAmount: 999,
+    holdingPct: (999 / 1e9) * 100,
   });
   // CA2: the 8d-old watch buy makes W1 an ever-bought member -> zero-stat row
   // with balUsd (2000 tokens × 0.001), NOT an absent entry.

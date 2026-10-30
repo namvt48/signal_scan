@@ -45,6 +45,7 @@ before(async () => {
   // entryUsd 10 < minUsd default 50 → the display gate drops this row unless allFactors=1.
   insertTrackedCa({ address: CA_CHEAP, chain: 'sol', note: '', entryUsd: 10 });
   insertTrackedCa({ address: CA_ACTIVITY, chain: 'sol', note: '', entryUsd: 60 });
+  const activityBaseTs = Date.now();
   for (let index = 0; index < 5; index += 1) {
     const wallet = insertWallet({
       address: `activity-wallet-${index}`,
@@ -55,7 +56,7 @@ before(async () => {
     });
     insertTrades(wallet.id, [{
       tx: `activity-tx-${index}`,
-      ts: Date.now() - index,
+      ts: activityBaseTs - index,
       side: 'buy',
       ca: CA_ACTIVITY,
       chain: 'sol',

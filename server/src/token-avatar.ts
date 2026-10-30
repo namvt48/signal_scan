@@ -5,13 +5,17 @@ import { canonicalCa, CHAINS, EVM_ADDRESS, isSolanaAddress, type Chain } from '.
 import { validatedIconUrl } from './providers/dexscreener.js';
 
 const MAX_SOURCE_BYTES = 2 * 1024 * 1024;
-const MAX_METADATA_BYTES = 512 * 1024;
 const AVATAR_SIZE = 192;
 const AVATAR_CACHE_MS = 24 * 60 * 60 * 1000;
 const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 3_600_000;
-const JUPITER_ICON_HOST = 'pub-03d440fb1e034bbdae70fd623f58ea37.r2.dev';
-const inflight = new Map<string, Promise<Buffer>>();
+interface ActiveAvatarLoad {
+  sourceUrl: string | null;
+  requestId: number;
+  promise: Promise<Buffer>;
+}
+const inflight = new WeakMap<Database.Database, Map<string, ActiveAvatarLoad>>();
+let nextRequestId = 0;
 
 interface CachedAvatar {
   source_url: string | null;
@@ -37,16 +41,27 @@ export async function tokenAvatarBytes(
   const ca = canonicalCa(rawCa, chain);
   const sourceUrl = validatedIconUrl(rawUrl) ?? null;
   const key = `${chain}\0${ca}`;
-  const active = inflight.get(key);
-  if (active !== undefined) return active;
-  const pending = loadAvatar(db, chain, ca, sourceUrl, now, fetcher);
-  inflight.set(key, pending);
+  let databaseLoads = inflight.get(db);
+  if (!databaseLoads) {
+    databaseLoads = new Map();
+    inflight.set(db, databaseLoads);
+  }
+  const active = databaseLoads.get(key);
+  if (active?.sourceUrl === sourceUrl) return active.promise;
+  const requestId = ++nextRequestId;
+  const isCurrent = () => databaseLoads.get(key)?.requestId === requestId;
+  const pending = loadAvatar(db, chain, ca, sourceUrl, now, fetcher, isCurrent);
+  databaseLoads.set(key, { sourceUrl, requestId, promise: pending });
   try {
     return await pending;
   } finally {
-    if (inflight.get(key) === pending) inflight.delete(key);
+    if (databaseLoads.get(key)?.requestId === requestId) {
+      databaseLoads.delete(key);
+      if (databaseLoads.size === 0) inflight.delete(db);
+    }
   }
 }
+
 
 async function loadAvatar(
   db: Database.Database,
@@ -55,82 +70,31 @@ async function loadAvatar(
   sourceUrl: string | null,
   now: number,
   fetcher: typeof fetch,
+  isCurrent: () => boolean,
 ): Promise<Buffer> {
   const read = db.prepare('SELECT source_url, attempt_url, retry_at, failures, image FROM token_avatar_cache WHERE chain = ? AND ca = ?');
   const cached = read.get(chain, ca) as CachedAvatar | undefined;
-  if (cached !== undefined && cached.source_url === sourceUrl && cached.retry_at > now) return Buffer.from(cached.image);
-
-  if (sourceUrl !== null) {
-    try {
-      const image = await fetchAndNormalize(sourceUrl, fetcher);
-      saveCache(db, chain, ca, sourceUrl, sourceUrl, now + AVATAR_CACHE_MS, 0, image);
-      return image;
-    } catch {
-      // Try exact-address metadata next; never pass upstream error bytes through.
-    }
+  if (cached && cached.source_url === sourceUrl && cached.retry_at > now) return Buffer.from(cached.image);
+  if (sourceUrl === null) {
+    if (cached) return Buffer.from(cached.image);
+    const image = await renderCaIdenticon(chain, ca);
+    if (isCurrent()) saveCache(db, chain, ca, null, null, now + AVATAR_CACHE_MS, 0, image);
+    return image;
   }
-
-  let attemptUrl = sourceUrl;
-  if (chain === 'sol') {
-    try {
-      const fallbackUrl = await fetchJupiterIcon(ca, fetcher);
-      if (fallbackUrl === null) {
-        const image = cached === undefined ? await renderCaIdenticon(chain, ca) : Buffer.from(cached.image);
-        saveCache(db, chain, ca, sourceUrl, sourceUrl, now + AVATAR_CACHE_MS, 0, image);
-        return image;
-      }
-      attemptUrl = fallbackUrl;
-      const image = await fetchAndNormalize(fallbackUrl, fetcher);
-      saveCache(db, chain, ca, sourceUrl, fallbackUrl, now + AVATAR_CACHE_MS, 0, image);
-      return image;
-    } catch {
-      // Keep the last valid image for this CA or use its deterministic identicon.
-    }
+  try {
+    const image = await fetchAndNormalize(sourceUrl, fetcher);
+    if (isCurrent()) saveCache(db, chain, ca, sourceUrl, sourceUrl, now + AVATAR_CACHE_MS, 0, image);
+    return image;
+  } catch {
+    // Keep the last valid image or serve the deterministic identicon.
   }
-
-  const failures = (cached?.failures ?? 0) + 1;
+  const failures = (cached?.source_url === sourceUrl ? cached.failures : 0) + 1;
   const retryAt = now + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(failures - 1, 6));
-  const image = cached === undefined ? await renderCaIdenticon(chain, ca) : Buffer.from(cached.image);
-  saveCache(db, chain, ca, sourceUrl, attemptUrl, retryAt, failures, image);
+  const image = cached ? Buffer.from(cached.image) : await renderCaIdenticon(chain, ca);
+  if (isCurrent()) saveCache(db, chain, ca, sourceUrl, sourceUrl, retryAt, failures, image);
   return image;
 }
 
-async function fetchJupiterIcon(ca: string, fetcher: typeof fetch): Promise<string | null> {
-  const endpoint = new URL('https://lite-api.jup.ag/tokens/v2/search');
-  endpoint.searchParams.set('query', ca);
-  const response = await fetcher(endpoint, {
-    redirect: 'manual',
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(5_000),
-  });
-  const mime = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
-  if (!response.ok || response.status >= 300 || mime !== 'application/json' || response.body === null) {
-    throw new Error('avatar_metadata_fetch_rejected');
-  }
-  const payload: unknown = JSON.parse((await readBounded(response.body, MAX_METADATA_BYTES)).toString('utf8'));
-  if (!Array.isArray(payload)) return null;
-  for (const item of payload) {
-    if (typeof item !== 'object' || item === null || !('id' in item) || !('icon' in item)) continue;
-    if (item.id !== ca) continue;
-    return validatedJupiterIconUrl(item.icon);
-  }
-  return null;
-}
-
-function validatedJupiterIconUrl(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null;
-  try {
-    const url = new URL(raw);
-    if (url.protocol !== 'https:' || url.hostname !== JUPITER_ICON_HOST || url.username !== '' || url.password !== '') {
-      return null;
-    }
-    const filename = url.pathname.startsWith('/logos/') ? url.pathname.slice('/logos/'.length) : '';
-    if (!/^[a-f0-9]{64}[.]png$/.test(filename) || url.search !== '' || url.hash !== '') return null;
-    return url.toString();
-  } catch {
-    return null;
-  }
-}
 
 async function fetchAndNormalize(url: string, fetcher: typeof fetch): Promise<Buffer> {
   const response = await fetcher(url, {

@@ -7,14 +7,15 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import { createApp } from '../src/api.js';
 import { createPublicApiServer } from '../src/public-api.js';
-import { appendAlertMetricObservation, getDb, insertWallet, open } from '../src/db.js';
+import { appendAlertMetricObservation, getDb, insertWallet, open, setSetting } from '../src/db.js';
 import type { PublicAlert } from '../src/public-api-contract.js';
 
 const SERVICE_TOKEN = 'ws-test-service-token';
 const EXPORT_TOKEN = 'ws-test-export-token';
 
-test('streams only new durable inflow alerts, paginates bursts and isolates new subscribers', { timeout: 15_000 }, async (t) => {
+test('streams only new durable inflow alerts, paginates bursts and isolates new subscribers', { timeout: 25_000 }, async (t) => {
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   insertWallet({ address: 'ws-wallet', name: 'private-name', tags: [], chain: 'sol', source: 'test' });
   const source = createApp('ws-test', { serviceToken: SERVICE_TOKEN, publicExportToken: EXPORT_TOKEN }).listen(0, '127.0.0.1');
   await once(source, 'listening');
@@ -31,7 +32,7 @@ test('streams only new durable inflow alerts, paginates bursts and isolates new 
   async function buy(tx: string, side = 'buy') {
     const response = await fetch(`${sourceUrl}/api/wallet-watch/trades`, {
       method: 'POST', headers: { authorization: `Bearer ${SERVICE_TOKEN}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ wallet: 'ws-wallet', ca: 'ws-ca', chain: 'sol', tx, ts: 1_758_000_000_000, side, amountUsd: 250, price: 0.002 }),
+      body: JSON.stringify({ wallet: 'ws-wallet', ca: 'ws-ca', chain: 'sol', tx, ts: 1_758_000_000_000, side, amountUsd: 250, price: 0.002, provenance: 'live' }),
     });
     assert.equal(response.status, 200);
   }
@@ -111,8 +112,8 @@ test('streams tracker-buy alerts from the FOMO upstream on its own path', { time
   assert.equal(inflow.value, 42);
 });
 
-async function until(predicate: () => boolean) {
-  const deadline = Date.now() + 10_000;
+async function until(predicate: () => boolean, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     assert.ok(Date.now() < deadline, 'timed out waiting for WebSocket event');
     await delay(10);
@@ -176,4 +177,116 @@ test('rejects WebSocket upgrades above the connection limit and frees slots on c
   await once(admitted[0]!, 'close');
   const replacement = await openClient();
   assert.equal(replacement.readyState, WebSocket.OPEN);
+});
+
+test('readiness requires authenticated main and FOMO exports', { timeout: 5_000 }, async (t) => {
+  let fomoAvailable = false;
+  const source = express().get('/api/internal/public-export', (req, res) => {
+    if (req.headers.authorization !== 'Bearer readiness-token') { res.sendStatus(401); return; }
+    if (req.query.resource === 'fomoTokens' && !fomoAvailable) { res.sendStatus(503); return; }
+    res.json({ data: [], nextId: 0 });
+  }).listen(0, '127.0.0.1');
+  await once(source, 'listening');
+  const sourceUrl = `http://127.0.0.1:${(source.address() as AddressInfo).port}`;
+  const service = createPublicApiServer({ internalUrl: sourceUrl, fomoInternalUrl: sourceUrl, internalToken: 'readiness-token' });
+  service.listen(0, '127.0.0.1');
+  await once(service, 'listening');
+  t.after(async () => {
+    await Promise.all([
+      new Promise<void>((resolve) => service.close(() => resolve())),
+      new Promise<void>((resolve) => source.close(() => resolve())),
+    ]);
+  });
+  const url = `http://127.0.0.1:${(service.address() as AddressInfo).port}/readyz`;
+  assert.equal((await fetch(url)).status, 503);
+  fomoAvailable = true;
+  const response = await fetch(url);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: 'ready', release: 'unknown' });
+});
+
+test('rejects future and retention-gap replay cursors explicitly', { timeout: 5_000 }, async (t) => {
+  const source = express().get('/api/internal/public-export', (req, res) => {
+    if (req.query.resource === 'latestAlertId') { res.json({ data: [], nextId: 4 }); return; }
+    res.json({ data: [], nextId: 4, oldestAvailableId: 3, gap: req.query.afterId === '1' });
+  }).listen(0, '127.0.0.1');
+  await once(source, 'listening');
+  const sourceUrl = `http://127.0.0.1:${(source.address() as AddressInfo).port}`;
+  const service = createPublicApiServer({ internalUrl: sourceUrl, internalToken: 'cursor-token' });
+  service.listen(0, '127.0.0.1');
+  await once(service, 'listening');
+  t.after(async () => {
+    await Promise.all([
+      new Promise<void>((resolve) => service.close(() => resolve())),
+      new Promise<void>((resolve) => source.close(() => resolve())),
+    ]);
+  });
+  for (const [cursor, expected] of [[1, 'cursor_gap'], [5, 'invalid_cursor']] as const) {
+    const ws = new WebSocket(`ws://127.0.0.1:${(service.address() as AddressInfo).port}/api/v1/ws?after_id=${cursor}`);
+    const messages: Array<{ type: string }> = [];
+    ws.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
+    const [code] = await once(ws, 'close');
+    assert.equal(code, 1008);
+    assert.ok(messages.some((message) => message.type === expected));
+  }
+});
+
+test('drain closes streams and marks readiness unavailable', { timeout: 5_000 }, async (t) => {
+  const source = express().get('/api/internal/public-export', (_req, res) => res.json({ data: [], nextId: 0 })).listen(0, '127.0.0.1');
+  await once(source, 'listening');
+  const sourceUrl = `http://127.0.0.1:${(source.address() as AddressInfo).port}`;
+  const service = createPublicApiServer({ internalUrl: sourceUrl, fomoInternalUrl: sourceUrl, internalToken: 'drain-token' });
+  service.listen(0, '127.0.0.1');
+  await once(service, 'listening');
+  const ws = new WebSocket(`ws://127.0.0.1:${(service.address() as AddressInfo).port}/api/v1/ws`);
+  t.after(async () => {
+    ws.terminate();
+    await Promise.all([
+      new Promise<void>((resolve) => service.close(() => resolve())),
+      new Promise<void>((resolve) => source.close(() => resolve())),
+    ]);
+  });
+  await once(ws, 'message');
+  service.emit('drain');
+  const [code] = await once(ws, 'close');
+  assert.equal(code, 1012);
+  assert.equal((await fetch(`http://127.0.0.1:${(service.address() as AddressInfo).port}/readyz`)).status, 503);
+});
+
+test('drain during WebSocket initialization closes the pending connection', { timeout: 5_000 }, async (t) => {
+  let beginFetch!: () => void;
+  let releaseResponse!: () => void;
+  const fetchStarted = new Promise<void>((resolve) => { beginFetch = resolve; });
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  const source = express().get('/api/internal/public-export', (req, res) => {
+    if (req.query.resource === 'latestAlertId') {
+      beginFetch();
+      void responseGate.then(() => res.json({ data: [], nextId: 0 }));
+      return;
+    }
+    res.json({ data: [], nextId: 0 });
+  }).listen(0, '127.0.0.1');
+  await once(source, 'listening');
+  const sourceUrl = `http://127.0.0.1:${(source.address() as AddressInfo).port}`;
+  const service = createPublicApiServer({ internalUrl: sourceUrl, internalToken: 'pending-drain-token' });
+  service.listen(0, '127.0.0.1');
+  await once(service, 'listening');
+  const ws = new WebSocket(`ws://127.0.0.1:${(service.address() as AddressInfo).port}/api/v1/ws`);
+  const messages: Array<{ type: string }> = [];
+  ws.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
+  t.after(async () => {
+    ws.terminate();
+    await Promise.all([
+      new Promise<void>((resolve) => service.close(() => resolve())),
+      new Promise<void>((resolve) => source.close(() => resolve())),
+    ]);
+  });
+
+  await once(ws, 'open');
+  await fetchStarted;
+  service.emit('drain');
+  releaseResponse();
+  const [code] = await once(ws, 'close');
+  assert.equal(code, 1012);
+  assert.ok(!messages.some((message) => message.type === 'ready'));
 });

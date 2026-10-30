@@ -43,10 +43,12 @@ export const BUDGET_EXCEEDED = 'exceeded';
 type BillableCaller = 'a' | 'b';
 
 export interface CreditAccountantOptions {
-  /** Credits per DAY, split equally. Defaults to `config.nansenDailyCreditBudget`. */
+  /** Credits per DAY. Defaults to `config.nansenDailyCreditBudget`. */
   budget?: number;
   /** Injected clock (tests); defaults to `Date.now`. */
   now?: () => number;
+  /** Whether to split budget equally across callers. Defaults to true. */
+  split?: boolean;
 }
 
 export interface CreditSnapshot {
@@ -55,6 +57,46 @@ export interface CreditSnapshot {
   budget: number;
   half: number;
   used: { a: number; b: number };
+}
+
+export interface PaidRequestCounters {
+  attempts: number;
+  responsesWithData: number;
+  emptyResponses: number;
+  invalidResponses: number;
+  errors: number;
+  reportedCredits: number;
+  estimatedCredits: number;
+}
+
+export interface NansenEfficiencySnapshot {
+  since: string;
+  total: PaidRequestCounters;
+  byEndpoint: Record<string, PaidRequestCounters>;
+}
+
+function emptyPaidCounters(): PaidRequestCounters {
+  return { attempts: 0, responsesWithData: 0, emptyResponses: 0, invalidResponses: 0,
+    errors: 0, reportedCredits: 0, estimatedCredits: 0 };
+}
+
+/** Response shape only; non-empty data is not proof that a setup factor improved. */
+function paidResponseOutcome(body: string): 'responsesWithData' | 'emptyResponses' | 'invalidResponses' | 'errors' {
+  let value: unknown;
+  try { value = JSON.parse(body); } catch { return 'invalidResponses'; }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'invalidResponses';
+  const record = value as Record<string, unknown>;
+  if (record.error != null || record.success === false) return 'errors';
+  const data = record.data;
+  if (data === null || Array.isArray(data) && data.length === 0) return 'emptyResponses';
+  if (typeof data !== 'object' || data === undefined) return 'invalidResponses';
+  return Object.keys(data).length === 0 ? 'emptyResponses' : 'responsesWithData';
+}
+
+function reportedCreditCost(header: string | undefined): number | undefined {
+  if (header === undefined || header.trim() === '') return undefined;
+  const value = Number(header);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 /** UTC calendar day key for a millisecond timestamp. */
@@ -103,10 +145,16 @@ export class CreditAccountant {
   private readonly now: () => number;
   private day: string;
   private readonly used: { a: number; b: number } = { a: 0, b: 0 };
+  private readonly split: boolean;
+  private readonly paid = emptyPaidCounters();
+  private readonly paidByEndpoint = new Map<string, PaidRequestCounters>();
+  private readonly startedAt: number;
 
   constructor(opts: CreditAccountantOptions = {}) {
     this.budget = opts.budget ?? config.nansenDailyCreditBudget;
     this.now = opts.now ?? Date.now;
+    this.startedAt = this.now();
+    this.split = opts.split ?? true;
     this.day = dayKey(this.now());
   }
 
@@ -140,10 +188,38 @@ export class CreditAccountant {
    */
   wrap(inner: UpstreamFetch): UpstreamFetch {
     return async (req, caller) => {
-      const res = await inner(req, caller);
-      const header = filterHeaders(res.headers)['x-nansen-credits-cost'];
-      this.charge(caller, req.endpoint, req.body, res.status, header);
-      return res;
+      const segment = lastSegment(req.endpoint);
+      // Only configured names become labels: never store arbitrary paths, CA values or queries.
+      const endpoint = Object.hasOwn(NANSEN_CREDIT_COSTS, segment) ? segment : 'other';
+      let counters = this.paidByEndpoint.get(endpoint);
+      if (!counters) {
+        counters = emptyPaidCounters();
+        this.paidByEndpoint.set(endpoint, counters);
+      }
+      this.paid.attempts += 1;
+      counters.attempts += 1;
+      try {
+        const res = await inner(req, caller);
+        const header = filterHeaders(res.headers)['x-nansen-credits-cost'];
+        this.charge(caller, req.endpoint, req.body, res.status, header);
+        const outcome = res.status >= 200 && res.status < 300
+          ? res.body === null ? 'invalidResponses' : paidResponseOutcome(res.body)
+          : 'errors';
+        const reported = reportedCreditCost(header);
+        const estimated = reported === undefined && res.status >= 200 && res.status < 300
+          ? creditCostFor(req.endpoint, req.body) : 0;
+        this.paid[outcome] += 1;
+        this.paid.reportedCredits += reported ?? 0;
+        this.paid.estimatedCredits += estimated;
+        counters[outcome] += 1;
+        counters.reportedCredits += reported ?? 0;
+        counters.estimatedCredits += estimated;
+        return res;
+      } catch (error) {
+        this.paid.errors += 1;
+        counters.errors += 1;
+        throw error;
+      }
     };
   }
 
@@ -158,8 +234,17 @@ export class CreditAccountant {
     };
   }
 
+  /** Process-lifetime paid dispatches; estimates exclude upstream-reported credits. */
+  efficiencySnapshot(): NansenEfficiencySnapshot {
+    return {
+      since: new Date(this.startedAt).toISOString(),
+      total: { ...this.paid },
+      byEndpoint: Object.fromEntries([...this.paidByEndpoint].map(([key, value]) => [key, { ...value }])),
+    };
+  }
+
   private half(): number {
-    return this.budget / 2;
+    return this.split ? this.budget / 2 : this.budget;
   }
 
   private billable(caller: Caller): caller is BillableCaller {
@@ -182,13 +267,8 @@ export class CreditAccountant {
     header: string | undefined,
   ): void {
     if (!this.billable(caller)) return;
-    const real = header === undefined ? undefined : Number(header);
-    const cost =
-      real !== undefined && Number.isFinite(real) && real >= 0
-        ? real
-        : status >= 200 && status < 300
-          ? creditCostFor(endpoint, body)
-          : undefined;
+    const real = reportedCreditCost(header);
+    const cost = real ?? (status >= 200 && status < 300 ? creditCostFor(endpoint, body) : undefined);
     if (cost === undefined) return;
     this.rollover();
     this.used[caller] += cost;

@@ -22,7 +22,7 @@ let bId = '';
 
 before(() => {
   open(':memory:');
-  aId = insertWallet({ address: ADDR_A, name: 'CTA', tags: [], chain: 'sol', source: 'test', clan: 'a' }).id;
+  aId = insertWallet({ address: ADDR_A, name: 'CTA', tags: [], chain: 'sol', source: 'test', clan: 'clan-a' }).id;
   bId = insertWallet({ address: ADDR_B, name: 'CTB', tags: [], chain: 'sol', source: 'test', clan: 'b' }).id;
 });
 
@@ -30,12 +30,12 @@ after(() => {
   // in-memory DB: nothing to tear down
 });
 
-test('clan round-trips through insert/list — and never partitions the wallet list', () => {
+test('clan labels round-trip without partitioning the wallet list', () => {
   const rows = listWallets();
-  assert.equal(rows.find((w) => w.id === aId)?.clan, 'a');
+  assert.equal(rows.find((w) => w.id === aId)?.clan, 'clan-a');
   assert.equal(rows.find((w) => w.id === bId)?.clan, 'b');
-  // Both clans coexist in ONE list: the label must not become a filter key.
-  assert.deepEqual(rows.map((w) => w.clan).sort(), ['a', 'b']);
+  // Both labels coexist in ONE list: clan never becomes a filter key.
+  assert.deepEqual(rows.map((w) => w.clan).sort(), ['b', 'clan-a']);
 });
 
 test('updateWallet rewrites clan; a wallet created without one stores the empty string', () => {
@@ -65,7 +65,7 @@ test('trackedWalletStats exposes clan beside the name (a clan-b wallet is still 
   assert.equal(row?.clan, 'b');
 });
 
-test('migration: a DB predating the clan column gets it backfilled to "a" on open()', () => {
+test('migration: a DB predating the clan column opens with unlabeled wallets', () => {
   const dir = mkdtempSync(join(tmpdir(), 'clan-mig-'));
   const path = join(dir, 'legacy.db');
   try {
@@ -80,11 +80,11 @@ test('migration: a DB predating the clan column gets it backfilled to "a" on ope
       .run('w-legacy', 'addr-legacy', 'OLD', '[]', 'sol', 'manual');
     legacy.close();
 
-    // When: the app opens it (SCHEMA + idempotent ALTER + backfill).
+    // When: the app adds the clan field and migrates the table.
     open(path);
 
-    // Then: the column exists and every pre-existing wallet reads as clan 'a'.
-    assert.equal(getWallet('w-legacy')?.clan, 'a');
+    // Then: an unclassified wallet has no clan.
+    assert.equal(getWallet('w-legacy')?.clan, '');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

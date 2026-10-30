@@ -92,6 +92,127 @@ function parse(d: Draft): { ok: true; values: NansenThresholds } | { ok: false; 
   return { ok: true, values };
 }
 
+function TelegramRulesSection({
+  title,
+  loadRules,
+  saveRules,
+  saveButtonText,
+  idPrefix,
+}: {
+  title: string;
+  loadRules: () => Promise<TelegramAlertRules>;
+  saveRules: (rules: TelegramAlertRules) => Promise<TelegramAlertRules>;
+  saveButtonText: string;
+  idPrefix: string;
+}) {
+  const [draft, setDraft] = useState<TelegramAlertRules | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    loadRules().then((rules) => {
+      if (alive) setDraft(rules);
+    }).catch((e: unknown) => {
+      if (alive) setError(e instanceof Error ? e.message : String(e));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [loadRules]);
+
+  async function submit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!draft) return;
+    const { minMcK, maxMcK, minHolders, maxHolders, ...otherRules } = draft;
+    if (Object.values(otherRules).some((value) => !Number.isFinite(value) || value < 0) ||
+        draft.minFwPct > 100 ||
+        [minMcK, maxMcK].some((value) => !Number.isFinite(value) || (value !== -1 && value < 0)) ||
+        (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK) ||
+        [minHolders, maxHolders].some((value) => !Number.isSafeInteger(value) || (value !== -1 && value < 0)) ||
+        (minHolders >= 0 && maxHolders >= 0 && minHolders > maxHolders)) {
+      setError('MC bounds must be -1 or ≥ 0 with Min MC ≤ Max MC; holder bounds must be integers -1 or ≥ 0 with Min holders ≤ Max holders; other thresholds must be non-negative and Min FW ≤ 100.');
+      setSaved(false);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const next = await saveRules(draft);
+      setDraft(next);
+      setSaved(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const renderField = (key: keyof TelegramAlertRules, label: string, min = 0, max?: number, step: number | 'any' = 'any') => (
+    <div key={key}>
+      <label htmlFor={`${idPrefix}-${key}`} className="block text-xs font-medium text-ink">{label}</label>
+      <TextField
+        id={`${idPrefix}-${key}`}
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={draft?.[key] ?? ''}
+        onChange={(e) => {
+          setSaved(false);
+          setDraft((prev) => prev ? { ...prev, [key]: Number(e.target.value) } : prev);
+        }}
+        className="mt-1.5"
+      />
+    </div>
+  );
+
+  return (
+    <section className="rounded-lg border border-line p-4">
+      <h3 className="text-sm font-semibold text-ink">{title}</h3>
+      {error && <p role="alert" className="mt-2 text-xs text-neg">{error}</p>}
+      {saved && <p role="status" className="mt-2 text-xs text-pos">{title} saved.</p>}
+      {!draft ? (
+        <p className="mt-3 text-xs text-muted">{error ?? 'Loading Telegram thresholds…'}</p>
+      ) : (
+        <form onSubmit={(e) => void submit(e)} className="mt-3">
+          <div className="space-y-3">
+            <div>
+              <p className="text-xs font-medium text-ink">Market cap filter · K USD</p>
+              <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                {renderField('minMcK', 'Min MC', -1)}
+                {renderField('maxMcK', 'Max MC', -1)}
+              </div>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-ink">Holder filter</p>
+              <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
+              <div className="mt-2 grid grid-cols-2 gap-3">
+                {renderField('minHolders', 'Min holders', -1, undefined, 1)}
+                {renderField('maxHolders', 'Max holders', -1, undefined, 1)}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {renderField('fwGrowthPct', 'FW growth (%)')}
+              {renderField('minFwPct', 'Min FW (%)', 0, 100)}
+            </div>
+            {renderField('t100GrowthPct', 'T100 growth (%)')}
+            {renderField('trackerBuyingK', 'Tracker Buying > (K USD)')}
+          </div>
+          <div className="mt-4 flex justify-end">
+            <Button type="submit" disabled={saving}>
+              {saving ? 'Saving…' : saveButtonText}
+            </Button>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
+
 export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
   onClose: () => void;
   onSaved?: (settings: Settings) => void;
@@ -103,10 +224,6 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
   const [signalError, setSignalError] = useState<string | null>(null);
   const [signalSaved, setSignalSaved] = useState(false);
   const [signalSaving, setSignalSaving] = useState(false);
-  const [telegramDraft, setTelegramDraft] = useState<TelegramAlertRules | null>(null);
-  const [telegramError, setTelegramError] = useState<string | null>(null);
-  const [telegramSaved, setTelegramSaved] = useState(false);
-  const [telegramSaving, setTelegramSaving] = useState(false);
   const [scanDraft, setScanDraft] = useState<PeriodicScanSettings | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanSaved, setScanSaved] = useState(false);
@@ -137,24 +254,6 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
       </div>
     );
   };
-  const renderTelegramField = (key: keyof TelegramAlertRules, label: string, min = 0, max?: number, step: number | 'any' = 'any') => (
-    <div key={key}>
-      <label htmlFor={`telegram-${key}`} className="block text-xs font-medium text-ink">{label}</label>
-      <TextField
-        id={`telegram-${key}`}
-        type="number"
-        min={min}
-        max={max}
-        step={step}
-        value={telegramDraft?.[key] ?? ''}
-        onChange={(e) => {
-          setTelegramSaved(false);
-          setTelegramDraft((prev) => prev ? { ...prev, [key]: Number(e.target.value) } : prev);
-        }}
-        className="mt-1.5"
-      />
-    </div>
-  );
 
 
   useEffect(() => {
@@ -165,11 +264,6 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
       setDraft(toDraft(next.values));
     }).catch((e: unknown) => {
       if (alive) setSignalError(e instanceof Error ? e.message : String(e));
-    });
-    (fomo ? dataStore.getFomoTelegramAlertRules() : dataStore.getTelegramAlertRules()).then((rules) => {
-      if (alive) setTelegramDraft(rules);
-    }).catch((e: unknown) => {
-      if (alive) setTelegramError(e instanceof Error ? e.message : String(e));
     });
     dataStore.getPeriodicScanSettings().then((scan) => {
       if (alive) setScanDraft(scan);
@@ -205,35 +299,6 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
     }
   }
 
-  async function submitTelegramRules(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!telegramDraft) return;
-    const { minMcK, maxMcK, minHolders, maxHolders, ...otherRules } = telegramDraft;
-    if (Object.values(otherRules).some((value) => !Number.isFinite(value) || value < 0) ||
-        telegramDraft.minFwPct > 100 ||
-        [minMcK, maxMcK].some((value) => !Number.isFinite(value) || (value !== -1 && value < 0)) ||
-        (minMcK >= 0 && maxMcK >= 0 && minMcK > maxMcK) ||
-        [minHolders, maxHolders].some((value) => !Number.isSafeInteger(value) || (value !== -1 && value < 0)) ||
-        (minHolders >= 0 && maxHolders >= 0 && minHolders > maxHolders)) {
-      setTelegramError('MC bounds must be -1 or ≥ 0 with Min MC ≤ Max MC; holder bounds must be integers -1 or ≥ 0 with Min holders ≤ Max holders; other thresholds must be non-negative and Min FW ≤ 100.');
-      setTelegramSaved(false);
-      return;
-    }
-    setTelegramSaving(true);
-    setTelegramError(null);
-    setTelegramSaved(false);
-    try {
-      const next = fomo
-        ? await dataStore.updateFomoTelegramAlertRules(telegramDraft)
-        : await dataStore.updateTelegramAlertRules(telegramDraft);
-      setTelegramDraft(next);
-      setTelegramSaved(true);
-    } catch (err) {
-      setTelegramError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setTelegramSaving(false);
-    }
-  }
   async function submitPeriodicScan(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!scanDraft) return;
@@ -263,7 +328,7 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
       wide
       className="max-h-[calc(100vh-2rem)] overflow-y-auto"
     >
-      <div className={`grid grid-cols-1 gap-4 ${fomo ? '' : 'lg:grid-cols-2'}`}>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <section className="rounded-lg border border-line p-4" aria-labelledby="signal-thresholds-title">
           <h3 id="signal-thresholds-title" className="text-sm font-semibold text-ink">Signal thresholds</h3>
           {signalError && <p role="alert" className="mt-2 text-xs text-neg">{signalError}</p>}
@@ -320,56 +385,26 @@ export default function SettingsPanel({ onClose, onSaved, fomo = SHOW_FOMO }: {
           )}
         </section>
 
-        <section className="rounded-lg border border-line p-4" aria-labelledby="telegram-thresholds-title">
-          <h3 id="telegram-thresholds-title" className="text-sm font-semibold text-ink">
-            {fomo ? 'FOMO Telegram alert thresholds' : 'Telegram alert thresholds · Instance A'}
-          </h3>
-          {telegramError && <p role="alert" className="mt-2 text-xs text-neg">{telegramError}</p>}
-          {telegramSaved && (
-            <p role="status" className="mt-2 text-xs text-pos">
-              {fomo ? 'FOMO Telegram alert thresholds saved.' : 'Instance A Telegram alert thresholds saved.'}
-            </p>
-          )}
-          {!telegramDraft ? (
-            <p className="mt-3 text-xs text-muted">{telegramError ?? 'Loading Telegram thresholds…'}</p>
-          ) : (
-            <form onSubmit={(e) => void submitTelegramRules(e)} className="mt-3">
-              <div className="space-y-3">
-                <div>
-                  <p className="text-xs font-medium text-ink">Market cap filter · K USD</p>
-                  <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
-                  <div className="mt-2 grid grid-cols-2 gap-3">
-                    {renderTelegramField('minMcK', 'Min MC', -1)}
-                    {renderTelegramField('maxMcK', 'Max MC', -1)}
-                  </div>
-                </div>
-                <div>
-                  <p className="text-xs font-medium text-ink">Holder filter</p>
-                  <p className="mt-1 text-[10px] text-muted">Set either bound to -1 to disable it.</p>
-                  <div className="mt-2 grid grid-cols-2 gap-3">
-                    {renderTelegramField('minHolders', 'Min holders', -1, undefined, 1)}
-                    {renderTelegramField('maxHolders', 'Max holders', -1, undefined, 1)}
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  {renderTelegramField('fwGrowthPct', 'FW growth (%)')}
-                  {renderTelegramField('minFwPct', 'Min FW (%)', 0, 100)}
-                </div>
-                {renderTelegramField('t100GrowthPct', 'T100 growth (%)')}
-                {renderTelegramField('trackerBuyingK', 'Tracker Buying > (K USD)')}
-              </div>
-              <div className="mt-4 flex justify-end">
-                <Button type="submit" disabled={telegramSaving}>
-                  {telegramSaving ? 'Saving…' : fomo ? 'Save FOMO Telegram thresholds' : 'Save Telegram thresholds'}
-                </Button>
-              </div>
-            </form>
-          )}
-        </section>
+        <TelegramRulesSection
+          title="Dashboard Telegram alert thresholds"
+          loadRules={() => dataStore.getTelegramAlertRules()}
+          saveRules={(r) => dataStore.updateTelegramAlertRules(r)}
+          saveButtonText="Save Dashboard Telegram thresholds"
+          idPrefix="telegram-dash"
+        />
+        {fomo && (
+          <TelegramRulesSection
+            title="FOMO Telegram alert thresholds"
+            loadRules={() => dataStore.getFomoTelegramAlertRules()}
+            saveRules={(r) => dataStore.updateFomoTelegramAlertRules(r)}
+            saveButtonText="Save FOMO Telegram thresholds"
+            idPrefix="telegram-fomo"
+          />
+        )}
 
         <section className="rounded-lg border border-line p-4" aria-labelledby="periodic-scan-title">
           <h3 id="periodic-scan-title" className="text-sm font-semibold text-ink">
-            Periodic Dashboard scan · Instance {fomo ? 'B' : 'A'}
+            Periodic Dashboard scan
           </h3>
           <p className="mt-1 text-xs text-muted">
             Every {scanDraft?.intervalHours ?? 6} hours at {scanDraft ? Array.from(

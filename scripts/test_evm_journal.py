@@ -134,6 +134,15 @@ class JournalTests(unittest.TestCase):
         item = self.journal.pending_candidates("base", now=100)[0]
         self.assertEqual(item["attempts"], 1)
 
+    def test_newer_candidates_precede_old_retries_when_both_are_due(self):
+        self.journal.enqueue_candidate("base", "old", 10, "hash")
+        self.journal.defer_candidate("base", "old", 10, "hash", 100)
+        self.journal.enqueue_candidate("base", "new", 20, "hash")
+
+        due = self.journal.pending_candidates("base", now=100)
+
+        self.assertEqual([item["tx"] for item in due], ["new", "old"])
+
     def test_soft_defer_preserves_attempts_and_pending_status(self):
         self.journal.enqueue_candidate("base", "tx", 20, "hash")
         self.journal.defer_candidate(

@@ -193,6 +193,7 @@ test('immutable Pass tombstone: cannot be cleared (null), re-rated (B), or re-ad
       tx: 'tx-immutable-buy',
       ts: Date.now(),
       amountUsd: 1000,
+      provenance: 'live',
     }),
   });
   assert.equal(tradeRes.status, 200);

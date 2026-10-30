@@ -157,10 +157,9 @@ class FakeEvm:
 def _isolate(monkeypatch, tmp_path):
     """Cache module sạch + state/heartbeat trỏ tmp + sleep/price stub (offline)."""
     feed._seen_tx.clear()
-    feed._startup_checked.clear()
     feed._decimals.clear()
     feed._block_ts.clear()
-    feed._tracked.clear()
+    
     feed._trace_defer_logged.clear()
     feed.rpc_health_reset()
     monkeypatch.setattr(st_mod, "STATE_PATH", str(tmp_path / "evm_state.json"))
@@ -220,36 +219,7 @@ def test_sort_logs_dedup_and_order():
     ]  # dedup (tx,logIndex) + sort
 
 
-def test_track_ca_caches_only_after_success(monkeypatch):
-    """duyệt từng TX: chỉ cache (chain,ca) SAU khi POST ok; lỗi POST KHÔNG được
-    nuốt CA (cùng lớp bug emit._posted_mints, 2026-09-30)."""
-    monkeypatch.setattr(config, "_track", True)
-    calls: list[dict] = []
 
-    def ok(url, body, timeout=None):
-        calls.append(body)
-        return None
-
-    ev = {"side": "BUY", "chain": "base", "ca": TOKEN, "wallet": WALLET, "tx": TX}
-
-    monkeypatch.setattr(config, "http_json", ok)
-    feed._track_ca(ev, 100.0)
-    assert ("base", TOKEN) in feed._tracked, "POST ok ⇒ phải cache"
-    feed._track_ca(ev, 100.0)  # đã tracked ⇒ không POST lại
-    assert len(calls) == 1, f"đã tracked ⇒ không POST lại, got {len(calls)}"
-
-    feed._tracked.clear()
-
-    def boom(url, body, timeout=None):
-        raise RuntimeError("network down")
-
-    monkeypatch.setattr(config, "http_json", boom)
-    feed._track_ca(ev, 100.0)  # lỗi ⇒ KHÔNG cache
-    assert ("base", TOKEN) not in feed._tracked, "lỗi POST KHÔNG được cache"
-
-    monkeypatch.setattr(config, "http_json", ok)
-    feed._track_ca(ev, 100.0)  # TX sau ⇒ thử lại
-    assert len(calls) == 2, f"TX sau phải POST lại sau lỗi, got {len(calls)}"
 
 
 def test_wss_url_derived_and_env_override(monkeypatch):
@@ -337,6 +307,34 @@ def test_mask_redacts_path_tokens_and_query_credentials():
 
 # ---------- backfill ----------
 
+@pytest.mark.parametrize("chain", ("base", "bsc", "eth", "robinhood"))
+def test_backfill_does_not_advance_on_null_getlogs_and_recovers(
+    monkeypatch, trades, chain
+):
+    state = {"evm": {chain: {"last_block": 9}}}
+    failed = False
+
+    def rpc_reply(_chain, method, _params, **_kwargs):
+        nonlocal failed
+        if method == "eth_blockNumber":
+            return "0xa"
+        if method == "eth_getBlockByNumber":
+            return {"transactions": []}
+        if not failed:
+            failed = True
+            return None
+        return []
+
+    monkeypatch.setattr(feed, "evm_rpc", rpc_reply)
+
+    with pytest.raises(RuntimeError, match="invalid result None"):
+        feed.backfill(chain, [WALLET], state, {"conf": 1, "span": 1})
+    assert state["evm"][chain]["last_block"] == 9
+
+    feed.backfill(chain, [WALLET], state, {"conf": 1, "span": 1})
+    assert state["evm"][chain]["last_block"] == 10
+
+
 
 def test_backfill_scans_persists_and_posts_trade(monkeypatch, trades):
     fake = FakeEvm(
@@ -394,10 +392,9 @@ def test_backfill_confirmation_gate(monkeypatch, trades):
     assert all(b <= 1000 for _, a, b in fake.getlogs_calls)
 
 
-def test_startup_skips_large_backlog(monkeypatch, trades):
+def test_startup_replays_large_backlog_in_bounded_chunks(monkeypatch, trades):
     fake = FakeEvm(latest=1000, logs=[])
     use_fake(monkeypatch, fake)
-    monkeypatch.setenv("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
     st = {
         "evm": {
             "base": {
@@ -410,14 +407,13 @@ def test_startup_skips_large_backlog(monkeypatch, trades):
     feed.backfill("base", [WALLET], st, {"conf": 1, "span": 500})
     base = st["evm"]["base"]
     assert base["last_block"] == 1000
-    assert base["last_tx_block"] == 1000
-    assert fake.getlogs_calls == []
+    assert set(fake.getlogs_calls) == {("base", 2, 501), ("base", 502, 1000)}
+    assert base["last_tx_block"] > 1
 
 
 def test_startup_replays_small_backlog(monkeypatch, trades):
     fake = FakeEvm(latest=1000, logs=[])
     use_fake(monkeypatch, fake)
-    monkeypatch.setenv("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
     st = {
         "evm": {
             "base": {
@@ -837,8 +833,8 @@ def test_trace_disabled_defers_pending_without_archiving(monkeypatch, tmp_path):
         monkeypatch.setattr(feed, "process_tx", unavailable)
         feed._drain_candidates("base", {WALLET}, confirmed_through=20)
         now = time.time()
-        assert store.pending_candidates("base", now=now) == []
-        due = store.pending_candidates("base", now=now + 3700)
+        assert store.pending_candidates("base", now=now + 59) == []
+        due = store.pending_candidates("base", now=now + 61)
         assert [item["tx"] for item in due] == [TX]
         assert due[0]["attempts"] == 0
 
@@ -850,6 +846,50 @@ def test_trace_disabled_defers_pending_without_archiving(monkeypatch, tmp_path):
         monkeypatch.setattr(feed, "process_tx", lambda *args, **kwargs: [])
         feed._drain_candidates("base", {WALLET}, confirmed_through=20)
         assert store.pending_candidates("base", now=time.time() + 1) == []
+    finally:
+        feed.configure_journal(None)
+        store.close()
+
+
+
+def test_metadata_lookup_timeout_keeps_candidate_pending_until_resume(monkeypatch, tmp_path):
+    store = Journal(str(tmp_path / "metadata-retry.sqlite"))
+    feed.configure_journal(store)
+    store.enqueue_candidate("base", TX, 10, "hash")
+
+    def metadata_pending(*args, **kwargs):
+        raise TimeoutError("v4 pool metadata lookup pending")
+
+    monkeypatch.setattr(feed, "process_tx", metadata_pending)
+    try:
+        feed._drain_candidates("base", {WALLET}, confirmed_through=20)
+        due = store.pending_candidates("base", now=time.time() + 61)
+        assert [item["tx"] for item in due] == [TX]
+        assert due[0]["attempts"] == 1
+
+        store.defer_candidate("base", TX, 10, "hash", 0, increment_attempts=False)
+        monkeypatch.setattr(feed, "process_tx", lambda *args, **kwargs: [])
+        feed._drain_candidates("base", {WALLET}, confirmed_through=20)
+        assert store.pending_candidates("base", now=time.time() + 1) == []
+    finally:
+        feed.configure_journal(None)
+        store.close()
+
+
+def test_candidate_retry_backoff_is_capped_at_sixty_seconds(monkeypatch, tmp_path):
+    store = Journal(str(tmp_path / "candidate-retry.sqlite"))
+    feed.configure_journal(store)
+    store.enqueue_candidate("base", TX, 10, "hash")
+
+    def rate_limited(*args, **kwargs):
+        raise feed.RpcFeedError("provider cooldown", "quota", 3600)
+
+    monkeypatch.setattr(feed, "process_tx", rate_limited)
+    try:
+        feed._drain_candidates("base", {WALLET}, confirmed_through=20)
+        due = store.pending_candidates("base", now=time.time() + 61)
+        assert [item["tx"] for item in due] == [TX]
+        assert due[0]["attempts"] == 1
     finally:
         feed.configure_journal(None)
         store.close()
@@ -992,7 +1032,7 @@ def test_emit_swap_min_usd_gate(monkeypatch, trades):
 
 
 def test_emit_swap_no_price_failopen(monkeypatch, trades):
-    # chưa định giá được (None) ⇒ VẪN emit, amountUsd 0 — không được tự bỏ trade thật
+    # Unknown price is omitted rather than sent as a priced zero-dollar BUY.
     monkeypatch.setattr(feed.price, "get_price_usd", lambda ca, chain="sol": None)
     ev = {
         "wallet": WALLET,
@@ -1004,7 +1044,7 @@ def test_emit_swap_no_price_failopen(monkeypatch, trades):
         "router": "uniswap-v3",
     }
     assert feed.emit_swap(ev, BLOCK_TIME) is not None
-    assert trades[0]["amountUsd"] == 0.0 and trades[0]["price"] == 0.0
+    assert "amountUsd" not in trades[0] and "price" not in trades[0]
 
 
 # ---------- poll feed ----------

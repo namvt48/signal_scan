@@ -2,7 +2,6 @@ import { CHAINS } from '../shared/chain.js';
 import type { AlertMetricObservation, AlertMetricSnapshot, AlertTrackedMetadata } from '../alert-feed.js';
 import { validatedIconUrl } from '../providers/dexscreener.js';
 import { DEFAULT_TELEGRAM_ALERT_RULES, type TelegramAlertRules } from '../telegram-alert-settings.js';
-import { isSuppressedTelegramAlert } from './alert-policy.js';
 import type { MonitorConfig } from './config.js';
 import { MonitorStore } from './store.js';
 import { TelegramBot, TelegramSendError } from './telegram.js';
@@ -94,6 +93,12 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
       !nullableNumber(t100Multiple) || !nullableNumber(lf) || !nullableNumber(trackedHoldingPct) ||
       (holders !== undefined && !nullableNumber(holders)) ||
       (t100First !== undefined && !nullableNumber(t100First))) return null;
+  const rawOrigin = field(raw, 'origin');
+  const origin = rawOrigin === 'market' || rawOrigin === 'wallet' || rawOrigin === 'fomo'
+    ? rawOrigin
+    : metric === 'trackerBuy'
+      ? trackerBuyer?.address ? 'wallet' : 'fomo'
+      : 'market';
   return {
     id: id as number,
     ca,
@@ -117,11 +122,32 @@ function parseObservation(raw: unknown): AlertMetricObservation | null {
       ...(xHandle ? { xHandle } : {}),
       ...(tracked ? { tracked } : {}),
     } satisfies AlertMetricSnapshot,
+    origin,
   };
 }
 
 function responseKind(error: unknown): string {
   return error instanceof Error ? error.name : 'UnknownError';
+}
+
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = error.cause;
+  const causeText = cause instanceof Error
+    ? `${cause.name}: ${cause.message}`
+    : cause === undefined
+      ? ''
+      : String(cause);
+  return `${error.name}: ${error.message}${causeText ? ` cause=${causeText}` : ''}`;
+}
+
+function bodyPreview(body: unknown, limit = 500): string {
+  try {
+    const text = typeof body === 'string' ? body : JSON.stringify(body);
+    return text.length > limit ? `${text.slice(0, limit)}…` : text;
+  } catch {
+    return '<unstringifiable>';
+  }
 }
 function parseRules(raw: unknown): TelegramAlertRules | null {
   const fwGrowthPct = field(raw, 'fwGrowthPct');
@@ -152,6 +178,10 @@ export class MonitorAlerts {
     A: { ...DEFAULT_TELEGRAM_ALERT_RULES },
     B: { ...DEFAULT_TELEGRAM_ALERT_RULES },
   };
+  private readonly fomoRules: Record<Source, TelegramAlertRules> = {
+    A: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+    B: { ...DEFAULT_TELEGRAM_ALERT_RULES },
+  };
   constructor(
     private readonly store: MonitorStore,
     private readonly config: MonitorConfig,
@@ -162,7 +192,9 @@ export class MonitorAlerts {
 
   async tick(): Promise<void> {
     await this.consumeSource('A', this.config.apiAUrl);
-    await this.consumeSource('B', this.config.apiBUrl);
+    if (this.config.apiBUrl && this.config.apiBUrl !== this.config.apiAUrl) {
+      await this.consumeSource('B', this.config.apiBUrl);
+    }
     await this.sendPending();
   }
 
@@ -171,27 +203,69 @@ export class MonitorAlerts {
     const endpoint = new URL('/api/monitor/alerts', baseUrl);
     endpoint.searchParams.set('afterId', String(cursor));
     endpoint.searchParams.set('limit', String(PAGE_SIZE));
+    let stage = 'fetch';
     try {
       const response = await this.fetcher(endpoint, {
         headers: { Authorization: `Bearer ${this.config.apiToken}` },
         signal: AbortSignal.timeout(5_000),
       });
-      const body: unknown = await response.json().catch(() => null);
+      stage = 'body';
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch (error) {
+        throw new Error(`feed_body_status_${response.status}: ${describeError(error)}`, { cause: error });
+      }
       const rawObservations = field(body, 'observations');
-      if (!response.ok || !Array.isArray(rawObservations)) throw new Error(`feed_http_${response.status}`);
+      if (!response.ok || !Array.isArray(rawObservations)) {
+        throw new Error(`feed_http_${response.status}: ${bodyPreview(body)}`);
+      }
+      stage = 'validate';
       const observations: AlertMetricObservation[] = [];
       let previousId = cursor;
+      let pageHighId = cursor;
+      let skipped = 0;
       for (const raw of rawObservations) {
+        const rawId = field(raw, 'id');
+        if (Number.isSafeInteger(rawId) && (rawId as number) > pageHighId) pageHighId = rawId as number;
         const observation = parseObservation(raw);
-        if (observation === null || observation.id <= previousId) throw new Error('invalid_alert_observation');
+        if (observation === null) {
+          skipped += 1;
+          const snapshot = field(raw, 'snapshot');
+          const keys = typeof snapshot === 'object' && snapshot !== null
+            ? Object.keys(snapshot).slice(0, 12).join(',')
+            : typeof snapshot;
+          console.error(
+            `[monitor] alert feed ${source} skipped malformed observation id=${String(rawId)}` +
+            ` ca=${String(field(raw, 'ca')).slice(0, 24)} metric=${String(field(raw, 'metric'))}` +
+            ` snapshotKeys=${keys} raw=${bodyPreview(raw, 300)}`,
+          );
+          continue;
+        }
+        if (observation.id <= previousId) {
+          skipped += 1;
+          console.error(
+            `[monitor] alert feed ${source} skipped out-of-order observation id=${observation.id}` +
+            ` after=${previousId}`,
+          );
+          continue;
+        }
         observations.push(observation);
         previousId = observation.id;
       }
+      if (skipped > 0) {
+        console.error(`[monitor] alert feed ${source} skipped ${skipped} observation(s) through id ${pageHighId}`);
+      }
       this.rules[source] = parseRules(field(body, 'telegramAlertRules')) ?? this.rules[source];
-      const committedCursor = this.store.commitAlertObservations(source, observations, this.rules[source]);
+      this.fomoRules[source] = parseRules(field(body, 'fomoTelegramAlertRules')) ?? this.rules[source];
+      stage = 'commit';
+      const committedCursor = this.store.commitAlertObservations(
+        source, observations, this.rules[source], this.fomoRules[source], pageHighId,
+      );
+      stage = 'ack';
       await this.acknowledgeSource(baseUrl, committedCursor);
     } catch (error) {
-      console.error(`[monitor] alert feed ${source} failed: ${responseKind(error)}`);
+      console.error(`[monitor] alert feed ${source} failed stage=${stage} error=${describeError(error)}`);
     }
   }
 
@@ -211,10 +285,6 @@ export class MonitorAlerts {
   private async sendPending(): Promise<void> {
     if (!this.bot.configured) return;
     for (const pending of this.store.pendingTelegramAlerts(this.now(), OUTBOX_BATCH_SIZE)) {
-      if (isSuppressedTelegramAlert(pending.payload, pending.alertId)) {
-        this.store.markTelegramAlertSuppressed(pending.alertId);
-        continue;
-      }
       if (!this.store.markTelegramAlertSending(pending.alertId)) continue;
       try {
         await this.bot.send(pending.payload, {

@@ -45,7 +45,7 @@ const post = async (body: Record<string, unknown>) => {
   });
   return { status: res.status, json: await res.json() };
 };
-const trade = { wallet: ADDR, ca: CA, ts: 1_758_000_000_000, side: 'buy', amountUsd: 250, price: 0.002 };
+const trade = { wallet: ADDR, ca: CA, ts: 1_758_000_000_000, side: 'buy', amountUsd: 250, price: 0.002, provenance: 'cursor' };
 console.log(`\n(2) POST chain='base' -> ${JSON.stringify(await post({ ...trade, tx: '0xtx-base', chain: 'base' }))}`);
 console.log(`    POST no chain    -> ${JSON.stringify(await post({ ...trade, tx: '0xtx-nochain' }))}`);
 console.log(`    POST chain='doge'-> ${JSON.stringify(await post({ ...trade, tx: '0xtx-doge', chain: 'doge' }))}`);

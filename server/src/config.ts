@@ -198,6 +198,12 @@ export const config = {
   /** Helius usage project IDs aligned by index with SOLANA_RPC_URL endpoints. */
   heliusProjectIds: str('HELIUS_PROJECT_IDS', '').split(',').map((id) => id.trim()).filter(Boolean),
   showFomo: str('SHOW_FOMO', '') === 'on',
+  fomoAlitaSync: str('FOMO_ALITA_SYNC', '') === 'on',
+  fomoAlitaHandle: str('FOMO_ALITA_HANDLE', 'ItsAlita'),
+  fomoAlitaUserId: str('FOMO_ALITA_USER_ID', '2c43be94-b528-5fe2-9dc3-27837e009cc8'),
+  fomoAlitaPollMs: posNum('FOMO_ALITA_POLL_MS', 900_000),
+  fomoAlitaTag: str('FOMO_ALITA_TAG', 'Alita follow').trim() || 'Alita follow',
+  fomoAlitaMaxPages: Math.max(1, Math.floor(posNum('FOMO_ALITA_MAX_PAGES', 20))),
   /** Dedicated Bearer secret for the central Monitor service; empty disables it. */
   monitorApiToken: str('MONITOR_API_TOKEN', ''),
   /** Private Bearer credential for the separately deployed public API export route. */

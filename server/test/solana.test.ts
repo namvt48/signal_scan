@@ -67,6 +67,16 @@ test('parseTokenAccounts: a non-empty list with no parsed info throws (never a s
     /no parsed token info/,
   );
 });
+test('parseTokenAccounts: a mixed parsed/raw token account list must fail closed', () => {
+  assert.throws(
+    () => parseTokenAccounts(value([
+      account('mintA', { uiAmountString: '5', amount: '5', decimals: 0 }),
+      { account: { data: ['BASE64', 'base64'] } },
+    ])),
+    /raw token account data/,
+  );
+});
+
 
 test('parseTokenAccounts: an empty value array is a legitimate empty result (no throw)', () => {
   const m = parseTokenAccounts({ jsonrpc: '2.0', id: 1, result: { value: [] } });

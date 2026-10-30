@@ -4,4 +4,5 @@ node_modules
 dist
 public-api.env*
 public-api.env.example
+data*
 coverage

@@ -10,12 +10,9 @@ services:
       MONITOR_DB_PATH: /data/monitor.sqlite3
       MONITOR_API_TOKEN: "${MONITOR_API_TOKEN:?MONITOR_API_TOKEN is required}"
       MONITOR_API_A_URL: http://signal-scan-api-a:3001
-      MONITOR_API_B_URL: http://signal-scan-api-b:3001
       MONITOR_GATEWAY_URL: http://gateway:8130
       MONITOR_WEB_A_URL: http://signal-scan-web-a/
-      MONITOR_WEB_B_URL: http://signal-scan-web-b/
       MONITOR_CHROME_A_URL: http://signal-scan-chrome-a:3000/pressure
-      MONITOR_CHROME_B_URL: http://signal-scan-chrome-b:3000/pressure
       MONITOR_GATEWAY_CHROME_URL: http://signal-scan-gateway-chrome:3000/pressure
       MONITOR_PUBLIC_SITE_URL: https://signal-scan.duckdns.org:8443/healthz
       MONITOR_FOMO_HEARTBEAT_PATH: /run/watcher-heartbeats/fomo

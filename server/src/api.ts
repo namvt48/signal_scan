@@ -7,17 +7,17 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import { CHAINS, EVM_ADDRESS, canonicalCa, isSolanaAddress, type Chain } from './shared/chain.js';
 import { TIERS, isTier, type Tier } from './shared/tier.js';
 import { matchServiceToken, type AuthDeps, createAuthMiddleware } from './auth.js';
-import { config } from './config.js';
+import { CA_INFLOW_WINDOW_MS, config } from './config.js';
 import { limiters } from './ratelimit/index.js';
 import { providerRequestCache } from './providers/request-cache.js';
 import { snapshotRpcUsage } from './providers/rpc-usage.js';
 import { HeliusUsagePoller } from './providers/helius-usage.js';
 import { getFomoApiUsageSnapshot } from './fomo-api.js';
+import { runAlitaFollowSync } from './fomo-follow-sync.js';
 import { solanaRpcEndpoints } from './providers/solana.js';
 import {
   acknowledgeAlertMetricObservations,
   appendAlertMetricObservation,
-  getLatestAlertMetricObservationId,
   getAlertMetricObservations,
   importSharedAlertMetricObservations,
   deleteFomoUser,
@@ -28,6 +28,7 @@ import {
   findFomoUserByUserId,
   findTrackedCa,
   findWalletByAddress,
+  getFomoFollowSync,
   getDb,
   getWallet,
   importFomoUsers,
@@ -72,12 +73,14 @@ import {
 import { log } from './log.js';
 import { assembleSignals, type TokenSignal } from './signals.js';
 import { createSignalResponseCache } from './signal-response-cache.js';
+import { buildSignalPage, type SignalView } from './signal-page.js';
 import { tokenAvatarBytes, validAvatarIdentity } from './token-avatar.js';
 import {
   getDebugAllFactors,
   getThresholds,
   isThresholdValueFor,
   setDebugAllFactors,
+  getTrackingSinceMs,
   settingsResponse,
   thresholdValueError,
   updateThresholds,
@@ -85,11 +88,13 @@ import {
   type NansenThresholds,
 } from './settings.js';
 import { insertTrades } from './ingest.js';
+import { enqueueWalletDiscovery, enqueueWalletDiscoveriesForWallets } from './wallet-holdings-discovery.js';
+import { enqueueAllFomoDiscoveries, enqueueFomoDiscovery } from './fomo-balance-discovery.js';
 import { getSetupFreshnessStats, kickCAs, kickFomoHoldings, kickFomoPositions, kickWalletRow } from './poller.js';
 import { cohortLabelIndex } from './cohort-labels.js';
 import { getPeriodicScanSettings, updatePeriodicScanSettings } from './periodic-scan-settings.js';
 import { selectPeriodicScanSignals, toPeriodicScanItem } from './periodic-scan.js';
-import { exportActivity, exportAlerts, exportBalanceSeries, exportFomoPositions, exportFomoToken, exportFomoTokens, exportFomoTokenStats, exportFomoTrades, exportFomoUsers, exportSnapshot, exportToken, exportTokenDetail, exportTrades, exportWallets } from './public-export.js';
+import { publicExportResource } from './public-export-route.js';
 
 interface WalletJson {
   id: string;
@@ -191,7 +196,6 @@ function parseWalletBody(body: unknown): ParseResult<WalletBody> {
   const b = body as Record<string, unknown>;
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
-  if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
   if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
   if (b.chain === 'evm' && !EVM_ADDRESS.test(address)) {
     return { error: 'invalid EVM address (expected 0x + 40 hex characters)' };
@@ -211,7 +215,6 @@ function parseWalletPatch(body: unknown): ParseResult<Partial<WalletBody>> {
   }
   if (b.chain !== undefined) {
     if (!isWalletScope(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')}${config.showFomo ? ', evm' : ''})` };
-    if (config.showFomo && b.chain === 'sol') return { error: 'Solana wallets are disabled on FOMO instance' };
     patch.chain = b.chain;
   }
   if (b.name !== undefined) patch.name = strField(b, 'name');
@@ -271,10 +274,13 @@ function parseFomoUserPatch(body: unknown): ParseResult<Partial<FomoUserInput>> 
   return patch;
 }
 
-function parseTrackedCaBody(
-  body: unknown,
-): ParseResult<{ address: string; chain: Chain; note: string; entryUsd?: number }> {
-  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+type TradeProvenance = 'live' | 'cursor' | 'historical';
+
+function parseTradeProvenance(value: unknown): TradeProvenance | undefined {
+  return value === 'live' || value === 'cursor' || value === 'historical' ? value : undefined;
+}
+function parseTrackedCaBody(body: unknown): ParseResult<{ address: string; chain: Chain; note: string; entryUsd?: number }> {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { error: 'body must be a JSON object' };
   const b = body as Record<string, unknown>;
   const address = strField(b, 'address');
   if (!address) return { error: 'address is required' };
@@ -283,13 +289,10 @@ function parseTrackedCaBody(
   if (usd !== undefined && (typeof usd !== 'number' || !Number.isFinite(usd) || usd < 0)) {
     return { error: 'usd must be a finite number >= 0' };
   }
-  return {
-    address,
-    chain: b.chain,
-    note: strField(b, 'note'),
-    ...(typeof usd === 'number' ? { entryUsd: usd } : {}),
-  };
+  return { address, chain: b.chain, note: strField(b, 'note'), ...(typeof usd === 'number' ? { entryUsd: usd } : {}) };
 }
+
+
 
 function parseTierBody(body: unknown): ParseResult<{ ca: string; chain: Chain; tier: Tier | null }> {
   if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
@@ -314,6 +317,7 @@ interface WatchTrade {
   ts: number;
   side: 'buy' | 'sell' | 'transfer';
   chain: Chain;
+  provenance: TradeProvenance;
   amountUsd?: number;
   price?: number;
 }
@@ -328,7 +332,7 @@ interface WatchTrade {
  * the wallet bought, and `Tracked by` never reads them.
  */
 function parseWatchTradeBody(body: unknown): ParseResult<WatchTrade> {
-  if (typeof body !== 'object' || body === null) return { error: 'body must be a JSON object' };
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return { error: 'body must be a JSON object' };
   const b = body as Record<string, unknown>;
   const wallet = strField(b, 'wallet');
   const ca = strField(b, 'ca');
@@ -340,6 +344,9 @@ function parseWatchTradeBody(body: unknown): ParseResult<WatchTrade> {
   if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) {
     return { error: 'ts must be a finite epoch-ms number > 0' };
   }
+  if (ts > Date.now()) return { error: 'ts cannot be in the future' };
+  const provenance = parseTradeProvenance(b.provenance);
+  if (provenance === undefined) return { error: "provenance must be 'live', 'cursor' or 'historical'" };
   const rawSide = strField(b, 'side') || 'buy';
   if (rawSide !== 'buy' && rawSide !== 'sell' && rawSide !== 'transfer') {
     return { error: "side must be 'buy', 'sell' or 'transfer'" };
@@ -349,7 +356,7 @@ function parseWatchTradeBody(body: unknown): ParseResult<WatchTrade> {
     if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
     chain = b.chain;
   }
-  const trade: WatchTrade = { wallet, ca, tx, ts, side: rawSide, chain };
+  const trade: WatchTrade = { wallet, ca, tx, ts, side: rawSide, chain, provenance };
   for (const key of ['amountUsd', 'price'] as const) {
     const v: unknown = b[key];
     if (v === undefined) continue;
@@ -374,6 +381,7 @@ interface FomoWatchTrade {
   ca: string;
   chain: Chain;
   ts: number;
+  provenance: TradeProvenance;
   usdValue?: number;
   /** USD actually traded, both directions. Present on ~17/102 captured rows. */
   tradeUsd?: number;
@@ -414,12 +422,18 @@ function parseFomoWatchTradeBody(body: unknown): ParseResult<FomoWatchTrade> {
   if (type !== 'buy' && type !== 'sell') return { error: "type must be 'buy' or 'sell'" };
   const tokenAddress = strField(b, 'tokenAddress');
   if (!tokenAddress) return { error: 'tokenAddress is required' };
+
   if (!isChain(b.chain)) return { error: `invalid chain (expected one of ${CHAINS.join(', ')})` };
   const ts: unknown = b.ts;
   if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) {
     return { error: 'ts must be a finite epoch-ms number > 0' };
   }
-  const trade: FomoWatchTrade = { eventId, type, ca: canonicalCa(tokenAddress, b.chain), chain: b.chain, ts };
+  if (ts > Date.now()) return { error: 'ts cannot be in the future' };
+  const provenance = parseTradeProvenance(b.provenance);
+  if (!provenance) return { error: "provenance must be 'live', 'cursor' or 'historical'" };
+  const trade: FomoWatchTrade = {
+    eventId, type, ca: canonicalCa(tokenAddress, b.chain), chain: b.chain, ts, provenance,
+  };
   if (userId) trade.userId = userId;
   if (trader) trade.trader = trader;
   const token = strField(b, 'token');
@@ -580,33 +594,42 @@ type EnqueueOutcome =
   | { kind: 'backfilled'; row: TrackedCaRow }
   | { kind: 'exists' }
   | { kind: 'chain-disabled' }
+  | { kind: 'stale-buy' }
   | { kind: 'skipped' };
 
 /**
- * THE single gate a CA passes to become polled — every producer goes through
- * here (wallet-watch POST /api/tracked-cas, FOMO buy ingest) so the rule can
- * never drift:
+ * The common gate for explicit admin adds and newly inserted live/cursor BUYs.
+ * Historical enrichment and duplicate trade deliveries never invoke admission:
  *   - already tracked → backfill entry_usd when unknown, or upgrade when
  *     sub-threshold (< minUsd) and a larger trade arrives; else no-op.
  *   - new + KNOWN entryUsd below minUsd → skipped. Absent usd fails open: the
  *     detector must never drop a real trade it could not price.
  *   - new → insert + kickCAs.
+ *   - a BUY timestamp at or beyond the 48h cutoff cannot admit/reactivate a CA.
  */
 function enqueueTrackedCa(input: {
   address: string;
   chain: Chain;
   note: string;
   entryUsd?: number;
+  buyTs?: number;
+  provenance?: TradeProvenance;
 }): EnqueueOutcome {
-  if (config.showFomo && input.chain === 'sol') return { kind: 'chain-disabled' };
   if (isPassTier(input.address, input.chain)) {
     return { kind: 'skipped' };
+  }
+  if (input.provenance === 'historical') return { kind: 'stale-buy' };
+  if (input.buyTs !== undefined && (!Number.isFinite(input.buyTs) || input.buyTs > Date.now())) {
+    return { kind: 'stale-buy' };
+  }
+  if (input.buyTs !== undefined && input.buyTs <= Date.now() - CA_INFLOW_WINDOW_MS) {
+    return { kind: 'stale-buy' };
   }
   const existing = findTrackedCa(input.address, input.chain, true);
   if (existing) {
     if (existing.status === 'inactive') {
       const row = reactivateTrackedCa(input.address, input.chain, input.note, input.entryUsd) ?? existing;
-      kickCAs([{ address: row.address, chain: row.chain }]);
+      kickCAs([{ address: row.address, chain: row.chain }], true);
       return { kind: 'inserted', row };
     }
     if (input.entryUsd != null) {
@@ -622,7 +645,7 @@ function enqueueTrackedCa(input: {
     return { kind: 'skipped' };
   }
   const row = insertTrackedCa(input);
-  kickCAs([{ address: row.address, chain: row.chain }]);
+  kickCAs([{ address: row.address, chain: row.chain }], true);
   return { kind: 'inserted', row };
 }
 
@@ -630,6 +653,37 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
   const signalResponseCache = createSignalResponseCache<TokenSignal[]>();
+  // The public export is polled continuously by the paper-trading consumer, and
+  // each page used to re-run the multi-second assemble — enough to pin the event
+  // loop. Reuse the snapshot until the DB actually changes: total_changes() is a
+  // per-connection write counter, so every insert/update (including the pollers'
+  // and direct test writes) invalidates it without a blind staleness window.
+  let exportSnapshotCache: { revision: number; externalRevision: number; signals: TokenSignal[] } | null = null;
+  /** Detect local writes and writes committed by the separate worker connection. */
+  const dbRevision = (): { local: number; external: number } => {
+    const db = getDb();
+    const row = db.prepare('SELECT total_changes() AS revision').get() as { revision: number };
+    const dataVersion = db.pragma('data_version', { simple: true }) as number;
+    return { local: row.revision, external: dataVersion };
+  };
+  const exportSignals = (): TokenSignal[] => {
+    let before = dbRevision();
+    if (
+      exportSnapshotCache !== null &&
+      exportSnapshotCache.revision === before.local &&
+      exportSnapshotCache.externalRevision === before.external
+    ) return exportSnapshotCache.signals;
+    let signals = assembleSignals(Date.now(), true);
+    let after = dbRevision();
+    if (before.local !== after.local || before.external !== after.external) {
+      before = after;
+      signals = assembleSignals(Date.now(), true);
+      after = dbRevision();
+      if (before.local !== after.local || before.external !== after.external) return signals;
+    }
+    exportSnapshotCache = { revision: after.local, externalRevision: after.external, signals };
+    return signals;
+  };
   app.use((req, res, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
       next();
@@ -671,144 +725,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     });
   });
   app.get('/api/internal/public-export', async (req, res) => {
-    const resource = req.query.resource;
-    const limitRaw = req.query.limit;
-    const limit = limitRaw === undefined ? 100 : typeof limitRaw === 'string' && /^\d+$/.test(limitRaw) ? Number(limitRaw) : NaN;
-    const afterIdRaw = req.query.afterId;
-    const afterId = afterIdRaw === undefined ? 0 : typeof afterIdRaw === 'string' && /^\d+$/.test(afterIdRaw) ? Number(afterIdRaw) : NaN;
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || !Number.isSafeInteger(afterId) || afterId < 0) {
-      res.status(400).json({ error: 'invalid pagination' });
-      return;
-    }
-    if (resource === 'tokens') {
-      const snapshot = exportSnapshot();
-      const offset = afterId;
-      res.json({ generatedAt: snapshot.generatedAt, data: snapshot.tokens.slice(offset, offset + limit), nextOffset: offset + limit < snapshot.tokens.length ? offset + limit : null });
-      return;
-    }
-    if (resource === 'wallets') {
-      const data = exportWallets();
-      res.json({ data: data.slice(afterId, afterId + limit), nextOffset: afterId + limit < data.length ? afterId + limit : null });
-      return;
-    }
-    if (resource === 'latestAlertId') {
-      res.json({ data: [], nextId: getLatestAlertMetricObservationId() });
-      return;
-    }
-    if (resource === 'alerts') {
-      res.json(exportAlerts(afterId, limit));
-      return;
-    }
-    if (resource === 'token') {
-      const chain = req.query.chain;
-      const ca = req.query.ca;
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
-        res.status(400).json({ error: 'invalid token identity' });
-        return;
-      }
-      const token = exportToken(chain as Chain, canonicalCa(ca, chain as Chain));
-      if (!token) { res.status(404).json({ error: 'token not found' }); return; }
-      res.json(token);
-      return;
-    }
-    if (resource === 'detail') {
-      const chain = req.query.chain;
-      const ca = req.query.ca;
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
-        res.status(400).json({ error: 'invalid token identity' });
-        return;
-      }
-      const detail = exportTokenDetail(chain as Chain, canonicalCa(ca, chain as Chain));
-      if (!detail) { res.status(404).json({ error: 'token not found' }); return; }
-      res.json(detail);
-      return;
-    }
-    if (resource === 'balance') {
-      const chain = req.query.chain;
-      const ca = req.query.ca;
-      const windowRaw = req.query.window;
-      const window = windowRaw === undefined ? 'day' : windowRaw;
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' ||
-          ca.length < 1 || ca.length > 128 || (window !== 'day' && window !== 'week' && window !== 'month')) {
-        res.status(400).json({ error: 'invalid balance query' });
-        return;
-      }
-      try {
-        res.json(await exportBalanceSeries(chain as Chain, canonicalCa(ca, chain as Chain), window));
-      } catch {
-        res.status(503).json({ error: 'balance series unavailable' });
-      }
-      return;
-    }
-    if (resource === 'activity') {
-      const chain = req.query.chain; const ca = req.query.ca;
-      const from = Number(req.query.from); const to = Number(req.query.to);
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' ||
-          !Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
-        res.status(400).json({ error: 'invalid activity query' }); return;
-      }
-      res.json(exportActivity(chain as Chain, canonicalCa(ca, chain as Chain), from, to));
-      return;
-    }
-    if (resource === 'trades') {
-      const walletId = req.query.walletId;
-      const from = Number(req.query.from); const to = Number(req.query.to);
-      if (typeof walletId !== 'string' || walletId.length > 128 || !Number.isSafeInteger(from) ||
-          !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
-        res.status(400).json({ error: 'invalid trade query' }); return;
-      }
-      res.json(exportTrades(walletId, afterId, limit, from, to));
-      return;
-    }
-    if (resource === 'fomoUsers') {
-      const data = exportFomoUsers();
-      res.json({ data: data.slice(afterId, afterId + limit), nextOffset: afterId + limit < data.length ? afterId + limit : null });
-      return;
-    }
-    if (resource === 'fomoTokens') {
-      const snapshot = exportFomoTokens();
-      const offset = afterId;
-      res.json({ generatedAt: snapshot.generatedAt, data: snapshot.tokens.slice(offset, offset + limit), nextOffset: offset + limit < snapshot.tokens.length ? offset + limit : null });
-      return;
-    }
-    if (resource === 'fomoToken') {
-      const chain = req.query.chain;
-      const ca = req.query.ca;
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
-        res.status(400).json({ error: 'invalid token identity' }); return;
-      }
-      const token = exportFomoToken(chain as Chain, canonicalCa(ca, chain as Chain));
-      if (!token) { res.status(404).json({ error: 'token not found' }); return; }
-      res.json(token);
-      return;
-    }
-    if (resource === 'fomoTokenStats') {
-      const chain = req.query.chain; const ca = req.query.ca;
-      if (typeof chain !== 'string' || !CHAINS.includes(chain as Chain) || typeof ca !== 'string' || ca.length < 1 || ca.length > 128) {
-        res.status(400).json({ error: 'invalid token identity' }); return;
-      }
-      res.json({ data: exportFomoTokenStats(chain as Chain, canonicalCa(ca, chain as Chain)) });
-      return;
-    }
-    if (resource === 'fomoTrades') {
-      const userId = req.query.userId;
-      const from = Number(req.query.from); const to = Number(req.query.to);
-      if (typeof userId !== 'string' || userId.length < 1 || userId.length > 128 || !Number.isSafeInteger(from) ||
-          !Number.isSafeInteger(to) || from < 0 || to <= from || to - from > 31 * 86_400_000) {
-        res.status(400).json({ error: 'invalid fomo trade query' }); return;
-      }
-      res.json(exportFomoTrades(userId, afterId, limit, from, to));
-      return;
-    }
-    if (resource === 'fomoPositions') {
-      const userId = req.query.userId;
-      if (typeof userId !== 'string' || userId.length < 1 || userId.length > 128) {
-        res.status(400).json({ error: 'invalid fomo user id' }); return;
-      }
-      res.json(exportFomoPositions(userId));
-      return;
-    }
-    res.status(400).json({ error: 'unknown resource' });
+    const result = await publicExportResource(req.query as Record<string, unknown>, { signals: exportSignals });
+    res.status(result.status).json(result.body);
   });
   app.get('/api/token-avatar/:chain/:ca', async (req, res) => {
     const { chain, ca } = req.params;
@@ -886,7 +804,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.json({
       observations,
       nextId: observations[observations.length - 1]?.id ?? afterId,
-      telegramAlertRules: config.showFomo ? getFomoTelegramAlertRules() : getTelegramAlertRules(),
+      telegramAlertRules: getTelegramAlertRules(),
+      fomoTelegramAlertRules: getFomoTelegramAlertRules(),
     });
 
   });
@@ -924,7 +843,29 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   app.get('/api/signals', (req, res) => {
     const af = req.query.allFactors;
     const allFactors = af === undefined ? getDebugAllFactors() : af === '1';
-    res.json(signalResponseCache.get(allFactors, () => assembleSignals(Date.now(), allFactors)));
+    res.json(signalResponseCache.getStale(allFactors, () => assembleSignals(Date.now(), allFactors)));
+  });
+
+  // Paged signals for the dashboard's infinite scroll. `view=dashboard` returns
+  // the active-signal set (score >= 1 or tiered), `view=rated` the tiered list.
+  // The cache is SWR: after the TTL the request is served from the last snapshot
+  // while the rebuild runs off the request path, so page fetches never queue
+  // behind the multi-second assemble pass. Body reads re-derive on demand.
+  app.get('/api/signals/page', (req, res) => {
+    const af = req.query.allFactors;
+    const allFactors = af === undefined ? getDebugAllFactors() : af === '1';
+    const view: SignalView = req.query.view === 'rated' ? 'rated' : 'dashboard';
+    const limitRaw = req.query.limit;
+    const offsetRaw = req.query.offset;
+    const limit = limitRaw === undefined ? 60 : Number(limitRaw);
+    const offset = offsetRaw === undefined ? 0 : Number(offsetRaw);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500 ||
+        !Number.isSafeInteger(offset) || offset < 0) {
+      res.status(400).json({ error: 'invalid pagination' });
+      return;
+    }
+    const signals = signalResponseCache.getStale(allFactors, () => assembleSignals(Date.now(), allFactors));
+    res.json(buildSignalPage(signals, { view, allFactors, limit, offset, showFomo: config.showFomo }));
   });
   app.get('/api/periodic-scan-settings', (_req, res) => {
     res.json(getPeriodicScanSettings());
@@ -970,18 +911,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
   });
   
   app.get('/api/telegram-alert-rules', (_req, res) => {
-    if (config.showFomo) {
-      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
-      return;
-    }
     res.json(getTelegramAlertRules());
   });
 
   app.put('/api/telegram-alert-rules', (req, res) => {
-    if (config.showFomo) {
-      res.status(404).json({ error: 'Telegram alert rules are available on instance A only' });
-      return;
-    }
     const body: unknown = req.body;
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
       res.status(400).json({ error: 'body must be a JSON object' });
@@ -1062,7 +995,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
         res.status(409).json({ error: 'wallet address already exists' });
         return;
       }
-      for (const row of inserted) kickWalletRow(row);
+      enqueueWalletDiscoveriesForWallets(inserted);
+      enqueueAllFomoDiscoveries();
       res.status(201).json(toWallet(inserted[0]));
       return;
     }
@@ -1071,16 +1005,14 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       return;
     }
     const inserted = insertWallet({ ...parsed, chain: parsed.chain as Chain });
+    enqueueWalletDiscovery(inserted);
+    enqueueAllFomoDiscoveries();
     kickWalletRow(inserted);
     res.status(201).json(toWallet(inserted));
   });
   app.patch('/api/wallets/:id', (req, res) => {
     const cur = getWallet(req.params.id);
     if (!cur) {
-      res.status(404).json({ error: 'not found' });
-      return;
-    }
-    if (config.showFomo && cur.chain === 'sol') {
       res.status(404).json({ error: 'not found' });
       return;
     }
@@ -1116,7 +1048,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
         res.status(404).json({ error: 'not found' });
         return;
       }
-      for (const row of updated) kickWalletRow(row);
+      if (next.address !== current.address) {
+        enqueueWalletDiscoveriesForWallets(updated);
+        enqueueAllFomoDiscoveries();
+      }
       res.json(toWallet(updated[0]));
       return;
     }
@@ -1140,7 +1075,10 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(404).json({ error: 'not found' });
       return;
     }
-    kickWalletRow(updated);
+    if (next.address !== current.address || next.chain !== current.chain) {
+      enqueueWalletDiscovery(updated);
+      enqueueAllFomoDiscoveries();
+    }
     res.json(toWallet(updated));
   });
 
@@ -1159,7 +1097,14 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: 'body must be { rows: [...] }' });
       return;
     }
-    res.json(importWallets(rows));
+    const existingIds = new Set(listWallets().map((wallet) => wallet.id));
+    const result = importWallets(rows);
+    if (listWallets().some((wallet) => !existingIds.has(wallet.id))) {
+      const added = listWallets().filter((wallet) => !existingIds.has(wallet.id));
+      enqueueWalletDiscoveriesForWallets(added);
+      enqueueAllFomoDiscoveries();
+    }
+    res.json(result);
   });
 
   // FOMO watch-list: a FOMO user is NOT a wallet — own table, own accessors,
@@ -1178,7 +1123,9 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(409).json({ error: 'fomo user handle already exists' });
       return;
     }
-    res.status(201).json(toFomoUser(insertFomoUser(parsed)));
+    const user = insertFomoUser(parsed);
+    enqueueFomoDiscovery(user);
+    res.status(201).json(toFomoUser(user));
   });
 
   app.patch('/api/fomo-users/:id', (req, res) => {
@@ -1200,6 +1147,7 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(404).json({ error: 'not found' });
       return;
     }
+    enqueueFomoDiscovery(updated);
     res.json(toFomoUser(updated));
   });
 
@@ -1215,9 +1163,23 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: 'body must be { rows: [...] }' });
       return;
     }
-    res.json(importFomoUsers(rows));
+    const existing = new Map(listFomoUsers().map((user) => [user.id, { handle: user.handle, user_id: user.user_id }]));
+    const result = importFomoUsers(rows);
+    for (const user of listFomoUsers()) {
+      const previous = existing.get(user.id);
+      if (!previous || previous.handle !== user.handle || previous.user_id !== user.user_id) enqueueFomoDiscovery(user);
+    }
+    res.json(result);
   });
 
+  app.get('/api/fomo/follow-sync', (_req, res) => {
+    res.json(getFomoFollowSync(config.fomoAlitaUserId) ?? null);
+  });
+
+  app.post('/api/fomo/follow-sync', async (_req, res) => {
+    const result = await runAlitaFollowSync();
+    res.status(result.ok ? 200 : 502).json(result);
+  });
   app.get('/api/tracked-cas', (_req, res) => {
     res.json(listTrackedCas().map(toTrackedCa));
   });
@@ -1228,11 +1190,12 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    // Dedupe + entry-size gate live in enqueueTrackedCa. A KNOWN entryUsd below
-    // minUsd is refused — 200, not 4xx, so the daemon's 2xx-is-ok client stays
-    // quiet; absent usd fails open; a repost carrying a price backfills an
-    // unknown entry_usd. Read per request so a settings change needs no restart.
-    const r = enqueueTrackedCa(parsed);
+    const r = enqueueTrackedCa({
+      address: parsed.address,
+      chain: parsed.chain,
+      note: parsed.note,
+      ...(parsed.entryUsd !== undefined ? { entryUsd: parsed.entryUsd } : {}),
+    });
     if (r.kind === 'inserted') {
       res.status(201).json(toTrackedCa(r.row));
       return;
@@ -1305,19 +1268,19 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     res.json({ ca: canonicalCa(parsed.ca, parsed.chain), chain: parsed.chain, tier: parsed.tier });
   });
 
-  // wallet_watch (Solana RPC) detected event. BUY rows are what `Tracked by`
-  // counts (user 2026-09-21), separate from /api/tracked-cas which only queues
-  // the CA. Reposting is a no-op: UNIQUE(wallet_id, ca, tx, side).
+  // Native watchers use one idempotent trade ingest; a newly inserted BUY also
+  // handles CA admission. Manual CA additions use the separate admin-only route.
   app.post('/api/wallet-watch/trades', (req, res) => {
     const parsed = parseWatchTradeBody(req.body);
     if (isParseError(parsed)) {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    if (config.showFomo && parsed.chain === 'sol') {
-      res.json({ inserted: 0, skipped: 'chain-disabled' });
+    if (parsed.provenance !== 'historical' && parsed.ts < getTrackingSinceMs()) {
+      res.json({ inserted: 0, skipped: 'pre-deploy' });
       return;
     }
+    const recentTrade = parsed.ts > Date.now() - CA_INFLOW_WINDOW_MS;
     if (isPassTier(parsed.ca, parsed.chain)) {
       res.json({ inserted: 0, skipped: 'pass-tier' });
       return;
@@ -1347,24 +1310,27 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
             ],
             'watch',
           );
-    if (parsed.side === 'buy' && inserted > 0 && parsed.amountUsd !== undefined) {
+    if (parsed.provenance !== 'historical' && parsed.side === 'buy' && inserted > 0 && parsed.amountUsd !== undefined) {
       appendAlertMetricObservation(getDb(), parsed.ca, parsed.chain, 'trackerBuy', parsed.amountUsd, parsed.ts, {
         name: wallet.name,
         address: wallet.address,
       });
     }
-    if (parsed.side === 'buy') {
+    if (parsed.provenance !== 'historical' && parsed.side === 'buy' && inserted > 0) {
       enqueueTrackedCa({
         address: parsed.ca,
         chain: parsed.chain,
         note: 'wallet-trade',
+        buyTs: parsed.ts,
+        provenance: parsed.provenance,
         ...(parsed.amountUsd !== undefined ? { entryUsd: parsed.amountUsd } : {}),
       });
     }
-    // Re-read the wallet's balance now (user 2026-09-23) rather than waiting up to
-    // POLL_WALLETS_MS for walletSweep, so a sell/transfer moves trackedHolding at once.
-    // One query, for the pair this event landed on.
-    kickWalletRow(wallet, parsed.ca);
+    // Transfers refresh balances for already-active CAs but cannot admit them.
+    if (parsed.provenance !== 'historical' && recentTrade && findTrackedCa(parsed.ca, parsed.chain) &&
+        (parsed.side === 'transfer' || inserted > 0)) {
+      kickWalletRow(wallet, parsed.ca);
+    }
     res.json({ inserted });
   });
 
@@ -1380,10 +1346,15 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    if (config.showFomo && parsed.chain === 'sol') {
-      res.json({ inserted: 0, skipped: 'chain-disabled' });
+    if (parsed.ts > Date.now()) {
+      res.status(400).json({ error: 'ts cannot be in the future' });
       return;
     }
+    if (parsed.provenance !== 'historical' && parsed.ts < getTrackingSinceMs()) {
+      res.json({ inserted: 0, skipped: 'pre-deploy' });
+      return;
+    }
+    const recentTrade = parsed.ts > Date.now() - CA_INFLOW_WINDOW_MS;
     // A FOMO user is NOT a wallet — resolve through the fomo_users accessors
     // only: userId (stable) first, handle (the 102/102-present fallback).
     const user =
@@ -1407,7 +1378,8 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       token: parsed.token ?? null,
       ts: parsed.ts,
     });
-    if (created && parsed.type === 'buy' && parsed.tradeUsd !== undefined && parsed.tradeUsd > 0) {
+    if (created && parsed.provenance !== 'historical' && parsed.type === 'buy' &&
+        parsed.tradeUsd !== undefined && parsed.tradeUsd > 0) {
       appendAlertMetricObservation(getDb(), parsed.ca, parsed.chain, 'trackerBuy', parsed.tradeUsd, parsed.ts, {
         name: user.handle,
       });
@@ -1417,18 +1389,21 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
     // usdValue is the entry size, so a KNOWN sub-minUsd buy is skipped and an
     // unpriced buy fails open. Only for a genuinely NEW trade row, so a replayed
     // alert stays a strict no-op. Still no wallet state here.
-    if (created && parsed.type === 'buy') {
+    if (created && parsed.provenance !== 'historical' && parsed.type === 'buy') {
       enqueueTrackedCa({
         address: parsed.ca,
         chain: parsed.chain,
         note: 'fomo',
+        buyTs: parsed.ts,
+        provenance: parsed.provenance,
         ...(parsed.usdValue !== undefined ? { entryUsd: parsed.usdValue } : {}),
       });
     }
     // Resolve the alert's wallet + measure its holding off the response path
     // (fire-and-forget; a missing/unresolvable txHash is a silent no-op). This
     // touches only the fomo_* tables — still no wallet state here.
-    if (created && parsed.txHash !== undefined) {
+    if (created && parsed.provenance !== 'historical' && recentTrade &&
+        findTrackedCa(parsed.ca, parsed.chain) && parsed.txHash !== undefined) {
       kickFomoHoldings(user.id, parsed.chain, parsed.ca, parsed.txHash);
     }
     if (created) {
@@ -1436,7 +1411,9 @@ export function createApp(providerName: string, authDeps?: AuthDeps): Express {
       if (parsed.userId !== undefined && user.user_id === null) {
         updateFomoUser(user.id, { user_id: parsed.userId });
       }
-      kickFomoPositions(user.id, user.handle, parsed.eventId, fomoApiUserId);
+      if (parsed.provenance !== 'historical' && recentTrade && findTrackedCa(parsed.ca, parsed.chain)) {
+        kickFomoPositions(user.id, user.handle, parsed.eventId, fomoApiUserId);
+      }
     }
     res.json({ inserted: created ? 1 : 0 });
   });

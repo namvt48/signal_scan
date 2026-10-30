@@ -15,14 +15,13 @@ import re
 import sys
 import threading
 import time
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 
 from watchers.common import config, emit, price
 from watchers.common import state as st_mod
+from watchers.evm import delivery, journal as journal_mod, receipt as receipt_mod, rpc
 from watchers.evm import classify as cl
-from watchers.evm import delivery, journal as journal_mod, rpc
 
 DEFAULT_RPC = {
     "base": "https://mainnet.base.org",
@@ -39,15 +38,14 @@ DEFAULT_CONFIRMATIONS = (
 DEFAULT_CHUNK = 500  # R2: bề rộng eth_getLogs; halve khi provider chê range
 POLL_MAX_CHUNKS_PER_CHAIN = 16
 CHUNK_RECOVER_AFTER = 16  # successful chunks before probing a wider getLogs range
+MAX_CANDIDATE_RETRY_SECONDS = 60.0
 _BSC_LOGS_POOL = ThreadPoolExecutor(max_workers=2)
 _SEEN_MAX = 4096
 
 _journal = None
 _seen_tx: set[tuple[str, str]] = set()  # transaction dedupe remains process-local without journal
-_startup_checked: set[str] = set()  # chains that already applied the startup backlog policy
 _decimals: dict[str, int] = {}  # "chain:ca" -> int (cache decimals())
 _block_ts: dict[tuple[str, int], int] = {}  # (chain, block) -> unix ts
-_tracked: set[tuple[str, str]] = set()
 _candidate_errors: dict[tuple[str, str], float] = {}
 _trace_defer_logged: set[str] = set()
 
@@ -311,7 +309,9 @@ def get_logs(chain, a, b, topics):
         "eth_getLogs",
         [{"fromBlock": hex(a), "toBlock": hex(b), "topics": topics}],
     )
-    return r if isinstance(r, list) else []
+    if not isinstance(r, list):
+        raise RuntimeError(f"evm rpc {chain} eth_getLogs: invalid result {r!r}")
+    return r
 
 def _range_logs(chain, start, end, wallets):
     """Fetch both transfer directions concurrently only on BSC's one-block RPC."""
@@ -395,38 +395,6 @@ def _sort_logs(logs):
 # ---------- emit ----------
 
 
-def _track_ca(ev, usd):
-    """--track: POST CA vào /api/tracked-cas (chain-aware — emit.track_post_body
-    hardcode 'sol' nên KHÔNG tái dùng). Fail-soft — duyệt TỪNG TX, chỉ cache
-    (chain,ca) SAU khi server xác nhận (không raise / 409); KHÔNG cache TRƯỚC
-    khi POST (lỗi mạng/400-500 trước đây vẫn cache ⇒ CA bị nuốt cả run — cùng
-    lớp bug emit._posted_mints, 2026-09-30)."""
-    if not config._track or ev["side"] != "BUY":
-        return
-    key = (ev["chain"], ev["ca"])
-    if key in _tracked:
-        return
-    body = {
-        "address": ev["ca"],
-        "chain": ev["chain"],
-        "note": f"auto:{ev['side']} by {ev['wallet']} {ev['tx']}",
-    }
-    if usd:
-        body["usd"] = usd
-    try:
-        config.http_json(f"{config._api_url}/api/tracked-cas", body, timeout=5)
-    except urllib.error.HTTPError as ex:
-        if ex.code != 409:  # 409 = đã tracked = ok (như emit.track_event)
-            print(f"  ! track {ev['ca'][:8]}…: HTTP {ex.code}", file=sys.stderr)
-            return  # KHÔNG cache ⇒ TX sau thử lại
-    except Exception as ex:
-        print(
-            f"  ! track {ev['ca'][:8]}…: {type(ex).__name__}: {str(ex)[:60]}",
-            file=sys.stderr,
-        )
-        return  # KHÔNG cache
-    _tracked.add(key)
-
 
 def emit_swap(ev, ts_unix):
     """Price and classify a swap, then durably enqueue its API event when configured."""
@@ -445,7 +413,6 @@ def emit_swap(ev, ts_unix):
         delivery.post_trade(body)
     else:
         emit.post_trade(body)
-    _track_ca(ev, usd)
     return ev
 
 
@@ -582,11 +549,20 @@ def process_tx(chain, t, wallets, transaction=None, trace_wallets=()):
                 transaction_loaded = True
                 if not isinstance(transaction, dict):
                     raise RuntimeError(f"missing transaction body for {chain}:{txh}")
-            if trace_legs is None:
-                trace = _process_trace(chain, txh, block)
-                trace_legs = cl.decode_call_trace(trace, chain, txh, block)
-            tx_args["transfers"] = _merge_trace_transfers(transfers, trace_legs)
-            events = cl.classify_swaps(chain, wallet, tx_args)
+            events = receipt_mod.classify_native_swaps(
+                chain,
+                wallet,
+                transaction,
+                receipt,
+                lambda ca: token_decimals(chain, ca),
+                lambda method, params: evm_rpc(chain, method, params),
+            )
+            if not events:
+                if trace_legs is None:
+                    trace = _process_trace(chain, txh, block)
+                    trace_legs = cl.decode_call_trace(trace, chain, txh, block)
+                tx_args["transfers"] = _merge_trace_transfers(transfers, trace_legs)
+                events = cl.classify_swaps(chain, wallet, tx_args)
 
         for event in events:
             event["block"] = block
@@ -623,8 +599,6 @@ def _queue_log(chain, log, wallets):
             )
         _journal.complete_log(chain, log)
         return transfer
-
-
 def _drain_candidates(chain, wallets, confirmed_through=None):
     if _journal is None:
         return []
@@ -632,13 +606,16 @@ def _drain_candidates(chain, wallets, confirmed_through=None):
         return _drain_candidates_locked(chain, wallets, confirmed_through)
 
 
-def _drain_candidates_locked(chain, wallets, confirmed_through):
+def _drain_candidates_locked(chain, wallets, confirmed_through, limit=8, budget=2.0):
     if _journal is None:
         return []
     if _journal.halted(chain):
         raise journal_mod.DeepReorgError(f"chain halted after deep reorg: {chain}")
     emitted = []
-    for candidate in _journal.pending_candidates(chain):
+    deadline = time.monotonic() + budget
+    for candidate in _journal.pending_candidates(chain, limit=limit):
+        if time.monotonic() >= deadline:
+            break
         block = int(candidate["block"])
         if confirmed_through is not None and block > confirmed_through:
             continue
@@ -673,12 +650,8 @@ def _drain_candidates_locked(chain, wallets, confirmed_through):
                     )
                     _trace_defer_logged.add(chain)
                 _journal.defer_candidate(
-                    chain,
-                    candidate["tx"],
-                    block,
-                    candidate.get("blockHash") or "",
-                    now + 3600.0,
-                    increment_attempts=False,
+                    chain, candidate["tx"], block, candidate.get("blockHash") or "",
+                    now + MAX_CANDIDATE_RETRY_SECONDS, increment_attempts=False, reason="trace_disabled"
                 )
                 continue
             if now - _candidate_errors.get(key, 0) >= 60:
@@ -689,14 +662,20 @@ def _drain_candidates_locked(chain, wallets, confirmed_through):
                 )
                 _candidate_errors[key] = now
             attempt = int(candidate.get("attempts", 0))
-            delay = min(3600.0, 2.0 ** min(attempt, 11))
-            delay = max(delay, float(getattr(exc, "retry_after", 0.0)))
+            delay = min(
+                MAX_CANDIDATE_RETRY_SECONDS,
+                max(
+                    2.0 ** min(attempt, 11),
+                    float(getattr(exc, "retry_after", 0.0)),
+                ),
+            )
             _journal.defer_candidate(
                 chain,
                 candidate["tx"],
                 block,
                 candidate.get("blockHash") or "",
                 now + delay,
+                reason="transient",
             )
             continue
         _candidate_errors.pop((chain, candidate["tx"]), None)
@@ -822,14 +801,6 @@ def backfill_transaction_blocks(chain, wallets, st, chain_state, end, opts):
 # ---------- backfill ----------
 
 
-def _startup_backfill_limit():
-    """Seconds of downtime still replayed at startup; 0 = always jump to latest."""
-    raw = os.environ.get("EVM_MAX_STARTUP_BACKFILL_SECONDS", "900")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("EVM_MAX_STARTUP_BACKFILL_SECONDS must be an integer") from exc
-    return max(0, value)
 
 
 def _chain_chunk_cap(chain):
@@ -874,26 +845,6 @@ def _backfill_locked(chain, wallets, st, opts):
         previous = int(cs.get("last_block") or end)
         cs["last_tx_block"] = previous - 1
         _save_state(st)
-    if chain not in _startup_checked:
-        _startup_checked.add(chain)
-        last = int(cs.get("last_block") or 0)
-        updated = cs.get("updated_at")
-        if last and updated is not None and end > last:
-            idle = time.time() - float(updated)
-            if idle > _startup_backfill_limit():
-                cs["last_block"] = end
-                cs["last_tx_block"] = end
-                cs["chunk_ok"] = 0
-                cs["updated_at"] = int(time.time())
-                if _journal is not None:
-                    _journal.advance_cursor(chain, "last_block", end)
-                    _journal.advance_cursor(chain, "last_tx_block", end)
-                _save_state(st)
-                print(
-                    f"# skip backlog {chain}: idle {int(idle)}s, "
-                    f"{end - last} block → latest {end}",
-                    flush=True,
-                )
     start = int(cs.get("last_block") or 0) + 1
     if not cs.get("last_block") and not cs.get("recovery"):
         start = end

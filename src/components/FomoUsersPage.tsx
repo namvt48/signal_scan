@@ -4,6 +4,7 @@ import type { FomoUser } from '../types';
 import { dataStore, parseFomoUsersCsv, type FomoImportRow, type ParsedFomoImportRow } from '../services/dataStore';
 import { Button, ConfirmDialog, CopyButton, EmptyState, ErrorState, IconButton, Modal, SkeletonRows, TableShell, Td, TextField, Th, walletNameClass } from './ui';
 import { useAuth } from '../auth/use-auth';
+import { normalizeClan } from '../lib/clan';
 
 interface Draft {
   handle: string;
@@ -24,17 +25,18 @@ function toMsg(e: unknown): string {
 }
 
 function toDraft(u: FomoUser): Draft {
-  return { handle: u.handle, name: u.name, clan: u.clan ?? '', userId: u.userId ?? '', walletSolana: u.walletSolana ?? '', walletEvm: u.walletEvm ?? '' };
+  return { handle: u.handle, name: u.name, clan: normalizeClan(u.clan), userId: u.userId ?? '', walletSolana: u.walletSolana ?? '', walletEvm: u.walletEvm ?? '' };
 }
 
 /** Non-empty optionals only: most watch-list rows are handle-only. Tags are
  *  edited inline (mirrors wallets), never from this modal. */
-function toPayload(d: Draft): Omit<FomoUser, 'id' | 'tags'> {
+function toPayload(d: Draft, editing: boolean): Omit<FomoUser, 'id' | 'tags'> {
   const trim = (v: string) => v.trim();
+  const clan = normalizeClan(d.clan);
   return {
     handle: trim(d.handle),
     name: trim(d.name),
-    ...(trim(d.clan) ? { clan: trim(d.clan) } : {}),
+    ...(editing ? { clan } : (clan ? { clan } : {})),
     ...(trim(d.userId) ? { userId: trim(d.userId) } : {}),
     ...(trim(d.walletSolana) ? { walletSolana: trim(d.walletSolana) } : {}),
     ...(trim(d.walletEvm) ? { walletEvm: trim(d.walletEvm) } : {}),
@@ -45,7 +47,7 @@ function downloadCsv(users: FomoUser[]): void {
   const esc = (v: string) => (/[",\n\r]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v);
   const lines = [
     CSV_HEADER,
-    ...users.map((u) => [u.handle, u.name, u.tags.join(';'), u.clan ?? '', u.userId ?? '', u.walletSolana ?? '', u.walletEvm ?? ''].map(esc).join(',')),
+    ...users.map((u) => [u.handle, u.name, u.tags.join(';'), normalizeClan(u.clan), u.userId ?? '', u.walletSolana ?? '', u.walletEvm ?? ''].map(esc).join(',')),
   ];
   const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv' }));
   const a = document.createElement('a');
@@ -97,8 +99,7 @@ function FomoUserModal({ initial, onClose, onSave }: { initial: FomoUser | null;
   }
 
   return (
-    // ponytail: zoom scales the whole popup+text 1.3×; swap to explicit sizes if a non-Chromium target appears.
-    <Modal title={initial ? 'Edit FOMO user' : 'Add FOMO user'} onClose={onClose} className="[zoom:1.3]">
+    <Modal title={initial ? 'Edit FOMO user' : 'Add FOMO user'} onClose={onClose}>
       <form onSubmit={(e) => void submit(e)} className="space-y-3">
         <label className="block">
           <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Handle</span>
@@ -111,7 +112,7 @@ function FomoUserModal({ initial, onClose, onSave }: { initial: FomoUser | null;
           </label>
           <label className="block w-24">
             <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Clan</span>
-            <TextField value={draft.clan} onChange={(e) => setDraft({ ...draft, clan: e.target.value })} placeholder="a, b…" className="font-mono" />
+            <TextField value={draft.clan} onChange={(e) => setDraft({ ...draft, clan: e.target.value })} placeholder="clan" className="font-mono" />
           </label>
         </div>
         <label className="block">
@@ -172,10 +173,10 @@ export default function FomoUsersPage() {
 
   async function saveFomoUser(draft: Draft) {
     if (modal === 'new') {
-      const added = await dataStore.addFomoUser({ ...toPayload(draft), tags: [] });
+      const added = await dataStore.addFomoUser({ ...toPayload(draft, false), tags: [] });
       setUsers((us) => (us ? [...us, added].sort((a, b) => a.handle.localeCompare(b.handle, undefined, { numeric: true })) : [added]));
     } else if (modal) {
-      const updated = await dataStore.updateFomoUser(modal.id, toPayload(draft));
+      const updated = await dataStore.updateFomoUser(modal.id, toPayload(draft, true));
       setUsers((us) => us?.map((u) => (u.id === updated.id ? updated : u)) ?? null);
     }
     setModal(null);
@@ -210,7 +211,10 @@ export default function FomoUsersPage() {
   }
 
   async function commitImport() {
-    const rows: FomoImportRow[] = (preview ?? []).map((r) => r.data).filter((d): d is FomoImportRow => d !== undefined);
+    const rows: FomoImportRow[] = (preview ?? [])
+      .map((r) => r.data)
+      .filter((d): d is FomoImportRow => d !== undefined)
+      .map((row) => ({ ...row, clan: normalizeClan(row.clan) }));
     if (rows.length === 0) return;
     await dataStore.importFomoUsers(rows);
     setPreview(null);
@@ -249,7 +253,7 @@ export default function FomoUsersPage() {
     <>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-base font-semibold text-ink">
-          FOMO watch list <span className="ml-1 font-mono text-xs font-normal text-muted">{users.length}</span>
+          FOMO users <span className="ml-1 font-mono text-xs font-normal text-muted">{users.length}</span>
           {unresolvedCount > 0 && <span className="ml-2 font-mono text-xs font-normal text-warn">· {unresolvedCount} unresolved (no userId)</span>}
         </h1>
         <div className="flex flex-wrap gap-2">
@@ -318,7 +322,7 @@ export default function FomoUsersPage() {
                     <Td className="font-mono">{r.data?.handle || '-'}</Td>
                     <Td className="font-mono">{r.data?.name || '-'}</Td>
                     <Td className="font-mono">{r.data?.tags.join('; ') || '-'}</Td>
-                    <Td className="font-mono">{r.data?.clan || '-'}</Td>
+                    <Td className="font-mono">{normalizeClan(r.data?.clan) || '-'}</Td>
                     <Td className="font-mono">{r.data?.userId || (r.data ? <UnresolvedTag /> : '-')}</Td>
                     <Td className="font-mono">{[r.data?.walletSolana, r.data?.walletEvm].filter(Boolean).join(', ') || '-'}</Td>
                     <Td>{r.data ? <span className="text-pos">ready</span> : <span className="text-neg">{r.reason}</span>}</Td>
@@ -352,7 +356,7 @@ export default function FomoUsersPage() {
                 <Th className="w-full">Name</Th>
                 <Th className="min-w-[160px]">Tags</Th>
                 <Th className="w-16">Clan</Th>
-                <Th className="min-w-[200px]">User ID</Th>
+                <Th className="min-w-[200px]">Identity</Th>
                 <Th className="min-w-[240px]">Wallets</Th>
                 <Th className="w-24">Source</Th>
                 <Th className="w-16 text-right">Actions</Th>
@@ -400,8 +404,8 @@ export default function FomoUsersPage() {
                       )}
                     </div>
                   </Td>
-                  <Td className="font-mono">{u.clan || '-'}</Td>
-                  <Td className="font-mono">{u.userId ? <span className="text-ink2">{u.userId}</span> : <UnresolvedTag />}</Td>
+                  <Td className="font-mono">{normalizeClan(u.clan) || '-'}</Td>
+                  <Td className="min-w-0"><div className="max-w-[180px] truncate font-mono text-ink2" title={u.userId || 'No FOMO userId — matched by handle only'}>{u.userId || <UnresolvedTag />}</div></Td>
                   <Td>
                     <WalletsCell u={u} />
                   </Td>

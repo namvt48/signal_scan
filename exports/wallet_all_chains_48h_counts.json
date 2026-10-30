@@ -1,0 +1,38 @@
+{
+  "start_ms": 1793104529155,
+  "end_ms": 1793277329155,
+  "chains": [
+    {
+      "chain": "sol",
+      "buy_rows": 3814,
+      "unique_cas": 839,
+      "wallets_with_buys": 184
+    },
+    {
+      "chain": "robinhood",
+      "buy_rows": 77,
+      "unique_cas": 40,
+      "wallets_with_buys": 6
+    },
+    {
+      "chain": "eth",
+      "buy_rows": 8,
+      "unique_cas": 4,
+      "wallets_with_buys": 4
+    },
+    {
+      "chain": "base",
+      "buy_rows": 5,
+      "unique_cas": 4,
+      "wallets_with_buys": 2
+    },
+    {
+      "chain": "bsc",
+      "buy_rows": 4,
+      "unique_cas": 3,
+      "wallets_with_buys": 1
+    }
+  ],
+  "unique_chain_ca_pairs": 890,
+  "unique_address_strings": 890
+}

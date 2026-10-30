@@ -6,7 +6,6 @@ import { renderCaIdenticon, tokenAvatarBytes, validAvatarIdentity } from '../src
 
 const AURA_CA = '6ZjXu9fMvvEWwpZFTvNaGfkYQU48VvHLYWmb5Uqbco3C';
 const OTHER_CA = '11111111111111111111111111111111';
-const JUPITER_ICON = 'https://pub-03d440fb1e034bbdae70fd623f58ea37.r2.dev/logos/82408bb973f893e47643bc7274163a743b6930d02975fe5461a4b6d1276f8e5a.png';
 
 function cacheDb(): Database.Database {
   const db = new Database(':memory:');
@@ -50,39 +49,8 @@ test('token avatar cache normalizes approved image bytes and keys results by cha
   }
 });
 
-test('an unavailable provider logo falls back to Jupiter metadata for the exact CA', async () => {
-  const db = cacheDb();
-  const source = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="blue"/></svg>')).png().toBuffer();
-  const requests: string[] = [];
-  const fetcher: typeof fetch = async (input) => {
-    const url = String(input);
-    requests.push(url);
-    if (url.startsWith('https://gmgn.ai/')) return new Response('blocked', { status: 403 });
-    if (url.startsWith('https://lite-api.jup.ag/')) {
-      return new Response(JSON.stringify([
-        { id: OTHER_CA, icon: JUPITER_ICON },
-        { id: AURA_CA, icon: JUPITER_ICON },
-      ]), { headers: { 'content-type': 'application/json' } });
-    }
-    if (url === JUPITER_ICON) return new Response(source, { headers: { 'content-type': 'image/png' } });
-    throw new Error('unexpected_avatar_url');
-  };
-  try {
-    const first = await tokenAvatarBytes(db, 'sol', AURA_CA, 'https://gmgn.ai/external-res/aura.webp', 30_000, fetcher);
-    const cached = await tokenAvatarBytes(db, 'sol', AURA_CA, 'https://gmgn.ai/external-res/aura.webp', 31_000, fetcher);
-    assert.deepEqual(cached, first);
-    assert.equal(requests.length, 3);
-    assert.ok(requests[1]?.startsWith('https://lite-api.jup.ag/tokens/v2/search?query='));
-    const row = db.prepare('SELECT source_url, attempt_url FROM token_avatar_cache WHERE chain = ? AND ca = ?').get('sol', AURA_CA);
-    assert.ok(row && typeof row === 'object' && 'source_url' in row && 'attempt_url' in row);
-    assert.equal(row.source_url, 'https://gmgn.ai/external-res/aura.webp');
-    assert.equal(row.attempt_url, JUPITER_ICON);
-  } finally {
-    db.close();
-  }
-});
 
-test('rejected HTML produces a stable CA-specific JPEG identicon and backs off', async () => {
+test('rejected image URL produces a stable CA-specific JPEG without metadata probing', async () => {
   const db = cacheDb();
   let fetches = 0;
   const fetcher: typeof fetch = async () => {
@@ -98,7 +66,7 @@ test('rejected HTML produces a stable CA-specific JPEG identicon and backs off',
     assert.deepEqual(retryWindow, first);
     assert.deepEqual(first, expected);
     assert.notDeepEqual(first, other);
-    assert.equal(fetches, 2);
+    assert.equal(fetches, 1);
     assert.equal(db.prepare('SELECT failures FROM token_avatar_cache WHERE ca = ?').pluck().get(AURA_CA), 1);
   } finally {
     db.close();

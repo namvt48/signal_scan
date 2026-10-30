@@ -52,10 +52,13 @@ PRIVY_APP_ID = os.environ.get("FOMO_PRIVY_APP_ID", "").strip()
 IMPERSONATE = os.environ.get("FOMO_IMPERSONATE", "chrome")
 REFRESH_SKEW_S = max(0, int(os.environ.get("FOMO_TOKEN_REFRESH_SKEW_SECONDS", "300")))
 REQUEST_DELAY_MS = max(0, int(os.environ.get("FOMO_REQUEST_DELAY_MS", "62")))
-MAX_CONCURRENCY = max(1, int(os.environ.get("FOMO_CONCURRENCY", "4")))
+MAX_CONCURRENCY = max(1, int(os.environ.get("FOMO_CONCURRENCY", "1")))
 TIMEOUT_S = max(1, int(os.environ.get("FOMO_TIMEOUT_SECONDS", "30")))
+from request_guard import GuardError, RequestGuard
 PORT = int(os.environ.get("PORT", os.environ.get("FOMO_PROD_PORT", "8080")))
-ALLOWED = re.compile(r"^/v2/users/([^/]+)/(balances|swaps)$")
+ALLOWED = re.compile(r"^/v2/users/([^/]+)/(balances|swaps|followingPaginate)$")
+PROFILE = re.compile(r"^/v2/users/[0-9a-fA-F-]{36}$")
+FOLLOWING_CURSOR = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 # The FOMO web client declares the chains it wants on /balances, /swaps and the
 # /trades list; without this header prod-api defaults to Solana only. Instance B
@@ -266,6 +269,7 @@ class Pacer:
 TOKENS = TokenStore()
 PACER = Pacer(REQUEST_DELAY_MS)
 SLOTS = threading.BoundedSemaphore(MAX_CONCURRENCY)
+GUARD = RequestGuard()
 
 
 def _request_headers(token: str) -> dict[str, str]:
@@ -277,48 +281,78 @@ def _request_headers(token: str) -> dict[str, str]:
     }
 
 
-def _retry_after(value: str | None) -> float:
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
     try:
-        return max(0.0, min(float(value or ""), 5.0))
-    except (TypeError, ValueError):
-        return 0.5
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+def following_query(query: dict[str, list[str]]) -> dict[str, str] | None:
+    """Validate the optional followingPaginate cursor; None means reject."""
+    last_id = query.get("lastId", [""])[0].strip()
+    if not last_id:
+        return {}
+    if not FOLLOWING_CURSOR.fullmatch(last_id):
+        return None
+    return {"lastId": last_id}
 
 
 def upstream_get(path: str, query: dict[str, str]) -> tuple[int, bytes, str]:
-    """GET one read-only upstream route; returns (status, body, content-type)."""
+    """Guarded read-only GET; each actual outbound attempt is budgeted first."""
+    try:
+        GUARD.check()
+    except GuardError as exc:
+        return _guard_response(exc)
     token = TOKENS.access_token()
     if not token:
         return 503, b'{"error":"fomo prod token not configured"}', "application/json"
     last_status, last_body, last_type = 502, b'{"error":"fomo prod upstream failed"}', "application/json"
     for attempt in range(1, 4):
-        PACER.wait()
         try:
             headers = _request_headers(token)
             if (path.endswith("/balances") or path.endswith("/swaps") or path == "/trades") and SUPPORTED_CHAINS:
                 headers["x-supported-chains"] = SUPPORTED_CHAINS
             with SLOTS:
-                response = curl_requests.get(
-                    f"{BASE}{path}",
-                    params=query or None,
-                    headers=headers,
-                    impersonate=IMPERSONATE,
-                    timeout=TIMEOUT_S,
-                )
+                PACER.wait()
+                GUARD.authorize()
+                response = curl_requests.get(f"{BASE}{path}", params=query or None, headers=headers,
+                                             impersonate=IMPERSONATE, timeout=TIMEOUT_S)
+                retry_after = _retry_after(response.headers.get("retry-after"))
+                content_type = response.headers.get("content-type", "application/json")
+                if response.status_code == 403:
+                    GUARD.suspend()
+                elif response.status_code == 429:
+                    GUARD.cooldown(retry_after if retry_after is not None and retry_after > 0 else 60)
+                elif response.status_code == 503 and retry_after is not None:
+                    GUARD.cooldown(retry_after)
+        except GuardError as exc:
+            return _guard_response(exc)
         except Exception as exc:
             last_status, last_body, last_type = 502, json.dumps(
-                {"error": f"fomo prod transport: {type(exc).__name__}"}
-            ).encode(), "application/json"
-            time.sleep(min(0.5 * 2 ** (attempt - 1), 2.0))
-            continue
-        content_type = response.headers.get("content-type", "application/json")
-        if response.status_code == 401 and attempt == 1:
-            token = TOKENS.access_token(force_refresh=True) or token
-            continue
-        if response.status_code in (429, 503) and attempt < 3:
-            time.sleep(_retry_after(response.headers.get("retry-after")))
+                {"error": f"fomo prod transport: {type(exc).__name__}"}).encode(), "application/json"
+            if attempt < 3:
+                time.sleep(min(0.5 * attempt, 1.0))
+                continue
+            break
+        if response.status_code in (403, 429) or (response.status_code == 503 and retry_after is not None):
+            return response.status_code, response.content, content_type
+        if response.status_code in (500, 502, 503, 504) and attempt < 3:
+            time.sleep(min(0.5 * attempt, 1.0))
             continue
         return response.status_code, response.content, content_type
     return last_status, last_body, last_type
+
+
+def _guard_response(exc: GuardError) -> tuple[int, bytes, str]:
+    status = 429 if exc.state in ("cooldown", "budget_exhausted") else 503
+    body = json.dumps({"error": "fomo request blocked by guard", "guard": exc.state}).encode()
+    return status, body, "application/json"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -335,6 +369,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Fomo-Retry-Handled", "1")
+        snapshot = GUARD.snapshot()
+        state = snapshot["state"]
+        if state != "ready":
+            self.send_header("X-Fomo-Guard", state)
+        if status == 429:
+            self.send_header("Retry-After", str(snapshot.get("retryAfterSeconds") or 1))
         self.end_headers()
         self.wfile.write(body)
 
@@ -344,11 +385,13 @@ class Handler(BaseHTTPRequestHandler):
             access, _ = _read_credentials()
             expires = _jwt_expiry(access)
             now = int(time.time())
+            guard = GUARD.snapshot()
             body = {
-                "ok": bool(access) and (expires is None or expires - now > 0),
+                "ok": bool(access) and (expires is None or expires - now > 0) and guard["state"] == "ready",
                 "base": BASE,
                 "tokenExpiresAt": expires,
                 "tokenExpiresInSeconds": None if expires is None else max(0, expires - now),
+                "guard": guard,
                 "checkedAt": now,
             }
             self._send(200 if body["ok"] else 503, json.dumps(body).encode())
@@ -395,6 +438,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(*upstream_get(f"/trades/{quote(trade_id, safe='')}", {}))
             return
+        if PROFILE.match(parsed.path):
+            self._send(*upstream_get(parsed.path, {}))
+            return
         match = ALLOWED.match(parsed.path)
         if match is None:
             self._send(404, b'{"error":"not found"}')
@@ -422,6 +468,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(400, b'{"error":"lastSwapIdV2 is too long"}')
                     return
                 query["lastSwapIdV2"] = after
+        elif endpoint == "followingPaginate":
+            parsed_query = following_query(parse_qs(parsed.query))
+            if parsed_query is None:
+                self._send(400, b'{"error":"invalid lastId"}')
+                return
+            query = parsed_query
         status, body, content_type = upstream_get(
             f"/v2/users/{quote(identity, safe='')}/{endpoint}", query,
         )

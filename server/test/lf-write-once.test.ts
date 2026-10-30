@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
 import { DoorPool, setPoolForTest, type DoorConn, type DoorHttpResponse } from '../src/crawl.js';
-import { getTokenState, open } from '../src/db.js';
+import { getTokenState, insertTrackedCa, open } from '../src/db.js';
 import { updateTokenAnalytics, updateTokenMetrics } from '../src/ingest.js';
 import { refreshSeries, setPollerDeps } from '../src/poller.js';
 import { NANSEN_HOURLY_STATS_URL, type HourlyStatsRow, type TgmFlowsRow, type TokenFlowsClient } from '../src/providers/nansen.js';
@@ -44,6 +44,7 @@ const stubProvider: MarketDataProvider = {
 
 /** Label-counting fake: exchange = LF (1 credit each), anything else = the T100 series. */
 function installFakeFlows(series: TgmFlowsRow[]): void {
+  insertTrackedCa({ address: CA, chain: CHAIN, note: '' });
   exchangeCalls = 0;
   seriesCalls = 0;
   const client: TokenFlowsClient = {
@@ -178,6 +179,7 @@ const SI_DAILY_ROWS: TgmFlowsRow[] = [
 function seedBucketCase(now: number, rule?: SetupCacheEntry['lf_rule'], lf?: number): void {
   open(':memory:');
   loadSetupCache(join(mkdtempSync(join(tmpdir(), 'lf-buckets-')), 'nansen-cache.json'));
+  insertTrackedCa({ address: CA, chain: CHAIN, note: '' });
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt: SI_DEPLOYED_AT });
   updateTokenAnalytics(CA, CHAIN, { t100Pct: 10, t100Multiple: 1.1, genesisBal: lf });
   putSetupCacheEntry({

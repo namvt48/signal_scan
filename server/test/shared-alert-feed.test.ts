@@ -79,7 +79,7 @@ async function readAndAckFeed(dbPath: string, marketPath: string, tokenAmount: n
   }
 }
 
-test('shared Fresh observation reaches A and B with local holdings and isolated acknowledgements', async () => {
+test('shared Fresh observation reaches feed with local holdings and compacts on single-caller acknowledgement', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'signal-scan-shared-alert-'));
   let market: ReturnType<typeof getDb> | undefined;
   try {
@@ -97,25 +97,14 @@ test('shared Fresh observation reaches A and B with local holdings and isolated 
     open(marketPath);
     const gatewayA = getDb();
     assert.equal(acknowledgeMarketAlertDelivery('a', a.sharedCursor), true);
-    assert.equal((gatewayA.prepare('SELECT COUNT(*) AS n FROM alert_metric_observations').get() as { n: number }).n, 2,
-      'A acknowledgement cannot remove either source event needed by B');
+    assert.equal((gatewayA.prepare('SELECT COUNT(*) AS n FROM alert_metric_observations').get() as { n: number }).n, 0,
+      'A acknowledgement compacts source events on single-caller gateway');
     gatewayA.close();
 
-    const b = await readAndAckFeed(join(dir, 'b.db'), marketPath, 30);
     assert.deepEqual(a.payload.observations.map(({ metric, value }) => ({ metric, value })), [
       { metric: 'fresh', value: 42 },
       { metric: 't100', value: 1.5 },
     ]);
-    assert.deepEqual(b.payload.observations.map(({ metric, value }) => ({ metric, value })), [
-      { metric: 'fresh', value: 42 },
-      { metric: 't100', value: 1.5 },
-    ]);
-    open(marketPath);
-    const gatewayB = getDb();
-    assert.equal(acknowledgeMarketAlertDelivery('b', b.sharedCursor), true);
-    assert.equal((gatewayB.prepare('SELECT COUNT(*) AS n FROM alert_metric_observations').get() as { n: number }).n, 0,
-      'the gateway compacts only after both independent imports');
-    gatewayB.close();
   } finally {
     market?.close();
     rmSync(dir, { recursive: true, force: true });

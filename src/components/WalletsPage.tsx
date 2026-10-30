@@ -5,6 +5,7 @@ import { dataStore, parseWalletsCsv, type ImportRow, type ParsedImportRow, type 
 import { SHOW_CLAN, SHOW_FOMO } from '../config';
 import { Button, ConfirmDialog, CopyButton, EmptyState, ErrorState, IconButton, Modal, Select, SkeletonRows, TableShell, Td, TextField, Th, walletNameClass } from './ui';
 import { useAuth } from '../auth/use-auth';
+import { normalizeClan } from '../lib/clan';
 
 interface Draft {
   address: string;
@@ -19,8 +20,12 @@ type DisplayWallet = Omit<Wallet, 'chain'> & { chain: WalletScope };
 function displayWallets(rows: Wallet[]): DisplayWallet[] {
   if (!SHOW_FOMO) return rows;
   const evmGroups = new Map<string, Wallet[]>();
+  const solWallets: DisplayWallet[] = [];
   for (const wallet of rows) {
-    if (wallet.chain === 'sol') continue;
+    if (wallet.chain === 'sol') {
+      solWallets.push(wallet);
+      continue;
+    }
     const key = wallet.address.toLowerCase();
     evmGroups.set(key, [...(evmGroups.get(key) ?? []), wallet]);
   }
@@ -31,10 +36,10 @@ function displayWallets(rows: Wallet[]): DisplayWallet[] {
     if (!preferred) throw new Error('cannot display an empty EVM wallet group');
     return { ...preferred, chain: 'evm' as const };
   });
-  return evm.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return [...solWallets, ...evm].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
 
-const EMPTY_DRAFT: Draft = { address: '', name: '', chain: SHOW_FOMO ? 'evm' : 'sol', source: '', clan: '' };
+const EMPTY_DRAFT: Draft = { address: '', name: '', chain: 'sol', source: '', clan: '' };
 
 function toMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -45,7 +50,7 @@ function downloadCsv(wallets: DisplayWallet[]): void {
   const lines = [
     SHOW_CLAN ? 'address,name,tags,chain,source,clan' : 'address,name,tags,chain,source',
     ...wallets.map((w) =>
-      [w.address, w.name, w.tags.join(';'), w.chain, w.source, ...(SHOW_CLAN ? [w.clan ?? ''] : [])]
+      [w.address, w.name, w.tags.join(';'), w.chain, w.source, ...(SHOW_CLAN ? [normalizeClan(w.clan)] : [])]
         .map(esc)
         .join(','),
     ),
@@ -58,9 +63,16 @@ function downloadCsv(wallets: DisplayWallet[]): void {
   URL.revokeObjectURL(url);
 }
 
-function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | null; onClose: () => void; onSave: (draft: Draft) => Promise<void> }) {
+interface WalletModalProps {
+  initial: DisplayWallet | null;
+  defaultChain: WalletScope;
+  onClose: () => void;
+  onSave: (draft: Draft) => Promise<void>;
+}
+
+function WalletModal({ initial, defaultChain, onClose, onSave }: WalletModalProps) {
   const [draft, setDraft] = useState<Draft>(
-    initial ? { address: initial.address, name: initial.name, chain: initial.chain, source: initial.source, clan: initial.clan ?? '' } : EMPTY_DRAFT,
+    initial ? { address: initial.address, name: initial.name, chain: initial.chain, source: initial.source, clan: normalizeClan(initial.clan) } : { ...EMPTY_DRAFT, chain: defaultChain },
   );
   const [err, setErr] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -102,21 +114,21 @@ function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | nu
         {SHOW_CLAN && (
           <label className="block">
             <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Clan (optional)</span>
-            <TextField value={draft.clan} onChange={(e) => setDraft({ ...draft, clan: e.target.value })} placeholder="a, b, ..." className="font-mono" />
+            <TextField value={draft.clan} onChange={(e) => setDraft({ ...draft, clan: e.target.value })} placeholder="clan" className="font-mono" />
           </label>
         )}
         <div className="flex gap-3">
           <label className="block w-40">
             <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted">Network</span>
             <Select value={draft.chain} onChange={(e) => setDraft({ ...draft, chain: e.target.value as WalletScope })} className="w-full font-mono uppercase">
-              {(initial && SHOW_FOMO
+              {(initial
                 ? [initial.chain]
                 : SHOW_FOMO
-                  ? ['evm'] as WalletScope[]
+                  ? [...CHAINS, 'evm'] as WalletScope[]
                   : CHAINS
               ).map((chain) => (
                 <option key={chain} value={chain}>
-                  {chain === 'evm' ? 'EVM (Base · BSC · Robinhood)' : chain}
+                  {chain === 'evm' ? 'EVM (Base · BSC · Robinhood · Ethereum)' : chain}
                 </option>
               ))}
             </Select>
@@ -140,7 +152,11 @@ function WalletModal({ initial, onClose, onSave }: { initial: DisplayWallet | nu
   );
 }
 
-export default function WalletsPage() {
+interface WalletsPageProps {
+  scope?: 'sol' | 'evm';
+}
+
+export default function WalletsPage({ scope }: WalletsPageProps) {
   const [wallets, setWallets] = useState<DisplayWallet[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [modal, setModal] = useState<'new' | DisplayWallet | null>(null);
@@ -169,7 +185,7 @@ export default function WalletsPage() {
   }, []);
 
   async function saveWallet(draft: Draft) {
-    const payload = { ...draft, address: draft.address.trim(), name: draft.name.trim(), source: draft.source.trim() };
+    const payload = { ...draft, address: draft.address.trim(), name: draft.name.trim(), source: draft.source.trim(), clan: normalizeClan(draft.clan) };
     if (modal === 'new') {
       await dataStore.addWallet({ ...payload, tags: [] });
     } else if (modal) {
@@ -209,7 +225,10 @@ export default function WalletsPage() {
   }
 
   async function commitImport() {
-    const rows: ImportRow[] = (preview ?? []).map((r) => r.data).filter((d): d is ImportRow => d !== undefined);
+    const rows: ImportRow[] = (preview ?? [])
+      .map((r) => r.data)
+      .filter((d): d is ImportRow => d !== undefined)
+      .map((row) => ({ ...row, clan: normalizeClan(row.clan) }));
     if (rows.length === 0) return;
     await dataStore.importWallets(rows);
     setPreview(null);
@@ -243,15 +262,17 @@ export default function WalletsPage() {
   }
 
   const validCount = preview?.filter((r) => r.data).length ?? 0;
+  const visibleWallets = scope === undefined ? wallets : wallets.filter((wallet) => scope === 'sol' ? wallet.chain === 'sol' : wallet.chain !== 'sol');
+  const title = scope === 'sol' ? 'Solana wallet' : scope === 'evm' ? 'EVM wallet' : 'Tracked wallets';
 
   return (
     <>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-base font-semibold text-ink">
-          Tracked wallets <span className="ml-1 font-mono text-xs font-normal text-muted">{wallets.length}</span>
+          {title} <span className="ml-1 font-mono text-xs font-normal text-muted">{visibleWallets.length}</span>
         </h1>
         <div className="flex flex-wrap gap-2">
-          <Button variant="ghost" onClick={() => downloadCsv(wallets)}>
+          <Button variant="ghost" onClick={() => downloadCsv(visibleWallets)}>
             <Download size={14} /> Export CSV
           </Button>
           {isAdmin && (
@@ -315,7 +336,7 @@ export default function WalletsPage() {
                     <Td className="font-mono">{r.row}</Td>
                     <Td className="font-mono break-all">{r.data ? r.data.address : '-'}</Td>
                     <Td className="font-mono"><span className={walletNameClass(r.data?.tags)}>{r.data?.name || '-'}</span></Td>
-                    {SHOW_CLAN && <Td className="font-mono">{r.data?.clan || '-'}</Td>}
+                    {SHOW_CLAN && <Td className="font-mono">{normalizeClan(r.data?.clan) || '-'}</Td>}
                     <Td className="font-mono">{r.data?.tags.join('; ') || '-'}</Td>
                     <Td className="font-mono uppercase">{r.data?.chain ?? '-'}</Td>
                     <Td className="font-mono">{r.data?.source || '-'}</Td>
@@ -328,9 +349,9 @@ export default function WalletsPage() {
         </div>
       )}
 
-      {wallets.length === 0 ? (
+      {visibleWallets.length === 0 ? (
         <EmptyState
-          title="No tracked wallets"
+          title={scope === undefined ? 'No tracked wallets' : `No ${scope === 'sol' ? 'Solana' : 'EVM'} wallets`}
           hint="Add a wallet manually or import a CSV file to start correlating signals."
           action={
             isAdmin ? (
@@ -358,7 +379,7 @@ export default function WalletsPage() {
               </tr>
             </thead>
             <tbody>
-              {wallets.map((w, idx) => (
+              {visibleWallets.map((w, idx) => (
                 <tr key={w.id} className="transition-colors hover:bg-surface2/50">
                   <Td className="text-muted">{idx + 1}</Td>
                   <Td className="whitespace-nowrap">
@@ -381,7 +402,7 @@ export default function WalletsPage() {
                       <span className="text-muted">—</span>
                     )}
                   </Td>
-                  {SHOW_CLAN && <Td className="font-mono">{w.clan || '-'}</Td>}
+                  {SHOW_CLAN && <Td className="font-mono">{normalizeClan(w.clan) || '-'}</Td>}
                   <Td>
                     <div className="flex flex-wrap items-center gap-1">
                       {w.tags.map((t) => (
@@ -437,7 +458,7 @@ export default function WalletsPage() {
         </TableShell>
       )}
 
-      {modal && <WalletModal initial={modal === 'new' ? null : modal} onClose={() => setModal(null)} onSave={saveWallet} />}
+      {modal && <WalletModal initial={modal === 'new' ? null : modal} defaultChain={scope ?? 'sol'} onClose={() => setModal(null)} onSave={saveWallet} />}
       {confirm && (
         <ConfirmDialog
           title="Delete wallet"

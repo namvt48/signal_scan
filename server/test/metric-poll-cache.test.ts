@@ -274,6 +274,26 @@ test('MC metric sweep enforces the 30-minute floor and retains the last success 
   const state = getDb().prepare('SELECT market_cap FROM token_state WHERE ca = ? AND chain = ?').get(ca, 'sol') as { market_cap: number } | undefined;
   assert.equal(state?.market_cap, 2_000);
 });
+test('metric sweep skips a cached target that became inactive and retains its prior cache', async () => {
+  open(':memory:');
+  const ca = 'MC-INACTIVE-SWEEP-CA';
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
+  const calls: MetricKind[] = [];
+  await metricSweep(providerWithCalls(calls), 'essential', 1_000, [{ address: ca, chain: 'sol' }]);
+  const prior = getMetricPollCache(ca, 'sol', 'essential');
+  assert.ok(prior?.response_at);
+
+  getDb().prepare("UPDATE tracked_cas SET status = 'inactive' WHERE address = ? AND chain = ?").run(ca, 'sol');
+  getDb().prepare('UPDATE metric_poll_cache SET next_allowed_at = ? WHERE ca = ? AND chain = ? AND kind = ?')
+    .run(Date.now() - 1, ca, 'sol', 'essential');
+  const callsBefore = calls.length;
+  await metricSweep(providerWithCalls(calls), 'essential', 1_000, [{ address: ca, chain: 'sol' }]);
+
+  assert.equal(calls.length, callsBefore, 'inactive cached targets make no provider request');
+  const after = getMetricPollCache(ca, 'sol', 'essential');
+  assert.equal(after?.response_at, prior?.response_at, 'inactive target keeps its last successful response');
+  assert.equal(after?.response_json, prior?.response_json);
+});
 
 test('first add seeds metric caches and a fresh repeated add makes no provider calls', async () => {
   open(':memory:');
@@ -288,6 +308,7 @@ test('first add seeds metric caches and a fresh repeated add makes no provider c
       return tokenInfo(address, chain);
     },
   };
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
   await kickToken(firstAdd, ca, 'sol');
   await kickToken(firstAdd, ca, 'sol');
   assert.equal(tokenInfoCalls, 1);
@@ -310,6 +331,7 @@ test('re-add rehydrates cached metric values at source timestamps without fresh 
       return tokenInfo(address, chain);
     },
   };
+  insertTrackedCa({ address: ca, chain: 'sol', note: 'test' });
   await kickToken(provider, ca, 'sol');
   const essentialAt = getMetricPollCache(ca, 'sol', 'essential')?.response_at;
   const volumeAt = getMetricPollCache(ca, 'sol', 'volume')?.response_at;

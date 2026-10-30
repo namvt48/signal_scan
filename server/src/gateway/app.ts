@@ -22,10 +22,13 @@ import {
 } from './contract.js';
 import {
   GMGN_TOKEN_INFO_PATH,
+  GMGN_WALLET_ACTIVITY_PATH,
   GmgnTokenInfoSingleFlight,
   createGmgnKeyPool,
   gmgnTokenInfoUpstream,
   handleGmgnTokenInfo,
+  handleGmgnWalletActivity,
+  type GmgnSingleFlightSnapshot,
 } from './gmgn.js';
 import type { GmgnKeyPool } from './gmgn-keys.js';
 import {
@@ -44,7 +47,7 @@ import {
   type DoorPost,
 } from './nansen.js';
 import { GatewayCache, type CacheStats, type Preflight } from './cache.js';
-import { CreditAccountant, type CreditSnapshot } from './credit.js';
+import { CreditAccountant, type CreditSnapshot, type NansenEfficiencySnapshot } from './credit.js';
 import { CHAINS, EVM_ADDRESS, canonicalCa, isSolanaAddress, type Chain } from '../shared/chain.js';
 import { acknowledgeMarketAlertDelivery, replaceMarketSubscriptions, type CaTarget, type MarketAlertCaller } from '../db.js';
 
@@ -123,7 +126,8 @@ export interface GatewayMetrics {
   ratelimit: Record<string, LimiterSnapshot>;
   credits: CreditSnapshot;
   cache: CacheStats;
-  gmgnSingleFlight: { joined: number; inflight: number };
+  gmgnSingleFlight: GmgnSingleFlightSnapshot;
+  nansenPaid: NansenEfficiencySnapshot;
   text: string;
 }
 
@@ -134,6 +138,7 @@ export function formatMetricsText(m: Omit<GatewayMetrics, 'text'>): string {
     `credits day=${m.credits.day} budget=${m.credits.budget} half=${m.credits.half} used_a=${m.credits.used.a} used_b=${m.credits.used.b}`,
     `cache hits=${m.cache.hits} misses=${m.cache.misses} joined=${m.cache.joined} size=${m.cache.size} inflight=${m.cache.inflight}`,
     `gmgn-singleflight joined=${m.gmgnSingleFlight.joined} inflight=${m.gmgnSingleFlight.inflight}`,
+    `nansen-paid since=${m.nansenPaid.since} attempts=${m.nansenPaid.total.attempts} with_data=${m.nansenPaid.total.responsesWithData} empty=${m.nansenPaid.total.emptyResponses} invalid=${m.nansenPaid.total.invalidResponses} errors=${m.nansenPaid.total.errors} reported_credits=${m.nansenPaid.total.reportedCredits} estimated_credits=${m.nansenPaid.total.estimatedCredits}`,
   ];
   for (const [key, s] of Object.entries(m.ratelimit)) {
     lines.push(
@@ -176,7 +181,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
   const tokens = deps.tokens ?? callerTokensFromConfig();
   const cache = deps.cache ?? new GatewayCache();
   const gmgnSingleFlight = deps.gmgnSingleFlight ?? new GmgnTokenInfoSingleFlight();
-  const credits = deps.credits ?? new CreditAccountant();
+  const credits = deps.credits ?? new CreditAccountant({ split: Boolean(tokens.b) && tokens.b !== '' });
   const app = express();
 
   // Request log — same shape as api.ts. NEVER logs headers, so no token leaks.
@@ -221,6 +226,7 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
       credits: credits.snapshot(),
       cache: cache.stats(),
       gmgnSingleFlight: gmgnSingleFlight.snapshot(),
+      nansenPaid: credits.efficiencySnapshot(),
     };
     const text = formatMetricsText(snapshot);
     if (req.query.format === 'text') {
@@ -349,6 +355,19 @@ export function createGatewayApp(deps: GatewayAppDeps = {}): Express {
         pool: gmgnPool,
       }))
       .then((result) => send(res, result), next);
+  });
+  app.post(GMGN_WALLET_ACTIVITY_PATH, parseJson, (req: Request, res: Response, next: NextFunction) => {
+    const caller = req.caller;
+    if (caller === undefined) {
+      send(res, denial(401, 'unauthorized'));
+      return;
+    }
+    void handleGmgnWalletActivity(req.body, caller, {
+      fetchUpstream: gmgnUpstream,
+      runLimiter: deps.runLimiter,
+      runEgressLimiter: deps.runEgressLimiter,
+      pool: gmgnPool,
+    }).then((result) => send(res, result), next);
   });
 
   // DexScreener (todo 9): a per-CLASS limiter route. The class is picked from

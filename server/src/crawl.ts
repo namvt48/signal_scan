@@ -120,6 +120,7 @@ export async function balanceSeries(
   ca: string,
   chain: Chain,
   window: 'day' | 'week' | 'month',
+  options: { allowRefresh?: boolean } = {},
 ): Promise<{ source: 'nansen' | 'snapshots'; points: BalancePoint[]; cachedAt?: number }> {
   const atMs = (p: BalancePoint) => (typeof p.t === 'number' ? p.t : Date.parse(String(p.t)));
   let cachedAt = nansenSeriesCachedAt(ca, chain, window);
@@ -133,7 +134,7 @@ export async function balanceSeries(
         const since = Date.now() - (window === 'day' ? 86_400_000 : window === 'week' ? 7 * 86_400_000 : 30 * 86_400_000);
         const points = entry.series.filter((point) => atMs(point) >= since).sort((a, b) => atMs(a) - atMs(b));
         if (points.length > 1) return { source: 'nansen', points, cachedAt: entry.series_at };
-      } else {
+      } else if (options.allowRefresh !== false) {
         cacheSeriesWindows(ca, chain, entry.series, entry.series_at);
         log.info(`[setup-cache] replayed ${ca.slice(0, 8)} (${chain}) chart windows from the file cache`);
         cachedAt = nansenSeriesCachedAt(ca, chain, window);
@@ -141,9 +142,7 @@ export async function balanceSeries(
       }
     }
   }
-  // Stale top-up: serve the cache immediately but kick a background refresh so
-  // the series converges toward Nansen live within one sweep interval.
-  if (cachedAt !== undefined && Date.now() - cachedAt > 3_600_000) kickNansen(ca, chain);
+  if (options.allowRefresh !== false && cachedAt !== undefined && Date.now() - cachedAt > 3_600_000) kickNansen(ca, chain);
 
   if (cached.length > 1) return { source: 'nansen', points: cached.sort((a, b) => atMs(a) - atMs(b)), cachedAt };
   const since = Date.now() - (window === 'day' ? 86_400_000 : window === 'week' ? 7 * 86_400_000 : 30 * 86_400_000);

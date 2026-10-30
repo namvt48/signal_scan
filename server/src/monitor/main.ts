@@ -43,7 +43,7 @@ function main(): void {
     fetch,
     async (symbol, ca, chain, source) => {
       if (ca !== undefined && chain !== undefined && source !== undefined) {
-        return fetchTokenAvatar(source === 'A' ? config.apiAUrl : config.apiBUrl, config.apiToken, chain, ca);
+        return fetchTokenAvatar(source === 'B' && config.apiBUrl ? config.apiBUrl : config.apiAUrl, config.apiToken, chain, ca);
       }
       return renderCaIdenticon(chain ?? 'sol', ca ?? symbol ?? '-');
     },

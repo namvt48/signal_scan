@@ -2,9 +2,8 @@
 
 export const CHAINS = ['sol', 'base', 'bsc', 'robinhood', 'eth'] as const;
 export type Chain = (typeof CHAINS)[number];
-// Wallet-group import networks. `eth` is a supported Chain for FOMO swaps and
-// tracked CAs, but is intentionally not auto-added to an EVM wallet group.
-export const EVM_CHAINS = ['base', 'bsc', 'robinhood'] as const satisfies readonly Chain[];
+// Wallet-group import includes every supported EVM watcher chain.
+export const EVM_CHAINS = ['base', 'bsc', 'robinhood', 'eth'] as const satisfies readonly Chain[];
 
 export const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 

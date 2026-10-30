@@ -2,12 +2,12 @@
 
 **API version:** v1  
 **Base URL:** `https://signal-scan.duckdns.org/api/v1`  
-**WebSocket URL:** `wss://signal-scan.duckdns.org/api/v1/ws` (A) · `wss://signal-scan.duckdns.org/api/v1/fomo/ws` (FOMO instance)  
+**WebSocket URL:** `wss://signal-scan.duckdns.org/api/v1/ws` (market + tracked-wallet) · `wss://signal-scan.duckdns.org/api/v1/fomo/ws` (FOMO-user alerts)
 **API type:** Read-only. Responses are built from data currently stored by Signal Scan.
 
 This guide is for API consumers. Public endpoints do not require an account, API key, or `Authorization` header.
 
-> **Privacy notice:** The API does not identify callers. Wallet addresses, wallet profiles, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO-instance tokens, FOMO-instance alerts, and FOMO-instance wallets are publicly accessible. Do not send internal credentials or user login credentials to these endpoints.
+> **Privacy notice:** The API does not identify callers. Wallet addresses, wallet profiles, wallet-watch trades, FOMO handles, FOMO trades, FOMO positions, FOMO tokens, FOMO alerts, and FOMO wallets are publicly accessible. Do not send internal credentials or user login credentials to these endpoints.
 
 ## Quick start
 
@@ -89,17 +89,17 @@ Use one of these patterns:
 | `GET` | `/alerts` | Alert observations ordered by ID. |
 | `GET` | `/wallets` | Paginated tracked-wallet records. |
 | `GET` | `/wallets/{id}/trades` | Time-bounded wallet-watch trades ordered by ID. |
-| `GET` | `/fomo/tokens` | Paginated FOMO-instance token table with `fomoUsers`. |
-| `GET` | `/fomo/tokens/{chain}/{address}` | One FOMO-instance token with `fomoUsers`. |
+| `GET` | `/fomo/tokens` | Paginated token table with `fomoUsers`. |
+| `GET` | `/fomo/tokens/{chain}/{address}` | One token with `fomoUsers`. |
 | `GET` | `/fomo/tokens/{chain}/{address}/users` | Per-token FOMO user stats. |
-| `GET` | `/fomo/alerts` | FOMO-instance alert observations ordered by ID. |
+| `GET` | `/fomo/alerts` | FOMO-user alert observations ordered by ID. |
 | `GET` | `/fomo/users` | Paginated FOMO watch-list. |
 | `GET` | `/fomo/users/{id}/trades` | Time-bounded FOMO buy/sell alerts ordered by ID. |
 | `GET` | `/fomo/users/{id}/positions` | Stored FOMO positions, balance measurements, and refresh metadata. |
-| `GET` | `/fomo/wallets` | Paginated FOMO-instance tracked wallets. |
-| `GET` | `/fomo/wallets/{id}/trades` | Time-bounded FOMO-instance wallet watch trades. |
-| `WS` | `/ws` | Live stream of new A-instance `trackerBuy` inflow alerts. |
-| `WS` | `/fomo/ws` | Live stream of new FOMO-instance `trackerBuy` alerts. |
+| `GET` | `/fomo/wallets` | Paginated FOMO tracked wallets. |
+| `GET` | `/fomo/wallets/{id}/trades` | Time-bounded FOMO wallet watch trades. |
+| `WS` | `/ws` | Live stream of market and tracked-wallet `trackerBuy` inflows. |
+| `WS` | `/fomo/ws` | Live stream of FOMO-user `trackerBuy` alerts. |
 
 Append each path to the Base URL. For example, `/tokens/sol/So111...` becomes `https://signal-scan.duckdns.org/api/v1/tokens/sol/So111...`.
 
@@ -349,7 +349,7 @@ wss://signal-scan.duckdns.org/api/v1/ws
 
 No API key is required. The stream is server-to-client; clients must not send commands or subscription messages.
 
-The FOMO instance has an equivalent stream at `wss://signal-scan.duckdns.org/api/v1/fomo/ws`. It uses the same protocol and only streams that instance's `trackerBuy` alerts; recover with `GET /fomo/alerts?after_id=<id>`. Both paths share the per-process connection limit but poll their own upstream.
+The FOMO-user stream is at `wss://signal-scan.duckdns.org/api/v1/fomo/ws`. It uses the same protocol and streams only `fomo`-origin `trackerBuy` alerts; recover with `GET /fomo/alerts?after_id=<id>`. Both paths share the per-process connection limit and use the same merged database with independent feed filters. Reset saved B-instance alert cursors after the one-time feed migration.
 
 The server sends one `ready` message after connection setup:
 
@@ -404,7 +404,13 @@ ws.addEventListener('message', (event) => {
 });
 ```
 
-The WebSocket stream does not replay events missed while disconnected. Deduplicate by `data.id` in the consumer.
+With `?after_id=<last-cursor>`, the WebSocket replays durable inflows after the cursor. Persist `cursor` messages as the cursor advances over filtered rows. Delivery is at-least-once; deduplicate by `data.id`.
+
+### Replay cursors and readiness
+
+For durable reconnect, connect to either WebSocket path with `?after_id=<last-cursor>`. Without the parameter the connection remains live-only. Persist `cursor` message `afterId` values as well as inflow IDs; filtered rows still advance the durable consumer position. Delivery is at-least-once, so deduplicate inflows by `data.id`. A `cursor_gap` or `invalid_cursor` message means the cursor cannot be replayed (retention gap or future ID); the server closes with `1008` and supplies the oldest retained ID when available. `1012` means the service is draining for replacement; reconnect with the last persisted cursor.
+
+`GET https://signal-scan.duckdns.org/readyz` is the deployment readiness probe. It returns `200` with `{ "status": "ready", "release": "<RELEASE_ID>" }` only when token configuration is present and authenticated real exports from both main and FOMO backends succeed. It is bounded, omits backend details, and does not consume public rate-limit quota. `/api/v1/status` remains a shallow process-only check.
 
 ### Recover missed events after reconnect
 
@@ -556,11 +562,11 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/wallets/wallet-id/trades?from=1
 
 ## FOMO watch-list and activity
 
-FOMO routes read the separate FOMO dashboard instance. They return `502` when that upstream is not configured or unreachable. FOMO token routes accept `eth` in addition to `sol`, `base`, `bsc`, and `robinhood`.
+FOMO routes read from the merged dashboard database. They return `502` when the private dashboard export endpoint is unreachable. FOMO token routes accept `eth` in addition to `sol`, `base`, `bsc`, and `robinhood`.
 
 ### Token table — `GET /fomo/tokens`
 
-Returns the FOMO dashboard's tracked tokens. Each entry is the same payload as `GET /tokens` plus `fomoUsers`, the rows the dashboard's FOMO sub-table renders:
+Returns the merged dashboard's tracked tokens. Each entry is the same payload as `GET /tokens` plus `fomoUsers`, the rows the dashboard's FOMO sub-table renders:
 
 ```bash
 curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/tokens?limit=50&offset=0'
@@ -576,11 +582,11 @@ curl -sS 'https://signal-scan.duckdns.org/api/v1/fomo/tokens?limit=50&offset=0'
 }
 ```
 
-`GET /fomo/tokens/{chain}/{address}` returns one entry with the same shape, or `404` when the FOMO instance does not track that token.
+`GET /fomo/tokens/{chain}/{address}` returns one entry with the same shape, or `404` when the merged dashboard does not track that token.
 
 ### Alerts and wallets — `GET /fomo/alerts`, `/fomo/wallets`
 
-`GET /fomo/alerts?after_id=<id>&limit=<n>` mirrors `/alerts`: same DTO, `nextId`, and `gap` semantics, read from the FOMO instance. `GET /fomo/wallets` and `GET /fomo/wallets/{id}/trades` mirror `/wallets` and `/wallets/{id}/trades` against the FOMO instance's wallet watch.
+`GET /fomo/alerts?after_id=<id>&limit=<n>` mirrors `/alerts`: same DTO, `nextId`, and `gap` semantics, filtered to FOMO-user observations from the merged feed. `GET /fomo/wallets` and `GET /fomo/wallets/{id}/trades` return FOMO watch data from the same merged dashboard database.
 
 ### FOMO users — `GET /fomo/users`
 
@@ -658,9 +664,13 @@ Same parameters and pagination as wallet trades: `from`/`to` default to the last
 - `after_id` is used for alerts, wallet trades, FOMO alerts, and FOMO trades and must be a non-negative integer.
 - Activity and trade time ranges use epoch milliseconds and the half-open interval `[from, to)`, with a maximum span of 31 days.
 - The HTTP quota is shared by all callers: 120 requests per minute per process. A `429` response includes `Retry-After` in seconds.
-- At most 16 HTTP requests are processed concurrently; excess requests may receive `503`.
+- At most 24 HTTP requests are processed concurrently; excess requests receive `503` with `Retry-After: 1`.
 - The WebSocket limit is 64 concurrent connections per process and is independent of the HTTP quota.
 - Quotas and caches are process-local; production runs one public API replica to keep behavior consistent.
+- Token lists and lookups share a snapshot refreshed in a read-only worker every 15 seconds. `generatedAt` records capture time. Failed refreshes retain a snapshot only while it is less than 60 seconds old; beyond that, token requests fail unavailable. Offset pages are not pinned across refreshes; deduplicate by token ID during long scans.
+- Successful token/detail responses cache for 5 seconds; wallet/user lists, balance charts and per-token FOMO statistics for 15 seconds; activity/trades/positions for 1 second; REST alerts for 500 ms. Errors are not cached. Snapshot responses never remain cached beyond the snapshot's age bound.
+- Omitted activity/trade time bounds use a last-24-hour range anchored to a one-second boundary. Explicit time bounds keep millisecond precision.
+- Keep full scans non-overlapping and use ID cursors for incremental trades/alerts; retry transient failures with backoff and jitter.
 
 ## Errors and recovery
 

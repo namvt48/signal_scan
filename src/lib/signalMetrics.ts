@@ -22,6 +22,31 @@ export function sumKnownUsd(values: readonly (number | null)[]): number | null {
   return total;
 }
 
+/** FOMO net inflow is complete only when both rolling-window flow totals are known. */
+export function netInflowUsd(buyUsd: number | null, sellUsd: number | null): number | null {
+  if (buyUsd === null || sellUsd === null || !Number.isFinite(buyUsd) || !Number.isFinite(sellUsd)) return null;
+  return buyUsd - sellUsd;
+}
+
+/** Total tracked balance is complete only when every member balance is measured. */
+export function totalBalanceUsd(
+  wallets: readonly { balUsd?: number }[],
+  fomoUsers?: readonly { balUsd?: number }[],
+): number | undefined {
+  let total = 0;
+  for (const member of wallets) {
+    if (member.balUsd === undefined || !Number.isFinite(member.balUsd)) return undefined;
+    total += member.balUsd;
+  }
+  if (fomoUsers) {
+    for (const member of fomoUsers) {
+      if (member.balUsd === undefined || !Number.isFinite(member.balUsd)) return undefined;
+      total += member.balUsd;
+    }
+  }
+  return Number.isFinite(total) ? total : undefined;
+}
+
 /** Blank bounds disable filtering; unknown values cannot satisfy an active range. */
 export function percentageInRange(value: number | undefined, min: string, max: string): boolean {
   const lower = min.trim() === '' ? undefined : Number(min);

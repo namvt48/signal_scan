@@ -7,7 +7,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { insertWallet, open } from '../src/db.js';
+import { insertWallet, open, setSetting } from '../src/db.js';
 import { createApp } from '../src/api.js';
 import { matchServiceToken, parseUserRoles, resolveRouteAccess, type AuthDeps } from '../src/auth.js';
 import { createTestAuth, TEST_SERVICE_TOKEN, type TestAuth } from './auth-testkit.js';
@@ -21,6 +21,7 @@ let base = '';
 
 before(async () => {
   open(':memory:');
+  setSetting('systemDeployAt', '1700000000000');
   insertWallet({ address: WALLET, name: 'AUTH', tags: [], chain: 'sol', source: 'test' });
   auth = await createTestAuth();
   server = createApp('test', auth.deps).listen(0);
@@ -169,18 +170,18 @@ test('role emails are matched case-insensitively', async () => {
 
 // --- the service role: least privilege ---------------------------------------
 
-test('service token: allowed on POST /api/tracked-cas (201)', async () => {
+test('service token cannot bypass BUY deduplication through manual CA admission', async () => {
   const res = await req(base, 'POST', '/api/tracked-cas', {
     token: TEST_SERVICE_TOKEN,
     body: { address: 'authCa-svc-001', chain: 'sol' },
   });
-  assert.equal(res.status, 201);
+  assert.equal(res.status, 403);
 });
 
 test('service token: allowed on POST /api/wallet-watch/trades (200 inserted)', async () => {
   const res = await req(base, 'POST', '/api/wallet-watch/trades', {
     token: TEST_SERVICE_TOKEN,
-    body: { wallet: WALLET, ca: 'authCa-svc-001', tx: 'sig-auth-1', ts: 1_758_000_000_000, amountUsd: 100, price: 0.01 },
+    body: { wallet: WALLET, ca: 'authCa-svc-001', tx: 'sig-auth-1', ts: 1_758_000_000_000, amountUsd: 100, price: 0.01, provenance: 'live' },
   });
   assert.equal(res.status, 200);
   assert.deepEqual(res.json, { inserted: 1 });
@@ -298,7 +299,7 @@ test('resolveRouteAccess: table hits, param paths, trailing slash, HEAD-as-GET, 
   assert.equal(resolveRouteAccess('GET', '/api/health'), 'public');
   assert.equal(resolveRouteAccess('HEAD', '/api/health'), 'public');
   assert.deepEqual(resolveRouteAccess('PUT', '/api/tier'), ['admin']);
-  assert.deepEqual(resolveRouteAccess('POST', '/api/tracked-cas'), ['admin', 'service']);
+  assert.deepEqual(resolveRouteAccess('POST', '/api/tracked-cas'), ['admin']);
   assert.deepEqual(resolveRouteAccess('DELETE', '/api/wallets/some-id/'), ['admin']);
   assert.equal(resolveRouteAccess('GET', '/api/wallets/some-id'), null, 'no GET /api/wallets/:id route exists');
   assert.equal(resolveRouteAccess('POST', '/api/health'), null, 'method matters');

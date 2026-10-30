@@ -18,12 +18,11 @@ Environment=EVM_RPC_MIN_INTERVAL_SECONDS=0.3
 Environment=EVM_CHUNK_CAPS=base=20
 Environment=EVM_CONFIRMATIONS_ETH=4
 Environment=EVM_MAX_TX_BLOCKS=16
-Environment=EVM_MAX_STARTUP_BACKFILL_SECONDS=900
 Environment=EVM_WSS_DISABLED_CHAINS=base,bsc,eth
 Environment=EVM_TRACE_DISABLED_CHAINS=base,bsc,robinhood,eth
 Environment=EVM_LOGS_DISABLED_CHAINS=bsc
 Environment=EVM_TX_SCAN_DISABLED_CHAINS=robinhood
-ExecStart=/opt/wallet-watch/venv/bin/python -m watchers.evm --chains base,bsc,robinhood,eth --feed hybrid --no-min-usd-gate --api-url http://127.0.0.1:8125 --confirmations 8 --chunk 500 --poll-sleep 3
+ExecStart=/opt/wallet-watch/venv/bin/python -m watchers.evm --chains base,bsc,robinhood,eth --feed hybrid --no-min-usd-gate --api-url http://127.0.0.1:8124 --confirmations 8 --chunk 500 --poll-sleep 3
 Restart=always
 RestartSec=5
 

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { config } from '../src/config.js';
 import {
+  fetchFomoFollowingPage,
+  fetchFomoUserProfile,
   fetchFomoBalances,
   fetchFomoSwaps,
   fetchFomoTradeDetail,
@@ -400,16 +402,88 @@ test('FOMO 429 honors Retry-After without inline retry', async () => {
   });
 });
 
-test('FOMO 503 without Retry-After retries at most three times', async () => {
+test('FOMO guard denial remains blocked and makes one request despite operational health', async () => {
+  let bridgeAttempts = 0;
+  await withBridge((url) => {
+    if (url.endsWith('/health')) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    bridgeAttempts++;
+    return new Response(JSON.stringify({ error: { code: 'suspended' } }), {
+      status: 403,
+      headers: { 'x-fomo-guard': 'suspended', 'x-fomo-retry-handled': '1' },
+    });
+  }, async () => {
+    const result = await fetchFomoBalances('stable-fomo-id');
+    assert.equal(result.outcome, 'guard_blocked');
+    assert.equal(result.value, null);
+    assert.equal(result.status, 403);
+    assert.equal(result.attempts, 1);
+    assert.equal(bridgeAttempts, 1);
+  });
+});
+
+test('FOMO bridge Retry-After preserves 120 seconds and HTTP-date', async () => {
+  await withBridge(() => new Response('rate limited', {
+    status: 429, headers: { 'retry-after': '120', 'x-fomo-retry-handled': '1' },
+  }), async () => {
+    const result = await fetchFomoSwaps('stable-fomo-id');
+    assert.equal(result.outcome, 'rate_limited');
+    assert.equal(result.retryAfterMs, 120_000);
+    assert.equal(result.attempts, 1);
+  });
+  const target = new Date(Date.now() + 120_000);
+  await withBridge(() => new Response('rate limited', {
+    status: 429,
+    headers: { 'retry-after': target.toUTCString(), 'x-fomo-retry-handled': '1' },
+  }), async () => {
+    const result = await fetchFomoSwaps('stable-fomo-id');
+    assert.ok((result.retryAfterMs ?? 0) > 0);
+    assert.ok((result.retryAfterMs ?? 0) <= 120_000);
+  });
+});
+
+test('FOMO 503 without Retry-After is not retried by the bridge consumer', async () => {
   let bridgeAttempts = 0;
   await withBridge(() => {
     bridgeAttempts++;
-    return new Response('unavailable', { status: 503 });
+    return new Response('unavailable', { status: 503, headers: { 'x-fomo-retry-handled': '1' } });
   }, async () => {
     const result = await fetchFomoSwaps('stable-fomo-id');
     assert.equal(result.outcome, 'http_error');
-    assert.equal(result.attempts, 3);
-    assert.equal(result.attemptFailures, 3);
-    assert.equal(bridgeAttempts, 3);
+    assert.equal(result.attempts, 1);
+    assert.equal(result.attemptFailures, 1);
+    assert.equal(bridgeAttempts, 1);
+  });
+});
+
+test('following page sends cursor and parses stable user identity', async () => {
+  let requested = '';
+  await withBridge((url) => {
+    requested = url;
+    return new Response(JSON.stringify({ success: true, responseObject: { users: [
+      { id: 'user-2', userHandle: 'Second', displayName: 'Second User', private: false },
+    ] } }), { status: 200 });
+  }, async () => {
+    const result = await fetchFomoFollowingPage('owner-id', 'cursor-id');
+    assert.equal(new URL(requested).pathname, '/v2/users/owner-id/followingPaginate');
+    assert.equal(new URL(requested).searchParams.get('lastId'), 'cursor-id');
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.users, [{ id: 'user-2', handle: 'Second', displayName: 'Second User', private: false }]);
+  });
+});
+
+test('owner profile requires a valid following count for completeness checks', async () => {
+  await withBridge(() => new Response(JSON.stringify({ success: true, responseObject: {
+    id: 'owner-id', userHandle: 'ItsAlita', private: false, following: 160,
+  } }), { status: 200 }), async () => {
+    const result = await fetchFomoUserProfile('owner-id');
+    assert.equal(result.ok, true);
+    assert.equal(result.profile?.following, 160);
+  });
+  await withBridge(() => new Response(JSON.stringify({ success: true, responseObject: {
+    id: 'owner-id', userHandle: 'ItsAlita', private: false, following: '160',
+  } }), { status: 200 }), async () => {
+    const result = await fetchFomoUserProfile('owner-id');
+    assert.equal(result.ok, true);
+    assert.equal(result.profile?.following, null);
   });
 });

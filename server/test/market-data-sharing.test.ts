@@ -73,3 +73,17 @@ test('A/B share gateway-owned public token state but subscriptions and holdings 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('market subscriptions do not reactivate an inactive locally tracked CA', () => {
+  open(':memory:');
+  const db = getDb();
+  const token = { address: 'inactive-market-subscription', chain: 'sol' as const };
+  db.prepare("INSERT INTO tracked_cas (id, address, chain, note, added_at, status) VALUES ('inactive-local', ?, ?, 'fomo', ?, 'inactive')")
+    .run(token.address, token.chain, new Date(0).toISOString());
+
+  assert.deepEqual(replaceMarketSubscriptions('a', [token], Date.now()), [], 'subscription conflict does not trigger a one-shot poll');
+
+  const row = db.prepare('SELECT status, note FROM tracked_cas WHERE address = ? AND chain = ?')
+    .get(token.address, token.chain) as { status: string; note: string };
+  assert.deepEqual(row, { status: 'inactive', note: 'fomo' });
+});

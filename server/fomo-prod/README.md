@@ -1,8 +1,8 @@
 # FOMO prod bridge
 
 Read-only HTTP bridge to `https://prod-api.fomo.family` using `curl_cffi`
-Chrome impersonation. Node fetch gets HTTP 430 from Cloudflare; this service is
-the only process that holds the Privy access/refresh tokens.
+Chrome impersonation. The bridge is intended to remain stopped unless explicitly
+operated; never copy browser cookies or credentials into this service.
 
 ## Routes
 
@@ -15,47 +15,54 @@ GET /feed/token?tokenAddress={ca}&networkId={id}
 GET /trades/{tradeId}
 ```
 
-`/balances`, `/swaps`, and the `/trades` list declare `x-supported-chains`; without
-it prod-api returns Solana-only rows. `/trades/{tradeId}` is fetched by id and does
-not need the header.
+Only read-only routes are proxied. All bridge responses advertise
+`X-Fomo-Retry-Handled: 1`; callers must not retry these responses. Provider 403
+latches the persisted account-wide suspension. Local paused/suspended/state errors
+are 503; cooldown and exhausted quota are 429 with `Retry-After`. The health route
+is local-only and reports safe guard state and remaining delays.
 
-`userId` must be FOMO's UUID. Prod rejects handles with HTTP 400, so the
-watcher skips watch-list rows without a `userId` (`skipped N without userId`).
-`/balances` returns at most 100 rows and no pagination flag; the API treats a
-full page as possibly truncated and does not close missing holdings.
+## Offline request guard
 
-The per-user `/swaps` endpoint is paged newest-first: `hasNextPage` +
-`lastSwapIdV2={last swap id}` walks backwards. The bridge forwards both the
-page size and cursor, and the watcher pages only back to that user's crawl
-window. Captured responses have been Solana-only, but the bridge and watcher do
-not assume that: any supported `networkId` in a swap is mapped normally. EVM
-activity is also exposed through `/feed/token` (token-scoped). A feed item
-carries the position's `tradeId`; `/trades/{tradeId}` returns that trade's full
-`swaps[]` (buy and sell fills, including cross-chain legs). A feed item's id is
-the swap id, and both routes use the same `fomo-swap:<swap id>` event id, so a
-fill seen on both is ingested once.
+Upstream access is fail-closed. Set `FOMO_UPSTREAM_ENABLED=true` to permit calls.
+The default `FOMO_REQUEST_QUOTA_MODE=limited` requires positive
+`FOMO_MAX_REQUESTS_PER_MINUTE`, `FOMO_MAX_REQUESTS_PER_HOUR`, and
+`FOMO_MAX_REQUESTS_PER_DAY` values; missing, invalid, or zero limits deny
+requests. `FOMO_REQUEST_QUOTA_MODE=unlimited` explicitly disables those quota
+windows, but still requires upstream enablement and valid persistent state.
 
-Only read-only routes are proxied. Write/trade endpoints are not reachable
-through this bridge.
+For Compose deployments, persist these variables in
+`${DATA_DIR:-data}/fomo-prod-runtime.env`; the bridge loads this optional
+per-instance file on every `docker compose up`. Keep Makefile defaults out of
+this policy file so ordinary `make up` cannot silently pause or limit it.
+Both modes serialize and pace outbound calls. The limited mode charges every
+attempt (including bounded transport/5xx retries) against all three windows.
+The bridge retries only transport failures and 5xx, at most three times; 401,
+403, and 429 are never retried. HTTP 403 persistently suspends every endpoint.
+HTTP 429 starts a global cooldown (60 seconds when the provider omits
+`Retry-After`); 503 with `Retry-After` also defers all endpoints.
 
-## Credentials
+Shared state defaults to `/state/request-guard.json`
+(`FOMO_GUARD_STATE_FILE`) on the persistent `DATA_DIR/fomo-prod-guard` volume.
+Corrupt/unreadable state deliberately blocks requests rather than resetting.
+All GET responses carry `X-Fomo-Retry-Handled: 1`; consumers make one request
+and preserve their cursors when blocked. `/health` is local-only and reports
+safe guard state; it never calls FOMO.
 
-Mount a private directory containing:
+After provider approval, an operator may clear suspension/cooldown while
+preserving quota history. From the repository root, set `DATA_DIR` as used by
+Compose if it differs from `data`:
 
-```text
-access_token    # Privy access JWT, or JSON with access_token/refresh_token
-refresh_token   # rotated Privy refresh token
+```sh
+FOMO_GUARD_STATE_FILE="${DATA_DIR:-data}/fomo-prod-guard/request-guard.json" \
+  python3 server/fomo-prod/request_guard.py --confirm-provider-approval
 ```
 
-Both files should be mode `0600` and are never committed. The bridge refreshes
-the access token five minutes before expiry and atomically rewrites both files.
-`FOMO_PRIVY_APP_ID` is required when the access-token audience is not the Privy
-app id (the fomo.family cookie token uses `privy.fomo.family`). If the refresh
-token is missing, read requests still work until the access token expires;
-`/health` reports `ok:false` after expiry or when the token file is absent.
+This command is local only; there is no HTTP reset route. Do not reset merely to
+work around a provider denial.
 
-## Runtime
+Run bridge tests entirely offline with a local fake upstream:
 
-The bridge is a compose service; the API talks to `http://fomo-prod:8080` and
-host watchers can use `http://127.0.0.1:8131` when the port is published.
-`/health` only inspects token expiry; it does not burn an upstream request.
+```sh
+cd server/fomo-prod
+python3 -m unittest -v test_bridge
+```

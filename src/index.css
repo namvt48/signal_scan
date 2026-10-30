@@ -166,6 +166,9 @@ body {
 }
 .mc-filter-input::placeholder{ color:#A6B0A2; font-weight:500; }
 .mc-filter-input:focus{ border-color:var(--c-accent); box-shadow:0 0 0 2px rgba(215,250,75,0.16); }
+
+.chain-filter-group{ display:flex; flex:1 1 420px; flex-wrap:wrap; align-items:center; gap:6px; min-width:0; }
+.chain-filter-chip{ display:inline-flex; align-items:center; gap:6px; white-space:nowrap; padding:4px 10px; }
 .mc-filter-input::-webkit-outer-spin-button, .mc-filter-input::-webkit-inner-spin-button{ margin:0; }
 .tier-select{
   appearance:none; -webkit-appearance:none; -moz-appearance:none;

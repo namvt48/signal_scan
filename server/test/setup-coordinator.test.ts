@@ -3,6 +3,7 @@ process.env.POLL_SETUP_RETRY_MS = '1';
 process.env.NEW_CA_PRIORITY_MS = '1000';
 
 import assert from 'node:assert/strict';
+import { EventEmitter, once } from 'node:events';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,9 +15,11 @@ import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } f
 // Imports must follow env setup because config is captured when poller modules load.
 // Dynamic imports intentionally isolate this node:test process's coordinator config.
 
-const { open, getTokenState, insertTrackedCa } = await import('../src/db.js');
+const { open, getTokenState, insertTrackedCa, deactivateTrackedCasByIds, findTrackedCa } = await import('../src/db.js');
 const { loadSetupCache, getSetupCacheEntry, getSetupRetry, putSetupCacheEntry } = await import('../src/setup-cache.js');
 const { kickToken, kickNansen, refreshSeries, setPollerDeps } = await import('../src/poller.js');
+// Load after the environment setup above; log/config are captured at import time.
+const { enqueueSetup } = await import('../src/setup-queue.js');
 
 const CHAIN: Chain = 'sol';
 const DAY = 86_400_000;
@@ -229,6 +232,7 @@ test('kickToken records info freshness when token info is obtained', async () =>
   loadSetupCache(cacheFile());
   const ca = 'CA-COORD-KICK-TOKEN';
   const now = Date.now();
+  insertTrackedCa({ address: ca, chain: CHAIN, note: '' });
   setPollerDeps(provider(now - 2 * DAY), null, {
     tokenFlows: async () => [],
   });
@@ -238,6 +242,7 @@ test('kickToken records info freshness when token info is obtained', async () =>
   assert.ok(getTokenState(ca, CHAIN), 'kickToken obtains token state');
   assert.ok((getSetupCacheEntry(ca, CHAIN)?.info_at ?? 0) > 0, 'obtained info has a persisted freshness marker');
 });
+
 
 test('failed LF retries survive reload and do not re-buy a fresh T100 series', async () => {
   open(':memory:');
@@ -363,4 +368,54 @@ test('empty T100 backoff survives reload and clears when the retry succeeds', as
   assert.equal(calls, firstCalls + 1);
   assert.equal(getSetupRetry(ca, CHAIN, 'series'), undefined);
   assert.equal(getTokenState(ca, CHAIN)?.t100_multiple, 1.5);
+});
+
+test('a CA deactivated while setup is queued does not spend flow credits', async () => {
+  open(':memory:');
+  loadSetupCache(cacheFile());
+  const ca = 'CA-DEACTIVATED-IN-QUEUE';
+  seed(ca, Date.now() - 2 * DAY);
+  let calls = 0;
+  setPollerDeps(provider(Date.now() - 2 * DAY), null, {
+    tokenFlows: async () => { calls += 1; return []; },
+  });
+  const gate = new EventEmitter();
+  const entered = once(gate, 'started');
+  const blocker = enqueueSetup('CA-QUEUE-BLOCKER', CHAIN, 0, async () => {
+    gate.emit('started');
+    await once(gate, 'release');
+  });
+  await entered;
+  const pending = refreshSeries(ca, CHAIN);
+  deactivateTrackedCasByIds([findTrackedCa(ca, CHAIN)!.id]);
+  gate.emit('release');
+  await Promise.all([blocker, pending]);
+  assert.equal(calls, 0, 'inactive queued CA must not issue T100 or LF requests');
+  assert.equal(getSetupCacheEntry(ca, CHAIN), undefined);
+});
+
+test('deactivation during T100 prevents the widened retry and later LF request', async () => {
+  open(':memory:');
+  loadSetupCache(cacheFile());
+  const ca = 'CA-DEACTIVATED-DURING-T100';
+  seed(ca, Date.now() - 2 * DAY);
+  const gate = new EventEmitter();
+  const started = once(gate, 'started');
+  const labels: string[] = [];
+  setPollerDeps(provider(Date.now() - 2 * DAY), null, {
+    tokenFlows: async (request) => {
+      labels.push(request.label);
+      gate.emit('started');
+      await once(gate, 'release');
+      return [];
+    },
+  });
+  const pending = refreshSeries(ca, CHAIN);
+  await started;
+  deactivateTrackedCasByIds([findTrackedCa(ca, CHAIN)!.id]);
+  gate.emit('release');
+  await pending;
+  assert.deepEqual(labels, ['top_100_holders']);
+  assert.equal(getSetupRetry(ca, CHAIN, 'series'), undefined, 'deactivation is not a missing-data failure');
+  assert.equal(getSetupRetry(ca, CHAIN, 'lf'), undefined);
 });

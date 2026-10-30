@@ -21,10 +21,10 @@ import type { MarketDataProvider, MetricPatch, TokenInfo, WalletTokenHolding } f
 import type { Chain } from '../src/shared/chain.js';
 import type { SetupCacheEntry } from '../src/setup-cache.js';
 
-const { open, getTokenState } = await import('../src/db.js');
+const { open, getTokenState, insertTrackedCa } = await import('../src/db.js');
 const { loadSetupCache, putSetupCacheEntry } = await import('../src/setup-cache.js');
 const { DoorPool, setPoolForTest } = await import('../src/crawl.js');
-const { kickCAs, setPollerDeps, earlySetupIdle } = await import('../src/poller.js');
+const { kickCAs, refreshSeries, setPollerDeps, earlySetupIdle } = await import('../src/poller.js');
 const { NANSEN_HOURLY_STATS_URL } = await import('../src/providers/nansen.js');
 
 const CHAIN: Chain = 'sol';
@@ -178,6 +178,8 @@ test('early kick: two CAs fill setup after metadata with one T100 and LF request
   const flows = installFakeFlows(flowRows([[2, 900], [1, 600], [0, 700]], now), flowRows([[2, 120], [1, 130]], now));
   setPollerDeps(fakeProvider(deployedAt), null, flows);
 
+  insertTrackedCa({ address: CA1, chain: CHAIN, note: '' });
+  insertTrackedCa({ address: CA2, chain: CHAIN, note: '' });
   kickCAs([
     { address: CA1, chain: CHAIN },
     { address: CA2, chain: CHAIN },
@@ -206,16 +208,18 @@ test('early kick: a fresh file-cache entry costs ZERO door fetches', async () =>
   await installFakeDoor(); // ANY fetch would be a regression (tripwire)
   setPollerDeps(fakeProvider(deployedAt), null, installFakeFlows([], []));
 
+  insertTrackedCa({ address: CA1, chain: CHAIN, note: '' });
+  insertTrackedCa({ address: CA2, chain: CHAIN, note: '' });
   kickCAs([
     { address: CA1, chain: CHAIN },
     { address: CA2, chain: CHAIN },
   ]);
   await awaitRows([CA1, CA2]);
   await earlySetupIdle();
-
   assert.equal(doorFetches, 0, 'fresh cache entries must absorb both early passes AND kickNansen');
   assert.equal(flowsCalls, 0, 'fresh cache entries must absorb every official API call');
   assert.equal(exchangeFetches, 0);
   assertFilled(CA1, deployedAt);
   assertFilled(CA2, deployedAt);
 });
+

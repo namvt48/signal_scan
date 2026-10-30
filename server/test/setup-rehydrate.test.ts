@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
 import { balanceSeries, DoorPool, setPoolForTest, type DoorConn, type DoorHttpResponse } from '../src/crawl.js';
-import { getDb, getNansenSeries, getTokenState, open } from '../src/db.js';
+import { getDb, getNansenSeries, getTokenState, insertTrackedCa, open } from '../src/db.js';
 import { updateTokenMetrics } from '../src/ingest.js';
 import { refreshSeries, setPollerDeps } from '../src/poller.js';
 import { NANSEN_HOURLY_STATS_URL, type HourlyStatsRow, type TgmFlowsRow, type TokenFlowsClient } from '../src/providers/nansen.js';
@@ -103,6 +103,7 @@ function tempCacheFile(): string {
 
 /** The essential sweep / kickToken creates the bare row (updateTokenAnalytics is an UPDATE). */
 function seedTokenRow(deployedAt: number): void {
+  insertTrackedCa({ address: CA, chain: CHAIN, note: 'test' });
   updateTokenMetrics(CA, CHAIN, { supply: 1_000_000_000, deployedAt });
 }
 
@@ -199,6 +200,7 @@ test('rehydrate waits: a fresh entry with NO token_state row applies nothing and
   open(':memory:');
   const now = Date.now();
   const deployedAt = now - 2 * DAY;
+  insertTrackedCa({ address: CA, chain: CHAIN, note: 'test' });
   loadSetupCache(file);
   putSetupCacheEntry(sampleEntry(now, deployedAt));
   await installFakeDoor();
